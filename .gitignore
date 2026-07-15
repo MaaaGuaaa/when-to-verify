@@ -1,0 +1,43 @@
+# Local-only history and previous implementation
+/legacy/
+/documents_old/
+
+# Raw data, downloaded sources, environments, and generated runs
+/data/
+/outputs/
+/sources/
+/environments/
+/checkpoints/
+/logs/
+/wandb/
+/lightning_logs/
+
+# Agent scratch space
+/.tmp/agent/
+
+# Local Python environments
+/.conda-envs/
+/.venv/
+/venv/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build and packaging output
+/build/
+/dist/
+*.egg-info/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+*~

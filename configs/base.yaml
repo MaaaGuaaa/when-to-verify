@@ -1,0 +1,62 @@
+# Frozen global configuration for the event-centered blind-spot risk project.
+# Owned by SOP-00. Any change to coordinates, tensor dimensions, risk formula
+# constants, or G* cost semantics is a schema change and must be recorded in
+# DECISIONS.md before other workflows adopt it.
+
+seed: 42
+schema_version: "1.0.0"
+
+bev:
+  range_m: 16.0          # full BEV width and height in meters ([-8, 8] each axis)
+  resolution_m: 0.1
+  size: 160              # H == W == 160 cells
+  history_steps: 8       # K, at history_dt_s spacing (1.6 s window)
+  history_dt_s: 0.2
+  future_steps: 15       # T, at future_dt_s spacing (3.0 s horizon)
+  future_dt_s: 0.2
+
+robot:
+  model: differential_drive
+  length_m: 0.70
+  width_m: 0.55
+  inflation_m: 0.15
+  max_linear_speed_mps: 0.9
+  max_angular_speed_radps: 0.8
+
+pedestrian:
+  radius_m: 0.30
+  min_speed_mps: 0.3
+  max_speed_mps: 2.0
+  max_acceleration_mps2: 2.5
+
+age_map:
+  a_max_s: 5.0
+  never_seen_value: 1.0
+  visible_value: 0.0
+
+trajectories:
+  linear_velocities: [0.2, 0.4, 0.6, 0.8]
+  angular_velocities: [-0.8, -0.4, 0.0, 0.4, 0.8]
+  reverse_velocities: [-0.2, -0.4]
+  reverse_probability: 0.2
+  horizon_s: 3.0
+  dt_s: 0.2
+
+risk_gt:
+  sigma_distance_m: 0.5
+  sigma_time_s: 2.0
+  near_miss_distance_m: 0.35
+
+scenario_bank:
+  size: 16
+  posterior_temperature: 0.2
+  reject_cost: 0.20
+
+verification:
+  useful_margin: 0.0
+  decision_margin: 0.01
+
+verification_cost:
+  lambda_time: 0.04
+  lambda_distance: 0.05
+  lambda_yaw_per_deg: 0.0015

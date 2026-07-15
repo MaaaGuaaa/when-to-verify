@@ -1,0 +1,11 @@
+# SOP-01 consumes a read-only recording/session/participant index.
+# Raw THÖR parsing and creation of this index belong to SOP-03.
+dataset: thor
+input_manifest: ../data/thor/recording_index.jsonl
+input_format: jsonl
+
+split_ratios:
+  train: 0.70
+  calibration: 0.10
+  val: 0.10
+  test: 0.10

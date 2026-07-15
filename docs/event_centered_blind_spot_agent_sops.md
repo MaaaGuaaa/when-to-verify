@@ -4,7 +4,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 
 > **For agentic workers:** 按本文任务逐项实施。每个任务必须独立阅读自己的“输入契约、禁止事项、SOP、验收标准和交付物”，使用复选框记录进度。实现时优先采用测试驱动；若后续启用 Agent 编排，使用 `subagent-driven-development` 或 `executing-plans` 逐任务执行。
 
-**目标：** 从 THÖR-MAGNI 真实机器人与行人轨迹出发，构建无数据泄漏的事件中心半合成盲区数据、轨迹条件风险学习、风险校准、反事实验证价值学习以及 `execute / verify / reject` 离线闭环。
+**目标：** 从 THÖR-MAGNI 真实机器人与动态对象轨迹出发，构建无数据泄漏的事件中心半合成盲区数据、轨迹条件风险学习、风险校准、反事实验证价值学习以及 `execute / verify / reject` 离线闭环。
 
 **架构：** 先冻结数据契约、坐标系、时间网格和 toy fixture，再让数据、几何、规划、风险模型、验证价值和评估工作流并行开发。所有工作流只通过版本化 schema、manifest 和结构化产物连接；模型输入与 oracle 标签信息在类型和存储层面分离。
 
@@ -25,7 +25,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 
 ### 1.2 第一版必须完成
 
-- 2D BEV、差速运动学、动态行人、矩形/柱状遮挡和结构性 FOV 盲区
+- 2D BEV、差速运动学、通用动态对象、矩形/柱状遮挡和结构性 FOV 盲区
 - 按 recording/participant 先切分，再在各 split 内独立建 snippet、base state 和样本
 - 六类配对事件、隐藏风险 GT、occupancy baseline、轨迹条件风险模型和校准
 - scenario bank、验证动作、验证后重规划、净验证价值 `G*` 和价值模型
@@ -65,12 +65,12 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 | BEV 范围 | `[-8, 8] m × [-8, 8] m` |
 | BEV 分辨率 | `0.1 m`，`H=W=160` |
 | 机器人尺寸 | `0.70 m × 0.55 m`，膨胀 `0.15 m` |
-| 行人尺寸 | 半径 `0.30 m` |
+| 动态对象尺寸 | `human` 圆半径 `0.30 m`（Carrier `0.45 m`）；其余类型使用 QTM marker P95 矩形或配置 fallback |
 | age map | `A_max=5.0 s`，未见 `1.0`，当前可见 `0.0` |
 
 ### 2.2 类型隔离决策
 
-原始规格中的 `BaseState` 同时出现 observed 与 oracle 字段，而并行计划中的版本未明确 oracle future。为防止未来信息泄漏，第一版冻结为三个层次：
+原始规格中的 `BaseState` 同时出现 observed 与 oracle 字段，而并行计划中的版本未明确 oracle future。为防止未来信息泄漏，schema v2 冻结为三个层次：
 
 ```python
 @dataclass(frozen=True)
@@ -78,11 +78,12 @@ class BaseState:
     state_id: str
     split: str
     recording_id: str
-    participant_ids: tuple[str, ...]
+    dynamic_object_ids: tuple[str, ...]
     timestamp: float
     robot_history: np.ndarray
     robot_state: np.ndarray
-    visible_pedestrian_history: dict[str, np.ndarray]
+    visible_dynamic_object_history: dict[str, np.ndarray]
+    visible_dynamic_object_specs: dict[str, dict]
     static_map_local: np.ndarray | None
     metadata: dict
 
@@ -90,8 +91,9 @@ class BaseState:
 @dataclass(frozen=True)
 class OracleContext:
     base_state_id: str
-    pedestrian_history: dict[str, np.ndarray]
-    pedestrian_future: dict[str, np.ndarray]
+    dynamic_object_history: dict[str, np.ndarray]
+    dynamic_object_future: dict[str, np.ndarray]
+    dynamic_object_specs: dict[str, dict]
     metadata: dict
 
 
@@ -100,14 +102,17 @@ class OracleWorld:
     world_id: str
     base_state_id: str
     static_occupancy: np.ndarray
-    pedestrian_trajectories: dict[str, np.ndarray]
+    dynamic_object_trajectories: dict[str, np.ndarray]
+    dynamic_object_specs: dict[str, dict]
     occluders: tuple[dict, ...]
     blind_spot_config: dict
     random_seed: int
     metadata: dict
 ```
 
-`RiskSample` 和 `VerificationSample` 只能包含部署时可获得的输入、监督标签及溯源 metadata；不得包含 `OracleContext`、隐藏行人未来位置或验证后真实 occupancy。
+`RiskSample` 和 `VerificationSample` 只能包含部署时可获得的输入、监督标签及溯源 metadata；不得包含 `OracleContext`、隐藏动态对象未来位置或验证后真实 occupancy。
+
+动态对象类型冻结为 `human`、`carried_object`、`unknown_dynamic`。适配器必须保留所有非机器人 BODY，不得用行人 allow-list 排除 `storage/cart/carrier/LO*` 等对象；原始 body name/role 仅进入 provenance。对象 ID 使用 `recording_id::body_name`，footprint spec 只允许圆或矩形，并与轨迹 key 严格对齐。schema v1 产物不兼容，必须重建。
 
 ### 2.3 随机性与 ID
 
@@ -525,8 +530,8 @@ python scripts/00_make_splits.py \
 
 - **优先级：** P0
 - **依赖：** SOP-00、01、02
-- **输入：** THÖR 官方导出机器人/行人坐标轨迹
-- **输出：** split 内独立的 recording index、base states、oracle context 和 snippets
+- **输入：** THÖR 官方导出机器人和所有非机器人 BODY 的坐标/marker 轨迹
+- **输出：** split 内独立的 recording index、base states、oracle context 和按对象类型分库的 snippets
 
 ### 文件
 
@@ -542,14 +547,16 @@ python scripts/00_make_splits.py \
 
 ### SOP
 
-- [ ] 只解析 robot pose/twist、pedestrian position 和必要元数据
+- [ ] 解析 robot pose/twist、所有非机器人 BODY 的 pose/marker 和必要元数据；禁止按行人 allow-list 丢弃对象
+- [ ] 将对象稳定分类为 `human`、`carried_object`、`unknown_dynamic`，并用 `recording_id::body_name` 生成 ID
+- [ ] `human` 使用配置圆；非人对象优先从有效 QTM marker 帧估计 P95 矩形 footprint，失败时使用配置 fallback
 - [ ] 将原始时间戳标准化为秒，检查排序、重复和间断
-- [ ] 对 robot/ped 轨迹按 0.2 s 网格重采样；跨度过大的 gap 不插值
+- [ ] 对 robot/object 轨迹按 0.2 s 网格重采样；跨度过大的 gap 不插值
 - [ ] 每 0.5–1.0 s 提取一个窗口完整的 base state
 - [ ] 将 observed 与 oracle 字段写入不同对象/文件
-- [ ] 在每个 split 内独立滑窗提取 3–5 s snippet
+- [ ] 在每个 split 和 `object_type` 内独立滑窗提取 3–5 s snippet
 - [ ] snippet 归一化到首点 `(0,0)`、初始运动方向 `+x`
-- [ ] 过滤速度、加速度、缺失、时间断裂和 footprint 重叠
+- [ ] 按对象类型过滤速度、加速度、缺失、时间断裂和 footprint 重叠；暂时静止不是删除整条对象轨迹的理由
 - [ ] 输出速度、加速度、曲率、duration 和 rejection reason 统计
 - [ ] 运行 source overlap audit
 
@@ -557,11 +564,11 @@ python scripts/00_make_splits.py \
 
 - 最低 base states `≥2,000`，理想 `≥10,000`
 - 最低 snippets `≥1,000`，理想 `≥5,000`
-- train/calibration/val/test 的 recording、participant 和 snippet source 交集为 0
+- train/calibration/val/test 的 recording、participant 和 snippet source object 交集为 0
 - 无 NaN/Inf，shape/dtype 与 schema 一致
 - 重采样后的速度分布与原始分布差异有量化报告，不出现系统性单位错误
-- snippet 速度范围 `0.3–2.0 m/s`，加速度不超过配置阈值
-- 随机抽取 50 条 robot/ped/snippet 轨迹人工检查
+- `human` snippet 速度范围 `0.3–2.0 m/s`；其他类型速度下限 `0.05 m/s`，所有类型加速度不超过各自配置阈值
+- 随机抽取 50 条 robot/object/snippet 轨迹人工检查，并覆盖每个实际出现的对象类型
 
 ### 运行
 
@@ -1432,4 +1439,3 @@ python scripts/08_generate_verification_dataset.py \
 - 工程结构、CLI、测试、实现顺序、失败判据：原始规格第 28–35 节
 - 并行原则、W0–W8、波次、关键路径和交付契约：并行计划第 1–17 节
 - 结果看板、风险转向、优先级和论文证据链：并行计划第 18–22 节
-

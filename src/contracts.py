@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "2.0.0"
 
 # --- Channel layout (order is a frozen contract; see spec §11.3 and §2.5) ------
 # Two per-timestep history channels, stacked over K history steps.
@@ -62,6 +62,11 @@ N_TRAJECTORY_CHANNELS = len(TRAJECTORY_CHANNELS)  # 4
 ROBOT_STATE_DIM = 2  # (v, omega)
 ACTION_VECTOR_DIM = 3  # (duration_s, delta_forward_m, delta_yaw_rad)
 QUANTILE_LEVELS: tuple[float, ...] = (0.5, 0.8, 0.9, 0.95)
+DYNAMIC_OBJECT_TYPES: tuple[str, ...] = (
+    "human",
+    "carried_object",
+    "unknown_dynamic",
+)
 
 # Tokens that must never appear in a model-input dataclass field name.
 FORBIDDEN_INPUT_TOKENS: tuple[str, ...] = (
@@ -69,6 +74,8 @@ FORBIDDEN_INPUT_TOKENS: tuple[str, ...] = (
     "hidden_future",
     "pedestrian_future",
     "ped_future",
+    "dynamic_object_future",
+    "object_future",
     "future_occupancy",
     "post_verification_occupancy",
     "post_verify_occupancy",
@@ -118,22 +125,24 @@ class BaseState:
     state_id: str
     split: str
     recording_id: str
-    participant_ids: tuple[str, ...]
+    dynamic_object_ids: tuple[str, ...]
     timestamp: float
     robot_history: np.ndarray  # [K, 3] -> x, y, yaw
     robot_state: np.ndarray  # [ROBOT_STATE_DIM]
-    visible_pedestrian_history: dict  # ped_id -> [K, >=2]
+    visible_dynamic_object_history: dict  # object_id -> [K, 3]
+    visible_dynamic_object_specs: dict  # object_id -> JSON-safe footprint spec
     static_map_local: np.ndarray | None
     metadata: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class OracleContext:
-    """Full pedestrian history and future. Labels/analysis only; never an input."""
+    """Full dynamic-object history/future for labels and analysis only."""
 
     base_state_id: str
-    pedestrian_history: dict  # ped_id -> [K, >=2]
-    pedestrian_future: dict  # ped_id -> [T, >=2]
+    dynamic_object_history: dict  # object_id -> [K, 3]
+    dynamic_object_future: dict  # object_id -> [T, 3]
+    dynamic_object_specs: dict  # object_id -> JSON-safe footprint spec
     metadata: dict = field(default_factory=dict)
 
 
@@ -144,7 +153,8 @@ class OracleWorld:
     world_id: str
     base_state_id: str
     static_occupancy: np.ndarray  # [H, W]
-    pedestrian_trajectories: dict  # ped_id -> [T, >=2]
+    dynamic_object_trajectories: dict  # object_id -> [T, 3]
+    dynamic_object_specs: dict  # object_id -> JSON-safe footprint spec
     occluders: tuple[dict, ...]
     blind_spot_config: dict
     random_seed: int
@@ -255,6 +265,141 @@ def _check_float_array(arr: Any, shape: tuple[int, ...], name: str) -> None:
     _require(arr.dtype == ARRAY_DTYPE, f"{name} dtype must be float32, got {arr.dtype}")
     _require(arr.shape == shape, f"{name} shape must be {shape}, got {arr.shape}")
     _require(np.isfinite(arr).all(), f"{name} contains NaN/Inf")
+
+
+def validate_dynamic_object_spec(spec: dict) -> None:
+    """Validate the JSON-safe type and footprint fields for one dynamic object."""
+    _require(isinstance(spec, dict), "dynamic object spec must be a dict")
+    _require(
+        set(spec) == {"object_type", "footprint"},
+        "dynamic object spec keys must be object_type and footprint",
+    )
+    object_type = spec["object_type"]
+    _require(
+        object_type in DYNAMIC_OBJECT_TYPES,
+        f"object_type must be one of {DYNAMIC_OBJECT_TYPES}",
+    )
+    footprint = spec["footprint"]
+    _require(isinstance(footprint, dict), "footprint must be a dict")
+    kind = footprint.get("kind")
+    _require(kind in {"circle", "rectangle"}, "unsupported footprint kind")
+    if object_type == "human":
+        _require(kind == "circle", "human footprint must be circle")
+    if object_type == "carried_object":
+        _require(kind == "rectangle", "carried_object footprint must be rectangle")
+    expected_keys = (
+        {"kind", "radius_m"}
+        if kind == "circle"
+        else {"kind", "length_m", "width_m"}
+    )
+    _require(set(footprint) == expected_keys, "footprint keys do not match kind")
+    dimensions = (
+        (footprint["radius_m"],)
+        if kind == "circle"
+        else (footprint["length_m"], footprint["width_m"])
+    )
+    _require(
+        all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float, np.integer, np.floating))
+            and np.isfinite(value)
+            and float(value) > 0.0
+            for value in dimensions
+        ),
+        "footprint dimensions must be finite and positive",
+    )
+
+
+def validate_base_state(state: BaseState, grid: GridSpec) -> None:
+    """Validate one deployment-observable dynamic-object base state."""
+    _check_float_array(
+        state.robot_history, (grid.history_steps, 3), "robot_history"
+    )
+    _check_float_array(state.robot_state, (ROBOT_STATE_DIM,), "robot_state")
+    _require(
+        isinstance(state.dynamic_object_ids, tuple),
+        "dynamic_object_ids must be a tuple",
+    )
+    _require(
+        all(isinstance(object_id, str) and object_id for object_id in state.dynamic_object_ids),
+        "dynamic_object_ids must contain non-empty strings",
+    )
+    _require(
+        state.dynamic_object_ids == tuple(sorted(set(state.dynamic_object_ids))),
+        "dynamic_object_ids must be sorted and unique",
+    )
+    object_ids = set(state.dynamic_object_ids)
+    _require(
+        object_ids == set(state.visible_dynamic_object_history),
+        "dynamic_object_ids and visible history keys must match",
+    )
+    _require(
+        object_ids == set(state.visible_dynamic_object_specs),
+        "dynamic_object_ids and visible spec keys must match",
+    )
+    for object_id in state.dynamic_object_ids:
+        _check_float_array(
+            state.visible_dynamic_object_history[object_id],
+            (grid.history_steps, 3),
+            f"visible_dynamic_object_history[{object_id!r}]",
+        )
+        validate_dynamic_object_spec(state.visible_dynamic_object_specs[object_id])
+    if state.static_map_local is not None:
+        _check_float_array(
+            state.static_map_local,
+            (grid.height, grid.width),
+            "static_map_local",
+        )
+
+
+def validate_oracle_context(context: OracleContext, grid: GridSpec) -> None:
+    """Validate full dynamic-object label context and key alignment."""
+    object_ids = set(context.dynamic_object_history)
+    _require(
+        object_ids == set(context.dynamic_object_future),
+        "oracle history and future keys must match",
+    )
+    _require(
+        object_ids == set(context.dynamic_object_specs),
+        "oracle trajectory and spec keys must match",
+    )
+    for object_id in sorted(object_ids):
+        _check_float_array(
+            context.dynamic_object_history[object_id],
+            (grid.history_steps, 3),
+            f"dynamic_object_history[{object_id!r}]",
+        )
+        _check_float_array(
+            context.dynamic_object_future[object_id],
+            (grid.future_steps, 3),
+            f"dynamic_object_future[{object_id!r}]",
+        )
+        validate_dynamic_object_spec(context.dynamic_object_specs[object_id])
+
+
+def validate_oracle_world(world: OracleWorld, grid: GridSpec) -> None:
+    """Validate one counterfactual world under the dynamic-object schema."""
+    _check_float_array(
+        world.static_occupancy,
+        (grid.height, grid.width),
+        "static_occupancy",
+    )
+    object_ids = set(world.dynamic_object_trajectories)
+    _require(
+        object_ids == set(world.dynamic_object_specs),
+        "oracle world trajectory and spec keys must match",
+    )
+    for object_id in sorted(object_ids):
+        _check_float_array(
+            world.dynamic_object_trajectories[object_id],
+            (grid.future_steps, 3),
+            f"dynamic_object_trajectories[{object_id!r}]",
+        )
+        validate_dynamic_object_spec(world.dynamic_object_specs[object_id])
+    _require(
+        isinstance(world.random_seed, int) and not isinstance(world.random_seed, bool),
+        "random_seed must be an int",
+    )
 
 
 def validate_risk_sample(sample: RiskSample, grid: GridSpec) -> None:
@@ -376,6 +521,13 @@ def encode_dataclass(obj: Any) -> tuple[dict[str, np.ndarray], dict]:
 
 def decode_dataclass(arrays: dict[str, np.ndarray], meta: dict) -> Any:
     """Rebuild a dataclass instance from an array map and JSON metadata."""
+    _require(
+        meta.get("schema_version") == SCHEMA_VERSION,
+        (
+            f"schema_version must be {SCHEMA_VERSION}, "
+            f"got {meta.get('schema_version')!r}"
+        ),
+    )
     cls = _CLASS_REGISTRY.get(meta["class"])
     if cls is None:
         raise ContractError(f"unknown class in metadata: {meta['class']!r}")

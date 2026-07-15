@@ -187,11 +187,19 @@ def make_base_state(state_id: str = "toy_bs_0", grid: GridSpec | None = None) ->
         state_id=state_id,
         split="toy",
         recording_id="toy_rec",
-        participant_ids=("toy_p0",),
+        dynamic_object_ids=("toy_rec::toy_p0",),
         timestamp=0.0,
         robot_history=np.zeros((k, 3), dtype=np.float32),
         robot_state=np.zeros((ROBOT_STATE_DIM,), dtype=np.float32),
-        visible_pedestrian_history={},
+        visible_dynamic_object_history={
+            "toy_rec::toy_p0": np.zeros((k, 3), dtype=np.float32)
+        },
+        visible_dynamic_object_specs={
+            "toy_rec::toy_p0": {
+                "object_type": "human",
+                "footprint": {"kind": "circle", "radius_m": 0.30},
+            }
+        },
         static_map_local=None,
         metadata={"source": "toy"},
     )
@@ -226,7 +234,17 @@ def make_oracle_world(
         world_id=world_id,
         base_state_id=base_state_id,
         static_occupancy=np.zeros((h, w), dtype=np.float32),
-        pedestrian_trajectories={"toy_ped": rollout(0.0, 0.0, steps=grid.future_steps)[:, :2]},
+        dynamic_object_trajectories={
+            "toy_rec::toy_ped": rollout(
+                0.0, 0.0, steps=grid.future_steps
+            )[:, :3]
+        },
+        dynamic_object_specs={
+            "toy_rec::toy_ped": {
+                "object_type": "human",
+                "footprint": {"kind": "circle", "radius_m": 0.30},
+            }
+        },
         occluders=({"type": "wall", "length_m": 1.5, "width_m": 0.3},),
         blind_spot_config={"kind": "environment"},
         random_seed=seed,

@@ -4,7 +4,7 @@
 # DECISIONS.md before other workflows adopt it.
 
 seed: 42
-schema_version: "1.0.0"
+schema_version: "2.0.0"
 
 bev:
   range_m: 16.0          # full BEV width and height in meters ([-8, 8] each axis)
@@ -23,11 +23,29 @@ robot:
   max_linear_speed_mps: 0.9
   max_angular_speed_radps: 0.8
 
-pedestrian:
-  radius_m: 0.30
-  min_speed_mps: 0.3
-  max_speed_mps: 2.0
-  max_acceleration_mps2: 2.5
+dynamic_objects:
+  human:
+    radius_m: 0.30
+    carrier_radius_m: 0.45
+    min_speed_mps: 0.30
+    max_speed_mps: 2.00
+    max_acceleration_mps2: 2.50
+  carried_object:
+    fallback_length_m: 0.80
+    fallback_width_m: 0.20
+    min_speed_mps: 0.05
+    max_speed_mps: 2.00
+    max_acceleration_mps2: 2.50
+  unknown_dynamic:
+    fallback_radius_m: 0.50
+    min_speed_mps: 0.05
+    max_speed_mps: 2.00
+    max_acceleration_mps2: 2.50
+  marker_geometry:
+    extent_quantile: 0.95
+    minimum_valid_frames: 20
+    min_extent_m: 0.05
+    max_extent_m: 3.00
 
 age_map:
   a_max_s: 5.0

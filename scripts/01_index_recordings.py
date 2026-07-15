@@ -27,6 +27,7 @@ from src.datasets.thor_adapter import (  # noqa: E402
     parse_recording_id,
     write_recording_indexes,
 )
+from src.utils.config import load_config  # noqa: E402
 
 
 def _reject_json_constant(value: str) -> None:
@@ -122,6 +123,11 @@ def main() -> int:
         description="Build split-isolated THÖR recording indexes."
     )
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--base-config",
+        type=Path,
+        default=_ROOT / "configs/base.yaml",
+    )
     parser.add_argument("--split", choices=SPLIT_NAMES, required=True)
     parser.add_argument(
         "--split-manifest",
@@ -151,6 +157,7 @@ def main() -> int:
     args = parser.parse_args()
 
     _load_data_config(args.config)
+    base_config = load_config(args.base_config)
     if not math.isfinite(args.dt_s) or args.dt_s <= 0.0:
         raise ThorDataError("--dt-s must be finite and positive")
     if not math.isfinite(args.max_gap_s) or args.max_gap_s < args.dt_s:
@@ -163,7 +170,10 @@ def main() -> int:
         sources = sources[: args.limit]
     recordings = [
         load_thor_recording(
-            source, dt_s=args.dt_s, max_gap_s=args.max_gap_s
+            source,
+            dt_s=args.dt_s,
+            max_gap_s=args.max_gap_s,
+            dynamic_object_config=base_config["dynamic_objects"],
         )
         for source in sources
     ]
@@ -176,6 +186,10 @@ def main() -> int:
     print(f"split={args.split}")
     print(f"recording_count={len(recordings)}")
     print(f"robot_sample_count={sum(r.timestamps.size for r in recordings)}")
+    print(
+        "dynamic_object_track_count="
+        f"{sum(len(r.dynamic_objects) for r in recordings)}"
+    )
     return 0
 
 

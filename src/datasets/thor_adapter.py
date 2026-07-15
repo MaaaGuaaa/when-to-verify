@@ -1,9 +1,9 @@
 """Dependency-free THÖR-MAGNI CSV parsing and trajectory resampling.
 
-Raw QTM centroids are millimetres in a world XY frame and ``Time`` is seconds.
-The adapter converts positions to metres, keeps only the robot and human
-participants, and resamples each contiguous segment independently so gaps are
-never interpolated over.
+Raw QTM centroids/markers are millimetres in a world frame and ``Time`` is
+seconds. The adapter converts them to metres, retains every valid non-robot
+body, and resamples each contiguous segment independently so gaps are never
+interpolated over.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
-from src.contracts import SCHEMA_VERSION
+from src.contracts import SCHEMA_VERSION, validate_dynamic_object_spec
+from src.utils.config import load_config
 
 
 class ThorDataError(ValueError):
@@ -30,20 +31,24 @@ def _reject_json_constant(value: str) -> None:
 
 
 @dataclass(frozen=True)
-class PedestrianTrack:
-    """One resampled human trajectory in world metres and seconds."""
+class DynamicObjectTrack:
+    """One typed, resampled non-robot trajectory in world coordinates."""
 
-    participant_id: str
+    object_id: str
+    source_body_name: str
+    object_type: str
+    raw_role: str
     timestamps: np.ndarray  # float64 [N], seconds
-    positions: np.ndarray  # float32 [N, 2], world metres
+    poses: np.ndarray  # float32 [N, 3], world x/y/yaw
     velocities: np.ndarray  # float32 [N, 2], metres/second
     segment_ids: np.ndarray  # int32 [N], no interpolation across ids
-    role: str
+    footprint: dict
+    provenance: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class RecordingIndex:
-    """Resampled robot and pedestrian trajectories for one recording."""
+    """Resampled robot and typed dynamic-object trajectories for a recording."""
 
     recording_id: str
     session_id: str
@@ -51,7 +56,7 @@ class RecordingIndex:
     robot_pose: np.ndarray  # float32 [N, 3], world x/y/yaw
     robot_twist: np.ndarray  # float32 [N, 2], forward v/yaw rate
     robot_segment_ids: np.ndarray  # int32 [N]
-    pedestrians: dict[str, PedestrianTrack]
+    dynamic_objects: dict[str, DynamicObjectTrack]
     static_map: np.ndarray | None
     source_file: str
     dt_s: float
@@ -99,33 +104,62 @@ def validate_recording_index(recording: RecordingIndex) -> None:
         ),
         "resampling_report contains invalid values",
     )
-    for participant_id, track in recording.pedestrians.items():
-        ped_count = track.timestamps.shape[0]
-        _require(track.participant_id == participant_id, "pedestrian key/id mismatch")
-        _require(track.timestamps.dtype == np.float64, "pedestrian timestamps must be float64")
-        _require(track.positions.dtype == np.float32, "pedestrian positions must be float32")
-        _require(track.velocities.dtype == np.float32, "pedestrian velocities must be float32")
-        _require(track.segment_ids.dtype == np.int32, "pedestrian segment_ids must be int32")
+    for object_id, track in recording.dynamic_objects.items():
+        object_count = track.timestamps.shape[0]
+        _require(track.object_id == object_id, "dynamic object key/id mismatch")
         _require(
-            track.positions.shape == (ped_count, 2),
-            "pedestrian positions shape must be [N,2]",
+            object_id == f"{recording.recording_id}::{track.source_body_name}",
+            "dynamic object id must be recording-scoped",
+        )
+        _require(bool(track.source_body_name), "source_body_name must not be empty")
+        _require(isinstance(track.raw_role, str), "raw_role must be a string")
+        _require(
+            track.timestamps.dtype == np.float64,
+            "dynamic object timestamps must be float64",
+        )
+        _require(track.poses.dtype == np.float32, "dynamic object poses must be float32")
+        _require(
+            track.velocities.dtype == np.float32,
+            "dynamic object velocities must be float32",
         )
         _require(
-            track.velocities.shape == (ped_count, 2),
-            "pedestrian velocities shape must be [N,2]",
+            track.segment_ids.dtype == np.int32,
+            "dynamic object segment_ids must be int32",
         )
         _require(
-            track.segment_ids.shape == (ped_count,),
-            "pedestrian segment_ids shape must be [N]",
+            track.poses.shape == (object_count, 3),
+            "dynamic object poses shape must be [N,3]",
         )
-        _require(np.isfinite(track.timestamps).all(), "pedestrian timestamps contain NaN/Inf")
-        _require(np.isfinite(track.positions).all(), "pedestrian positions contain NaN/Inf")
-        _require(np.isfinite(track.velocities).all(), "pedestrian velocities contain NaN/Inf")
+        _require(
+            track.velocities.shape == (object_count, 2),
+            "dynamic object velocities shape must be [N,2]",
+        )
+        _require(
+            track.segment_ids.shape == (object_count,),
+            "dynamic object segment_ids shape must be [N]",
+        )
+        _require(object_count > 0, "dynamic object track must not be empty")
+        _require(
+            np.isfinite(track.timestamps).all(),
+            "dynamic object timestamps contain NaN/Inf",
+        )
+        _require(
+            np.isfinite(track.poses).all(),
+            "dynamic object poses contain NaN/Inf",
+        )
+        _require(
+            np.isfinite(track.velocities).all(),
+            "dynamic object velocities contain NaN/Inf",
+        )
+        validate_dynamic_object_spec(
+            {"object_type": track.object_type, "footprint": track.footprint}
+        )
+        _require(isinstance(track.provenance, dict), "provenance must be a dict")
         _validate_resampled_grid(
             track.timestamps,
             track.segment_ids,
             recording.dt_s,
-            f"pedestrian {participant_id}",
+            f"dynamic object {object_id}",
         )
 
 
@@ -166,18 +200,22 @@ def save_recording_index(recording: RecordingIndex, path: str | Path) -> Path:
         "robot_twist": recording.robot_twist,
         "robot_segment_ids": recording.robot_segment_ids,
     }
-    pedestrian_meta: list[dict[str, str]] = []
-    for index, participant_id in enumerate(sorted(recording.pedestrians)):
-        track = recording.pedestrians[participant_id]
-        prefix = f"ped_{index}"
+    object_meta: list[dict[str, object]] = []
+    for index, object_id in enumerate(sorted(recording.dynamic_objects)):
+        track = recording.dynamic_objects[object_id]
+        prefix = f"object_{index}"
         payload[f"{prefix}_timestamps"] = track.timestamps
-        payload[f"{prefix}_positions"] = track.positions
+        payload[f"{prefix}_poses"] = track.poses
         payload[f"{prefix}_velocities"] = track.velocities
         payload[f"{prefix}_segment_ids"] = track.segment_ids
-        pedestrian_meta.append(
+        object_meta.append(
             {
-                "participant_id": participant_id,
-                "role": track.role,
+                "object_id": object_id,
+                "source_body_name": track.source_body_name,
+                "object_type": track.object_type,
+                "raw_role": track.raw_role,
+                "footprint": track.footprint,
+                "provenance": track.provenance,
                 "prefix": prefix,
             }
         )
@@ -191,10 +229,12 @@ def save_recording_index(recording: RecordingIndex, path: str | Path) -> Path:
         "dt_s": recording.dt_s,
         "coordinate_frame": recording.coordinate_frame,
         "resampling_report": recording.resampling_report,
-        "pedestrians": pedestrian_meta,
+        "dynamic_objects": object_meta,
         "has_static_map": recording.static_map is not None,
     }
-    payload["meta_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+    payload["meta_json"] = np.asarray(
+        json.dumps(metadata, sort_keys=True, allow_nan=False)
+    )
     temporary = output_path.with_suffix(".npz.tmp")
     with temporary.open("wb") as handle:
         np.savez(handle, **payload)
@@ -212,16 +252,20 @@ def load_recording_index(path: str | Path) -> RecordingIndex:
             raise ThorDataError(
                 f"schema_version must be {SCHEMA_VERSION}, got {metadata.get('schema_version')!r}"
             )
-        pedestrians = {
-            item["participant_id"]: PedestrianTrack(
-                participant_id=item["participant_id"],
+        dynamic_objects = {
+            item["object_id"]: DynamicObjectTrack(
+                object_id=item["object_id"],
+                source_body_name=item["source_body_name"],
+                object_type=item["object_type"],
+                raw_role=item["raw_role"],
                 timestamps=payload[f"{item['prefix']}_timestamps"].copy(),
-                positions=payload[f"{item['prefix']}_positions"].copy(),
+                poses=payload[f"{item['prefix']}_poses"].copy(),
                 velocities=payload[f"{item['prefix']}_velocities"].copy(),
                 segment_ids=payload[f"{item['prefix']}_segment_ids"].copy(),
-                role=item["role"],
+                footprint=item["footprint"],
+                provenance=item["provenance"],
             )
-            for item in metadata["pedestrians"]
+            for item in metadata["dynamic_objects"]
         }
         static_map = payload["static_map"].copy() if metadata["has_static_map"] else None
         recording = RecordingIndex(
@@ -231,7 +275,7 @@ def load_recording_index(path: str | Path) -> RecordingIndex:
             robot_pose=payload["robot_pose"].copy(),
             robot_twist=payload["robot_twist"].copy(),
             robot_segment_ids=payload["robot_segment_ids"].copy(),
-            pedestrians=pedestrians,
+            dynamic_objects=dynamic_objects,
             static_map=static_map,
             source_file=metadata["source_file"],
             dt_s=float(metadata["dt_s"]),
@@ -240,6 +284,21 @@ def load_recording_index(path: str | Path) -> RecordingIndex:
         )
     validate_recording_index(recording)
     return recording
+
+
+def _dynamic_object_type_counts(recording: RecordingIndex) -> dict[str, int]:
+    counts = {name: 0 for name in ("human", "carried_object", "unknown_dynamic")}
+    for track in recording.dynamic_objects.values():
+        counts[track.object_type] += 1
+    return counts
+
+
+def _geometry_source_counts(recording: RecordingIndex) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for track in recording.dynamic_objects.values():
+        source = str(track.provenance.get("geometry_source", "unknown"))
+        counts[source] = counts.get(source, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def write_recording_indexes(
@@ -279,7 +338,11 @@ def write_recording_indexes(
                     "split": split,
                     "recording_id": recording.recording_id,
                     "session_id": recording.session_id,
-                    "participant_ids": sorted(recording.pedestrians),
+                    "dynamic_object_ids": sorted(recording.dynamic_objects),
+                    "dynamic_object_type_counts": _dynamic_object_type_counts(
+                        recording
+                    ),
+                    "geometry_source_counts": _geometry_source_counts(recording),
                     "source_file": recording.source_file,
                     "recording_index_file": filename,
                     "sample_count": int(recording.timestamps.size),
@@ -297,8 +360,8 @@ def write_recording_indexes(
             "robot_sample_count": sum(
                 int(recording.timestamps.size) for recording in ordered
             ),
-            "pedestrian_track_count": sum(
-                len(recording.pedestrians) for recording in ordered
+            "dynamic_object_track_count": sum(
+                len(recording.dynamic_objects) for recording in ordered
             ),
         }
         (staging / "recording_manifest.jsonl").write_text(
@@ -374,12 +437,22 @@ def _is_robot(body_name: str, role: str) -> bool:
     return "darko" in text or "robot" in text
 
 
-def _is_pedestrian(body_name: str, role: str) -> bool:
-    text = f"{body_name} {role}".lower()
-    excluded = ("carrier", "storage", "cart", "bin")
-    if any(token in text for token in excluded):
-        return False
-    return any(token in text for token in ("helmet", "visitor", "pedestrian", "human"))
+def classify_dynamic_object(body_name: str, role: str) -> str:
+    """Map raw THÖR body metadata to the frozen three-type taxonomy."""
+    normalized_name = body_name.strip().lower()
+    normalized_role = role.strip().lower()
+    if normalized_name.startswith("helmet_") or "visitor" in normalized_role:
+        return "human"
+    carried_name = bool(
+        re.match(r"^lo(?:\d+|\b)", normalized_name)
+        or any(
+            token in normalized_name
+            for token in ("cart", "bin", "box", "bucket")
+        )
+    )
+    if carried_name or normalized_role == "carried":
+        return "carried_object"
+    return "unknown_dynamic"
 
 
 def _float(value: str) -> float:
@@ -501,6 +574,180 @@ def _resample_track(
     )
 
 
+def _motion_heading(velocities: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    speeds = np.linalg.norm(velocities, axis=1)
+    moving = np.flatnonzero(speeds > 1e-6)
+    if moving.size == 0:
+        return np.zeros(timestamps.shape, dtype=np.float64)
+    moving_heading = np.unwrap(
+        np.arctan2(velocities[moving, 1], velocities[moving, 0])
+    )
+    return np.interp(timestamps, timestamps[moving], moving_heading)
+
+
+def _resample_object_yaw(
+    source_time: np.ndarray,
+    source_yaw: np.ndarray,
+    sampled_time: np.ndarray,
+    sampled_velocity: np.ndarray,
+    sampled_segments: np.ndarray,
+    *,
+    max_gap_s: float,
+) -> tuple[np.ndarray, str, dict[str, int]]:
+    yaw = np.zeros(sampled_time.shape, dtype=np.float64)
+    source_counts: dict[str, int] = {}
+    for segment_id, segment in enumerate(_segment_slices(source_time, max_gap_s)):
+        target_mask = sampled_segments == segment_id
+        if not np.any(target_mask):
+            continue
+        segment_time = source_time[segment]
+        segment_yaw = source_yaw[segment]
+        finite = np.isfinite(segment_yaw)
+        if np.any(finite):
+            finite_yaw = np.unwrap(segment_yaw[finite])
+            yaw[target_mask] = np.interp(
+                sampled_time[target_mask], segment_time[finite], finite_yaw
+            )
+            source = "qtm_rotation"
+        else:
+            target_velocity = sampled_velocity[target_mask]
+            target_time = sampled_time[target_mask]
+            yaw[target_mask] = _motion_heading(target_velocity, target_time)
+            source = (
+                "motion_fallback"
+                if np.any(np.linalg.norm(target_velocity, axis=1) > 1e-6)
+                else "zero_fallback"
+            )
+        source_counts[source] = source_counts.get(source, 0) + int(
+            np.count_nonzero(target_mask)
+        )
+    orientation_source = (
+        next(iter(source_counts)) if len(source_counts) == 1 else "mixed"
+    )
+    return yaw, orientation_source, dict(sorted(source_counts.items()))
+
+
+def _marker_columns(
+    header_index: dict[str, int], body_name: str
+) -> tuple[tuple[str, str, str], ...]:
+    pattern = re.compile(rf"^{re.escape(body_name)} - .+ X$")
+    triplets: list[tuple[str, str, str]] = []
+    for x_name in sorted(name for name in header_index if pattern.match(name)):
+        stem = x_name[:-1]
+        y_name = stem + "Y"
+        z_name = stem + "Z"
+        if y_name in header_index and z_name in header_index:
+            triplets.append((x_name, y_name, z_name))
+    return tuple(triplets)
+
+
+def _marker_extent_local_m(
+    row: list[str],
+    header_index: dict[str, int],
+    marker_columns: tuple[tuple[str, str, str], ...],
+    centroid_m: np.ndarray,
+    rotation: np.ndarray | None,
+    yaw: float,
+) -> tuple[float, float] | None:
+    markers: list[tuple[float, float, float]] = []
+    for columns in marker_columns:
+        marker = tuple(_float(row[header_index[column]]) / 1000.0 for column in columns)
+        if all(math.isfinite(value) for value in marker):
+            markers.append(marker)
+    if len(markers) < 2:
+        return None
+    delta = np.asarray(markers, dtype=np.float64) - centroid_m
+    if rotation is not None:
+        local = delta @ rotation.T
+        local_xy = local[:, :2]
+    elif math.isfinite(yaw):
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        local_xy = delta[:, :2] @ np.array(
+            [[cosine, -sine], [sine, cosine]], dtype=np.float64
+        )
+    else:
+        return None
+    extent = np.ptp(local_xy, axis=0)
+    if not np.isfinite(extent).all():
+        return None
+    return float(extent[0]), float(extent[1])
+
+
+def _validated_dynamic_object_config(config: dict | None) -> dict:
+    resolved = load_config()["dynamic_objects"] if config is None else config
+    if not isinstance(resolved, dict):
+        raise ThorDataError("dynamic object config must be a mapping")
+    required = {"human", "carried_object", "unknown_dynamic", "marker_geometry"}
+    if set(resolved) != required:
+        raise ThorDataError("dynamic object config keys do not match schema v2")
+    marker = resolved["marker_geometry"]
+    quantile = float(marker["extent_quantile"])
+    minimum_frames = int(marker["minimum_valid_frames"])
+    min_extent = float(marker["min_extent_m"])
+    max_extent = float(marker["max_extent_m"])
+    if not (0.0 < quantile <= 1.0):
+        raise ThorDataError("marker extent_quantile must be in (0, 1]")
+    if minimum_frames < 1:
+        raise ThorDataError("marker minimum_valid_frames must be positive")
+    if not (0.0 < min_extent <= max_extent and math.isfinite(max_extent)):
+        raise ThorDataError("marker extent bounds are invalid")
+    return resolved
+
+
+def _footprint_for_object(
+    object_type: str,
+    raw_role: str,
+    marker_extents: list[tuple[float, float]],
+    config: dict,
+) -> tuple[dict, dict]:
+    if object_type == "human":
+        human = config["human"]
+        radius_key = (
+            "carrier_radius_m" if "carrier" in raw_role.lower() else "radius_m"
+        )
+        footprint = {"kind": "circle", "radius_m": float(human[radius_key])}
+        return footprint, {
+            "geometry_source": "config_human",
+            "valid_marker_frame_count": len(marker_extents),
+        }
+
+    marker = config["marker_geometry"]
+    minimum_frames = int(marker["minimum_valid_frames"])
+    if len(marker_extents) >= minimum_frames:
+        extents = np.asarray(marker_extents, dtype=np.float64)
+        quantile = float(marker["extent_quantile"])
+        length_m, width_m = np.quantile(extents, quantile, axis=0)
+        lower = float(marker["min_extent_m"])
+        upper = float(marker["max_extent_m"])
+        footprint = {
+            "kind": "rectangle",
+            "length_m": float(np.clip(length_m, lower, upper)),
+            "width_m": float(np.clip(width_m, lower, upper)),
+        }
+        return footprint, {
+            "geometry_source": "qtm_marker_p95",
+            "valid_marker_frame_count": len(marker_extents),
+        }
+
+    if object_type == "carried_object":
+        carried = config["carried_object"]
+        footprint = {
+            "kind": "rectangle",
+            "length_m": float(carried["fallback_length_m"]),
+            "width_m": float(carried["fallback_width_m"]),
+        }
+    else:
+        unknown = config["unknown_dynamic"]
+        footprint = {
+            "kind": "circle",
+            "radius_m": float(unknown["fallback_radius_m"]),
+        }
+    return footprint, {
+        "geometry_source": "config_fallback",
+        "valid_marker_frame_count": len(marker_extents),
+    }
+
+
 def _validate_raw_timestamps(timestamps: np.ndarray) -> None:
     if timestamps.size < 2:
         raise ThorDataError("recording must contain at least two timestamped rows")
@@ -515,9 +762,12 @@ def load_thor_recording(
     *,
     dt_s: float = 0.2,
     max_gap_s: float = 0.3,
+    dynamic_object_config: dict | None = None,
 ) -> RecordingIndex:
-    """Parse and resample one official THÖR-MAGNI scenario CSV."""
+    """Parse every valid non-robot QTM body from one THÖR scenario CSV."""
     path = Path(csv_path)
+    recording_id = parse_recording_id(path)
+    object_config = _validated_dynamic_object_config(dynamic_object_config)
     if not math.isfinite(dt_s) or dt_s <= 0.0:
         raise ThorDataError("dt_s must be finite and positive")
     if not math.isfinite(max_gap_s) or max_gap_s < dt_s:
@@ -549,18 +799,24 @@ def load_thor_recording(
         selected: dict[str, tuple[str, bool]] = {}
         for index, body_name in enumerate(body_names):
             role = body_roles[index] if index < len(body_roles) else ""
-            if _is_robot(body_name, role):
-                selected[body_name] = (role, True)
-            elif _is_pedestrian(body_name, role):
-                selected[body_name] = (role, False)
+            selected[body_name] = (role, _is_robot(body_name, role))
         robots = [name for name, (_, robot) in selected.items() if robot]
         if len(robots) != 1:
             raise ThorDataError(f"expected exactly one robot body, found {len(robots)}")
 
         raw_time: list[float] = []
-        tracks: dict[str, dict[str, list[float]]] = {
-            name: {"time": [], "x": [], "y": [], "yaw": []}
+        tracks: dict[str, dict[str, list]] = {
+            name: {
+                "time": [],
+                "x": [],
+                "y": [],
+                "yaw": [],
+                "marker_extents": [],
+            }
             for name in selected
+        }
+        marker_columns = {
+            name: _marker_columns(header_index, name) for name in selected
         }
         for row in reader:
             if not row:
@@ -571,23 +827,55 @@ def load_thor_recording(
                 required = (
                     f"{body_name} Centroid_X",
                     f"{body_name} Centroid_Y",
-                    f"{body_name} R0",
-                    f"{body_name} R1",
                 )
                 if any(column not in header_index for column in required):
                     continue
                 x = _float(row[header_index[required[0]]]) / 1000.0
                 y = _float(row[header_index[required[1]]]) / 1000.0
-                r0 = _float(row[header_index[required[2]]])
-                r1 = _float(row[header_index[required[3]]])
+                z_name = f"{body_name} Centroid_Z"
+                z = (
+                    _float(row[header_index[z_name]]) / 1000.0
+                    if z_name in header_index
+                    else 0.0
+                )
                 if not (math.isfinite(timestamp) and math.isfinite(x) and math.isfinite(y)):
                     continue
+                rotation_values = []
+                for rotation_index in range(9):
+                    column = f"{body_name} R{rotation_index}"
+                    rotation_values.append(
+                        _float(row[header_index[column]])
+                        if column in header_index
+                        else float("nan")
+                    )
+                rotation = (
+                    np.asarray(rotation_values, dtype=np.float64).reshape(3, 3)
+                    if np.isfinite(rotation_values).all()
+                    else None
+                )
+                if rotation is not None:
+                    yaw = math.atan2(float(rotation[0, 1]), float(rotation[0, 0]))
+                else:
+                    r0, r1 = rotation_values[:2]
+                    yaw = (
+                        math.atan2(r1, r0)
+                        if math.isfinite(r0) and math.isfinite(r1)
+                        else float("nan")
+                    )
                 tracks[body_name]["time"].append(timestamp)
                 tracks[body_name]["x"].append(x)
                 tracks[body_name]["y"].append(y)
-                tracks[body_name]["yaw"].append(
-                    math.atan2(r1, r0) if math.isfinite(r0) and math.isfinite(r1) else 0.0
+                tracks[body_name]["yaw"].append(yaw)
+                extent = _marker_extent_local_m(
+                    row,
+                    header_index,
+                    marker_columns[body_name],
+                    np.asarray((x, y, z), dtype=np.float64),
+                    rotation,
+                    yaw,
                 )
+                if extent is not None:
+                    tracks[body_name]["marker_extents"].append(extent)
 
     _validate_raw_timestamps(np.asarray(raw_time, dtype=np.float64))
     robot_name = robots[0]
@@ -596,6 +884,10 @@ def load_thor_recording(
     _validate_raw_timestamps(robot_time)
     robot_position = np.column_stack((robot_source["x"], robot_source["y"]))
     robot_yaw = np.asarray(robot_source["yaw"], dtype=np.float64)
+    if not np.isfinite(robot_yaw).all():
+        robot_velocity = _gradient(robot_position, robot_time)
+        fallback_yaw = _motion_heading(robot_velocity, robot_time)
+        robot_yaw = np.where(np.isfinite(robot_yaw), robot_yaw, fallback_yaw)
     timestamps, position, yaw, velocity, robot_segments = _resample_track(
         robot_time,
         robot_position,
@@ -635,81 +927,115 @@ def load_thor_recording(
             float(resampled_speed[quantile]) - float(raw_speed[quantile])
         )
 
-    pedestrians: dict[str, PedestrianTrack] = {}
-    raw_pedestrian_speeds: list[np.ndarray] = []
-    resampled_pedestrian_speeds: list[np.ndarray] = []
+    dynamic_objects: dict[str, DynamicObjectTrack] = {}
+    raw_object_speeds: list[np.ndarray] = []
+    resampled_object_speeds: list[np.ndarray] = []
+    rejection_reasons = {
+        "insufficient_samples": 0,
+        "no_resampleable_segment": 0,
+    }
     for body_name, (role, robot) in selected.items():
         if robot:
             continue
         source = tracks[body_name]
         source_time = np.asarray(source["time"], dtype=np.float64)
         if source_time.size < 2:
+            rejection_reasons["insufficient_samples"] += 1
             continue
         _validate_raw_timestamps(source_time)
         source_position = np.column_stack((source["x"], source["y"]))
-        raw_pedestrian_segments = np.zeros(source_time.shape, dtype=np.int32)
+        raw_object_segments = np.zeros(source_time.shape, dtype=np.int32)
         for segment_id, segment in enumerate(
             _segment_slices(source_time, max_gap_s)
         ):
-            raw_pedestrian_segments[segment] = segment_id
-        ped_time, ped_position, _, ped_velocity, ped_segments = _resample_track(
-            source_time,
-            source_position,
-            dt_s=dt_s,
-            max_gap_s=max_gap_s,
-        )
-        if ped_time.size == 0:
-            continue
-        raw_pedestrian_speeds.append(
-            _speed_samples(
-                source_time, source_position, raw_pedestrian_segments
+            raw_object_segments[segment] = segment_id
+        object_time, object_position, _, object_velocity, object_segments = (
+            _resample_track(
+                source_time,
+                source_position,
+                dt_s=dt_s,
+                max_gap_s=max_gap_s,
             )
         )
-        resampled_pedestrian_speeds.append(
-            _speed_samples(ped_time, ped_position, ped_segments)
+        if object_time.size == 0:
+            rejection_reasons["no_resampleable_segment"] += 1
+            continue
+        object_yaw, orientation_source, orientation_counts = _resample_object_yaw(
+            source_time,
+            np.asarray(source["yaw"], dtype=np.float64),
+            object_time,
+            object_velocity,
+            object_segments,
+            max_gap_s=max_gap_s,
         )
-        pedestrians[body_name] = PedestrianTrack(
-            participant_id=body_name,
-            timestamps=ped_time,
-            positions=ped_position.astype(np.float32),
-            velocities=ped_velocity.astype(np.float32),
-            segment_ids=ped_segments,
-            role=role,
+        object_type = classify_dynamic_object(body_name, role)
+        footprint, geometry_provenance = _footprint_for_object(
+            object_type,
+            role,
+            source["marker_extents"],
+            object_config,
+        )
+        object_id = f"{recording_id}::{body_name}"
+        dynamic_objects[object_id] = DynamicObjectTrack(
+            object_id=object_id,
+            source_body_name=body_name,
+            object_type=object_type,
+            raw_role=role,
+            timestamps=object_time,
+            poses=np.column_stack((object_position, object_yaw)).astype(np.float32),
+            velocities=object_velocity.astype(np.float32),
+            segment_ids=object_segments,
+            footprint=footprint,
+            provenance={
+                **geometry_provenance,
+                "orientation_source": orientation_source,
+                "orientation_source_counts": orientation_counts,
+            },
+        )
+        raw_object_speeds.append(
+            _speed_samples(source_time, source_position, raw_object_segments)
+        )
+        resampled_object_speeds.append(
+            _speed_samples(object_time, object_position, object_segments)
         )
 
-    raw_pedestrian_speed = _quantiles(
-        np.concatenate(raw_pedestrian_speeds)
-        if raw_pedestrian_speeds
+    raw_object_speed = _quantiles(
+        np.concatenate(raw_object_speeds)
+        if raw_object_speeds
         else np.empty((0,), dtype=np.float64)
     )
-    resampled_pedestrian_speed = _quantiles(
-        np.concatenate(resampled_pedestrian_speeds)
-        if resampled_pedestrian_speeds
+    resampled_object_speed = _quantiles(
+        np.concatenate(resampled_object_speeds)
+        if resampled_object_speeds
         else np.empty((0,), dtype=np.float64)
     )
     resampling_report.update(
         {
-            "raw_pedestrian_sample_count": raw_pedestrian_speed[
+            "raw_dynamic_object_count": len(selected) - 1,
+            "indexed_dynamic_object_count": len(dynamic_objects),
+            "rejected_dynamic_object_count": sum(rejection_reasons.values()),
+            "raw_dynamic_object_sample_count": raw_object_speed["sample_count"],
+            "resampled_dynamic_object_sample_count": resampled_object_speed[
                 "sample_count"
             ],
-            "resampled_pedestrian_sample_count": resampled_pedestrian_speed[
-                "sample_count"
-            ],
+            **{
+                f"rejected_dynamic_object_{reason}": count
+                for reason, count in rejection_reasons.items()
+            },
         }
     )
     for quantile in ("p05", "p50", "p95"):
-        resampling_report[f"raw_pedestrian_speed_{quantile}_mps"] = (
-            raw_pedestrian_speed[quantile]
+        resampling_report[f"raw_dynamic_object_speed_{quantile}_mps"] = (
+            raw_object_speed[quantile]
         )
         resampling_report[
-            f"resampled_pedestrian_speed_{quantile}_mps"
-        ] = resampled_pedestrian_speed[quantile]
-        resampling_report[f"pedestrian_speed_{quantile}_delta_mps"] = abs(
-            float(resampled_pedestrian_speed[quantile])
-            - float(raw_pedestrian_speed[quantile])
+            f"resampled_dynamic_object_speed_{quantile}_mps"
+        ] = resampled_object_speed[quantile]
+        resampling_report[f"dynamic_object_speed_{quantile}_delta_mps"] = abs(
+            float(resampled_object_speed[quantile])
+            - float(raw_object_speed[quantile])
         )
 
-    recording_id = parse_recording_id(path)
     session_id = recording_id.split("_", 1)[0]
     recording = RecordingIndex(
         recording_id=recording_id,
@@ -718,7 +1044,7 @@ def load_thor_recording(
         robot_pose=np.column_stack((position, yaw)).astype(np.float32),
         robot_twist=np.column_stack((forward_speed, yaw_rate)).astype(np.float32),
         robot_segment_ids=robot_segments,
-        pedestrians=pedestrians,
+        dynamic_objects=dynamic_objects,
         static_map=None,
         source_file=path.name,
         dt_s=float(dt_s),

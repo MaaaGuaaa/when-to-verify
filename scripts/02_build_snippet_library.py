@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build one split-isolated THÖR pedestrian snippet library.
+"""Build split- and type-isolated THÖR dynamic-object snippet libraries.
 
 Usage:
     python scripts/02_build_snippet_library.py \
@@ -18,6 +18,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.contracts import DYNAMIC_OBJECT_TYPES  # noqa: E402
 from src.datasets.snippet_library import (  # noqa: E402
     audit_snippet_source_overlap,
     build_snippet_library,
@@ -43,7 +44,7 @@ def _validate_data_config(path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build a normalized pedestrian snippet library for one split."
+        description="Build normalized dynamic-object snippet libraries for one split."
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--split", choices=SPLIT_NAMES, required=True)
@@ -77,35 +78,61 @@ def main() -> int:
         raise ThorDataError("history and future dt must match for SOP-03")
     if any(abs(recording.dt_s - expected_dt) > 1e-9 for recording in recordings):
         raise ThorDataError("recording dt does not match the frozen base config")
-    pedestrian = base_config["pedestrian"]
-    library = build_snippet_library(
-        recordings,
-        split=args.split,
-        duration_s=args.duration_s,
-        stride_s=args.stride_s,
-        min_mean_speed_mps=float(pedestrian["min_speed_mps"]),
-        max_mean_speed_mps=float(pedestrian["max_speed_mps"]),
-        max_acceleration_mps2=float(pedestrian["max_acceleration_mps2"]),
-    )
+    dynamic_config = base_config["dynamic_objects"]
+    libraries = []
+    for object_type in DYNAMIC_OBJECT_TYPES:
+        thresholds = dynamic_config[object_type]
+        libraries.append(
+            build_snippet_library(
+                recordings,
+                split=args.split,
+                object_type=object_type,
+                duration_s=args.duration_s,
+                stride_s=args.stride_s,
+                min_mean_speed_mps=float(thresholds["min_speed_mps"]),
+                max_mean_speed_mps=float(thresholds["max_speed_mps"]),
+                max_acceleration_mps2=float(
+                    thresholds["max_acceleration_mps2"]
+                ),
+            )
+        )
 
     existing = []
     for split in SPLIT_NAMES:
-        path = args.output_dir / split / "snippet_library.npz"
-        if path.is_file():
-            existing.append(load_snippet_library(path))
-    report = audit_snippet_source_overlap([*existing, library])
+        for object_type in DYNAMIC_OBJECT_TYPES:
+            path = args.output_dir / split / object_type / "snippet_library.npz"
+            if path.is_file():
+                existing.append(load_snippet_library(path))
+    report = audit_snippet_source_overlap([*existing, *libraries])
     if report["total_overlap_count"]:
         raise SplitLeakageError("snippet source overlap detected")
-    paths = write_snippet_artifacts(
-        library,
-        args.output_dir / args.split,
-        overlap_report=report,
-    )
-    print(f"library={paths['library']}")
+    paths = [
+        write_snippet_artifacts(
+            library,
+            args.output_dir / args.split / library.object_type,
+            overlap_report=report,
+        )
+        for library in libraries
+    ]
+    for library, library_paths in zip(libraries, paths):
+        print(f"library[{library.object_type}]={library_paths['library']}")
+        print(
+            f"accepted_count[{library.object_type}]="
+            f"{library.summary['accepted_count']}"
+        )
     print(f"split={args.split}")
-    print(f"candidate_count={library.summary['candidate_count']}")
-    print(f"accepted_count={library.summary['accepted_count']}")
-    print(f"rejected_count={library.summary['rejected_count']}")
+    print(
+        "total_candidate_count="
+        f"{sum(int(item.summary['candidate_count']) for item in libraries)}"
+    )
+    print(
+        "total_accepted_count="
+        f"{sum(int(item.summary['accepted_count']) for item in libraries)}"
+    )
+    print(
+        "total_rejected_count="
+        f"{sum(int(item.summary['rejected_count']) for item in libraries)}"
+    )
     print(f"source_overlap_count={report['total_overlap_count']}")
     return 0
 

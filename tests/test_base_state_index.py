@@ -1,4 +1,4 @@
-"""Tests for robot-centric BaseState and isolated OracleContext extraction."""
+"""Tests for dynamic-object BaseState and isolated OracleContext extraction."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from src.contracts import build_grid_spec
-from src.datasets.thor_adapter import PedestrianTrack, RecordingIndex
+from src.contracts import build_grid_spec, validate_base_state, validate_oracle_context
+from src.datasets.thor_adapter import DynamicObjectTrack, RecordingIndex
 from src.utils.config import load_config
 
 
@@ -23,18 +23,39 @@ def _recording(duration_s: float = 6.0) -> RecordingIndex:
     robot_twist = np.tile(
         np.array([1.0, 0.0], dtype=np.float32), (timestamps.size, 1)
     )
-    pedestrian_positions = np.column_stack(
-        (timestamps + 2.0, np.ones_like(timestamps))
-    ).astype(np.float32)
-    pedestrian = PedestrianTrack(
-        participant_id="ped-1",
+    human_id = "toy-recording::Helmet_1"
+    carried_id = "toy-recording::LO1"
+    human = DynamicObjectTrack(
+        object_id=human_id,
+        source_body_name="Helmet_1",
+        object_type="human",
+        raw_role="Visitors-Alone",
         timestamps=timestamps.copy(),
-        positions=pedestrian_positions,
+        poses=np.column_stack(
+            (timestamps + 2.0, np.ones_like(timestamps), np.zeros_like(timestamps))
+        ).astype(np.float32),
         velocities=np.tile(
             np.array([1.0, 0.0], dtype=np.float32), (timestamps.size, 1)
         ),
         segment_ids=np.zeros(timestamps.shape, dtype=np.int32),
-        role="Visitors-Alone",
+        footprint={"kind": "circle", "radius_m": 0.30},
+        provenance={"geometry_source": "config_human"},
+    )
+    carried = DynamicObjectTrack(
+        object_id=carried_id,
+        source_body_name="LO1",
+        object_type="carried_object",
+        raw_role="Carried",
+        timestamps=timestamps.copy(),
+        poses=np.column_stack(
+            (timestamps + 3.0, np.full_like(timestamps, 2.0), np.zeros_like(timestamps))
+        ).astype(np.float32),
+        velocities=np.tile(
+            np.array([1.0, 0.0], dtype=np.float32), (timestamps.size, 1)
+        ),
+        segment_ids=np.zeros(timestamps.shape, dtype=np.int32),
+        footprint={"kind": "rectangle", "length_m": 0.80, "width_m": 0.20},
+        provenance={"geometry_source": "qtm_marker_p95"},
     )
     return RecordingIndex(
         recording_id="toy-recording",
@@ -43,14 +64,14 @@ def _recording(duration_s: float = 6.0) -> RecordingIndex:
         robot_pose=robot_pose,
         robot_twist=robot_twist,
         robot_segment_ids=np.zeros(timestamps.shape, dtype=np.int32),
-        pedestrians={"ped-1": pedestrian},
+        dynamic_objects={human_id: human, carried_id: carried},
         static_map=None,
         source_file="THOR-Magni_toy-recording.csv",
         dt_s=0.2,
     )
 
 
-def test_extract_base_states_separates_observed_and_oracle_data():
+def test_extract_base_states_separates_observed_and_oracle_dynamic_objects():
     from src.datasets.base_state_index import extract_base_states
 
     grid = build_grid_spec(load_config())
@@ -65,33 +86,38 @@ def test_extract_base_states_separates_observed_and_oracle_data():
     state = result.base_states[0]
     oracle = result.oracle_contexts[0]
     assert state.state_id == oracle.base_state_id
-    assert state.split == "train"
-    assert state.recording_id == "toy-recording"
-    assert state.participant_ids == ("ped-1",)
+    assert state.dynamic_object_ids == (
+        "toy-recording::Helmet_1",
+        "toy-recording::LO1",
+    )
     assert state.robot_history.shape == (grid.history_steps, 3)
     assert state.robot_history.dtype == np.float32
     assert np.allclose(state.robot_history[-1], 0.0, atol=1e-6)
-    assert state.robot_state.shape == (2,)
-    assert state.robot_state.dtype == np.float32
-    visible = state.visible_pedestrian_history["ped-1"]
-    assert visible.shape == (grid.history_steps, 2)
-    assert visible.dtype == np.float32
-    assert np.allclose(visible[-1], [2.0, 1.0], atol=1e-6)
-    assert oracle.pedestrian_history["ped-1"].shape == (grid.history_steps, 2)
-    assert oracle.pedestrian_future["ped-1"].shape == (grid.future_steps, 2)
-    assert oracle.pedestrian_future["ped-1"].dtype == np.float32
+    human_history = state.visible_dynamic_object_history[
+        "toy-recording::Helmet_1"
+    ]
+    assert human_history.shape == (grid.history_steps, 3)
+    assert human_history.dtype == np.float32
+    assert np.allclose(human_history[-1], [2.0, 1.0, 0.0], atol=1e-6)
+    assert set(state.visible_dynamic_object_specs) == set(state.dynamic_object_ids)
+    assert oracle.dynamic_object_future["toy-recording::LO1"].shape == (
+        grid.future_steps,
+        3,
+    )
+    assert oracle.dynamic_object_future["toy-recording::LO1"].dtype == np.float32
+    assert set(oracle.dynamic_object_specs) == set(oracle.dynamic_object_future)
     assert not any("future" in field for field in state.__dict__)
     assert not any("oracle" in field for field in state.__dict__)
-    assert np.isfinite(state.robot_history).all()
-    assert np.isfinite(oracle.pedestrian_future["ped-1"]).all()
+    validate_base_state(state, grid)
+    validate_oracle_context(oracle, grid)
 
 
-def test_empty_dynamic_base_states_are_accepted_not_counted_as_rejections():
+def test_empty_dynamic_base_states_are_accepted_not_rejected():
     from src.datasets.base_state_index import extract_base_states
 
     grid = build_grid_spec(load_config())
     result = extract_base_states(
-        replace(_recording(), pedestrians={}),
+        replace(_recording(), dynamic_objects={}),
         split="train",
         grid=grid,
         stride_s=0.6,
@@ -102,21 +128,25 @@ def test_empty_dynamic_base_states_are_accepted_not_counted_as_rejections():
     assert result.summary["empty_dynamic_count"] == 3
 
 
-def test_observed_participants_do_not_depend_on_future_availability():
+def test_observed_objects_do_not_depend_on_future_availability():
     from src.datasets.base_state_index import extract_base_states
 
     recording = _recording()
-    track = recording.pedestrians["ped-1"]
-    history_only_track = replace(
+    object_id = "toy-recording::Helmet_1"
+    track = recording.dynamic_objects[object_id]
+    history_only = replace(
         track,
         timestamps=track.timestamps[:20],
-        positions=track.positions[:20],
+        poses=track.poses[:20],
         velocities=track.velocities[:20],
         segment_ids=track.segment_ids[:20],
     )
     grid = build_grid_spec(load_config())
     result = extract_base_states(
-        replace(recording, pedestrians={"ped-1": history_only_track}),
+        replace(
+            recording,
+            dynamic_objects={**recording.dynamic_objects, object_id: history_only},
+        ),
         split="train",
         grid=grid,
         stride_s=0.6,
@@ -124,34 +154,41 @@ def test_observed_participants_do_not_depend_on_future_availability():
 
     first_state = result.base_states[0]
     first_oracle = result.oracle_contexts[0]
-    assert first_state.participant_ids == ("ped-1",)
-    assert "ped-1" in first_state.visible_pedestrian_history
-    assert "ped-1" not in first_oracle.pedestrian_future
+    assert object_id in first_state.dynamic_object_ids
+    assert object_id in first_state.visible_dynamic_object_history
+    assert object_id not in first_oracle.dynamic_object_future
+    assert object_id not in first_oracle.dynamic_object_history
+    assert object_id not in first_oracle.dynamic_object_specs
 
 
-def test_out_of_view_oracle_participants_are_not_exposed_in_base_state():
+def test_out_of_view_oracle_object_is_not_exposed_in_base_state():
     from src.datasets.base_state_index import extract_base_states
 
     recording = _recording()
-    track = recording.pedestrians["ped-1"]
-    far_track = replace(
-        track,
-        positions=(track.positions + np.array([50.0, 0.0], dtype=np.float32)),
-    )
+    object_id = "toy-recording::LO1"
+    track = recording.dynamic_objects[object_id]
+    far_poses = track.poses.copy()
+    far_poses[:, 0] += 50.0
     grid = build_grid_spec(load_config())
     result = extract_base_states(
-        replace(recording, pedestrians={"ped-1": far_track}),
+        replace(
+            recording,
+            dynamic_objects={
+                **recording.dynamic_objects,
+                object_id: replace(track, poses=far_poses),
+            },
+        ),
         split="train",
         grid=grid,
         stride_s=0.6,
     )
 
-    assert result.base_states[0].participant_ids == ()
-    assert result.base_states[0].visible_pedestrian_history == {}
-    assert "ped-1" in result.oracle_contexts[0].pedestrian_future
+    assert object_id not in result.base_states[0].dynamic_object_ids
+    assert object_id not in result.base_states[0].visible_dynamic_object_history
+    assert object_id in result.oracle_contexts[0].dynamic_object_future
 
 
-def test_base_and_oracle_artifacts_are_written_to_separate_directories(tmp_path):
+def test_base_and_oracle_artifacts_keep_dynamic_provenance_separate(tmp_path):
     from src.datasets.base_state_index import (
         extract_base_states,
         write_base_state_extraction,
@@ -165,24 +202,27 @@ def test_base_and_oracle_artifacts_are_written_to_separate_directories(tmp_path)
 
     assert paths["base_states"].name == "base_states"
     assert paths["oracle_contexts"].name == "oracle_contexts"
-    assert set(path.name for path in paths["base_states"].iterdir()) == {
-        f"{state.state_id}.npz" for state in result.base_states
-    }
-    assert set(path.name for path in paths["oracle_contexts"].iterdir()) == {
-        f"{oracle.base_state_id}.npz" for oracle in result.oracle_contexts
-    }
     manifest_rows = [
         json.loads(line)
         for line in paths["manifest"].read_text(encoding="utf-8").splitlines()
     ]
     assert len(manifest_rows) == 3
+    assert manifest_rows[0]["dynamic_object_ids"] == [
+        "toy-recording::Helmet_1",
+        "toy-recording::LO1",
+    ]
     assert all("oracle_path" not in row for row in manifest_rows)
-    assert json.loads(paths["summary"].read_text(encoding="utf-8"))[
-        "accepted_count"
-    ] == 3
+    oracle_rows = [
+        json.loads(line)
+        for line in paths["oracle_manifest"].read_text(encoding="utf-8").splitlines()
+    ]
+    assert oracle_rows[0]["source_dynamic_object_ids"] == [
+        "toy-recording::Helmet_1",
+        "toy-recording::LO1",
+    ]
 
 
-def test_extract_base_states_cli_writes_observed_and_oracle_artifacts(tmp_path):
+def test_extract_base_states_cli_writes_v2_artifacts(tmp_path):
     from src.datasets.thor_adapter import write_recording_indexes
 
     write_recording_indexes(
@@ -217,6 +257,9 @@ def test_extract_base_states_cli_writes_observed_and_oracle_artifacts(tmp_path):
     summary = json.loads(
         (split_dir / "summary.json").read_text(encoding="utf-8")
     )
-    assert summary["recording_count"] == 1
-    assert summary["accepted_count"] == 3
+    assert summary["dynamic_object_type_counts"] == {
+        "carried_object": 1,
+        "human": 1,
+        "unknown_dynamic": 0,
+    }
     assert "accepted_count=3" in completed.stdout

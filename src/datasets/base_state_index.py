@@ -15,10 +15,11 @@ from src.contracts import (
     BaseState,
     GridSpec,
     OracleContext,
-    ROBOT_STATE_DIM,
     save_dataclass,
+    validate_base_state,
+    validate_oracle_context,
 )
-from src.geometry.transforms import global_to_local, transform_poses_global_to_local
+from src.geometry.transforms import transform_poses_global_to_local
 from src.utils.seeding import stable_digest
 
 from .thor_adapter import RecordingIndex, ThorDataError, validate_recording_index
@@ -46,24 +47,8 @@ def _same_segment(segment_ids: np.ndarray, indices: np.ndarray) -> bool:
     return bool(indices.size and np.all(segment_ids[indices] == segment_ids[indices[0]]))
 
 
-def _validate_base_state(state: BaseState, grid: GridSpec) -> None:
-    if state.robot_history.shape != (grid.history_steps, 3):
-        raise ThorDataError("robot_history shape must be [K,3]")
-    if state.robot_history.dtype != np.float32:
-        raise ThorDataError("robot_history dtype must be float32")
-    if state.robot_state.shape != (ROBOT_STATE_DIM,):
-        raise ThorDataError("robot_state shape must be [2]")
-    if state.robot_state.dtype != np.float32:
-        raise ThorDataError("robot_state dtype must be float32")
-    if not np.isfinite(state.robot_history).all() or not np.isfinite(state.robot_state).all():
-        raise ThorDataError("BaseState robot arrays contain NaN/Inf")
-    for participant_id, history in state.visible_pedestrian_history.items():
-        if history.shape != (grid.history_steps, 2) or history.dtype != np.float32:
-            raise ThorDataError(
-                f"visible history for {participant_id} must be float32 [K,2]"
-            )
-        if not np.isfinite(history).all():
-            raise ThorDataError(f"visible history for {participant_id} contains NaN/Inf")
+def _object_spec(object_type: str, footprint: dict) -> dict:
+    return {"object_type": object_type, "footprint": footprint}
 
 
 def extract_base_states(
@@ -118,38 +103,43 @@ def extract_base_states(
         history_times = recording.timestamps[history_indices]
         future_times = recording.timestamps[future_indices]
         visible_history: dict[str, np.ndarray] = {}
+        visible_specs: dict[str, dict] = {}
         oracle_history: dict[str, np.ndarray] = {}
         oracle_future: dict[str, np.ndarray] = {}
+        oracle_specs: dict[str, dict] = {}
 
-        for participant_id in sorted(recording.pedestrians):
-            track = recording.pedestrians[participant_id]
-            ped_history_indices = _exact_indices(
+        for object_id in sorted(recording.dynamic_objects):
+            track = recording.dynamic_objects[object_id]
+            object_history_indices = _exact_indices(
                 track.timestamps, history_times, tolerance
             )
-            if ped_history_indices is None or not _same_segment(
-                track.segment_ids, ped_history_indices
+            if object_history_indices is None or not _same_segment(
+                track.segment_ids, object_history_indices
             ):
                 continue
-            local_history = global_to_local(
-                track.positions[ped_history_indices], current_pose
+            local_history = transform_poses_global_to_local(
+                track.poses[object_history_indices], current_pose
             ).astype(np.float32)
-            current_position = local_history[-1]
+            spec = _object_spec(track.object_type, track.footprint)
+            current_position = local_history[-1, :2]
             if np.all(np.abs(current_position) <= half_extent_m):
-                visible_history[participant_id] = local_history
-            ped_future_indices = _exact_indices(
+                visible_history[object_id] = local_history
+                visible_specs[object_id] = spec
+            object_future_indices = _exact_indices(
                 track.timestamps, future_times, tolerance
             )
-            if ped_future_indices is None:
+            if object_future_indices is None:
                 continue
-            combined_ped_indices = np.concatenate(
-                (ped_history_indices, ped_future_indices)
+            combined_object_indices = np.concatenate(
+                (object_history_indices, object_future_indices)
             )
-            if not _same_segment(track.segment_ids, combined_ped_indices):
+            if not _same_segment(track.segment_ids, combined_object_indices):
                 continue
-            oracle_history[participant_id] = local_history
-            oracle_future[participant_id] = global_to_local(
-                track.positions[ped_future_indices], current_pose
+            oracle_history[object_id] = local_history
+            oracle_future[object_id] = transform_poses_global_to_local(
+                track.poses[object_future_indices], current_pose
             ).astype(np.float32)
+            oracle_specs[object_id] = spec
 
         if not visible_history:
             empty_dynamic_count += 1
@@ -158,7 +148,7 @@ def extract_base_states(
             f"{split}-base-"
             f"{stable_digest(recording.recording_id, f'{timestamp:.9f}', size=12)}"
         )
-        participant_ids = tuple(sorted(visible_history))
+        dynamic_object_ids = tuple(sorted(visible_history))
         metadata = {
             "session_id": recording.session_id,
             "source_file": recording.source_file,
@@ -174,26 +164,29 @@ def extract_base_states(
             state_id=state_id,
             split=split,
             recording_id=recording.recording_id,
-            participant_ids=participant_ids,
+            dynamic_object_ids=dynamic_object_ids,
             timestamp=timestamp,
             robot_history=robot_history,
             robot_state=recording.robot_twist[current_index].astype(np.float32),
-            visible_pedestrian_history=visible_history,
+            visible_dynamic_object_history=visible_history,
+            visible_dynamic_object_specs=visible_specs,
             static_map_local=static_map,
             metadata=metadata,
         )
         oracle = OracleContext(
             base_state_id=state_id,
-            pedestrian_history=oracle_history,
-            pedestrian_future=oracle_future,
+            dynamic_object_history=oracle_history,
+            dynamic_object_future=oracle_future,
+            dynamic_object_specs=oracle_specs,
             metadata={
                 "source_recording_id": recording.recording_id,
-                "source_participant_ids": sorted(oracle_history),
+                "source_dynamic_object_ids": sorted(oracle_history),
                 "future_dt_s": recording.dt_s,
                 "coordinate_frame": metadata["coordinate_frame"],
             },
         )
-        _validate_base_state(state, grid)
+        validate_base_state(state, grid)
+        validate_oracle_context(oracle, grid)
         base_states.append(state)
         oracle_contexts.append(oracle)
 
@@ -208,6 +201,13 @@ def extract_base_states(
         "history_steps": grid.history_steps,
         "future_steps": grid.future_steps,
         "dt_s": recording.dt_s,
+        "dynamic_object_type_counts": {
+            object_type: sum(
+                track.object_type == object_type
+                for track in recording.dynamic_objects.values()
+            )
+            for object_type in ("human", "carried_object", "unknown_dynamic")
+        },
     }
     return BaseStateExtraction(
         base_states=tuple(base_states),
@@ -276,6 +276,13 @@ def extract_base_state_index(
         "future_steps": grid.future_steps,
         "dt_s": results[0].summary["dt_s"],
         "stride_s": stride_s,
+        "dynamic_object_type_counts": {
+            object_type: sum(
+                int(result.summary["dynamic_object_type_counts"][object_type])
+                for result in results
+            )
+            for object_type in ("human", "carried_object", "unknown_dynamic")
+        },
     }
     return BaseStateExtraction(
         base_states=base_states,
@@ -334,7 +341,7 @@ def write_base_state_extraction(
                     "state_id": state.state_id,
                     "split": state.split,
                     "recording_id": state.recording_id,
-                    "participant_ids": list(state.participant_ids),
+                    "dynamic_object_ids": list(state.dynamic_object_ids),
                     "timestamp": state.timestamp,
                     "base_state_file": f"base_states/{state.state_id}.npz",
                 }
@@ -346,8 +353,8 @@ def write_base_state_extraction(
                     "source_recording_id": oracle.metadata.get(
                         "source_recording_id"
                     ),
-                    "source_participant_ids": oracle.metadata.get(
-                        "source_participant_ids", []
+                    "source_dynamic_object_ids": oracle.metadata.get(
+                        "source_dynamic_object_ids", []
                     ),
                     "oracle_context_file": (
                         f"oracle_contexts/{oracle.base_state_id}.npz"

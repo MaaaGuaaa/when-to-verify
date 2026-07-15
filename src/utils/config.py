@@ -43,11 +43,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_linear_speed_mps": 0.9,
         "max_angular_speed_radps": 0.8,
     },
-    "pedestrian": {
-        "radius_m": 0.30,
-        "min_speed_mps": 0.3,
-        "max_speed_mps": 2.0,
-        "max_acceleration_mps2": 2.5,
+    "dynamic_objects": {
+        "human": {
+            "radius_m": 0.30,
+            "carrier_radius_m": 0.45,
+            "min_speed_mps": 0.30,
+            "max_speed_mps": 2.00,
+            "max_acceleration_mps2": 2.50,
+        },
+        "carried_object": {
+            "fallback_length_m": 0.80,
+            "fallback_width_m": 0.20,
+            "min_speed_mps": 0.05,
+            "max_speed_mps": 2.00,
+            "max_acceleration_mps2": 2.50,
+        },
+        "unknown_dynamic": {
+            "fallback_radius_m": 0.50,
+            "min_speed_mps": 0.05,
+            "max_speed_mps": 2.00,
+            "max_acceleration_mps2": 2.50,
+        },
+        "marker_geometry": {
+            "extent_quantile": 0.95,
+            "minimum_valid_frames": 20,
+            "min_extent_m": 0.05,
+            "max_extent_m": 3.00,
+        },
     },
     "age_map": {
         "a_max_s": 5.0,
@@ -131,7 +153,13 @@ def load_config(path: str | Path | None = None) -> dict:
     if not isinstance(raw, dict):
         raise ConfigError("top-level config must be a mapping")
     validate_config(raw)
-    return apply_defaults(raw)
+    merged = apply_defaults(raw)
+    if merged["schema_version"] != SCHEMA_VERSION:
+        raise ConfigError(
+            f"schema_version must be {SCHEMA_VERSION}, "
+            f"got {merged['schema_version']!r}"
+        )
+    return merged
 
 
 def config_digest(cfg: dict, size: int = 16) -> str:

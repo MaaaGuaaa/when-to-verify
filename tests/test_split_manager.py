@@ -188,6 +188,7 @@ def test_source_index_rejects_incompatible_schema_version():
 
 
 def test_written_artifacts_are_complete_and_byte_identical(tmp_path):
+    from src.contracts import SCHEMA_VERSION
     from src.datasets.split_manager import make_split_manifest, write_split_artifacts
 
     records = [
@@ -214,9 +215,9 @@ def test_written_artifacts_are_complete_and_byte_identical(tmp_path):
         json.loads(line)
         for line in first_paths["manifest"].read_text(encoding="utf-8").splitlines()
     ]
-    assert summary["schema_version"] == "1.0.0"
-    assert report["schema_version"] == "1.0.0"
-    assert {row["schema_version"] for row in manifest_rows} == {"1.0.0"}
+    assert summary["schema_version"] == SCHEMA_VERSION
+    assert report["schema_version"] == SCHEMA_VERSION
+    assert {row["schema_version"] for row in manifest_rows} == {SCHEMA_VERSION}
     assert summary["seed"] == 42
     assert summary["source_record_count"] == 20
     assert summary["connected_group_count"] == 10

@@ -168,12 +168,13 @@ class BaseState:
     state_id: str
     split: str
     recording_id: str
-    participant_ids: list[str]
+    dynamic_object_ids: tuple[str, ...]
     timestamp: float
     robot_history: np.ndarray      # [K, 3] -> x, y, yaw
     robot_state: np.ndarray        # [D]
-    pedestrian_history: dict       # ped_id -> [K, state_dim]
-    static_map: np.ndarray | None
+    visible_dynamic_object_history: dict  # object_id -> [K, 3]
+    visible_dynamic_object_specs: dict    # object_id -> type + footprint
+    static_map_local: np.ndarray | None
     metadata: dict
 
 
@@ -194,7 +195,8 @@ class OracleWorld:
     world_id: str
     base_state_id: str
     static_occupancy: np.ndarray   # [H, W]
-    pedestrian_trajectories: dict  # ped_id -> [T, state_dim]
+    dynamic_object_trajectories: dict  # object_id -> [T, 3]
+    dynamic_object_specs: dict         # object_id -> type + footprint
     occluders: list
     blind_spot_config: dict
     random_seed: int
@@ -237,6 +239,8 @@ class VerificationSample:
     post_risk: float
     metadata: dict
 ```
+
+动态对象 schema v2 冻结为 `human`、`carried_object`、`unknown_dynamic`。数据适配器保留所有有效非机器人 BODY，以 `recording_id::body_name` 作为对象 ID；split 的 human participant 分组语义保持独立。`human` 使用配置圆 footprint，非人对象优先使用 QTM marker P95 矩形估计并在无有效 marker 时回退配置。snippet 必须按 `snippets/<split>/<object_type>/` 隔离；schema v1 序列化产物全部重建，不做静默兼容。
 
 ## 3.2 固定 tensor 约定
 

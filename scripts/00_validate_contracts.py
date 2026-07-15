@@ -30,6 +30,8 @@ from src.contracts import (  # noqa: E402
     build_grid_spec,
     load_dataclass,
     save_dataclass,
+    validate_base_state,
+    validate_oracle_world,
     validate_risk_sample,
     validate_verification_sample,
 )
@@ -61,7 +63,13 @@ def _check_no_oracle_leakage() -> None:
 
 def _check_roundtrip(grid) -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        for builder in (toy_world.make_risk_sample, toy_world.make_verification_sample):
+        builders = (
+            toy_world.make_risk_sample,
+            toy_world.make_verification_sample,
+            lambda spec: toy_world.make_base_state("toy_bs_0", spec),
+            lambda spec: toy_world.make_oracle_world("toy_world_0", "toy_bs_0", 7, spec),
+        )
+        for builder in builders:
             obj = builder(grid)
             path = save_dataclass(obj, Path(tmp) / "obj.npz")
             restored = load_dataclass(path)
@@ -72,7 +80,13 @@ def _check_roundtrip(grid) -> None:
                         raise SystemExit(f"[fail] round trip mismatch on field {f}")
         validate_risk_sample(toy_world.make_risk_sample(grid), grid)
         validate_verification_sample(toy_world.make_verification_sample(grid), grid)
+        validate_base_state(toy_world.make_base_state("toy_bs_0", grid), grid)
+        validate_oracle_world(
+            toy_world.make_oracle_world("toy_world_0", "toy_bs_0", 7, grid),
+            grid,
+        )
     print("[ok] risk/verification samples round-trip and validate")
+    print("[ok] dynamic-object base/oracle artifacts round-trip and validate")
 
 
 def _check_determinism() -> None:

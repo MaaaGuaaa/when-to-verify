@@ -56,3 +56,45 @@ First version uses NPZ + JSON (implemented). Zarr/Parquet are optional enhanceme
 ### D9. Toy fixture geometry simplification (test oracle only)
 
 `tests/fixtures/toy_world.py` uses circular robot/pedestrian footprints (radius `0.30 m`, `R_SUM = 0.60 m`) and a `{execute nominal, reject}` candidate set so risk labels and `G*` are hand-derivable. This is an independent test oracle, not a production simplification; production geometry (SOP-02+) uses the full robot rectangle and inflation.
+
+---
+
+## 2026-07-15 · Generic dynamic-object schema v2
+
+### D10. Preserve every non-robot tracked body
+
+The THÖR adapter must retain every valid non-robot rigid body exposed by a
+recording. Objects such as `storage`, `cart`, `carrier`, `LO*`, bins, boxes, and
+buckets must not be discarded merely because they are not pedestrians or are
+temporarily stationary. The adapter assigns one of the stable types `human`,
+`carried_object`, or `unknown_dynamic`; it also preserves the raw name/role in
+provenance metadata. Object IDs are recording-scoped (`recording_id::body_name`)
+so they remain unique across recordings.
+
+Rationale: collision risk depends on occupied space and motion, not semantic
+membership in a pedestrian-only allow-list. Temporarily stationary bodies may
+move later and must therefore remain available to observed-state and oracle
+construction.
+
+### D11. Dynamic-object fields and geometry replace pedestrian-only contracts
+
+Schema `2.0.0` supersedes the pedestrian-only parts of D2 and D4:
+
+- `BaseState` carries sorted `dynamic_object_ids`, visible dynamic-object
+  histories, and their frozen type/footprint specs.
+- `OracleContext` carries full dynamic-object histories/futures and aligned
+  specs; `OracleWorld` carries dynamic-object trajectories and aligned specs.
+- Supported specs are JSON-safe `human` circles, `carried_object` rectangles,
+  and `unknown_dynamic` circles or rectangles. Raw roles are provenance only and
+  are not embedded in the geometry contract.
+- Human radius is `0.30 m`, or `0.45 m` for the THÖR `Carrier` human role.
+  Non-human rectangles use the 95th-percentile QTM marker extent when at least
+  20 valid frames are available; extents are clamped to `[0.05, 3.0] m` and
+  fall back to configured type geometry when marker inference is unavailable.
+- Snippet libraries are split- and type-scoped:
+  `snippets/<split>/<object_type>/`. Kinematic filters are configured per type.
+
+Serialized schema-v1 artifacts are rejected rather than silently upgraded.
+They must be regenerated after the v2 producer pipeline is integrated. Split
+grouping by human participant remains unchanged and is distinct from the
+dynamic-object IDs stored in base states.

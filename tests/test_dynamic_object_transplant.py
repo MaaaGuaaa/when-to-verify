@@ -17,6 +17,7 @@ from src.contracts import (
 from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
 from src.generation.dynamic_object_transplant import (
     TargetPolicyError,
+    footprint_from_spec,
     normalize_target_type_policy,
     transplant_snippet,
 )
@@ -26,7 +27,13 @@ from src.generation.event_sampler import (
     load_generator_config,
     normalize_generator_config,
 )
-from src.geometry import CircleFootprint, RectangleFootprint, rasterize_footprint_sweep
+from src.geometry import (
+    CircleFootprint,
+    RectangleFootprint,
+    inflate_footprint,
+    rasterize_footprint_sweep,
+    trajectory_signed_clearances,
+)
 from src.planning.query_maps import build_local_trajectory
 from src.planning.trajectory_sampler import sample_candidate_rollouts
 from src.utils.config import load_config
@@ -438,6 +445,21 @@ def test_impossible_world_exhausts_finite_retries_with_explicit_reason() -> None
     assert report.summary["rejected_count"] == 3
     assert report.summary["rejection_reasons"] == {"target_static_collision": 3}
     assert report.summary["by_object_type"]["human"]["rejected"] == 3
+    structural_summary = report.summary["by_event_kind"]["structural"]
+    assert structural_summary == {
+        "requested": 1,
+        "attempted": 3,
+        "accepted": 0,
+        "rejected": 3,
+        "request_acceptance_rate": 0.0,
+        "attempt_acceptance_rate": 0.0,
+        "rejection_reasons": {"target_static_collision": 3},
+        "rejection_stage_counts": {
+            "occluder_geometry": 0,
+            "target_conditioning": 3,
+            "visibility": 0,
+        },
+    }
 
 
 def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
@@ -482,3 +504,98 @@ def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
     )
     assert target_mask.any()
     assert np.unique(np.round(event.target.future_poses[:, 2], decimals=5)).size > 1
+
+
+def test_environment_generation_uses_single_layer_joint_attempts() -> None:
+    config, _, base, oracle, trajectory, libraries = _base_inputs()
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=load_generator_config(
+            ROOT / "configs" / "generator_train.yaml"
+        ),
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert len(report.events) == 1
+    assert report.summary["generator_algorithm_version"] == "joint_occluder_first_v2"
+    assert report.summary["joint_candidate_attempted_count"] == report.summary[
+        "attempted_count"
+    ]
+    assert report.summary["attempt_acceptance_rate"] >= 0.5
+    assert report.summary["rejection_stage_counts"] == {
+        "occluder_geometry": 0,
+        "target_conditioning": 0,
+        "visibility": 0,
+    }
+    environment_summary = report.summary["by_event_kind"]["environment"]
+    assert environment_summary["requested"] == 1
+    assert environment_summary["attempted"] == report.summary["attempted_count"]
+    assert environment_summary["accepted"] == 1
+    assert environment_summary["rejected"] == environment_summary["attempted"] - 1
+    assert environment_summary["request_acceptance_rate"] == 1.0
+    assert environment_summary["attempt_acceptance_rate"] == pytest.approx(
+        1.0 / environment_summary["attempted"]
+    )
+    assert sum(environment_summary["rejection_stage_counts"].values()) == (
+        environment_summary["rejected"]
+    )
+    event = report.events[0]
+    assert event.world.metadata["generator_algorithm_version"] == (
+        "joint_occluder_first_v2"
+    )
+    assert event.world.occluders[0]["placement_strategy"] == (
+        "joint_occluder_first_v2"
+    )
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    clearances = trajectory_signed_clearances(
+        robot_footprint,
+        trajectory.poses,
+        footprint_from_spec(event.target.footprint_spec),
+        event.target.future_poses,
+    )
+    assert float(np.min(clearances)) <= 0.0
+
+
+def test_environment_physics_prefix_accepts_first_candidate_for_fixture_batch() -> None:
+    config, _, base, oracle, trajectory, libraries = _base_inputs()
+    generator_config = load_generator_config(
+        ROOT / "configs" / "generator_train.yaml"
+    )
+    generator_config["event_type_weights"] = {
+        "environment": 1.0,
+        "structural": 0.0,
+        "mixed": 0.0,
+    }
+    generator_config["max_resample_attempts"] = 1
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=4,
+    )
+
+    assert len(report.events) == 4
+    assert report.summary["attempted_count"] == 4
+    assert report.summary["attempt_acceptance_rate"] == 1.0
+    assert report.summary["rejection_reasons"] == {}
+    assert all(event.conflict_time_s == 2.2 for event in report.events)
+    occluder_poses = {
+        tuple(np.round(event.world.occluders[0]["pose"], decimals=4))
+        for event in report.events
+    }
+    assert len(occluder_poses) >= 3

@@ -684,8 +684,14 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 - [ ] 从轨迹 `τ*=1.0–2.2 s` 选择冲突时刻和位置
 - [ ] 计算轨迹切向与法向，拒绝高曲率或无放置空间的位置
-- [ ] 按 wall/shelf/pillar 参数沿法向放置遮挡物
-- [ ] 验证遮挡物不与机器人 swept volume 相交
+- [ ] 环境/混合事件采用单层联合候选：先按 wall/shelf/pillar 参数沿法向放置并验证
+      遮挡物，再根据遮挡物法向侧条件化 typed snippet；一次 attempt 只计一个完整候选
+- [ ] `joint_occluder_first_v2` 先用 seeded 高可行前缀：最小 pillar、offset quantile
+      `0.3/0.4`、angle multiplier `0/0.25/0.5/0.7`、time-scale quantile
+      `0/0.16/0.25/0.5`、最晚 conflict-time；每个模板紧邻相反侧 fallback，再进入
+      wall/shelf/pillar 通用分层候选；禁用 pillar 时跳过前缀，不得套用到其他类型
+- [ ] 验证遮挡物不与机器人 swept volume 相交；先加密 SE(2) 轨迹并做真实 footprint
+      signed clearance，再以保守运动上界递归认证帧间连续净空，栅格接触不得直接判碰撞
 - [ ] 实现 FOV `160/180/220°`、range `6/8/10 m` 和可选 blind sector
 - [ ] 按 `60/30/10` 生成 environment/structural/mixed
 - [ ] 从 split 内按对象类型分库的 `MotionSnippet` 选择目标，记录
@@ -714,8 +720,11 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - 目标轨迹与静态/新遮挡物无相交
 - 遮挡物与候选轨迹 swept volume 无相交
 - 同 seed 生成相同事件
-- 最低 event acceptance `≥50%`，理想 `≥80%`
+- `attempt_acceptance_rate = accepted / complete_joint_candidates_attempted`，最低 `≥50%`，
+  理想 `≥80%`；请求级最终接受率必须单独报告
 - 无效几何比例理想 `<1%`
+- environment、structural、mixed 分别报告 requested/attempted/accepted、两种接受率、
+  拒绝原因和 occluder-geometry/target-conditioning/visibility 阶段计数
 - 按 object type、footprint kind 和 geometry source 报告尝试数、接受率和拒绝原因
 - 100 个可视化事件无系统性穿墙、瞬移、当前可见或遮挡物挡路
 
@@ -742,6 +751,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 - Create: `src/generation/paired_variants.py`
 - Create: `src/generation/observation_renderer.py`
+- Create: `configs/paired_variants.yaml`
 - Create: `tests/test_pair_variants.py`
 - Create: `tests/test_observation_renderer.py`
 - Create: `tests/test_input_oracle_isolation.py`
@@ -752,8 +762,15 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 生成 near-miss，最小安全间隔目标 `0.05–0.35 m`
 - [ ] 生成 temporal-safe，时间偏移 `±0.8–1.5 s`
 - [ ] 生成 spatial-safe，横向间隔目标 `0.5–1.0 m`
-- [ ] 生成 irrelevant-hidden，确保有隐藏目标但不接近 swept volume
+- [ ] 空间变体以当前隐藏位姿为枢轴对完整 snippet/yaw 做刚性旋转；必要时先沿盲区
+      射线向后做配置上限内的刚性平移，且每个变体重新验证物理与可见性
+- [ ] temporal-safe 只使用独立配置的冻结偏移序列重设冲突锚点，不外推，并验证空间
+      路径相交但同步 footprint 不相交
+- [ ] 生成 irrelevant-hidden，确保有隐藏目标且同步 signed clearance `≥1.5 m`
 - [ ] 生成 empty-blind-spot，只移除 `target_dynamic_object_id`，保留其他动态对象
+- [ ] 允许训练使用部分配对，但最低包含 collision、empty-blind-spot，以及
+      near-miss/temporal-safe/spatial-safe 中至少一种；输出固定 coverage mask 和缺失原因
+- [ ] 严格 paired evaluation 只使用完整 six-pack
 - [ ] 六类共享 `pair_group_id` 和固定几何 ID
 - [ ] 同一 pair 保持 target object type、footprint spec 和 source object ID 不变
 - [ ] 主训练/paired evaluation 中，非目标动态对象在全部 variant 保持不变且不形成

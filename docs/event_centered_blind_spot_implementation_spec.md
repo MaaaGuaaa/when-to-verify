@@ -590,6 +590,27 @@ p^*=q(\tau^*)
 
 ### 8.4 环境遮挡物放置
 
+环境遮挡事件采用**遮挡物优先的单层联合候选**。每个内部 attempt 只对应一个完整
+候选：先选择冲突点和遮挡物几何，检查地图、上下文对象和机器人 swept volume；再
+根据遮挡物所在的轨迹法向侧约束目标横穿方向并移植一个 typed snippet；最后统一检查
+目标 footprint、可见性和连续出现。不允许在一个顶层 attempt 内隐藏另一层固定次数的
+遮挡物重试。
+
+`joint_occluder_first_v2` 在通用分层候选前放置一个 seeded 高可行前缀。前缀使用配置
+范围内的最小 pillar、normal-offset quantile `0.3/0.4`、crossing-angle multiplier
+`0/0.25/0.5/0.7`、time-scale quantile `0/0.16/0.25/0.5`，并把 conflict-time
+quantile 固定为 `1.0`（配置窗口内最晚的可用离散时刻）。八个组合按事件 seed 排列；
+每个组合先尝试法向 `-1` 侧，再紧邻 `+1` 侧 fallback。前缀失败后才进入覆盖
+wall/shelf/pillar、两侧和完整尺寸/时间分位数的通用分层候选。所有选中参数及算法版本
+必须进入 oracle metadata；不得根据最终标签删除失败 attempt。若配置禁用 pillar，则
+不得把该前缀套用到 wall/shelf，而是直接使用通用分层候选。
+
+机器人 swept-volume 检查不能直接用栅格掩码相交作为最终判据。实现先按不超过半个
+BEV cell 的平移步长和 `5°` yaw 步长加密 SE(2) 轨迹，再用真实 footprint signed
+clearance 做窄相检查；相邻加密点之间用“平移距离 + footprint 外接半径乘 yaw 变化”
+的保守运动上界认证整段安全。若区间不能被证明为正净空，则递归检查中点并在精度上限
+处保守拒绝。这样既不会因栅格接触误拒绝真实正净空，也不会漏掉帧间窄碰撞。
+
 遮挡物中心：
 
 \[
@@ -730,6 +751,11 @@ t^{source}_{k^*}-1.4\approx \tau^*
 - 速度/加速度超限；
 - 事件无法形成指定 collision/near-miss/safe 版本。
 
+`attempt_acceptance_rate` 统一定义为接受事件数除以完整联合候选数；不能用最终接受数
+除以请求数替代该指标。环境/混合候选的拒绝原因分别按遮挡物几何、目标条件化和最终
+可见性阶段统计。除全局汇总外，必须分别输出 environment、structural 和 mixed 的
+requested、attempted、accepted、两种接受率、拒绝原因和阶段计数。
+
 ---
 
 ## 10. 配对反事实样本生成
@@ -751,6 +777,12 @@ t^{source}_{k^*}-1.4\approx \tau^*
 0.05m ~ 0.35m
 ```
 
+空间变体不能直接平移整条目标轨迹后忽略可见性。为保持同一遮挡骨架下“当前隐藏、
+未来出现”，默认以目标当前隐藏位姿为枢轴，对完整 `MotionSnippet` 轨迹和逐帧 yaw 做
+同一个刚性旋转；若单纯旋转不能达到所需间距，允许先沿传感器到当前目标的盲区射线
+向后做配置上限内的刚性平移，再做枢轴旋转。每个候选仍须重新通过静态地图、遮挡物、
+上下文对象、速度/加速度和可见性检查；禁止逐帧扭曲轨迹。
+
 #### C. Temporal-safe hard negative
 
 空间路径相交，但时间错开：
@@ -758,6 +790,9 @@ t^{source}_{k^*}-1.4\approx \tau^*
 ```text
 ±0.8s ~ ±1.5s
 ```
+
+时间变体只能从独立配置给出的冻结偏移序列重设 snippet 的冲突锚点，不得外推；它必须
+保持空间路径相交、同步 footprint 不相交，并重新满足当前隐藏和连续出现条件。
 
 #### D. Spatial-safe hard negative
 
@@ -769,11 +804,17 @@ t^{source}_{k^*}-1.4\approx \tau^*
 
 #### E. Irrelevant hidden dynamic object
 
-盲区里有目标动态对象，但完全不接近当前候选轨迹。
+盲区里有目标动态对象，但完全不接近当前候选轨迹；同步 signed clearance 至少为
+`1.5 m`。
 
 #### F. Empty blind spot
 
 同一场景只移除 `target_dynamic_object_id`；其他动态对象必须保持不变。
+
+训练允许保留部分配对组，但最低覆盖必须包含 `collision`、`empty_blind_spot`，以及
+`near_miss`、`temporal_safe`、`spatial_safe` 中至少一种。每组必须输出固定六位
+coverage mask 和逐类型缺失原因。严格 paired evaluation 只使用完整 six-pack；部分组
+不得静默混入完整配对评测。
 
 为避免多对象上下文破坏 paired 因果对照，主训练和 paired evaluation 要求非目标
 动态对象在所有 variant 中完全相同，且不形成 collision/near miss。违反者拒绝，

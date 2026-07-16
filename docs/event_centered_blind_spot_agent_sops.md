@@ -112,7 +112,7 @@ class OracleWorld:
 
 `RiskSample` 和 `VerificationSample` 只能包含部署时可获得的输入、监督标签及溯源 metadata；不得包含 `OracleContext`、隐藏动态对象未来位置或验证后真实 occupancy。
 
-动态对象类型冻结为 `human`、`carried_object`、`unknown_dynamic`。适配器必须保留所有非机器人 BODY，不得用行人 allow-list 排除 `storage/cart/carrier/LO*` 等对象；原始 body name/role 仅进入 provenance。对象 ID 使用 `recording_id::body_name`，footprint spec 只允许圆或矩形，并与轨迹 key 严格对齐。schema v1 产物不兼容，必须重建。
+动态对象类型冻结为 `human`、`carried_object`、`unknown_dynamic`。适配器必须保留所有非机器人 BODY，不得用行人 allow-list 排除 `storage/cart/carrier/LO*` 等对象；原始 body name/role 仅进入 provenance。对象 ID 使用 `recording_id::body_name`，footprint spec 只允许圆或矩形，并与轨迹 key 严格对齐。适配完成后，下游只能消费 contract 冻结的 `object_type` 和 footprint spec，禁止根据 body name、role 或文件名重新分类或重估 footprint。schema v1 产物不兼容，必须重建。
 
 ### 2.3 随机性与 ID
 
@@ -124,7 +124,7 @@ class OracleWorld:
 
 ### 2.4 存储与 manifest
 
-每个数据产物必须有：
+每个数据产物必须有适用于自身阶段的基础字段：
 
 ```text
 schema_version
@@ -143,6 +143,17 @@ nan_inf_counts
 created_at
 code_version
 ```
+
+不适用于当前阶段的字段必须省略，不得伪造空语义。SOP-03 及之后的 typed 动态对象
+产物增加 `source_dynamic_object_ids` 和按 object type 的计数；SOP-05 及之后的事件、
+数据、checkpoint、calibration 和评测产物增加 `target_object_type_counts` 与
+`target_type_policy_digest`。
+
+`target_type_policy` 是 generator config 中目标类型白名单和三类对象完整权重映射。
+解析后权重必须有限、非负，白名单外权重归零，白名单内至少一项为正，再归一化为和
+为 1 的确定顺序映射。主论文默认白名单为 `[human]`，完整权重为
+`human=1.0, carried_object=0.0, unknown_dynamic=0.0`。对解析后 policy 做规范化序列化
+并计算稳定 digest；所有下游产物必须逐级传播并校验该 digest。
 
 当前无 Git 时 `code_version` 写 `unversioned`，不得伪造 commit；初始化 Git 后再记录真实 commit。
 
@@ -277,7 +288,7 @@ flowchart LR
 - 最低事件接受率 `≥ 50%`
 - 至少稳定生成 collision、near-miss、temporal-safe、empty 四类
 - 最低 risk samples `≥ 50,000`
-- 当前不可见、未来出现、行人不穿墙、遮挡物不阻塞机器人扫掠体
+- 目标动态对象当前不可见、未来出现、真实 footprint 不穿墙，遮挡物不阻塞机器人扫掠体
 - 100 个可视化样本人工检查无系统性错误
 
 ### 4.3 G2：风险门禁
@@ -465,7 +476,7 @@ flowchart LR
 python scripts/00_make_splits.py \
   --config configs/data_thor.yaml \
   --seed 42 \
-  --output-dir data/manifests
+  --output-dir outputs/splits
 ```
 
 ### 降级
@@ -634,7 +645,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ---
 
-## ✍️ 11. SOP-05：事件中心遮挡、盲区与行人移植
+## ✍️ 11. SOP-05：事件中心遮挡、盲区与 typed 动态对象移植
 
 ### 目标与依赖
 
@@ -647,12 +658,12 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - Create: `src/generation/event_sampler.py`
 - Create: `src/generation/occluder_sampler.py`
 - Create: `src/generation/structural_blindspot.py`
-- Create: `src/generation/pedestrian_transplant.py`
+- Create: `src/generation/dynamic_object_transplant.py`
 - Create: `configs/generator_train.yaml`
 - Create: `configs/generator_test.yaml`
 - Create: `tests/test_occluder_visibility.py`
 - Create: `tests/test_structural_blindspot.py`
-- Create: `tests/test_pedestrian_transplant.py`
+- Create: `tests/test_dynamic_object_transplant.py`
 
 ### SOP
 
@@ -662,20 +673,32 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 验证遮挡物不与机器人 swept volume 相交
 - [ ] 实现 FOV `160/180/220°`、range `6/8/10 m` 和可选 blind sector
 - [ ] 按 `60/30/10` 生成 environment/structural/mixed
-- [ ] 选择 snippet 索引，做 SE(2) 和 `0.8–1.2` 时间缩放
+- [ ] 从 split 内按对象类型分库的 `MotionSnippet` 选择目标，记录
+      `target_dynamic_object_id/type/footprint_spec`
+- [ ] 主论文分布默认仅采样 `human`；`carried_object/unknown_dynamic` 只能通过显式
+      typed-sampler 配置启用并单独报告
+- [ ] 在 `generator_train.yaml`、`generator_test.yaml` 中解析完整
+      `target_type_policy`；将规范化 policy 和稳定 digest 写入事件 manifest
+- [ ] 直接使用 snippet 冻结的 `object_type` 与 footprint spec，不得按原始 name/role
+      重新分类；生成的 target ID 必须确定、不得与上下文对象 ID 冲突，并另存
+      `source_object_id` 作为 provenance
+- [ ] 对目标 snippet 做 SE(2) 和 `0.8–1.2` 时间缩放
 - [ ] 横穿方向与轨迹法向夹角默认 `<35°`
-- [ ] 检查不穿墙、速度/加速度、当前不可见、未来进入局部图和当前不重叠
+- [ ] 使用对象真实 circle/rectangle footprint 与逐帧 yaw 检查不穿墙、
+      速度/加速度、当前不可见、未来进入局部图和当前不重叠
+- [ ] 场景中所有非目标动态对象继续保留并参与可见性和碰撞，不得作为背景删除
 - [ ] 失败时有限重采样，达到上限后记录明确 rejection reason
 
 ### 验收
 
-- 当前机器人到隐藏行人历史位置的视线被截断或位于 FOV 外
-- 行人未来从遮挡边界连续出现
-- 行人轨迹与静态/新遮挡物无相交
+- 当前机器人到隐藏目标历史位置的视线被截断或位于 FOV 外
+- 目标未来从遮挡边界连续出现
+- 目标轨迹与静态/新遮挡物无相交
 - 遮挡物与候选轨迹 swept volume 无相交
 - 同 seed 生成相同事件
 - 最低 event acceptance `≥50%`，理想 `≥80%`
 - 无效几何比例理想 `<1%`
+- 按 object type、footprint kind 和 geometry source 报告尝试数、接受率和拒绝原因
 - 100 个可视化事件无系统性穿墙、瞬移、当前可见或遮挡物挡路
 
 ### 降级
@@ -684,7 +707,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 1. 只做结构性 FOV 盲区
 2. 增加单矩形货架
-3. 只保留直线/小弧线机器人轨迹与侧向行人
+3. 只保留直线/小弧线机器人轨迹与侧向 human target
 4. 暂不使用复杂真实静态地图
 
 ---
@@ -707,14 +730,18 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### SOP
 
-- [ ] 从同一 base/trajectory/occluder/snippet 生成 collision
+- [ ] 从同一 base/trajectory/occluder/target dynamic object 生成 collision
 - [ ] 生成 near-miss，最小安全间隔目标 `0.05–0.35 m`
 - [ ] 生成 temporal-safe，时间偏移 `±0.8–1.5 s`
 - [ ] 生成 spatial-safe，横向间隔目标 `0.5–1.0 m`
-- [ ] 生成 irrelevant-hidden，确保有隐藏人但不接近 swept volume
-- [ ] 生成 empty-blind-spot，只移除行人
+- [ ] 生成 irrelevant-hidden，确保有隐藏目标但不接近 swept volume
+- [ ] 生成 empty-blind-spot，只移除 `target_dynamic_object_id`，保留其他动态对象
 - [ ] 六类共享 `pair_group_id` 和固定几何 ID
+- [ ] 同一 pair 保持 target object type、footprint spec 和 source object ID 不变
+- [ ] 主训练/paired evaluation 中，非目标动态对象在全部 variant 保持不变且不形成
+      collision/near miss；否则拒绝或标为 `multi_object_context`，仅用于自然/OOD 分析
 - [ ] 对 K 个历史时刻逐帧 ray cast，生成 visible/free/occupied/unknown
+- [ ] 渲染所有动态对象的逐帧 circle/rectangle footprint 和 yaw
 - [ ] 更新 last-seen occupancy 和 age map
 - [ ] 断言 unknown 与 visible 互斥、visible free 与 occupied 互斥
 - [ ] 断言模型输入仅从可见模拟传感器内容生成
@@ -725,8 +752,9 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - near-miss 未碰撞且 clearance 在配置范围
 - temporal-safe 空间路径相交但同时间 footprint 不相交
 - spatial-safe 时间接近但 clearance 在配置范围
-- irrelevant-hidden 有 actor 且与轨迹无关
-- empty world 没有移植行人
+- irrelevant-hidden 有目标动态对象且与轨迹无关
+- empty world 仅移除目标动态对象，其他动态对象保持不变
+- 主 paired 样本的 collision/near-miss critical object 必须是 target
 - 除指定变量外，同一 pair 的 base、trajectory、occluder 和背景一致
 - `current_visible_*`、`unobservable`、age map 满足不变量
 - 任何 RiskSample 输入中无法检索到 hidden future 或 oracle occupancy
@@ -759,13 +787,18 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### SOP
 
-- [ ] 只将当前不可见 actor 纳入主 hidden-risk 标签
-- [ ] 用膨胀机器人 footprint 和行人圆计算逐时刻 signed clearance
+- [ ] 只将当前不可见且与候选轨迹相关的 dynamic object 纳入主 hidden-risk 标签
+- [ ] 用膨胀机器人 footprint 和 `dynamic_object_specs` 中的 circle/rectangle
+      计算逐时刻 signed clearance
 - [ ] 计算 `collision_label`
 - [ ] 计算 `min_clearance`、`first_collision_time`、`time_to_min_clearance`
 - [ ] 计算未碰撞且 clearance `<0.35 m` 的 near miss
 - [ ] 按 `sigma_distance=0.5`、`sigma_time=2.0` 计算 severity
 - [ ] 碰撞时 severity 强制为 1
+- [ ] 记录造成最小 clearance 的 `critical_object_id/type`，仅作为标签/审计 metadata
+- [ ] 启动时将 BEV 物理宽高的对角线解析为有限
+      `no_object_clearance_sentinel_m` 并写入 manifest；无相关隐藏对象时使用该值、
+      零 severity 和空 critical ID，禁止用 `Inf/NaN` 表示安全
 - [ ] 组装 `RiskSample`，写 NPZ shards + JSONL metadata
 - [ ] 每个 shard 先写临时文件，通过完整性检查后原子 rename
 - [ ] 输出 rejection report、class prior、pair coverage、source coverage 和 digest
@@ -778,6 +811,8 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - visible actor 不计入 hidden-risk 主标签
 - near miss 必须 `collision=0`
 - first collision time 与人工 toy 场景完全一致
+- circle-circle、circle-rectangle、rectangle-rectangle、旋转矩形和多对象取最危险
+  目标均与手算一致
 - 50k 样本无 NaN/Inf、shape/dtype 错误和 split/source 泄漏
 - 同 seed 重跑 shard 内容 digest 一致
 - 最低 50k risk samples，MVP 目标 240k
@@ -789,7 +824,7 @@ python scripts/04_generate_risk_dataset.py \
   --config configs/generator_train.yaml \
   --split train \
   --seed 42 \
-  --output-dir data/risk/train
+  --output-dir outputs/event_centered_blind_spot/schema-v2/risk-data/main-seed42-v1/train
 ```
 
 ---
@@ -821,6 +856,7 @@ python scripts/04_generate_risk_dataset.py \
 - [ ] 实现 `1 - product(1-p_occ)` probabilistic union
 - [ ] 避免对同一 cell/时刻重复计算导致概率失真，并记录聚合定义
 - [ ] 使用与主模型完全相同的 train/calibration/val/test
+- [ ] 强制读取 schema `2.0.0` 与当前 G1 manifest digest，拒绝 v1 数据和 checkpoint
 - [ ] 保存 occupancy 指标和 trajectory risk 指标
 - [ ] 将聚合后风险送入与主模型同样的校准流程
 
@@ -863,6 +899,8 @@ python scripts/04_generate_risk_dataset.py \
 ### SOP
 
 - [ ] 实现通道检查，拒绝错误顺序或 schema version
+- [ ] checkpoint 绑定 schema、channel spec、G1 digest、`dynamic_objects` config
+      digest 和 `target_type_policy_digest`；禁止复用任何由 v1 shard 训练的 checkpoint
 - [ ] 实现 R0：BEV/state/trajectory concat + 小 CNN + pooling + MLP
 - [ ] 输出 `Q50/Q80/Q90/Q95` 和 `p_collision`
 - [ ] 实现 pinball loss、collision BCE 和可选 occupancy auxiliary loss
@@ -913,12 +951,17 @@ python scripts/04_generate_risk_dataset.py \
 - [ ] 只在 calibration split 拟合 conformal residual 和任何统计量
 - [ ] 实现 one-sided residual `max(0, y-Q)`
 - [ ] 实现有限样本 conformal quantile，明确取整规则
-- [ ] 输出全局 calibration 和按 blind type、critical area、age、density 分组结果
+- [ ] 输出全局 calibration 和按 blind type、critical area、age、density、
+      target object type、footprint kind 分组结果
 - [ ] 对样本不足分组回退到全局值并记录回退
 - [ ] 实现 AUROC、AUPRC、Brier、NLL、ECE、quantile coverage、tightness、false-safe
 - [ ] 实现 pairwise risk ordering accuracy
 - [ ] 输出 temporal-safe、same-area、irrelevant-hidden、empty 和 OOD 参数子集指标
+- [ ] `critical_object_id=None` 的 no-object 行保留在 collision/severity 指标中，但从
+      clearance 分布聚合中排除，禁止把哨兵当作真实测量值
 - [ ] 对主模型和 occupancy baseline 使用相同校准协议
+- [ ] calibration artifact 绑定 v2 checkpoint、split digest、`dynamic_objects` config
+      digest 和 `target_type_policy_digest`，拒绝 v1 calibration
 
 ### 验收
 
@@ -934,14 +977,14 @@ python scripts/04_generate_risk_dataset.py \
 
 ```bash
 python scripts/07_calibrate_risk.py \
-  --checkpoint outputs/risk/best.pt \
+  --checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt \
   --split calibration \
-  --output-dir outputs/risk/calibration
+  --output-dir outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/calibration
 
 python scripts/10_eval_offline.py \
   --task risk \
   --split test \
-  --output-dir outputs/risk/test
+  --output-dir outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/test
 ```
 
 ---
@@ -969,8 +1012,12 @@ python scripts/10_eval_offline.py \
 - [ ] 实现 yaw left/right 10°、yaw left/right 20°、forward peek、stop scan
 - [ ] 每个 action 明确 duration、distance、yaw 和运动可行性
 - [ ] 从完整 oracle world 仅在标签生成阶段 ray cast post-action observation
+- [ ] post-action ray cast 和 collision filtering 使用完整
+      `dynamic_object_trajectories/specs`，支持旋转矩形和多对象遮挡
 - [ ] 生成预期可见区域几何 mask；该 mask 不含 oracle occupancy
 - [ ] 计算 observation signature 的 7 类特征
+- [ ] signature 只使用 post-action 可观察内容，不使用隐藏 object type、footprint、
+      critical object ID 或其他 oracle metadata
 - [ ] 用 train statistics 标准化 signature；统计量不从 val/test 拟合
 - [ ] 以新机器人位姿为起点，以原 nominal endpoint/direction 为任务锚点
 - [ ] 使用同一差速 sampler 重生成候选集并过滤静态碰撞
@@ -981,7 +1028,7 @@ python scripts/10_eval_offline.py \
 - 6 个 action 位姿变化与解析值一致
 - yaw action 不产生非法侧移
 - verification FOV mask 仅表达几何可见潜力
-- 一个 action 能看到 toy 冲突 actor，另一个只看到无关区域
+- 一个 action 能看到 toy 冲突动态对象（包含矩形对象用例），另一个只看到无关区域
 - verify 后所有候选轨迹起点等于 post-action pose
 - 原始轨迹剩余 poses 不出现在 replanned set
 - signature 标准化只使用 train 统计量
@@ -1012,6 +1059,8 @@ python scripts/10_eval_offline.py \
 - [ ] 默认组成：1 当前 world、2 empty、5 temporal、4 spatial、2 speed、2 irrelevant
 - [ ] 断言所有 world 当前 visible occupancy 完全一致
 - [ ] 断言 world 差异只在 unknown/future，不违反静态几何
+- [ ] 断言每个 world 内 `dynamic_object_trajectories/specs` key 对齐；跨 variant 只允许
+      计划定义的 target 缺失/状态变化，非目标动态对象不得被删除或改型
 - [ ] 先实现 exact discrete posterior，作为 toy 真值
 - [ ] 再实现标准化 signature + `tau_o=0.2` 的 soft posterior
 - [ ] 计算不验证时 `min(mean execute loss, reject cost)`
@@ -1028,6 +1077,7 @@ python scripts/10_eval_offline.py \
 - 完全揭示冲突 actor 的 action post-risk 低于无关 action
 - 空盲区验证通常为非正价值；若为正必须可由 task/reject cost 解释
 - verify 后使用新候选集
+- mixed circle/rectangle toy bank 的 `G*` 与人工枚举一致
 - 训练/验证/测试 bank 的 source snippet 与 seed namespace 隔离
 - `M=8/16/32` 和 `tau=0.1/0.2/0.5` 可配置
 
@@ -1064,6 +1114,9 @@ python scripts/10_eval_offline.py \
 - [ ] 不存储 post-verification actor、oracle occupancy 或 world identity 特征
 - [ ] 保留 `br_before`、`post_risk` 供审计，不作为默认模型输入
 - [ ] 按 split 写独立 shards 和 metadata
+- [ ] manifest 绑定 schema `2.0.0`、target object type、footprint kind、
+      source object ID 和上游 G2 digest
+- [ ] forbidden-token 测试覆盖 dynamic-object future/oracle/post-verify 字段名
 - [ ] 输出每动作、每 blind type、正负价值和 value quantile 分布
 - [ ] 验证 pair/group 不跨 split
 
@@ -1085,7 +1138,7 @@ python scripts/08_generate_verification_dataset.py \
   --split train \
   --scenario-bank-size 16 \
   --seed 42 \
-  --output-dir data/verification/train
+  --output-dir outputs/event_centered_blind_spot/schema-v2/verification-data/main-seed42-v1/train
 ```
 
 ---
@@ -1121,6 +1174,9 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] 实现 F1、MSE/Huber、Spearman、Kendall、pairwise accuracy、top-1 regret
 - [ ] 风险 encoder 复用时先冻结，联合训练仅作为后续实验
 - [ ] 输出选中最优/次优动作比例和按 action/blind type 子集结果
+- [ ] checkpoint 绑定 v2 verification manifest；v1 模型禁止加载
+- [ ] 输出按 target object type 和 footprint kind 的切片；主 gate 仍使用默认
+      human-target 分布
 
 ### 验收
 
@@ -1163,6 +1219,9 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] verify 执行 0.5–1.0 s，更新可见性后从新位姿重规划
 - [ ] reject 停止当前轮或请求新候选，不伪装为成功
 - [ ] 实现 Never、Always、Visible、Swept、Entropy、Learned、Oracle 七种策略
+- [ ] 启动时校验 risk/value checkpoint、calibration 与 world 均为同一 schema v2
+      证据链，禁止 v1/v2 混用
+- [ ] closed-loop 碰撞、near miss 和终止条件使用 typed dynamic-object footprint
 - [ ] 记录 collision、near miss、false-safe、verify、reject、success、time、path
 - [ ] 扫描风险/验证阈值并输出 safety-efficiency Pareto 数据
 
@@ -1210,9 +1269,13 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] 注册风险方法：Last、Age、Occupancy+Aggregation、Risk-only、Risk+Calibration、可选 Aux
 - [ ] 注册验证方法：Never、Always、Visible、Swept、Entropy、Learned、Oracle
 - [ ] 注册消融：without age/history/trajectory query/calibration/ranking
+- [ ] 注册 schema v2 语义消融：主表默认 human target；所有 contextual dynamic
+      objects 保留；非人 target 仅在显式扩展配置和样本充分时报告
 - [ ] 注册 controlled tests：same-area、temporal-safe、irrelevant-hidden、empty
 - [ ] 注册敏感性：`M={8,16,32}`、`tau={0.1,0.2,0.5}`、composition、signature、prior、cost scale
 - [ ] 每个 run 保存 config、manifest digest、seed、checkpoint、metrics 和失败计数
+- [ ] 每个结果记录 schema version、`dynamic_objects` config digest、解析后的
+      target-type policy 及其 digest、按 type 样本数、geometry source 与 fallback 比例
 - [ ] 聚合 1–3 seeds，报告均值、标准差和每 seed 原始值
 - [ ] 从 metrics 自动生成 calibration、coverage、regret、Pareto 和案例图
 - [ ] 生成 claim-to-evidence index，禁止手工复制数字
@@ -1227,6 +1290,7 @@ python scripts/08_generate_verification_dataset.py \
 - scenario bank 和 verification cost 敏感性
 - 5–10 个成功/失败案例
 - 所有数字可追溯至结构化 artifact
+- 所有主结果只能来自 v2 数据、checkpoint、calibration 和评测产物；v1 证据撤销
 
 ### 外部验证的非阻塞顺序
 
@@ -1263,7 +1327,7 @@ python scripts/08_generate_verification_dataset.py \
 - 所有角度为弧度；配置中的 degree 必须在边界显式转换一次
 - 所有 future index 到时间统一使用 `tau=k*future_dt`
 - grid x/y、row/column 映射只定义一次
-- 机器人和行人轨迹必须在相同时间网格比较
+- 机器人和所有动态对象轨迹必须在相同时间网格比较
 
 ### 23.4 决策价值语义
 
@@ -1275,9 +1339,9 @@ python scripts/08_generate_verification_dataset.py \
 
 ### 23.5 生成器捷径
 
-- 同面积不同 hidden actor 位置
+- 同面积不同 hidden dynamic object 位置
 - 同空间交叉不同到达时间
-- 同行人轨迹不同机器人 trajectory
+- 同一 dynamic-object 轨迹不同机器人 trajectory
 - 同可见面积不同 critical swept coverage
 - empty 与 irrelevant-hidden 对照
 - test 使用未见参数范围
@@ -1296,7 +1360,7 @@ python scripts/08_generate_verification_dataset.py \
 
 **触发：** acceptance `<50%` 或无效几何系统性出现。
 
-**转向：** structural FOV → 单矩形遮挡 → 直线/小弧线 + 侧向行人。不得跳过失败约束直接保存。
+**转向：** structural FOV → 单矩形遮挡 → 直线/小弧线 + 侧向 human target。不得跳过失败约束直接保存。
 
 ### 24.3 风险线
 
@@ -1411,9 +1475,9 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] SOP-02：几何、ray casting 和 collision 通过解析测试
 - [ ] SOP-03：THÖR base/snippet 达到最低规模
 - [ ] SOP-04：轨迹和 query maps 不变量通过
-- [ ] SOP-05：事件接受率达到最低门槛
-- [ ] SOP-06：至少四类稳定、最终六类齐全
-- [ ] SOP-07：risk GT 与 50k 数据审计通过
+- [ ] SOP-05：typed target 事件接受率达到最低门槛，主分布保持 human-target
+- [ ] SOP-06：至少四类稳定、最终六类齐全，empty 只移除目标对象
+- [ ] SOP-07：typed-footprint risk GT 与 50k v2 数据审计通过
 - [ ] SOP-08：三类必做 baseline 齐全
 - [ ] SOP-09：risk model 小样本过拟合
 - [ ] SOP-10：达到 G2 或留下可复核失败证据
@@ -1422,7 +1486,7 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] SOP-13：verification 数据无 oracle 泄漏
 - [ ] SOP-14：达到 G3 或留下可复核失败证据
 - [ ] SOP-15：闭环达到 G4
-- [ ] SOP-16：主实验、消融、敏感性和图表达到 G5
+- [ ] SOP-16：v2 主实验、消融、敏感性和图表达到 G5，v1 证据已撤销
 - [ ] 所有失败样本、降级和未运行项被明确记录
 - [ ] 所有论文主张与结构化 artifact 可互相追溯
 

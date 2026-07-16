@@ -19,7 +19,7 @@ THÖR-MAGNI 原始轨迹
     ↓
 按 recording/participant 分组切分
     ↓
-真实行人轨迹片段库
+按 split/type 隔离的真实 MotionSnippet libraries
     ↓
 事件中心半合成盲区场景生成
     ↓
@@ -37,6 +37,15 @@ execute / verify / reject 离线闭环
     ↓
 核心表格、消融、案例图
 ```
+
+Schema v2 迁移期间，主论文目标事件默认使用 `human` snippet；所有
+`carried_object/unknown_dynamic` 仍保留在 observed/oracle world，并参与可见性、
+占据和真实 footprint 风险计算。W2 及之后的任务必须拒绝 v1 artifact，并在每一级
+门禁后重建下游数据、checkpoint、calibration 和结果；非人 target 只作为显式扩展。
+下游只能读取 contract/snippet 冻结的 `object_type` 与 footprint spec，禁止根据原始
+body name、role 或文件名重新分类。W2 的 target-type policy 必须包含白名单和三类
+对象的完整归一化权重映射；主论文默认 `human=1.0`、其余为 `0.0`。解析后 policy 的
+稳定 digest 必须逐级写入并校验所有下游 manifest、checkpoint 和评测结果。
 
 ### 0.2 必须交付的代码与结果
 
@@ -274,24 +283,25 @@ metadata：Parquet / JSONL
 依赖受限时：NPZ shards + JSONL
 ```
 
-目录：
+`data/` 仅作为原始输入且只读。生成产物写入：
 
 ```text
-data/
-  manifests/
-    split_manifest.parquet
-    base_states.parquet
-    snippets.parquet
-  risk/
-    train/*.npz
-    calibration/*.npz
-    val/*.npz
-    test/*.npz
-  verification/
-    train/*.npz
-    val/*.npz
-    test/*.npz
+outputs/
+  splits/
+  recording_indexes/<split>/
+  base_state_indexes/<split>/
+  snippets/<split>/<object_type>/
+  event_centered_blind_spot/schema-v2/
+    risk-data/<run-id>/
+    risk-model/<run-id>/
+    verification-data/<run-id>/
+    verification-model/<run-id>/
+    closed-loop/<run-id>/
+    reports/<run-id>/
 ```
+
+以上运行产物不得提交；每个 schema-v2 run 目录必须原子创建，已有 run ID 直接失败，
+不得静默覆盖。
 
 ## 3.4 Toy fixture
 
@@ -375,7 +385,7 @@ project/
   schemas.py
   tests/test_schema.py
   tests/test_toy_fixture.py
-  data/toy_fixture/
+  tests/fixtures/toy_world.py
   STATUS.md
   DECISIONS.md
 ```
@@ -401,17 +411,18 @@ project/
 
 ---
 
-# 6. W1：THÖR 数据适配、分组切分与行人片段库
+# 6. W1：THÖR 数据适配、分组切分与 typed 动态对象片段库
 
 ## 6.1 任务
 
 1. 解析机器人轨迹；
-2. 解析行人轨迹；
+2. 解析所有非机器人 BODY 的 pose/marker，分类为
+   `human/carried_object/unknown_dynamic`；
 3. 统一时间戳并重采样；
 4. 按 recording/session/participant 分组切分；
 5. 提取 base states；
-6. 提取真实行人 trajectory snippets；
-7. 输出速度、加速度、曲率统计。
+6. 按 split/type 提取真实 `MotionSnippet`；
+7. 输出速度、加速度、曲率、footprint/orientation source 和 rejection 统计。
 
 ## 6.2 严格切分流程
 
@@ -431,23 +442,25 @@ train / calibration / val / test
 
 ## 6.3 Snippet 过滤
 
-建议提取 3—5 秒行人片段：
+建议提取 3—5 秒动态对象片段；速度阈值按 object type 读取 schema v2 配置：
 
 ```yaml
 min_duration_s: 3.0
 max_duration_s: 5.0
-min_speed_mps: 0.25
-max_speed_mps: 2.0
+human_min_speed_mps: 0.30
+nonhuman_min_speed_mps: 0.05
+max_speed_mps: 2.00
 max_gap_s: 0.3
-max_accel_mps2: 3.0
+max_accel_mps2: 2.50
 ```
 
-每个 snippet 保存相对坐标、速度、朝向、来源 recording 和 participant。
+每个 snippet 保存 object type、相对 pose/yaw、速度、footprint spec、source object
+ID、recording 和可用的 participant provenance。
 
 ## 6.4 理想结果
 
 - 有效 base states ≥ 10,000；
-- 有效行人 snippets ≥ 5,000；
+- 有效 human snippets 理想 ≥ 5,000；非人 snippets 按实际数量独立报告；
 - train/test snippet 来源完全隔离；
 - 重采样后的速度分布与原始数据基本一致；
 - 坐标变换可逆误差 < 1e-4；
@@ -457,14 +470,14 @@ max_accel_mps2: 3.0
 
 - base states ≥ 2,000；
 - snippets ≥ 1,000；
-- 能画出 50 条机器人/行人轨迹进行人工检查；
+- 能画出 50 条机器人/typed dynamic-object 轨迹进行人工检查；
 - split 泄漏检测为 0。
 
 ## 6.6 降级方案
 
 若 THÖR 原始传感器解析复杂：
 
-- 只读取官方导出的机器人/行人坐标轨迹；
+- 只读取官方导出的机器人与所有非机器人刚体坐标/marker 轨迹；
 - 静态地图和障碍物由程序化生成器提供；
 - 不解析 RGB、点云和复杂传感器包。
 
@@ -474,10 +487,14 @@ max_accel_mps2: 3.0
 
 ## 7.1 任务
 
-- 接收 `BaseState`、`LocalTrajectory`、行人 snippet；
+- 接收 `BaseState`、`LocalTrajectory`、typed `MotionSnippet`；
 - 在候选轨迹上选冲突时刻和冲突点；
 - 放置矩形墙体、货架、柱子或结构性 blind sector；
-- 对行人 snippet 做 SE(2) 变换和有限时间缩放；
+- 对目标 snippet 做 SE(2) 变换和有限时间缩放；主分布默认 human target；
+- 从完整 `target_type_policy` 解析白名单和三类归一化权重，并把稳定 digest 写入事件
+  manifest；非人 target 只能由显式扩展配置启用；
+- 直接使用 snippet 冻结的 type/spec；生成的 target ID 必须确定且不与上下文 ID
+  冲突，原 `source_object_id` 独立保留用于 provenance；
 - 生成六类配对事件；
 - 渲染历史可见 BEV、不可观测 mask、last-seen 和 age map；
 - 输出完整 `OracleWorld`。
@@ -509,10 +526,13 @@ empty_blind_spot: 0.10
 ## 7.3 关键几何约束
 
 - 遮挡物不能和机器人候选轨迹扫掠体碰撞；
-- 当前机器人到隐藏行人的视线必须被遮挡或落在结构性盲区；
-- 行人轨迹不能穿墙；
-- 行人速度/加速度必须在合理范围；
+- 当前机器人到隐藏目标动态对象的视线必须被遮挡或落在结构性盲区；
+- 所有动态对象的真实 circle/rectangle footprint 轨迹不能穿墙；
+- 对象速度/加速度必须满足所属 type 的配置范围；
 - 不同成对样本只改变必要因素，如时间偏移或横向距离；
+- empty 只移除 `target_dynamic_object_id`，其他动态对象保持不变；
+- 主 paired 样本中非目标动态对象不得形成 collision/near miss；否则拒绝或标记为
+  `multi_object_context`，仅进入自然/OOD 分析；
 - 事件必须有固定 `pair_group_id`。
 
 ## 7.4 理想结果
@@ -522,7 +542,7 @@ empty_blind_spot: 0.10
 - 六类事件实际比例与目标比例偏差 < 3%；
 - `collision` 样本 100% 真碰撞；
 - `temporal_safe` 空间路径相交但时序不碰撞；
-- `irrelevant_hidden` 中确有隐藏人，但与轨迹无关；
+- `irrelevant_hidden` 中确有隐藏目标动态对象，但与轨迹无关；
 - 同一 pair 的场景几何保持一致；
 - 人工可视化 100 个样本无明显穿墙/瞬移。
 
@@ -540,7 +560,7 @@ empty_blind_spot: 0.10
 1. 先只做结构性 FOV 盲区；
 2. 再做单矩形货架遮挡；
 3. 取消复杂静态地图约束；
-4. 只保留直线/小弧线轨迹和侧向行人。
+4. 只保留直线/小弧线轨迹和侧向 human target。
 
 ---
 
@@ -552,6 +572,11 @@ empty_blind_spot: 0.10
 - 过滤静态碰撞和动力学不合理轨迹；
 - 生成 swept mask、TTA、braking map；
 - 计算 collision、near miss、min clearance、TTC、连续风险严重度；
+- 从 `dynamic_object_specs` 构造 circle/rectangle footprint，并记录
+  `critical_object_id/type`；
+- 启动时把 BEV 物理宽高对角线解析为有限 `no_object_clearance_sentinel_m` 并写入
+  manifest；无相关对象的行使用该值且从 clearance 分布聚合排除，但仍计入
+  collision/severity 指标；
 - 输出 `RiskSample`。
 
 ## 8.2 候选轨迹
@@ -599,6 +624,8 @@ Y_{risk}=\max_{j,\tau}
 
 - 风险样本 ≥ 50,000；
 - 二值标签、clearance 和 TTC 单元测试通过；
+- circle-circle、circle-rectangle、rectangle-rectangle 和多对象最小 clearance
+  手算测试通过；
 - 人工查看 100 个标签无明显错误。
 
 ## 8.6 降级方案
@@ -618,9 +645,9 @@ Y_{risk}=\max_{j,\tau}
 提供公平的两阶段 baseline：
 
 ```text
-历史 BEV/行人历史
+历史 BEV/可见动态对象历史
     ↓
-occupancy 或行人未来轨迹预测
+occupancy 或动态对象未来轨迹预测
     ↓
 栅格化成 p_occ(x, τ)
     ↓
@@ -787,7 +814,7 @@ False-safe rate           比 occupancy baseline 相对降低 ≥ 10%—15%
 - 高价值验证动作确实暴露关键扫掠区域；
 - 无关大视野动作可能信息增益高但 G* 低；
 - 增大验证成本时 G* 单调下降；
-- 完美揭示关键行人的动作，其 post-risk 显著下降；
+- 完美揭示关键动态对象的动作，其 post-risk 显著下降；
 - scenario bank 大小从 8→16→32 时，动作排序趋于稳定；
 - verification samples ≥ 60,000，推荐 ≥ 200,000。
 
@@ -1009,7 +1036,7 @@ toy G* 与人工结果一致
 
 ### A1：数据
 
-- 解析 THÖR 机器人/行人轨迹；
+- 解析 THÖR 机器人与所有非机器人 dynamic-object 轨迹/spec；
 - 完成 group split；
 - 提取第一批 snippets 和 base states。
 
@@ -1355,10 +1382,10 @@ python -m scripts.build_risk_dataset \
 预期产物：
 
 ```text
-split_manifest.parquet
-snippets/{split}.parquet
-risk/{split}/shard_*.npz
-risk/{split}/metadata.jsonl
+outputs/splits/split_manifest.parquet
+outputs/snippets/<split>/<object_type>/...
+outputs/event_centered_blind_spot/schema-v2/risk-data/<run-id>/<split>/shard_*.npz
+outputs/event_centered_blind_spot/schema-v2/risk-data/<run-id>/<split>/metadata.jsonl
 ```
 
 ## 17.2 风险
@@ -1371,25 +1398,25 @@ python -m training.train_risk \
   --config configs/risk_model.yaml
 
 python -m training.calibrate_risk \
-  --checkpoint outputs/risk/best.pt \
+  --checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt \
   --split calibration
 ```
 
 预期产物：
 
 ```text
-best.pt
-metrics_val.json
-calibration.json
-reliability_curve.png
-risk_examples/
+outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/best.pt
+outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/metrics-val.json
+outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/calibration/calibration.json
+outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/reliability-curve.png
+outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/risk-examples/
 ```
 
 ## 17.3 验证价值
 
 ```bash
 python -m scripts.build_verification_dataset \
-  --risk-manifest data/risk/train/metadata.jsonl \
+  --risk-manifest outputs/event_centered_blind_spot/schema-v2/risk-data/main-seed42-v1/train/metadata.jsonl \
   --scenario-bank-size 16 \
   --config configs/verification_gt.yaml
 
@@ -1400,22 +1427,22 @@ python -m training.train_verify \
 预期产物：
 
 ```text
-verification/{split}/shard_*.npz
-value_best.pt
-value_metrics.json
-action_ranking_examples/
+outputs/event_centered_blind_spot/schema-v2/verification-data/<run-id>/<split>/shard_*.npz
+outputs/event_centered_blind_spot/schema-v2/verification-model/<run-id>/best.pt
+outputs/event_centered_blind_spot/schema-v2/verification-model/<run-id>/metrics.json
+outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/action-ranking-examples/
 ```
 
 ## 17.4 闭环
 
 ```bash
 python -m evaluation.eval_closed_loop \
-  --risk-checkpoint outputs/risk/best.pt \
-  --value-checkpoint outputs/value/best.pt \
+  --risk-checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt \
+  --value-checkpoint outputs/event_centered_blind_spot/schema-v2/verification-model/main-seed42-v1/best.pt \
   --config configs/closed_loop.yaml
 
 python -m evaluation.plot_pareto \
-  --input outputs/closed_loop/all_methods.csv
+  --input outputs/event_centered_blind_spot/schema-v2/closed-loop/main-seed42-v1/all_methods.csv
 ```
 
 ---
@@ -1452,7 +1479,7 @@ python -m evaluation.plot_pareto \
 
 **预防**：
 
-- 行人运动片段来自真实数据；
+- 主分布 human 运动片段来自真实数据，其他动态对象也保留真实轨迹和 footprint；
 - 配对反事实样本；
 - held-out participant/recording；
 - 参数 OOD 测试；

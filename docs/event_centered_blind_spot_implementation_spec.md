@@ -501,9 +501,9 @@ S(\xi)=\bigcup_{\tau=1}^{T}B_r(q_\tau)
 
 ### 8.1 为什么必须事件中心
 
-随机放墙、随机放人、随机采样轨迹会导致有效冲突事件极低。正确做法是：
+随机放墙、随机放动态对象、随机采样轨迹会导致有效冲突事件极低。正确做法是：
 
-> 先确定轨迹上的潜在冲突时刻和位置，再反向构造遮挡物和隐藏行人。
+> 先确定轨迹上的潜在冲突时刻和位置，再反向构造遮挡物和隐藏目标动态对象。
 
 ### 8.2 总流程
 
@@ -584,9 +584,9 @@ normal_offset_range: [0.5, 1.5]
 
 1. 遮挡物不得与机器人候选轨迹扫掠体相交；
 2. 遮挡物不得与基础静态障碍大面积重叠；
-3. 当前机器人到行人历史位置的视线需被遮挡物截断；
-4. 行人未来从遮挡边界出现时应在物理上连续；
-5. 不允许行人轨迹穿墙。
+3. 当前机器人到目标动态对象历史位置的视线需被遮挡物截断；
+4. 目标对象未来从遮挡边界出现时应在物理上连续；
+5. 不允许任何动态对象的真实 footprint 轨迹穿墙。
 
 ### 8.5 结构性盲区生成
 
@@ -601,7 +601,7 @@ structural_fov:
       width_deg: 60
 ```
 
-行人必须在当前及部分历史时刻落入 FOV 外，未来与候选轨迹发生交互。
+目标动态对象必须在当前及部分历史时刻落入 FOV 外，未来与候选轨迹发生交互。
 
 ### 8.6 混合盲区
 
@@ -615,7 +615,29 @@ mixed 10%
 
 ---
 
-## 9. 将真实行人轨迹移植到冲突事件
+## 9. 将真实 typed 动态对象轨迹移植到冲突事件
+
+主论文事件分布默认只从 `human` snippet library 采样目标，以保持原始隐藏行人研究
+口径。`carried_object` 和 `unknown_dynamic` 始终保留在场景中并参与观测、占据和
+碰撞；将它们作为目标时必须通过显式 typed-sampler 配置启用，并单独报告结果。
+
+`generator_train.yaml` 和 `generator_test.yaml` 必须提供完整 target-type policy：
+
+```yaml
+target_type_policy:
+  whitelist: [human]
+  weights:
+    human: 1.0
+    carried_object: 0.0
+    unknown_dynamic: 0.0
+```
+
+解析时要求三类 key 齐全、权重有限且非负；白名单外权重归零，白名单内至少一项为
+正，再按冻结类型顺序归一化。对解析后的 policy 做规范化序列化和稳定摘要，所得
+`target_type_policy_digest` 必须写入事件 manifest，并由所有下游数据、checkpoint、
+calibration 和评测产物逐级传播、严格校验。下游只使用 snippet/contract 冻结的
+`object_type` 和 footprint spec，不得根据原始 body name、role 或文件名重新分类或
+重估 footprint。
 
 ### 9.1 对齐目标
 
@@ -655,10 +677,10 @@ t_{k^*}\approx \tau^*
 
 以下任一失败时重新选 snippet/遮挡物参数：
 
-- 当前时刻行人可见；
-- 过去历史中行人已被看到但不符合目标样本类型；
-- 行人穿墙；
-- 行人与机器人当前重叠；
+- 当前时刻目标对象可见；
+- 过去历史中目标对象已被看到但不符合目标样本类型；
+- 对象真实 circle/rectangle footprint 穿墙；
+- 对象与机器人当前 footprint 重叠；
 - 未来轨迹超出范围过多；
 - 速度/加速度超限；
 - 事件无法形成指定 collision/near-miss/safe 版本。
@@ -667,7 +689,8 @@ t_{k^*}\approx \tau^*
 
 ## 10. 配对反事实样本生成
 
-对同一 BaseState、候选轨迹、遮挡物和行人 snippet，生成多个只改变关键变量的版本。
+对同一 BaseState、候选轨迹、遮挡物和目标 `MotionSnippet`，生成多个只改变关键
+变量的版本。所有变体固定目标 object type、footprint spec 和 source object ID。
 
 ### 10.1 样本类型
 
@@ -693,19 +716,25 @@ t_{k^*}\approx \tau^*
 
 #### D. Spatial-safe hard negative
 
-时间接近，但行人横向偏移，使最小距离：
+时间接近，但目标动态对象横向偏移，使最小距离：
 
 ```text
 0.5m ~ 1.0m
 ```
 
-#### E. Irrelevant hidden pedestrian
+#### E. Irrelevant hidden dynamic object
 
-盲区里有人，但完全不接近当前候选轨迹。
+盲区里有目标动态对象，但完全不接近当前候选轨迹。
 
 #### F. Empty blind spot
 
-同一场景移除行人。
+同一场景只移除 `target_dynamic_object_id`；其他动态对象必须保持不变。
+
+为避免多对象上下文破坏 paired 因果对照，主训练和 paired evaluation 要求非目标
+动态对象在所有 variant 中完全相同，且不形成 collision/near miss。违反者拒绝，
+或标记为 `multi_object_context` 后仅进入自然分布/OOD 分析。保留
+`empty_blind_spot` 事件名时，其严格含义是“target-empty”，不是删除场景中的全部
+动态对象。
 
 ### 10.2 训练比例建议
 
@@ -733,8 +762,15 @@ pair_group_id
 base_state_id
 trajectory_id
 occluder_geometry_id
-ped_snippet_id
+dynamic_object_snippet_id
+target_dynamic_object_id
+target_object_type
+target_footprint_spec_digest
 ```
+
+`target_dynamic_object_id` 必须从生成世界的稳定输入确定性派生，并与该世界已有上下文
+对象 ID 无冲突；原始 snippet 的 `source_object_id` 作为独立 provenance 字段保留，
+不得复用它来覆盖上下文对象。
 
 便于做 paired evaluation 和防止生成器捷径。
 
@@ -744,7 +780,7 @@ ped_snippet_id
 
 ### 11.1 模型可见输入与 oracle 世界必须分离
 
-模型输入只能由模拟传感器可见内容生成；完整隐藏行人轨迹只用于标签。
+模型输入只能由模拟传感器可见内容生成；完整隐藏动态对象轨迹和 specs 只用于标签。
 
 ### 11.2 每个历史时刻渲染
 
@@ -752,7 +788,7 @@ ped_snippet_id
 
 1. 读取真实机器人历史位姿；
 2. 应用同一个程序化遮挡物/FOV 模型；
-3. 放置变换后的行人历史位置；
+3. 按每个动态对象的 pose/yaw 和 circle/rectangle spec 放置历史 footprint；
 4. 用 ray casting 计算 visible cells；
 5. 写入 visible free / visible occupied；
 6. 不可见区域写入 unknown；
@@ -859,25 +895,38 @@ sigma_time: 2.0
 near_miss_distance: 0.35
 ```
 
+启动时从解析后的 BEV 物理宽高计算
+`no_object_clearance_sentinel_m = hypot(bev.width_m, bev.height_m)`，并写入 resolved
+config 与 manifest。若没有相关隐藏动态对象，`risk_severity=0`、
+`critical_object_id=None`，`min_clearance` 使用该有限哨兵；不得写入 `Inf/NaN`。
+这类行仍计入 collision/severity 指标，但必须从 clearance 分布聚合中排除，避免把
+哨兵解释为真实测量值。
+
 ### 12.5 风险标签伪代码
 
 ```python
-def compute_risk_gt(robot_traj, hidden_ped_trajs, cfg):
+def compute_risk_gt(robot_traj, hidden_object_trajectories, dynamic_object_specs, cfg):
     collision = False
     min_clearance = float("inf")
     first_collision_time = None
     max_severity = 0.0
+    critical_object_id = None
 
     for k, robot_pose in enumerate(robot_traj.poses):
         tau = k * cfg.future_dt
         robot_shape = inflated_robot_shape(robot_pose, cfg.robot_inflation)
 
-        for ped_traj in hidden_ped_trajs:
-            ped_shape = pedestrian_shape(ped_traj.position_at(k), cfg.ped_radius)
-            clearance = shape_distance(robot_shape, ped_shape)
-            min_clearance = min(min_clearance, clearance)
+        for object_id, object_traj in hidden_object_trajectories.items():
+            object_shape = footprint_at_pose(
+                object_traj.pose_at(k),
+                dynamic_object_specs[object_id],
+            )
+            clearance = shape_distance(robot_shape, object_shape)
+            if clearance < min_clearance:
+                min_clearance = clearance
+                critical_object_id = object_id
 
-            if shapes_intersect(robot_shape, ped_shape):
+            if shapes_intersect(robot_shape, object_shape):
                 collision = True
                 if first_collision_time is None:
                     first_collision_time = tau
@@ -888,12 +937,21 @@ def compute_risk_gt(robot_traj, hidden_ped_trajs, cfg):
 
             max_severity = max(max_severity, severity)
 
+    if critical_object_id is None:
+        min_clearance = float(cfg.no_object_clearance_sentinel_m)
+
     return {
         "collision": int(collision),
         "risk_severity": float(max_severity),
         "min_clearance": float(min_clearance),
         "first_collision_time": first_collision_time,
         "near_miss": int((not collision) and min_clearance < cfg.near_miss_distance),
+        "critical_object_id": critical_object_id,
+        "critical_object_type": (
+            dynamic_object_specs[critical_object_id]["object_type"]
+            if critical_object_id is not None
+            else None
+        ),
     }
 ```
 
@@ -927,8 +985,11 @@ metadata 至少保存：
 
 ```text
 source_recording_id
-source_participant_id
-ped_snippet_id
+source_object_id
+source_participant_id（可用时，仅用于 split/leakage 审计）
+dynamic_object_snippet_id
+target_object_type / target_footprint_kind
+target_type_policy_digest
 trajectory primitive (v, omega)
 occluder type / size / pose
 blind spot type
@@ -1066,7 +1127,8 @@ U_{1-\alpha}=Q_{1-\alpha}+q_{cal}
 - blind spot type；
 - critical blind area \(|U_t\cap S(\xi)|\)；
 - occlusion age；
-- pedestrian density。
+- dynamic object density；
+- target object type / footprint kind（样本足够时）。
 
 ---
 
@@ -1107,7 +1169,7 @@ M = 32（敏感性实验）
 5 个时间偏移变体
 4 个空间偏移变体
 2 个速度缩放变体
-2 个无关隐藏行人变体
+2 个无关隐藏动态对象变体
 ```
 
 每个世界必须和当前模型输入一致：
@@ -1115,7 +1177,9 @@ M = 32（敏感性实验）
 - 当前 visible cells 的 occupancy 一致；
 - 差异仅位于不可观测区域或未来状态；
 - 不违反静态几何；
-- 不产生当前时刻直接可见的新增行人。
+- 不产生当前时刻直接可见的新增动态对象；
+- 每个 world 内 `dynamic_object_trajectories/specs` key 对齐；跨 variant 只允许计划定义
+  的 target 缺失/状态变化，非目标对象不会被删除或改型。
 
 ### 16.4 世界先验权重
 
@@ -1531,13 +1595,13 @@ scenario bank: M=16
 
 ### 24.1 配对样本
 
-相同几何只改变时间偏移/横向偏移/是否存在行人。
+相同几何只改变目标动态对象的时间偏移、横向偏移或是否存在；其他动态对象不变。
 
 ### 24.2 随机化
 
 - 遮挡物尺寸、朝向、类型；
 - FOV 角度和 range；
-- 行人速度和时间偏移；
+- 目标动态对象速度和时间偏移；
 - 轨迹 primitive；
 - event time；
 - background static map。
@@ -1552,11 +1616,11 @@ scenario bank: M=16
 
 ### 24.4 关键 controlled tests
 
-1. 同样盲区面积，不同隐藏人位置；
+1. 同样盲区面积，不同隐藏动态对象位置；
 2. 同样路径空间交叉，不同到达时间；
-3. 同样行人轨迹，不同候选机器人轨迹；
+3. 同样动态对象轨迹，不同候选机器人轨迹；
 4. 同样验证可见面积，但对关键扫掠区域覆盖不同；
-5. 空盲区与有无关行人的对照。
+5. 空盲区与有无关动态对象的对照。
 
 ---
 
@@ -1680,7 +1744,7 @@ project/
 │   │   ├── event_sampler.py
 │   │   ├── occluder_sampler.py
 │   │   ├── structural_blindspot.py
-│   │   ├── pedestrian_transplant.py
+│   │   ├── dynamic_object_transplant.py
 │   │   ├── paired_variants.py
 │   │   ├── observation_renderer.py
 │   │   ├── risk_gt.py
@@ -1723,7 +1787,7 @@ project/
     ├── test_raycasting.py
     ├── test_trajectory_rollout.py
     ├── test_occluder_visibility.py
-    ├── test_pedestrian_transplant.py
+    ├── test_dynamic_object_transplant.py
     ├── test_pair_variants.py
     ├── test_risk_gt.py
     └── test_verification_gt.py
@@ -1825,7 +1889,7 @@ python scripts/01_index_recordings.py --split calibration
 python scripts/01_index_recordings.py --split val
 python scripts/01_index_recordings.py --split test
 
-# 3. 每个 split 单独建立行人轨迹片段库
+# 3. 每个 split 和对象类型单独建立 MotionSnippet library
 python scripts/02_build_snippet_library.py --split train
 python scripts/02_build_snippet_library.py --split calibration
 python scripts/02_build_snippet_library.py --split val
@@ -1846,7 +1910,8 @@ python scripts/05_train_occupancy_baseline.py --config configs/risk_model.yaml
 python scripts/06_train_risk_model.py --config configs/risk_model.yaml
 
 # 8. 独立 calibration groups 做校准
-python scripts/07_calibrate_risk.py --checkpoint outputs/risk/best.ckpt
+python scripts/07_calibrate_risk.py \
+  --checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt
 
 # 9. 生成验证价值目标
 python scripts/08_generate_verification_dataset.py \
@@ -1879,7 +1944,8 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - 遮挡物后 cell 被 ray casting 标为不可见；
 - 遮挡物本身不阻塞候选轨迹；
 - 结构性 FOV 外所有 cell 不可见；
-- 行人当前不可见，未来可从边缘出现。
+- 目标动态对象当前不可见，未来可从边缘出现；
+- circle/rectangle footprint 与逐帧 yaw 的遮挡和碰撞结果正确。
 
 ### 31.3 配对样本测试
 
@@ -1887,7 +1953,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 
 - collision variant 的 min clearance ≤ 0；
 - temporal-safe 空间路径相交但时间不相交；
-- empty variant 没有行人；
+- empty variant 只移除目标动态对象，其他动态对象不变；
 - 除指定变量外几何相同。
 
 ### 31.4 风险 GT 测试
@@ -1896,12 +1962,14 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - 距离越近风险不降低；
 - 同距离下越早出现风险越高；
 - visible actor 不计入 hidden-risk 主标签。
+- circle-circle、circle-rectangle、rectangle-rectangle 和多对象最小 clearance
+  与手算一致。
 
 ### 31.5 验证价值测试
 
 构造人工小场景：
 
-- 一个动作正好看到冲突行人，价值应高；
+- 一个动作正好看到冲突动态对象（至少包含矩形对象用例），价值应高；
 - 一个动作只看到无关区域，价值应低/负；
 - 增大验证成本后价值应下降；
 - 空盲区场景验证通常不应有正价值；
@@ -1913,7 +1981,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 ```text
 ✓ 能从一个 recording 生成 base states
 ✓ 能建立独立 train/test snippet libraries
-✓ 能从一条直线候选轨迹生成墙后横穿行人事件
+✓ 能从一条直线候选轨迹生成墙后横穿 human-target 事件
 ✓ 能生成六类 paired variants
 ✓ 能渲染 K 帧不完整 BEV 和完整 oracle
 ✓ 能计算 collision/risk GT
@@ -1929,10 +1997,10 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 
 ### Phase A：最小生成器（最高优先级）
 
-1. 解析 THÖR robot/ped trajectories；
+1. 解析 THÖR robot 与所有非机器人 dynamic-object trajectories/specs；
 2. 坐标转换和 resampling；
 3. 候选轨迹 rollout；
-4. 行人 snippet library；
+4. 按 split/type 建立 MotionSnippet libraries；
 5. 在直线轨迹旁放矩形墙体；
 6. 移植横穿 snippet；
 7. 生成 collision + temporal-safe pair；
@@ -2009,7 +2077,8 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 
 ### 可以主张
 
-1. 提出事件中心的反事实盲区场景生成器，利用真实行人轨迹先验构造大规模 collision/near-miss/hard-negative 样本；
+1. 提出事件中心的反事实盲区场景生成器，保留所有 typed 动态对象，并以真实 human
+   轨迹先验作为主目标分布构造大规模 collision/near-miss/hard-negative 样本；
 2. 直接学习 trajectory-conditioned hidden risk，优于 cell-wise occupancy + aggregation；
 3. 学习 simulator-defined counterfactual verification value，优于可见面积/信息增益式验证策略；
 4. 在统计校准和闭环实验中减少 false-safe execution 和不必要验证。

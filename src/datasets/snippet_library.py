@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -186,7 +188,7 @@ def _normalize_motion(
     return normalized_positions, normalized_velocities, normalized_headings
 
 
-def build_snippet_library(
+def _build_snippet_library_serial(
     recordings: list[RecordingIndex] | tuple[RecordingIndex, ...],
     *,
     split: str,
@@ -372,6 +374,105 @@ def build_snippet_library(
     return SnippetLibrary(
         object_type=object_type,
         snippets=tuple(snippets),
+        summary=summary,
+    )
+
+
+def build_snippet_library(
+    recordings: list[RecordingIndex] | tuple[RecordingIndex, ...],
+    *,
+    split: str,
+    object_type: str,
+    duration_s: float = 3.0,
+    stride_s: float = 1.0,
+    min_mean_speed_mps: float = 0.3,
+    max_mean_speed_mps: float = 2.0,
+    max_acceleration_mps2: float = 2.5,
+    workers: int = 1,
+) -> SnippetLibrary:
+    """Extract a deterministic library, optionally across recording workers."""
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ThorDataError("workers must be a positive integer")
+    ordered = tuple(sorted(recordings, key=lambda item: item.recording_id))
+    kwargs = {
+        "split": split,
+        "object_type": object_type,
+        "duration_s": duration_s,
+        "stride_s": stride_s,
+        "min_mean_speed_mps": min_mean_speed_mps,
+        "max_mean_speed_mps": max_mean_speed_mps,
+        "max_acceleration_mps2": max_acceleration_mps2,
+    }
+    if workers == 1 or len(ordered) <= 1:
+        return _build_snippet_library_serial(ordered, **kwargs)
+
+    build_one = partial(_build_snippet_library_serial, **kwargs)
+    with ProcessPoolExecutor(max_workers=min(workers, len(ordered))) as executor:
+        libraries = list(executor.map(build_one, ((item,) for item in ordered)))
+
+    snippets = tuple(
+        sorted(
+            (
+                snippet
+                for library in libraries
+                for snippet in library.snippets
+            ),
+            key=lambda item: item.snippet_id,
+        )
+    )
+    rejection_keys = libraries[0].summary["rejection_reasons"].keys()
+    rejection_reasons = {
+        key: sum(
+            int(library.summary["rejection_reasons"][key])
+            for library in libraries
+        )
+        for key in rejection_keys
+    }
+
+    def _sum_count_map(name: str) -> dict[str, int]:
+        keys = {
+            key
+            for library in libraries
+            for key in library.summary[name]
+        }
+        return {
+            key: sum(
+                int(library.summary[name].get(key, 0))
+                for library in libraries
+            )
+            for key in sorted(keys)
+        }
+
+    summary = dict(libraries[0].summary)
+    summary.update(
+        {
+            "recording_count": len(ordered),
+            "source_object_count": len(
+                {
+                    object_id
+                    for recording in ordered
+                    for object_id, track in recording.dynamic_objects.items()
+                    if track.object_type == object_type
+                }
+            ),
+            "candidate_count": sum(
+                int(library.summary["candidate_count"])
+                for library in libraries
+            ),
+            "accepted_count": len(snippets),
+            "rejected_count": sum(rejection_reasons.values()),
+            "rejection_reasons": rejection_reasons,
+            "geometry_source_counts": _sum_count_map(
+                "geometry_source_counts"
+            ),
+            "orientation_source_counts": _sum_count_map(
+                "orientation_source_counts"
+            ),
+        }
+    )
+    return SnippetLibrary(
+        object_type=object_type,
+        snippets=snippets,
         summary=summary,
     )
 

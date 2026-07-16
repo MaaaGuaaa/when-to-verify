@@ -33,6 +33,18 @@ from src.datasets.thor_adapter import (  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
 
 
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a positive integer"
+        ) from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _validate_data_config(path: Path) -> None:
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
@@ -65,6 +77,7 @@ def main() -> int:
     )
     parser.add_argument("--duration-s", type=float, default=3.0)
     parser.add_argument("--stride-s", type=float, default=1.0)
+    parser.add_argument("--workers", type=_positive_integer, default=8)
     args = parser.parse_args()
 
     _validate_data_config(args.config)
@@ -94,6 +107,7 @@ def main() -> int:
                 max_acceleration_mps2=float(
                     thresholds["max_acceleration_mps2"]
                 ),
+                workers=args.workers,
             )
         )
 
@@ -121,6 +135,8 @@ def main() -> int:
             f"{library.summary['accepted_count']}"
         )
     print(f"split={args.split}")
+    print(f"workers_requested={args.workers}")
+    print(f"workers_used={min(args.workers, len(recordings))}")
     print(
         "total_candidate_count="
         f"{sum(int(item.summary['candidate_count']) for item in libraries)}"

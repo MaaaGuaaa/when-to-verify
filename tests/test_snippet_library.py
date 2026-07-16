@@ -148,6 +148,47 @@ def test_build_motion_snippets_normalizes_pose_and_preserves_type_geometry():
     assert library.summary["accepted_count"] == 4
 
 
+def test_parallel_snippet_library_matches_serial():
+    from src.datasets.snippet_library import build_snippet_library
+
+    recordings = [_recording("parallel-a"), _recording("parallel-b")]
+    kwargs = {
+        "split": "train",
+        "object_type": "human",
+        "duration_s": 3.0,
+        "stride_s": 1.0,
+        "min_mean_speed_mps": 0.30,
+        "max_mean_speed_mps": 2.00,
+        "max_acceleration_mps2": 2.50,
+    }
+    serial = build_snippet_library(recordings, workers=1, **kwargs)
+    parallel = build_snippet_library(recordings, workers=2, **kwargs)
+
+    assert parallel.summary == serial.summary
+    assert [snippet.snippet_id for snippet in parallel.snippets] == [
+        snippet.snippet_id for snippet in serial.snippets
+    ]
+    for actual, expected in zip(parallel.snippets, serial.snippets):
+        assert actual.provenance == expected.provenance
+        assert actual.footprint == expected.footprint
+        assert np.array_equal(actual.positions, expected.positions)
+        assert np.array_equal(actual.velocities, expected.velocities)
+        assert np.array_equal(actual.headings, expected.headings)
+
+
+def test_snippet_library_rejects_nonpositive_workers():
+    from src.datasets.snippet_library import build_snippet_library
+    from src.datasets.thor_adapter import ThorDataError
+
+    with pytest.raises(ThorDataError, match="workers must be a positive integer"):
+        build_snippet_library(
+            [_recording()],
+            split="train",
+            object_type="human",
+            workers=0,
+        )
+
+
 def test_snippet_library_round_trip_uses_numeric_npz(tmp_path):
     from src.datasets.snippet_library import (
         load_snippet_library,
@@ -314,3 +355,5 @@ def test_build_snippet_library_cli_writes_type_scoped_artifacts(tmp_path):
     )
     assert report["status"] == "ok"
     assert "total_accepted_count=12" in completed.stdout
+    assert "workers_requested=8" in completed.stdout
+    assert "workers_used=1" in completed.stdout

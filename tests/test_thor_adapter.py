@@ -241,7 +241,8 @@ def test_resampling_keeps_large_time_gaps_in_separate_segments(tmp_path):
 def test_index_recordings_cli_selects_only_requested_split(tmp_path):
     from src.datasets.thor_adapter import load_recording_indexes_from_dir
 
-    train_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_train.csv")
+    train_a_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_train_a.csv")
+    train_b_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_train_b.csv")
     test_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_test.csv")
     split_manifest = tmp_path / "split_manifest.jsonl"
     split_manifest.write_text(
@@ -249,10 +250,17 @@ def test_index_recordings_cli_selects_only_requested_split(tmp_path):
             json.dumps(row) + "\n"
             for row in (
                 {
-                    "recording_id": "train",
-                    "session_id": "session-train",
+                    "recording_id": "train_a",
+                    "session_id": "session-train-a",
                     "participant_ids": ["Helmet_1"],
-                    "source_path": str(train_csv),
+                    "source_path": str(train_a_csv),
+                    "split": "train",
+                },
+                {
+                    "recording_id": "train_b",
+                    "session_id": "session-train-b",
+                    "participant_ids": ["Helmet_1"],
+                    "source_path": str(train_b_csv),
                     "split": "train",
                 },
                 {
@@ -281,6 +289,8 @@ def test_index_recordings_cli_selects_only_requested_split(tmp_path):
             str(tmp_path),
             "--output-dir",
             str(tmp_path / "indexes"),
+            "--workers",
+            "2",
         ],
         cwd=root,
         capture_output=True,
@@ -292,6 +302,34 @@ def test_index_recordings_cli_selects_only_requested_split(tmp_path):
     restored = load_recording_indexes_from_dir(
         tmp_path / "indexes/train", expected_split="train"
     )
-    assert [recording.recording_id for recording in restored] == ["train"]
-    assert len(restored[0].dynamic_objects) == 5
-    assert "dynamic_object_track_count=5" in completed.stdout
+    assert [recording.recording_id for recording in restored] == [
+        "train_a",
+        "train_b",
+    ]
+    assert all(len(recording.dynamic_objects) == 5 for recording in restored)
+    assert "dynamic_object_track_count=10" in completed.stdout
+    assert "workers_requested=2" in completed.stdout
+    assert "workers_used=2" in completed.stdout
+
+
+def test_index_recordings_cli_rejects_nonpositive_workers():
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/01_index_recordings.py"),
+            "--config",
+            str(root / "configs/data_thor.yaml"),
+            "--split",
+            "train",
+            "--workers",
+            "0",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "positive integer" in completed.stderr

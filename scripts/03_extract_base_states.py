@@ -31,6 +31,18 @@ from src.datasets.thor_adapter import (  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
 
 
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a positive integer"
+        ) from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _validate_data_config(path: Path) -> None:
     with path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
@@ -64,6 +76,7 @@ def main() -> int:
         default=_ROOT / "outputs/base_state_indexes",
     )
     parser.add_argument("--stride-s", type=float, default=0.6)
+    parser.add_argument("--workers", type=_positive_integer, default=8)
     args = parser.parse_args()
 
     _validate_data_config(args.config)
@@ -93,6 +106,7 @@ def main() -> int:
             split=split,
             grid=grid,
             stride_s=args.stride_s,
+            workers=args.workers,
         )
         paths = write_base_state_extraction(
             extraction, args.output_dir / split
@@ -101,6 +115,8 @@ def main() -> int:
         total += accepted
         print(f"manifest={paths['manifest']}")
         print(f"split={split}")
+        print(f"workers_requested={args.workers}")
+        print(f"workers_used={min(args.workers, len(loaded[split]))}")
         print(f"accepted_count={accepted}")
         print(f"rejected_count={extraction.summary['rejected_count']}")
     print(f"total_accepted_count={total}")

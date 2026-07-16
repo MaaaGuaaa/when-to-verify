@@ -46,10 +46,14 @@ from .dynamic_object_transplant import (
     transplant_snippet,
 )
 from .occluder_sampler import (
+    JointOccluderParameters,
     OccluderPlacement,
     OccluderSamplingError,
+    align_environment_occluder_to_target_los,
+    build_joint_occluder_schedule,
     normalize_occluder_config,
-    sample_environment_occluder,
+    propose_environment_occluder_geometry,
+    validate_environment_occluder_target,
 )
 from .structural_blindspot import (
     StructuralBlindSpot,
@@ -60,6 +64,7 @@ from .structural_blindspot import (
 
 
 _EVENT_TYPES = ("environment", "structural", "mixed")
+_GENERATOR_ALGORITHM_VERSION = "joint_occluder_first_v2"
 
 
 class GeneratorConfigError(ValueError):
@@ -412,6 +417,7 @@ def _trajectory_geometry(
     conflict_range: tuple[float, float],
     rng: np.random.Generator,
     max_curvature: float,
+    conflict_time_quantile: float | None = None,
 ) -> tuple[int, float, np.ndarray, np.ndarray, np.ndarray]:
     poses = np.asarray(trajectory.poses)
     if poses.ndim != 2 or poses.shape[1:] != (3,) or poses.dtype != np.float32:
@@ -425,7 +431,16 @@ def _trajectory_geometry(
     )
     if eligible.size == 0:
         raise _EventRejection("conflict_time_unavailable")
-    index = int(eligible[int(rng.integers(0, eligible.size))])
+    if conflict_time_quantile is None:
+        eligible_index = int(rng.integers(0, eligible.size))
+    else:
+        quantile = _finite_real(
+            conflict_time_quantile, name="conflict_time_quantile"
+        )
+        if not 0.0 <= quantile <= 1.0:
+            raise ValueError("conflict_time_quantile must lie in [0, 1]")
+        eligible_index = int(np.rint(quantile * (eligible.size - 1)))
+    index = int(eligible[eligible_index])
     previous = poses[max(0, index - 1), :2].astype(np.float64)
     following = poses[min(poses.shape[0] - 1, index + 1), :2].astype(np.float64)
     tangent = following - previous
@@ -464,6 +479,24 @@ def _rotated_direction(
 
 def _sample_range(bounds: tuple[float, float], rng: np.random.Generator) -> float:
     return bounds[0] if bounds[0] == bounds[1] else float(rng.uniform(*bounds))
+
+
+def _range_quantile(bounds: tuple[float, float], quantile: float) -> float:
+    return bounds[0] + quantile * (bounds[1] - bounds[0])
+
+
+def _joint_crossing_direction(
+    normal: np.ndarray,
+    parameters: JointOccluderParameters,
+    *,
+    max_angle_deg: float,
+) -> np.ndarray:
+    base = -float(parameters.side) * normal
+    radians = np.deg2rad(parameters.angle_multiplier * max_angle_deg)
+    cosine = np.cos(radians)
+    sine = np.sin(radians)
+    rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
+    return rotation @ base
 
 
 def _validate_target_physics(
@@ -590,38 +623,14 @@ def _visibility_for_event(
     oracle_context: OracleContext,
     generator_config: Mapping[str, Any],
     rng: np.random.Generator,
+    precomputed_placement: OccluderPlacement | None = None,
 ) -> tuple[np.ndarray, OccluderPlacement | None, StructuralBlindSpot | None, np.ndarray]:
-    placement = None
+    placement = precomputed_placement
     structural = None
     occupied = np.asarray(static_occupancy != 0, dtype=bool)
-    context_footprints = _footprints_for_specs(oracle_context.dynamic_object_specs)
     if event_kind in {"environment", "mixed"}:
-        context_trajectories = {
-            object_id: np.vstack(
-                (
-                    oracle_context.dynamic_object_history[object_id][-1],
-                    oracle_context.dynamic_object_future[object_id],
-                )
-            )
-            for object_id in sorted(context_footprints)
-        }
-        placement = sample_environment_occluder(
-            static_occupancy=static_occupancy,
-            grid=grid,
-            sensor_pose=sensor_pose,
-            conflict_point=conflict_point,
-            trajectory_normal=normal,
-            robot_poses=trajectory.poses,
-            robot_footprint=robot_footprint,
-            target_current_pose=target.current_pose,
-            target_future_poses=target.future_poses,
-            target_footprint=target_footprint,
-            context_trajectories=context_trajectories,
-            context_footprints=context_footprints,
-            config=generator_config["occluders"],
-            rng=rng,
-            max_attempts=8,
-        )
+        if placement is None:
+            raise _EventRejection("occluder_geometry_missing")
         occupied |= placement.mask
 
     target_poses = np.vstack((target.current_pose, target.future_poses))
@@ -717,11 +726,54 @@ def _sort_buckets(buckets: dict[str, dict[str, object]]) -> dict[str, dict[str, 
     }
 
 
+def _summarize_event_kind_buckets(
+    buckets: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    summary = {}
+    for event_kind in _EVENT_TYPES:
+        bucket = buckets[event_kind]
+        requested = int(bucket["requested"])
+        attempted = int(bucket["attempted"])
+        accepted = int(bucket["accepted"])
+        summary[event_kind] = {
+            "requested": requested,
+            "attempted": attempted,
+            "accepted": accepted,
+            "rejected": attempted - accepted,
+            "request_acceptance_rate": (
+                accepted / requested if requested else 0.0
+            ),
+            "attempt_acceptance_rate": (
+                accepted / attempted if attempted else 0.0
+            ),
+            "rejection_reasons": dict(
+                sorted(bucket["rejection_reasons"].items())
+            ),
+            "rejection_stage_counts": dict(bucket["rejection_stage_counts"]),
+        }
+    return summary
+
+
 def _merge_reason_counts(
     destination: dict[str, int], source: Mapping[str, int]
 ) -> None:
     for reason, count in source.items():
         destination[reason] = destination.get(reason, 0) + int(count)
+
+
+def _rejection_stage(reason: str) -> str:
+    if reason in {
+        "occluder_los_degenerate",
+        "occluder_offset_outside_line_of_sight",
+        "occluder_out_of_bounds",
+        "occluder_static_overlap",
+        "occluder_robot_swept_overlap",
+        "occluder_context_collision",
+    }:
+        return "occluder_geometry"
+    if "visibility" in reason or "hide_current" in reason or "does_not_emerge" in reason:
+        return "visibility"
+    return "target_conditioning"
 
 
 def generate_events(
@@ -767,6 +819,15 @@ def generate_events(
     context_current = _context_current_occupancy(
         oracle_context, grid=grid, context_footprints=context_footprints
     )
+    context_trajectories = {
+        object_id: np.vstack(
+            (
+                oracle_context.dynamic_object_history[object_id][-1],
+                oracle_context.dynamic_object_future[object_id],
+            )
+        )
+        for object_id in sorted(context_footprints)
+    }
     robot_cfg = base_config["robot"]
     robot_footprint = inflate_footprint(
         RectangleFootprint(robot_cfg["length_m"], robot_cfg["width_m"]),
@@ -781,14 +842,58 @@ def generate_events(
     by_footprint_kind: dict[str, dict[str, object]] = {}
     by_geometry_source: dict[str, dict[str, object]] = {}
     event_kind_counts = {event_type: 0 for event_type in _EVENT_TYPES}
+    requested_event_kind_counts = {
+        event_type: event_type_schedule.count(event_type)
+        for event_type in _EVENT_TYPES
+    }
+    by_event_kind = {
+        event_type: {
+            "requested": requested_event_kind_counts[event_type],
+            "attempted": 0,
+            "accepted": 0,
+            "rejection_reasons": {},
+            "rejection_stage_counts": {
+                "occluder_geometry": 0,
+                "target_conditioning": 0,
+                "visibility": 0,
+            },
+        }
+        for event_type in _EVENT_TYPES
+    }
+    rejection_stage_counts = {
+        "occluder_geometry": 0,
+        "target_conditioning": 0,
+        "visibility": 0,
+    }
     attempted_count = 0
 
     for event_index in range(desired_count):
         event_kind = event_type_schedule[event_index]
+        joint_schedule = (
+            build_joint_occluder_schedule(
+                types=normalized["occluders"]["types"],
+                max_candidates=normalized["max_resample_attempts"],
+                rng=make_rng(
+                    int(seed),
+                    base_state.state_id,
+                    trajectory.trajectory_id,
+                    event_index,
+                    "joint_occluder_schedule",
+                ),
+            )
+            if event_kind in {"environment", "mixed"}
+            else ()
+        )
         accepted = False
         for attempt_index in range(normalized["max_resample_attempts"]):
             attempted_count += 1
+            by_event_kind[event_kind]["attempted"] += 1
             target = None
+            joint_parameters = (
+                joint_schedule[attempt_index]
+                if event_kind in {"environment", "mixed"}
+                else None
+            )
             attempt_seed = derive_seed(
                 int(seed),
                 base_state.state_id,
@@ -805,12 +910,6 @@ def generate_events(
             )
             reason = None
             try:
-                snippet = sample_motion_snippet(
-                    snippet_libraries,
-                    split=base_state.split,
-                    policy=policy,
-                    rng=rng,
-                )
                 (
                     conflict_index,
                     conflict_time_s,
@@ -823,13 +922,52 @@ def generate_events(
                     conflict_range=normalized["conflict_time_range_s"],
                     rng=rng,
                     max_curvature=normalized["max_local_curvature_per_m"],
+                    conflict_time_quantile=(
+                        None
+                        if joint_parameters is None
+                        else joint_parameters.conflict_time_quantile
+                    ),
                 )
-                crossing_direction = _rotated_direction(
-                    normal,
-                    max_angle_deg=normalized["crossing_angle_max_deg"],
+                placement = None
+                geometry_candidate = None
+                if joint_parameters is not None:
+                    geometry_candidate = propose_environment_occluder_geometry(
+                        static_occupancy=static_occupancy,
+                        grid=grid,
+                        sensor_pose=np.zeros(3, dtype=np.float64),
+                        conflict_point=conflict_point,
+                        trajectory_normal=normal,
+                        robot_poses=trajectory.poses,
+                        robot_footprint=robot_footprint,
+                        context_trajectories=context_trajectories,
+                        context_footprints=context_footprints,
+                        config=normalized["occluders"],
+                        parameters=joint_parameters,
+                        proposal_index=attempt_index,
+                    )
+                snippet = sample_motion_snippet(
+                    snippet_libraries,
+                    split=base_state.split,
+                    policy=policy,
                     rng=rng,
                 )
-                time_scale = _sample_range(normalized["time_scale_range"], rng)
+                if joint_parameters is None:
+                    crossing_direction = _rotated_direction(
+                        normal,
+                        max_angle_deg=normalized["crossing_angle_max_deg"],
+                        rng=rng,
+                    )
+                    time_scale = _sample_range(normalized["time_scale_range"], rng)
+                else:
+                    time_scale = _range_quantile(
+                        normalized["time_scale_range"],
+                        joint_parameters.time_scale_quantile,
+                    )
+                    crossing_direction = _joint_crossing_direction(
+                        normal,
+                        joint_parameters,
+                        max_angle_deg=normalized["crossing_angle_max_deg"],
+                    )
                 target = transplant_snippet(
                     snippet,
                     conflict_point=conflict_point,
@@ -850,6 +988,33 @@ def generate_events(
                     oracle_context=oracle_context,
                     base_config=base_config,
                 )
+                if geometry_candidate is not None:
+                    geometry_candidate = align_environment_occluder_to_target_los(
+                        geometry_candidate,
+                        static_occupancy=static_occupancy,
+                        grid=grid,
+                        sensor_pose=np.zeros(3, dtype=np.float64),
+                        trajectory_normal=normal,
+                        robot_poses=trajectory.poses,
+                        robot_footprint=robot_footprint,
+                        target_current_pose=target.current_pose,
+                        context_trajectories=context_trajectories,
+                        context_footprints=context_footprints,
+                    )
+                    placement = validate_environment_occluder_target(
+                        geometry_candidate,
+                        target_current_pose=target.current_pose,
+                        target_future_poses=target.future_poses,
+                        target_footprint=target_footprint,
+                    )
+                robot_target_clearances = trajectory_signed_clearances(
+                    robot_footprint,
+                    trajectory.poses,
+                    target_footprint,
+                    target.future_poses,
+                )
+                if not np.any(robot_target_clearances <= 0.0):
+                    raise _EventRejection("target_not_collision_mother")
                 (
                     visibility_sequence,
                     placement,
@@ -870,6 +1035,7 @@ def generate_events(
                     oracle_context=oracle_context,
                     generator_config=normalized,
                     rng=rng,
+                    precomputed_placement=placement,
                 )
                 if placement is not None:
                     _merge_reason_counts(
@@ -908,10 +1074,12 @@ def generate_events(
                     event_kind,
                     target.target_dynamic_object_id,
                     generator_digest,
+                    _GENERATOR_ALGORITHM_VERSION,
                     size=12,
                 )
                 metadata = {
                     "schema_version": SCHEMA_VERSION,
+                    "generator_algorithm_version": _GENERATOR_ALGORITHM_VERSION,
                     "event_kind": event_kind,
                     "trajectory_id": trajectory.trajectory_id,
                     "target_dynamic_object_id": target.target_dynamic_object_id,
@@ -998,21 +1166,24 @@ def generate_events(
                 reason=reason,
             )
             if accepted:
+                by_event_kind[event_kind]["accepted"] += 1
                 break
+            stage = _rejection_stage(reason)
+            rejection_stage_counts[stage] += 1
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            kind_reasons = by_event_kind[event_kind]["rejection_reasons"]
+            kind_reasons[reason] = kind_reasons.get(reason, 0) + 1
+            by_event_kind[event_kind]["rejection_stage_counts"][stage] += 1
         if not accepted:
             continue
 
     rejected_count = attempted_count - len(events)
-    requested_event_kind_counts = {
-        event_type: event_type_schedule.count(event_type)
-        for event_type in _EVENT_TYPES
-    }
     summary = {
         "schema_version": SCHEMA_VERSION,
         "seed": int(seed),
         "requested_event_count": desired_count,
         "attempted_count": attempted_count,
+        "joint_candidate_attempted_count": attempted_count,
         "accepted_count": len(events),
         "rejected_count": rejected_count,
         "acceptance_rate": len(events) / desired_count,
@@ -1021,16 +1192,19 @@ def generate_events(
         ),
         "unaccepted_event_count": desired_count - len(events),
         "rejection_reasons": dict(sorted(rejection_reasons.items())),
+        "rejection_stage_counts": rejection_stage_counts,
         "occluder_candidate_rejection_reasons": dict(
             sorted(occluder_candidate_rejection_reasons.items())
         ),
         "requested_event_kind_counts": requested_event_kind_counts,
         "event_kind_counts": event_kind_counts,
+        "by_event_kind": _summarize_event_kind_buckets(by_event_kind),
         "by_object_type": _sort_buckets(by_object_type),
         "by_footprint_kind": _sort_buckets(by_footprint_kind),
         "by_geometry_source": _sort_buckets(by_geometry_source),
         "target_type_policy": policy.as_dict(),
         "target_type_policy_digest": policy.digest,
         "generator_config_digest": generator_digest,
+        "generator_algorithm_version": _GENERATOR_ALGORITHM_VERSION,
     }
     return EventGenerationReport(events=tuple(events), summary=summary)

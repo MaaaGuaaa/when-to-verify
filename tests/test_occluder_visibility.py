@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from src.contracts import build_grid_spec
+import src.generation.occluder_sampler as occluder_sampler
 from src.generation.occluder_sampler import (
     OccluderSamplingError,
     sample_environment_occluder,
@@ -364,3 +365,384 @@ def test_occluder_search_covers_feasible_band_with_broad_default_ranges() -> Non
     assert placement.attempt <= 8
     assert placement.occluder["type"] in {"wall", "shelf", "pillar"}
     assert sum(placement.rejection_reasons.values()) == placement.attempt - 1
+
+
+def test_joint_schedule_covers_both_sides_types_and_full_quantiles() -> None:
+    first = occluder_sampler.build_joint_occluder_schedule(
+        types=("wall", "shelf", "pillar"),
+        max_candidates=64,
+        rng=np.random.default_rng(19),
+    )
+    repeated = occluder_sampler.build_joint_occluder_schedule(
+        types=("wall", "shelf", "pillar"),
+        max_candidates=64,
+        rng=np.random.default_rng(19),
+    )
+    different_seed = occluder_sampler.build_joint_occluder_schedule(
+        types=("wall", "shelf", "pillar"),
+        max_candidates=64,
+        rng=np.random.default_rng(23),
+    )
+
+    assert first == repeated
+    assert first[:16] != different_seed[:16]
+    assert len(first) == 64
+    assert {item.side for item in first} == {-1, 1}
+    assert {item.occluder_type for item in first} == {"wall", "shelf", "pillar"}
+    assert {item.offset_quantile for item in first} == {
+        0.1,
+        0.3,
+        0.4,
+        0.5,
+        0.7,
+        0.9,
+    }
+    assert {item.dimension_quantile for item in first} == {
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+    }
+    assert {item.angle_multiplier for item in first} >= {
+        -0.95,
+        -0.5,
+        0.0,
+        0.5,
+        0.95,
+    }
+    assert {item.time_scale_quantile for item in first} >= {
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+    }
+    physics_prefix = first[:16]
+    assert all(item.occluder_type == "pillar" for item in physics_prefix)
+    assert all(item.dimension_quantile == 0.0 for item in physics_prefix)
+    assert {item.side for item in physics_prefix} == {-1, 1}
+    assert {item.offset_quantile for item in physics_prefix} == {0.3, 0.4}
+    assert {abs(item.angle_multiplier) for item in physics_prefix} == {
+        0.0,
+        0.25,
+        0.5,
+        0.7,
+    }
+    assert all(
+        item.angle_multiplier == 0.0
+        or np.sign(item.angle_multiplier) == -item.side
+        for item in physics_prefix
+    )
+    assert {item.time_scale_quantile for item in physics_prefix} == {
+        0.0,
+        0.16,
+        0.25,
+        0.5,
+    }
+    assert all(item.conflict_time_quantile == 1.0 for item in physics_prefix)
+    for first_side, second_side in zip(
+        physics_prefix[::2], physics_prefix[1::2], strict=True
+    ):
+        assert first_side.side == -1
+        assert second_side.side == 1
+        assert first_side.occluder_type == second_side.occluder_type
+        assert first_side.offset_quantile == second_side.offset_quantile
+        assert first_side.dimension_quantile == second_side.dimension_quantile
+        assert first_side.angle_multiplier == -second_side.angle_multiplier
+        assert first_side.time_scale_quantile == second_side.time_scale_quantile
+        assert (
+            first_side.conflict_time_quantile
+            == second_side.conflict_time_quantile
+        )
+
+    wall_only = occluder_sampler.build_joint_occluder_schedule(
+        types=("wall",),
+        max_candidates=10,
+        rng=np.random.default_rng(19),
+    )
+    assert all(item.occluder_type == "wall" for item in wall_only)
+    assert {item.offset_quantile for item in wall_only} == {
+        0.1,
+        0.3,
+        0.5,
+        0.7,
+        0.9,
+    }
+    assert {item.dimension_quantile for item in wall_only} == {
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+    }
+
+
+def test_joint_occluder_uses_exact_robot_clearance_when_raster_masks_touch() -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    robot_poses = np.vstack(
+        (np.zeros(3, dtype=np.float32), _straight_robot_poses())
+    )
+    occluder_footprint = RectangleFootprint(0.4, 0.4)
+    center = np.asarray([1.6, -0.75], dtype=np.float64)
+    occluder_pose = np.asarray(
+        [
+            center[0],
+            center[1],
+            np.arctan2(center[1], center[0]) + 0.5 * np.pi,
+        ],
+        dtype=np.float64,
+    )
+    exact_clearances = trajectory_signed_clearances(
+        occluder_footprint,
+        np.tile(occluder_pose, (robot_poses.shape[0], 1)),
+        robot_footprint,
+        robot_poses,
+    )
+    occluder_mask = rasterize_footprint_sweep(
+        occluder_footprint, occluder_pose[None, :], grid
+    )
+    robot_mask = rasterize_footprint_sweep(robot_footprint, robot_poses, grid)
+    assert float(np.min(exact_clearances)) > 0.0
+    assert np.any(occluder_mask & robot_mask)
+
+    candidate = occluder_sampler.propose_environment_occluder_geometry(
+        static_occupancy=np.zeros((grid.height, grid.width), dtype=np.float32),
+        grid=grid,
+        sensor_pose=(0.0, 0.0, 0.0),
+        conflict_point=(1.6, 0.0),
+        trajectory_normal=(0.0, 1.0),
+        robot_poses=_straight_robot_poses(),
+        robot_footprint=robot_footprint,
+        context_trajectories={},
+        context_footprints={},
+        config={
+            **_occluder_config(),
+            "normal_offset_range_m": [0.75, 0.75],
+            "pillar": {
+                "length_range_m": [0.4, 0.4],
+                "width_range_m": [0.4, 0.4],
+            },
+        },
+        parameters=occluder_sampler.JointOccluderParameters(
+            occluder_type="pillar",
+            side=-1,
+            offset_quantile=0.5,
+            dimension_quantile=0.0,
+            angle_multiplier=0.7,
+            time_scale_quantile=0.16,
+        ),
+        proposal_index=0,
+    )
+
+    np.testing.assert_allclose(candidate.pose, occluder_pose, atol=1e-6)
+
+
+def test_joint_occluder_rejects_collision_between_robot_samples() -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    future_robot_poses = np.asarray([[2.0, 0.0, 0.0]], dtype=np.float32)
+    occluder_footprint = RectangleFootprint(0.2, 0.2)
+    occluder_pose = np.asarray([1.0, 0.0, 0.5 * np.pi], dtype=np.float64)
+    endpoint_clearances = trajectory_signed_clearances(
+        occluder_footprint,
+        np.tile(occluder_pose, (2, 1)),
+        robot_footprint,
+        np.vstack((np.zeros(3), future_robot_poses)),
+    )
+    assert np.all(endpoint_clearances > 0.0)
+
+    with pytest.raises(OccluderSamplingError) as exc_info:
+        occluder_sampler.propose_environment_occluder_geometry(
+            static_occupancy=np.zeros(
+                (grid.height, grid.width), dtype=np.float32
+            ),
+            grid=grid,
+            sensor_pose=(0.0, 0.0, 0.0),
+            conflict_point=(0.25, 0.0),
+            trajectory_normal=(1.0, 0.0),
+            robot_poses=future_robot_poses,
+            robot_footprint=robot_footprint,
+            context_trajectories={},
+            context_footprints={},
+            config={
+                **_occluder_config(),
+                "normal_offset_range_m": [0.75, 0.75],
+                "pillar": {
+                    "length_range_m": [0.2, 0.2],
+                    "width_range_m": [0.2, 0.2],
+                },
+            },
+            parameters=occluder_sampler.JointOccluderParameters(
+                occluder_type="pillar",
+                side=1,
+                offset_quantile=0.5,
+                dimension_quantile=0.0,
+                angle_multiplier=-0.7,
+                time_scale_quantile=0.16,
+            ),
+            proposal_index=0,
+        )
+
+    assert exc_info.value.reason == "occluder_robot_swept_overlap"
+
+
+def test_joint_occluder_rejects_narrow_collision_between_dense_samples() -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    robot_footprint = RectangleFootprint(0.002, 0.002)
+    future_robot_poses = np.asarray([[0.04, 0.0, 0.0]], dtype=np.float32)
+    occluder_footprint = RectangleFootprint(0.002, 0.002)
+    occluder_pose = np.asarray([0.02, 0.0, 0.5 * np.pi], dtype=np.float64)
+    endpoint_clearances = trajectory_signed_clearances(
+        occluder_footprint,
+        np.tile(occluder_pose, (2, 1)),
+        robot_footprint,
+        np.vstack((np.zeros(3), future_robot_poses)),
+    )
+    assert np.all(endpoint_clearances > 0.0)
+
+    with pytest.raises(OccluderSamplingError) as exc_info:
+        occluder_sampler.propose_environment_occluder_geometry(
+            static_occupancy=np.zeros(
+                (grid.height, grid.width), dtype=np.float32
+            ),
+            grid=grid,
+            sensor_pose=(0.0, 0.0, 0.0),
+            conflict_point=(0.0, 0.0),
+            trajectory_normal=(1.0, 0.0),
+            robot_poses=future_robot_poses,
+            robot_footprint=robot_footprint,
+            context_trajectories={},
+            context_footprints={},
+            config={
+                **_occluder_config(),
+                "normal_offset_range_m": [0.02, 0.02],
+                "pillar": {
+                    "length_range_m": [0.002, 0.002],
+                    "width_range_m": [0.002, 0.002],
+                },
+            },
+            parameters=occluder_sampler.JointOccluderParameters(
+                occluder_type="pillar",
+                side=1,
+                offset_quantile=0.5,
+                dimension_quantile=0.0,
+                angle_multiplier=-0.7,
+                time_scale_quantile=0.16,
+            ),
+            proposal_index=0,
+        )
+
+    assert exc_info.value.reason == "occluder_robot_swept_overlap"
+
+
+def test_occluder_geometry_is_proposed_before_target_exists() -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    static = np.zeros((grid.height, grid.width), dtype=np.float32)
+
+    candidate = occluder_sampler.propose_environment_occluder_geometry(
+        static_occupancy=static,
+        grid=grid,
+        sensor_pose=(0.0, 0.0, 0.0),
+        conflict_point=(1.6, 0.0),
+        trajectory_normal=(0.0, 1.0),
+        robot_poses=_straight_robot_poses(),
+        robot_footprint=robot_footprint,
+        context_trajectories={},
+        context_footprints={},
+        config=_occluder_config(),
+        parameters=occluder_sampler.JointOccluderParameters(
+            occluder_type="pillar",
+            side=-1,
+            offset_quantile=0.5,
+            dimension_quantile=0.0,
+            angle_multiplier=0.0,
+            time_scale_quantile=0.5,
+        ),
+        proposal_index=0,
+    )
+
+    np.testing.assert_allclose(candidate.pose[:2], [1.6, -1.0], atol=1e-6)
+    assert candidate.occluder["placement_strategy"] == "joint_occluder_first_v2"
+    assert candidate.occluder["proposal_index"] == 0
+    assert candidate.mask.dtype == np.bool_
+    assert not np.any(
+        candidate.mask
+        & rasterize_footprint_sweep(
+            robot_footprint,
+            np.vstack((np.zeros(3, dtype=np.float32), _straight_robot_poses())),
+            grid,
+        )
+    )
+
+
+def test_joint_occluder_keeps_normal_band_and_aligns_tangentially_to_target_los() -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    static = np.zeros((grid.height, grid.width), dtype=np.float32)
+    candidate = occluder_sampler.propose_environment_occluder_geometry(
+        static_occupancy=static,
+        grid=grid,
+        sensor_pose=(0.0, 0.0, 0.0),
+        conflict_point=(1.6, 0.0),
+        trajectory_normal=(0.0, 1.0),
+        robot_poses=_straight_robot_poses(),
+        robot_footprint=robot_footprint,
+        context_trajectories={},
+        context_footprints={},
+        config=_occluder_config(),
+        parameters=occluder_sampler.JointOccluderParameters(
+            occluder_type="pillar",
+            side=-1,
+            offset_quantile=0.5,
+            dimension_quantile=0.0,
+            angle_multiplier=0.95,
+            time_scale_quantile=0.5,
+        ),
+        proposal_index=4,
+    )
+
+    aligned = occluder_sampler.align_environment_occluder_to_target_los(
+        candidate,
+        static_occupancy=static,
+        grid=grid,
+        sensor_pose=(0.0, 0.0, 0.0),
+        trajectory_normal=(0.0, 1.0),
+        robot_poses=_straight_robot_poses(),
+        robot_footprint=robot_footprint,
+        target_current_pose=(1.6, -2.0, np.pi / 2.0),
+        context_trajectories={},
+        context_footprints={},
+    )
+
+    np.testing.assert_allclose(aligned.pose[:2], [0.8, -1.0], atol=1e-6)
+    assert aligned.occluder["normal_offset_m"] == -1.0
+    assert aligned.occluder["line_of_sight_fraction"] == pytest.approx(0.5)
+    assert aligned.occluder["placement_strategy"] == "joint_occluder_first_v2"

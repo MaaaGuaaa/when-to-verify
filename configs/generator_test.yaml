@@ -1,0 +1,41 @@
+schema_version: "2.0.0"
+
+target_type_policy:
+  whitelist: [human]
+  weights:
+    human: 1.0
+    carried_object: 0.0
+    unknown_dynamic: 0.0
+
+event_type_weights:
+  environment: 0.60
+  structural: 0.30
+  mixed: 0.10
+
+conflict_time_range_s: [1.0, 2.2]
+max_local_curvature_per_m: 1.0
+crossing_angle_max_deg: 35.0
+time_scale_range: [0.8, 1.2]
+max_resample_attempts: 128
+min_contiguous_visible_frames: 2
+
+occluders:
+  types: [wall, shelf, pillar]
+  normal_offset_range_m: [0.5, 1.5]
+  wall:
+    length_range_m: [1.0, 3.0]
+    width_range_m: [0.2, 0.5]
+  shelf:
+    length_range_m: [1.0, 2.5]
+    width_range_m: [0.4, 0.8]
+  pillar:
+    length_range_m: [0.4, 0.8]
+    width_range_m: [0.4, 0.8]
+
+structural_fov:
+  forward_fov_deg: [160.0, 180.0, 220.0]
+  range_m: [6.0, 8.0, 10.0]
+  optional_blind_sectors:
+    - {center_deg: -90.0, width_deg: 80.0}
+    - {center_deg: 90.0, width_deg: 80.0}
+    - {center_deg: 150.0, width_deg: 60.0}

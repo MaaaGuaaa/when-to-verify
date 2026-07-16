@@ -766,6 +766,9 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       射线向后做配置上限内的刚性平移，且每个变体重新验证物理与可见性
 - [ ] temporal-safe 只使用独立配置的冻结偏移序列重设冲突锚点，不外推，并验证空间
       路径相交但同步 footprint 不相交
+- [ ] 环境遮挡 six-pack 采用联合搜索：优先冲突锚点连续消费完整 16 候选高可行前缀，
+      再用单个配置内矩形同时遮住 collision/temporal-safe 的两条当前 LOS；共同遮挡物
+      必须避开机器人、上下文、静态图和两条目标轨迹，并让两条目标都连续出现
 - [ ] 生成 irrelevant-hidden，确保有隐藏目标且同步 signed clearance `≥1.5 m`
 - [ ] 生成 empty-blind-spot，只移除 `target_dynamic_object_id`，保留其他动态对象
 - [ ] 允许训练使用部分配对，但最低包含 collision、empty-blind-spot，以及
@@ -791,6 +794,8 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - empty world 仅移除目标动态对象，其他动态对象保持不变
 - 主 paired 样本的 collision/near-miss critical object 必须是 target
 - 除指定变量外，同一 pair 的 base、trajectory、occluder 和背景一致
+- 环境 six-pack 单独报告请求级成功率、母候选数、配对候选数、遮挡候选数和内部候选
+  接受率，不得与 SOP-05 原始事件接受率混为同一指标
 - `current_visible_*`、`unobservable`、age map 满足不变量
 - 任何 RiskSample 输入中无法检索到 hidden future 或 oracle occupancy
 

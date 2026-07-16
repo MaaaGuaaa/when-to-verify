@@ -13,6 +13,7 @@ import yaml
 
 from src.contracts import (
     SCHEMA_VERSION,
+    BaseState,
     LocalTrajectory,
     OracleContext,
     OracleWorld,
@@ -20,7 +21,7 @@ from src.contracts import (
     validate_oracle_context,
     validate_oracle_world,
 )
-from src.datasets.snippet_library import MotionSnippet
+from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
 from src.geometry import (
     Footprint,
     RectangleFootprint,
@@ -34,14 +35,22 @@ from src.geometry import (
     trajectory_signed_clearances,
     wrap_angle,
 )
-from src.utils.seeding import stable_digest
+from src.utils.seeding import derive_seed, stable_digest
 
 from .dynamic_object_transplant import (
     TransplantedDynamicObject,
     footprint_from_spec,
     transplant_snippet,
 )
-from .event_sampler import GeneratedEvent
+from .event_sampler import (
+    GeneratedEvent,
+    generate_events,
+    normalize_generator_config,
+)
+from .occluder_sampler import (
+    OccluderSamplingError,
+    align_environment_occluder_to_target_los_envelope,
+)
 from .structural_blindspot import (
     StructuralBlindSpot,
     build_structural_visibility,
@@ -61,6 +70,8 @@ VARIANT_ORDER = (
 _TEMPORAL_OFFSETS = (0.8, -0.8, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5)
 _REQUIRED_VARIANTS = ("collision", "empty_blind_spot")
 _CONTRAST_VARIANTS = ("near_miss", "temporal_safe", "spatial_safe")
+_JOINT_ENVIRONMENT_PAIR_VERSION = "joint_environment_pair_v1"
+_JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE = 16
 
 
 class PairedVariantConfigError(ValueError):
@@ -152,6 +163,15 @@ class PairedEventGroup:
     @property
     def by_kind(self) -> dict[str, PairedVariant]:
         return {variant.variant_kind: variant for variant in self.variants}
+
+
+@dataclass(frozen=True)
+class JointEnvironmentPairReport:
+    """One bounded environment-mother search and its complete paired group."""
+
+    mother_event: GeneratedEvent | None
+    group: PairedEventGroup | None
+    summary: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -1357,6 +1377,507 @@ def generate_paired_variants(
         variants=variants,
         missing_variant_reasons=missing,
         paired_config=normalized,
+    )
+
+
+def _joint_environment_anchor_schedule(
+    *,
+    trajectory: LocalTrajectory,
+    generator_config: Mapping[str, Any],
+    paired_config: PairedVariantConfig,
+    future_dt_s: float,
+) -> tuple[float, ...]:
+    times = (
+        np.arange(trajectory.poses.shape[0], dtype=np.float64) + 1.0
+    ) * future_dt_s
+    lower, upper = generator_config["conflict_time_range_s"]
+    eligible = tuple(
+        float(time)
+        for time in times
+        if lower - 1e-9 <= time <= upper + 1e-9
+    )
+    positive_offsets = tuple(
+        offset
+        for offset in paired_config.temporal_offset_candidates_s
+        if offset > 0.0
+    )
+    horizon_s = trajectory.poses.shape[0] * future_dt_s
+    if not eligible or not positive_offsets:
+        raise PairGenerationError("joint_environment_anchor_unavailable")
+
+    def maximum_available_offset(anchor: float) -> float:
+        available = tuple(
+            offset
+            for offset in positive_offsets
+            if anchor + offset <= horizon_s + 1e-9
+        )
+        return max(available, default=-np.inf)
+
+    scheduled = tuple(
+        sorted(
+            eligible,
+            key=lambda anchor: (
+                -maximum_available_offset(anchor),
+                -anchor,
+            ),
+        )
+    )
+    if not np.isfinite(maximum_available_offset(scheduled[0])):
+        raise PairGenerationError("joint_environment_anchor_unavailable")
+    return scheduled
+
+
+def _source_snippet_for_event(
+    mother_event: GeneratedEvent,
+    snippet_libraries: Mapping[str, SnippetLibrary],
+) -> MotionSnippet:
+    library = snippet_libraries.get(mother_event.target.object_type)
+    if not isinstance(library, SnippetLibrary):
+        raise PairGenerationError("mother_snippet_library_missing")
+    matches = tuple(
+        snippet
+        for snippet in library.snippets
+        if snippet.snippet_id == mother_event.target.snippet_id
+        and snippet.source_object_id == mother_event.target.source_object_id
+    )
+    if len(matches) != 1:
+        raise PairGenerationError("mother_source_snippet_not_unique")
+    return matches[0]
+
+
+def _retimed_target_candidate(
+    *,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    environment: _PairEnvironment,
+    offset_s: float,
+) -> TransplantedDynamicObject | None:
+    provenance = mother_event.target.provenance
+    required = {
+        "conflict_point",
+        "crossing_direction",
+        "time_scale",
+        "target_type_policy_digest",
+        "seed",
+    }
+    if not required <= set(provenance):
+        raise PairGenerationError("mother_target_provenance_incomplete")
+    conflict_time = mother_event.conflict_time_s + offset_s
+    horizon_s = environment.grid.future_steps * environment.future_dt_s
+    if not 0.0 < conflict_time <= horizon_s:
+        return None
+    target = transplant_snippet(
+        source_snippet,
+        conflict_point=provenance["conflict_point"],
+        conflict_time_s=conflict_time,
+        crossing_direction=provenance["crossing_direction"],
+        time_scale=provenance["time_scale"],
+        future_dt_s=environment.future_dt_s,
+        future_steps=environment.grid.future_steps,
+        base_state_id=mother_event.world.base_state_id,
+        trajectory_id=trajectory.trajectory_id,
+        target_type_policy_digest=provenance[
+            "target_type_policy_digest"
+        ],
+        seed=provenance["seed"],
+        context_object_ids=tuple(oracle_context.dynamic_object_future),
+    )
+    return replace(
+        target,
+        target_dynamic_object_id=mother_event.target.target_dynamic_object_id,
+        provenance={
+            **target.provenance,
+            "paired_transform": {
+                "kind": "temporal_offset_v1",
+                "temporal_offset_s": float(offset_s),
+                "mother_conflict_time_s": mother_event.conflict_time_s,
+            },
+        },
+    )
+
+
+def _event_trajectory_normal(
+    mother_event: GeneratedEvent, trajectory: LocalTrajectory
+) -> np.ndarray:
+    index = mother_event.conflict_index
+    poses = trajectory.poses
+    previous = poses[max(0, index - 1), :2].astype(np.float64)
+    following = poses[min(poses.shape[0] - 1, index + 1), :2].astype(
+        np.float64
+    )
+    tangent = following - previous
+    norm = float(np.linalg.norm(tangent))
+    if norm <= 1e-9:
+        raise PairGenerationError("joint_environment_tangent_degenerate")
+    tangent /= norm
+    return np.asarray([-tangent[1], tangent[0]], dtype=np.float64)
+
+
+def _joint_environment_summary(
+    *,
+    seed: int,
+    anchor_schedule: tuple[float, ...],
+    attempted_count: int,
+    mother_accepted_count: int,
+    pair_candidate_count: int,
+    occluder_candidate_count: int,
+    rejection_reasons: Mapping[str, int],
+    mother_event: GeneratedEvent | None,
+    group: PairedEventGroup | None,
+) -> dict[str, object]:
+    accepted = int(group is not None and group.is_complete)
+    temporal = None if group is None else group.by_kind.get("temporal_safe")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generator_algorithm_version": _JOINT_ENVIRONMENT_PAIR_VERSION,
+        "seed": int(seed),
+        "requested_count": 1,
+        "attempted_count": attempted_count,
+        "mother_accepted_count": mother_accepted_count,
+        "pair_candidate_count": pair_candidate_count,
+        "occluder_candidate_count": occluder_candidate_count,
+        "accepted_count": accepted,
+        "complete_group_count": accepted,
+        "request_acceptance_rate": float(accepted),
+        "attempt_acceptance_rate": (
+            accepted / attempted_count if attempted_count else 0.0
+        ),
+        "anchor_schedule_s": list(anchor_schedule),
+        "selected_conflict_time_s": (
+            None if mother_event is None else mother_event.conflict_time_s
+        ),
+        "selected_temporal_offset_s": (
+            None if temporal is None else temporal.temporal_offset_s
+        ),
+        "rejection_reasons": dict(sorted(rejection_reasons.items())),
+    }
+
+
+def generate_joint_environment_pair(
+    *,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    trajectory: LocalTrajectory,
+    snippet_libraries: Mapping[str, SnippetLibrary],
+    base_config: Mapping[str, Any],
+    generator_config: Mapping[str, Any],
+    paired_config: PairedVariantConfig | Mapping[str, Any],
+    seed: int,
+) -> JointEnvironmentPairReport:
+    """Jointly search one environment mother, temporal target, and LOS envelope.
+
+    One top-level attempt creates at most one SOP-05 mother candidate.  Only a
+    physically valid, complete SOP-06 six-pack is accepted; partial groups are
+    counted with explicit reasons and the bounded search continues.
+    """
+
+    if not isinstance(base_state, BaseState):
+        raise TypeError("base_state must be a BaseState")
+    if not isinstance(oracle_context, OracleContext):
+        raise TypeError("oracle_context must be an OracleContext")
+    if not isinstance(trajectory, LocalTrajectory):
+        raise TypeError("trajectory must be a LocalTrajectory")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(
+        seed, (int, np.integer)
+    ):
+        raise TypeError("seed must be an integer")
+    normalized_generator = normalize_generator_config(generator_config)
+    normalized_paired = _as_paired_config(paired_config)
+    future_dt_s = float(base_config["bev"]["future_dt_s"])
+    anchor_schedule = _joint_environment_anchor_schedule(
+        trajectory=trajectory,
+        generator_config=normalized_generator,
+        paired_config=normalized_paired,
+        future_dt_s=future_dt_s,
+    )
+    max_attempts = int(normalized_generator["max_resample_attempts"])
+    grid = build_grid_spec(dict(base_config))
+    base_static = (
+        np.zeros((grid.height, grid.width), dtype=bool)
+        if base_state.static_map_local is None
+        else np.asarray(base_state.static_map_local != 0, dtype=bool)
+    )
+    context_footprints = {
+        object_id: footprint_from_spec(
+            oracle_context.dynamic_object_specs[object_id]
+        )
+        for object_id in sorted(oracle_context.dynamic_object_specs)
+    }
+    context_trajectories = {
+        object_id: np.vstack(
+            (
+                oracle_context.dynamic_object_history[object_id][-1],
+                oracle_context.dynamic_object_future[object_id],
+            )
+        )
+        for object_id in sorted(context_footprints)
+    }
+
+    rejection_reasons: dict[str, int] = {}
+    mother_accepted_count = 0
+    pair_candidate_count = 0
+    occluder_candidate_count = 0
+    attempted_count = 0
+    search_round = 0
+    while attempted_count < max_attempts:
+        round_index = search_round
+        search_round += 1
+        anchor = anchor_schedule[round_index % len(anchor_schedule)]
+        event_seed = (
+            int(seed)
+            if round_index == 0
+            else derive_seed(
+                int(seed),
+                base_state.state_id,
+                trajectory.trajectory_id,
+                "joint_environment_pair",
+                round_index,
+            )
+        )
+        # The SOP-05 joint schedule starts with eight pillar templates on both
+        # sides. Consume that complete high-feasibility prefix before moving to
+        # the next conflict-time anchor; shorter batches repeatedly reseed a
+        # truncated prefix and substantially reduce acceptance.
+        mother_candidate_budget = min(
+            _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE,
+            max_attempts - attempted_count,
+        )
+        candidate_generator = {
+            **normalized_generator,
+            "event_type_weights": {
+                "environment": 1.0,
+                "structural": 0.0,
+                "mixed": 0.0,
+            },
+            "conflict_time_range_s": (anchor, anchor),
+            "max_resample_attempts": mother_candidate_budget,
+        }
+        event_report = generate_events(
+            base_state=base_state,
+            oracle_context=oracle_context,
+            trajectory=trajectory,
+            snippet_libraries=snippet_libraries,
+            base_config=base_config,
+            generator_config=candidate_generator,
+            seed=event_seed,
+            event_count=1,
+        )
+        attempted_count += int(event_report.summary["attempted_count"])
+        for reason, count in event_report.summary[
+            "rejection_reasons"
+        ].items():
+            key = f"mother:{reason}"
+            rejection_reasons[key] = rejection_reasons.get(key, 0) + int(
+                count
+            )
+        if not event_report.events:
+            continue
+
+        mother = event_report.events[0]
+        mother_accepted_count += 1
+        try:
+            source_snippet = _source_snippet_for_event(
+                mother, snippet_libraries
+            )
+            environment = _pair_environment(
+                mother_event=mother,
+                trajectory=trajectory,
+                oracle_context=oracle_context,
+                base_config=base_config,
+                critical_clearance_threshold_m=(
+                    normalized_paired.near_miss_clearance_range_m[1]
+                ),
+            )
+            normal = _event_trajectory_normal(mother, trajectory)
+        except PairGenerationError as exc:
+            key = f"pair:{exc.reason}"
+            rejection_reasons[key] = rejection_reasons.get(key, 0) + 1
+            continue
+
+        if len(mother.world.occluders) != 1:
+            key = "pair:environment_occluder_count_invalid"
+            rejection_reasons[key] = rejection_reasons.get(key, 0) + 1
+            continue
+        original_occluder = mother.world.occluders[0]
+        for offset_s in normalized_paired.temporal_offset_candidates_s:
+            temporal_target = _retimed_target_candidate(
+                mother_event=mother,
+                source_snippet=source_snippet,
+                trajectory=trajectory,
+                oracle_context=oracle_context,
+                environment=environment,
+                offset_s=offset_s,
+            )
+            if temporal_target is None:
+                continue
+            temporal_clearances = _target_clearances(
+                temporal_target,
+                trajectory=trajectory,
+                environment=environment,
+            )
+            if np.any(temporal_clearances <= 0.0):
+                continue
+            if not _paths_spatially_intersect(
+                trajectory=trajectory,
+                target=temporal_target,
+                environment=environment,
+            ):
+                continue
+            pair_candidate_count += 1
+            try:
+                placement, visibility_sequences = (
+                    align_environment_occluder_to_target_los_envelope(
+                        occluder_type=str(original_occluder["type"]),
+                        normal_offset_m=float(
+                            original_occluder["normal_offset_m"]
+                        ),
+                        proposal_index=int(
+                            original_occluder["proposal_index"]
+                        ),
+                        static_occupancy=base_static,
+                        grid=grid,
+                        sensor_pose=np.zeros(3, dtype=np.float64),
+                        conflict_point=mother.target.provenance[
+                            "conflict_point"
+                        ],
+                        trajectory_normal=normal,
+                        robot_poses=trajectory.poses,
+                        robot_footprint=environment.robot_footprint,
+                        target_pose_sequences=(
+                            np.vstack(
+                                (
+                                    mother.target.current_pose,
+                                    mother.target.future_poses,
+                                )
+                            ),
+                            np.vstack(
+                                (
+                                    temporal_target.current_pose,
+                                    temporal_target.future_poses,
+                                )
+                            ),
+                        ),
+                        target_footprint=environment.target_footprint,
+                        context_trajectories=context_trajectories,
+                        context_footprints=context_footprints,
+                        config=normalized_generator["occluders"],
+                        min_contiguous_visible_frames=int(
+                            normalized_generator[
+                                "min_contiguous_visible_frames"
+                            ]
+                        ),
+                    )
+                )
+            except OccluderSamplingError as exc:
+                occluder_candidate_count += exc.attempts
+                detailed_reasons = exc.rejection_reasons or {exc.reason: 1}
+                for reason, count in detailed_reasons.items():
+                    key = f"occluder:{reason}"
+                    rejection_reasons[key] = rejection_reasons.get(
+                        key, 0
+                    ) + int(count)
+                continue
+            occluder_candidate_count += placement.attempt
+            for reason, count in placement.rejection_reasons.items():
+                key = f"occluder:{reason}"
+                rejection_reasons[key] = rejection_reasons.get(key, 0) + int(
+                    count
+                )
+            world_id = "world-" + stable_digest(
+                mother.world.world_id,
+                _JOINT_ENVIRONMENT_PAIR_VERSION,
+                placement.occluder["occluder_id"],
+                event_seed,
+                size=12,
+            )
+            metadata = {
+                **mother.world.metadata,
+                "joint_pair_generator_algorithm_version": (
+                    _JOINT_ENVIRONMENT_PAIR_VERSION
+                ),
+                "joint_pair_attempt_index": attempted_count - 1,
+                "joint_pair_anchor_schedule_s": list(anchor_schedule),
+                "joint_pair_temporal_offset_s": float(offset_s),
+                "joint_pair_occluder_candidate_attempts": placement.attempt,
+                "joint_pair_occluder_rejection_reasons": dict(
+                    placement.rejection_reasons
+                ),
+                "visibility_sequence": [
+                    bool(value) for value in visibility_sequences[0]
+                ],
+            }
+            blind_spot_config = dict(mother.world.blind_spot_config)
+            blind_spot_config["occluder_ids"] = [
+                placement.occluder["occluder_id"]
+            ]
+            updated_world = replace(
+                mother.world,
+                world_id=world_id,
+                static_occupancy=(base_static | placement.mask).astype(
+                    np.float32
+                ),
+                occluders=(dict(placement.occluder),),
+                blind_spot_config=blind_spot_config,
+                random_seed=event_seed,
+                metadata=metadata,
+            )
+            updated_mother = replace(
+                mother,
+                world=updated_world,
+                visibility_sequence=visibility_sequences[0].copy(),
+            )
+            try:
+                group = generate_paired_variants(
+                    mother_event=updated_mother,
+                    source_snippet=source_snippet,
+                    trajectory=trajectory,
+                    oracle_context=oracle_context,
+                    base_config=base_config,
+                    paired_config=normalized_paired,
+                    seed=int(seed),
+                )
+            except PairGenerationError as exc:
+                key = f"pair:{exc.reason}"
+                rejection_reasons[key] = rejection_reasons.get(key, 0) + 1
+                continue
+            if group.is_complete:
+                summary = _joint_environment_summary(
+                    seed=int(seed),
+                    anchor_schedule=anchor_schedule,
+                    attempted_count=attempted_count,
+                    mother_accepted_count=mother_accepted_count,
+                    pair_candidate_count=pair_candidate_count,
+                    occluder_candidate_count=occluder_candidate_count,
+                    rejection_reasons=rejection_reasons,
+                    mother_event=updated_mother,
+                    group=group,
+                )
+                return JointEnvironmentPairReport(
+                    mother_event=updated_mother,
+                    group=group,
+                    summary=summary,
+                )
+            for kind, reason in group.missing_variant_reasons.items():
+                key = f"variant:{kind}:{reason}"
+                rejection_reasons[key] = rejection_reasons.get(key, 0) + 1
+
+    summary = _joint_environment_summary(
+        seed=int(seed),
+        anchor_schedule=anchor_schedule,
+        attempted_count=attempted_count,
+        mother_accepted_count=mother_accepted_count,
+        pair_candidate_count=pair_candidate_count,
+        occluder_candidate_count=occluder_candidate_count,
+        rejection_reasons=rejection_reasons,
+        mother_event=None,
+        group=None,
+    )
+    return JointEnvironmentPairReport(
+        mother_event=None,
+        group=None,
+        summary=summary,
     )
 
 

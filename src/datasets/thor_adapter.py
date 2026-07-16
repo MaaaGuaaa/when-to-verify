@@ -455,13 +455,33 @@ def classify_dynamic_object(body_name: str, role: str) -> str:
     return "unknown_dynamic"
 
 
+_MISSING_CSV_VALUES = {"", "N/A", "NA", "NAN"}
+
+
+def _is_missing_csv_value(value: str) -> bool:
+    return value.strip().upper() in _MISSING_CSV_VALUES
+
+
 def _float(value: str) -> float:
-    if value.strip().upper() in {"", "N/A", "NA", "NAN"}:
+    if _is_missing_csv_value(value):
         return float("nan")
     try:
         return float(value)
     except ValueError:
         return float("nan")
+
+
+def _csv_cell(row: list[str], index: int) -> str:
+    return row[index].strip() if index < len(row) else ""
+
+
+def _same_qtm_observation(
+    left: list[str], right: list[str], qtm_column_indices: tuple[int, ...]
+) -> bool:
+    return all(
+        _csv_cell(left, index) == _csv_cell(right, index)
+        for index in qtm_column_indices
+    )
 
 
 def _regular_grid(start: float, end: float, dt_s: float) -> np.ndarray:
@@ -818,11 +838,107 @@ def load_thor_recording(
         marker_columns = {
             name: _marker_columns(header_index, name) for name in selected
         }
+        qtm_column_names = {"Frame", "Time"}
+        for body_name in selected:
+            qtm_column_names.update(
+                {
+                    f"{body_name} Centroid_X",
+                    f"{body_name} Centroid_Y",
+                    f"{body_name} Centroid_Z",
+                    *(f"{body_name} R{index}" for index in range(9)),
+                }
+            )
+            for triplet in marker_columns[body_name]:
+                qtm_column_names.update(triplet)
+        qtm_column_indices = tuple(
+            sorted(
+                header_index[name]
+                for name in qtm_column_names
+                if name in header_index
+            )
+        )
+        frame_index = header_index["Frame"]
+        time_index = header_index["Time"]
+        qtm_data_indices = tuple(
+            index
+            for index in qtm_column_indices
+            if index not in {frame_index, time_index}
+        )
+        raw_csv_row_count = 0
+        collapsed_duplicate_qtm_row_count = 0
+        ignored_auxiliary_row_count = 0
+        previous_frame = float("nan")
+        previous_timestamp = float("nan")
+        previous_qtm_row: list[str] | None = None
         for row in reader:
             if not row:
                 continue
-            timestamp = _float(row[header_index["Time"]])
+            raw_csv_row_count += 1
+            time_text = _csv_cell(row, time_index)
+            frame_text = _csv_cell(row, frame_index)
+            timestamp = _float(time_text)
+            frame = _float(frame_text)
+            finite_frame = math.isfinite(frame)
+            finite_timestamp = math.isfinite(timestamp)
+            missing_frame = _is_missing_csv_value(frame_text)
+            missing_timestamp = _is_missing_csv_value(time_text)
+            if not finite_frame or not finite_timestamp:
+                populated_qtm_columns = [
+                    header[index]
+                    for index in qtm_data_indices
+                    if not _is_missing_csv_value(_csv_cell(row, index))
+                ]
+                if (
+                    missing_frame
+                    and missing_timestamp
+                    and not populated_qtm_columns
+                ):
+                    ignored_auxiliary_row_count += 1
+                    continue
+                if missing_frame and missing_timestamp:
+                    raise ThorDataError(
+                        f"CSV row {reader.line_num} has QTM data but missing "
+                        "Frame/Time; populated QTM columns: "
+                        + ", ".join(populated_qtm_columns)
+                    )
+                raise ThorDataError(
+                    f"CSV row {reader.line_num} has invalid or incomplete "
+                    f"QTM Frame/Time: Frame={frame_text!r}, Time={time_text!r}"
+                )
+            if (
+                previous_qtm_row is not None
+                and frame == previous_frame
+                and timestamp == previous_timestamp
+            ):
+                if _same_qtm_observation(
+                    previous_qtm_row, row, qtm_column_indices
+                ):
+                    collapsed_duplicate_qtm_row_count += 1
+                    continue
+                differing_columns = [
+                    header[index]
+                    for index in qtm_column_indices
+                    if _csv_cell(previous_qtm_row, index)
+                    != _csv_cell(row, index)
+                ]
+                raise ThorDataError(
+                    "conflicting duplicate QTM frame "
+                    f"{frame:g} at {timestamp:g} s; differing columns: "
+                    + ", ".join(differing_columns)
+                )
+            if previous_qtm_row is not None and (
+                frame <= previous_frame or timestamp <= previous_timestamp
+            ):
+                raise ThorDataError(
+                    "QTM Frame/Time must strictly increase after "
+                    f"canonicalization; previous=({previous_frame:g}, "
+                    f"{previous_timestamp:g}), current=({frame:g}, "
+                    f"{timestamp:g})"
+                )
             raw_time.append(timestamp)
+            previous_frame = frame
+            previous_timestamp = timestamp
+            previous_qtm_row = row
             for body_name in selected:
                 required = (
                     f"{body_name} Centroid_X",
@@ -913,6 +1029,13 @@ def load_thor_recording(
         timestamps, position, robot_segments
     )
     resampling_report: dict[str, float | int] = {
+        "raw_csv_row_count": raw_csv_row_count,
+        "canonical_qtm_frame_count": len(raw_time),
+        "collapsed_duplicate_qtm_row_count": (
+            collapsed_duplicate_qtm_row_count
+        ),
+        "ignored_auxiliary_row_count": ignored_auxiliary_row_count,
+        "conflicting_duplicate_qtm_row_count": 0,
         "raw_robot_sample_count": raw_speed["sample_count"],
         "resampled_robot_sample_count": resampled_speed["sample_count"],
     }

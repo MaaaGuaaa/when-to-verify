@@ -37,6 +37,12 @@ def _write_toy_thor_csv(
     *,
     gap_after_s: float | None = None,
     sample_count: int = 21,
+    duplicate_qtm_index: int | None = None,
+    duplicate_qtm_conflict: bool = False,
+    auxiliary_tail_row_count: int = 0,
+    qtm_geometry_without_time_tail: bool = False,
+    nonincreasing_qtm_frame_index: int | None = None,
+    malformed_auxiliary_time_tail: bool = False,
 ) -> Path:
     marker_names = tuple(f"LO1 - {index}" for index in range(1, 5))
     header = ["Frame", "Time"]
@@ -51,6 +57,8 @@ def _write_toy_thor_csv(
                 *(f"{body} R{index}" for index in range(9)),
             )
         )
+    auxiliary_column = "Helmet_1 TB2_Accelerometer_X"
+    header.append(auxiliary_column)
 
     marker_offsets_m = (
         (-0.40, -0.10),
@@ -80,6 +88,8 @@ def _write_toy_thor_csv(
                 "Mystery_Rig": (5.0, 0.25 * timestamp),
             }
             row: dict[str, object] = {"Frame": raw_index, "Time": f"{timestamp:.3f}"}
+            if raw_index == nonincreasing_qtm_frame_index:
+                row["Frame"] = raw_index - 1
             lo_x, lo_y = positions_m["LO1"]
             for marker, (dx, dy) in zip(marker_names, marker_offsets_m):
                 world_dx = lo_cosine * dx - lo_sine * dy
@@ -98,7 +108,38 @@ def _write_toy_thor_csv(
                 )
                 for index, value in enumerate(rotation):
                     row[f"{body} R{index}"] = "" if body == "Mystery_Rig" else value
+            row[auxiliary_column] = float(raw_index)
             writer.writerow([row.get(column, "") for column in header])
+            if raw_index == duplicate_qtm_index:
+                duplicate = dict(row)
+                duplicate[auxiliary_column] = float(raw_index) + 0.5
+                if duplicate_qtm_conflict:
+                    duplicate["DARKO_Robot Centroid_X"] = (
+                        float(duplicate["DARKO_Robot Centroid_X"]) + 1.0
+                    )
+                writer.writerow([duplicate.get(column, "") for column in header])
+        for _ in range(auxiliary_tail_row_count):
+            writer.writerow(
+                ["N/A" if column == auxiliary_column else "" for column in header]
+            )
+        if qtm_geometry_without_time_tail:
+            writer.writerow(
+                [
+                    "1000.0" if column == "DARKO_Robot Centroid_X" else ""
+                    for column in header
+                ]
+            )
+        if malformed_auxiliary_time_tail:
+            writer.writerow(
+                [
+                    "not-a-time"
+                    if column == "Time"
+                    else "N/A"
+                    if column == auxiliary_column
+                    else ""
+                    for column in header
+                ]
+            )
     return path
 
 
@@ -130,6 +171,135 @@ def test_load_recording_retains_and_classifies_all_non_robot_bodies(tmp_path):
     stationary = recording.dynamic_objects["toy::Storage_Cart"]
     assert np.allclose(stationary.velocities, 0.0)
     assert recording.resampling_report["indexed_dynamic_object_count"] == 5
+
+
+def test_duplicate_qtm_rows_with_identical_geometry_are_collapsed(tmp_path):
+    from src.datasets.thor_adapter import load_thor_recording
+
+    baseline = load_thor_recording(
+        _write_toy_thor_csv(tmp_path / "THOR-Magni_baseline.csv")
+    )
+    duplicated = load_thor_recording(
+        _write_toy_thor_csv(
+            tmp_path / "THOR-Magni_duplicated.csv",
+            duplicate_qtm_index=10,
+        )
+    )
+
+    assert duplicated.resampling_report["raw_csv_row_count"] == 22
+    assert duplicated.resampling_report["canonical_qtm_frame_count"] == 21
+    assert duplicated.resampling_report["collapsed_duplicate_qtm_row_count"] == 1
+    assert duplicated.resampling_report["ignored_auxiliary_row_count"] == 0
+    assert duplicated.resampling_report["conflicting_duplicate_qtm_row_count"] == 0
+    assert np.array_equal(duplicated.timestamps, baseline.timestamps)
+    assert np.array_equal(duplicated.robot_pose, baseline.robot_pose)
+    assert np.array_equal(duplicated.robot_twist, baseline.robot_twist)
+    baseline_tracks = {
+        track.source_body_name: track
+        for track in baseline.dynamic_objects.values()
+    }
+    duplicated_tracks = {
+        track.source_body_name: track
+        for track in duplicated.dynamic_objects.values()
+    }
+    assert duplicated_tracks.keys() == baseline_tracks.keys()
+    for body_name in baseline_tracks:
+        actual = duplicated_tracks[body_name]
+        expected = baseline_tracks[body_name]
+        assert np.array_equal(actual.timestamps, expected.timestamps)
+        assert np.array_equal(actual.poses, expected.poses)
+        assert np.array_equal(actual.velocities, expected.velocities)
+        assert np.array_equal(actual.segment_ids, expected.segment_ids)
+        assert actual.footprint == expected.footprint
+        assert actual.provenance == expected.provenance
+
+
+def test_duplicate_qtm_rows_with_conflicting_geometry_are_rejected(tmp_path):
+    from src.datasets.thor_adapter import ThorDataError, load_thor_recording
+
+    path = _write_toy_thor_csv(
+        tmp_path / "THOR-Magni_conflict.csv",
+        duplicate_qtm_index=10,
+        duplicate_qtm_conflict=True,
+    )
+
+    with pytest.raises(
+        ThorDataError,
+        match=(
+            r"conflicting duplicate QTM frame 10.*"
+            r"DARKO_Robot Centroid_X"
+        ),
+    ):
+        load_thor_recording(path)
+
+
+def test_rows_without_qtm_frame_time_or_geometry_are_ignored(tmp_path):
+    from src.datasets.thor_adapter import load_thor_recording
+
+    baseline = load_thor_recording(
+        _write_toy_thor_csv(tmp_path / "THOR-Magni_aux_baseline.csv")
+    )
+    with_auxiliary_tail = load_thor_recording(
+        _write_toy_thor_csv(
+            tmp_path / "THOR-Magni_aux_tail.csv",
+            auxiliary_tail_row_count=2,
+        )
+    )
+
+    assert with_auxiliary_tail.resampling_report["raw_csv_row_count"] == 23
+    assert with_auxiliary_tail.resampling_report["canonical_qtm_frame_count"] == 21
+    assert with_auxiliary_tail.resampling_report["ignored_auxiliary_row_count"] == 2
+    assert np.array_equal(with_auxiliary_tail.timestamps, baseline.timestamps)
+    assert np.array_equal(with_auxiliary_tail.robot_pose, baseline.robot_pose)
+    assert np.array_equal(with_auxiliary_tail.robot_twist, baseline.robot_twist)
+
+
+def test_qtm_geometry_without_frame_and_time_is_rejected(tmp_path):
+    from src.datasets.thor_adapter import ThorDataError, load_thor_recording
+
+    path = _write_toy_thor_csv(
+        tmp_path / "THOR-Magni_missing_time.csv",
+        qtm_geometry_without_time_tail=True,
+    )
+
+    with pytest.raises(
+        ThorDataError,
+        match=(
+            r"QTM data but missing Frame/Time.*"
+            r"DARKO_Robot Centroid_X"
+        ),
+    ):
+        load_thor_recording(path)
+
+
+def test_qtm_frame_must_increase_after_canonicalization(tmp_path):
+    from src.datasets.thor_adapter import ThorDataError, load_thor_recording
+
+    path = _write_toy_thor_csv(
+        tmp_path / "THOR-Magni_frame_order.csv",
+        nonincreasing_qtm_frame_index=10,
+    )
+
+    with pytest.raises(
+        ThorDataError,
+        match=r"QTM Frame/Time must strictly increase after canonicalization",
+    ):
+        load_thor_recording(path)
+
+
+def test_nonempty_invalid_qtm_frame_or_time_is_rejected(tmp_path):
+    from src.datasets.thor_adapter import ThorDataError, load_thor_recording
+
+    path = _write_toy_thor_csv(
+        tmp_path / "THOR-Magni_invalid_time.csv",
+        malformed_auxiliary_time_tail=True,
+    )
+
+    with pytest.raises(
+        ThorDataError,
+        match=r"invalid or incomplete QTM Frame/Time",
+    ):
+        load_thor_recording(path)
 
 
 def test_marker_geometry_and_human_sizes_follow_frozen_policy(tmp_path):

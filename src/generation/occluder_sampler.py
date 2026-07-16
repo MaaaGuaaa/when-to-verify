@@ -696,6 +696,295 @@ def align_environment_occluder_to_target_los(
     )
 
 
+def align_environment_occluder_to_target_los_envelope(
+    *,
+    occluder_type: str,
+    normal_offset_m: float,
+    proposal_index: int,
+    static_occupancy: Any,
+    grid: GridSpec,
+    sensor_pose: Any,
+    conflict_point: Any,
+    trajectory_normal: Any,
+    robot_poses: Any,
+    robot_footprint: Footprint,
+    target_pose_sequences: Any,
+    target_footprint: Footprint,
+    context_trajectories: Mapping[str, np.ndarray],
+    context_footprints: Mapping[str, Footprint],
+    config: Mapping[str, Any],
+    min_contiguous_visible_frames: int,
+) -> tuple[OccluderPlacement, tuple[np.ndarray, ...]]:
+    """Find one thin, asymmetric occluder covering multiple current LOS rays.
+
+    Length and width remain inside the configured range for ``occluder_type``.
+    Candidate centres lie on the envelope between the per-target LOS
+    intersections at one frozen trajectory-normal coordinate.  Every returned
+    candidate clears the robot, all target trajectories, context objects, and
+    the static map while keeping every target currently hidden and eventually
+    visible.
+    """
+
+    normalized = normalize_occluder_config(config)
+    if occluder_type not in normalized["types"]:
+        raise ValueError("occluder_type is disabled by config")
+    offset = _finite_real(normal_offset_m, name="normal_offset_m")
+    offset_bounds = normalized["normal_offset_range_m"]
+    if not offset_bounds[0] <= abs(offset) <= offset_bounds[1]:
+        raise ValueError("normal_offset_m lies outside the configured range")
+    if isinstance(proposal_index, (bool, np.bool_)) or not isinstance(
+        proposal_index, (int, np.integer)
+    ):
+        raise TypeError("proposal_index must be an integer")
+    proposal_index = int(proposal_index)
+    if proposal_index < 0:
+        raise ValueError("proposal_index must be non-negative")
+    visible_frames = _positive_integer(
+        min_contiguous_visible_frames,
+        name="min_contiguous_visible_frames",
+    )
+
+    occupancy = np.asarray(static_occupancy)
+    if (
+        occupancy.shape != (grid.height, grid.width)
+        or occupancy.dtype.kind not in "biuf"
+    ):
+        raise ValueError("static_occupancy must be a numeric grid-shaped array")
+    if not np.isfinite(occupancy).all():
+        raise ValueError("static_occupancy must contain only finite values")
+    base_occupied = np.asarray(occupancy != 0, dtype=bool)
+    sensor = _vector(sensor_pose, name="sensor_pose", size=3)
+    conflict = _vector(conflict_point, name="conflict_point", size=2)
+    normal = _vector(trajectory_normal, name="trajectory_normal", size=2)
+    normal_norm = float(np.linalg.norm(normal))
+    if normal_norm <= 1e-9:
+        raise ValueError("trajectory_normal must be non-zero")
+    normal /= normal_norm
+    robot_pose_array = np.vstack(
+        (sensor, _poses(robot_poses, name="robot_poses"))
+    )
+    if set(context_trajectories) != set(context_footprints):
+        raise ValueError("context trajectory and footprint keys must match")
+    context_pose_arrays = {
+        object_id: _poses(poses, name=f"context_trajectories[{object_id!r}]")
+        for object_id, poses in sorted(context_trajectories.items())
+    }
+    pose_sequences = tuple(
+        _poses(poses, name="target_pose_sequences")
+        for poses in target_pose_sequences
+    )
+    if len(pose_sequences) < 2:
+        raise ValueError("target_pose_sequences must contain at least two paths")
+
+    desired_coordinate = float(
+        np.dot(conflict + offset * normal, normal)
+    )
+    sensor_coordinate = float(np.dot(sensor[:2], normal))
+    intersections = []
+    los_directions = []
+    for poses in pose_sequences:
+        los = poses[0, :2] - sensor[:2]
+        los_norm = float(np.linalg.norm(los))
+        denominator = float(np.dot(los, normal))
+        if los_norm <= 1e-9 or abs(denominator) <= 1e-9:
+            raise OccluderSamplingError(
+                "occluder_multilos_los_degenerate",
+                attempts=1,
+                rejection_reasons={"occluder_multilos_los_degenerate": 1},
+            )
+        fraction = (desired_coordinate - sensor_coordinate) / denominator
+        if not 0.0 < fraction < 1.0:
+            raise OccluderSamplingError(
+                "occluder_multilos_offset_outside_line_of_sight",
+                attempts=1,
+                rejection_reasons={
+                    "occluder_multilos_offset_outside_line_of_sight": 1
+                },
+            )
+        intersections.append(sensor[:2] + fraction * los)
+        los_directions.append(los / los_norm)
+
+    mean_direction = np.sum(los_directions, axis=0)
+    yaw_directions = list(los_directions)
+    if float(np.linalg.norm(mean_direction)) > 1e-9:
+        yaw_directions.append(mean_direction / np.linalg.norm(mean_direction))
+    yaw_candidates = []
+    for direction in yaw_directions:
+        yaw = float(
+            wrap_angle(np.arctan2(direction[1], direction[0]) + 0.5 * np.pi)
+        )
+        if not any(
+            np.isclose(yaw, existing, atol=1e-12, rtol=0.0)
+            for existing in yaw_candidates
+        ):
+            yaw_candidates.append(yaw)
+
+    dimensions = normalized[occluder_type]
+    quantiles = (1.0, 0.75, 0.5, 0.25, 0.0)
+    length_candidates = tuple(
+        dict.fromkeys(
+            _range_quantile(dimensions["length_range_m"], quantile)
+            for quantile in quantiles
+        )
+    )
+    width_candidates = tuple(
+        dict.fromkeys(
+            _range_quantile(dimensions["width_range_m"], quantile)
+            for quantile in reversed(quantiles)
+        )
+    )
+    alpha_candidates = (
+        0.5,
+        0.4,
+        0.6,
+        0.3,
+        0.7,
+        0.2,
+        0.8,
+        0.1,
+        0.9,
+        0.0,
+        1.0,
+    )
+    context_current = np.zeros((grid.height, grid.width), dtype=bool)
+    for object_id, poses in context_pose_arrays.items():
+        context_current |= rasterize_footprint(
+            context_footprints[object_id], poses[0], grid
+        )
+
+    rejection_reasons: dict[str, int] = {}
+    attempts = 0
+    for length_m in length_candidates:
+        for width_m in width_candidates:
+            footprint = RectangleFootprint(length_m, width_m)
+            for yaw_index, yaw in enumerate(yaw_candidates):
+                for alpha in alpha_candidates:
+                    attempts += 1
+                    center = (
+                        alpha * intersections[0]
+                        + (1.0 - alpha) * intersections[1]
+                    )
+                    pose = np.asarray(
+                        [center[0], center[1], yaw], dtype=np.float64
+                    )
+                    mask = rasterize_footprint(footprint, pose, grid)
+                    reason = None
+                    if not _inside_grid(footprint, pose, grid):
+                        reason = "occluder_out_of_bounds"
+                    elif np.any(mask & base_occupied):
+                        reason = "occluder_static_overlap"
+                    elif _intersects_robot_sweep(
+                        footprint,
+                        pose,
+                        robot_footprint,
+                        robot_pose_array,
+                        grid=grid,
+                    ):
+                        reason = "occluder_robot_swept_overlap"
+                    elif any(
+                        np.any(
+                            trajectory_signed_clearances(
+                                footprint,
+                                np.tile(pose, (poses.shape[0], 1)),
+                                context_footprints[object_id],
+                                poses,
+                            )
+                            <= 0.0
+                        )
+                        for object_id, poses in context_pose_arrays.items()
+                    ):
+                        reason = "occluder_context_collision"
+                    elif any(
+                        np.any(
+                            trajectory_signed_clearances(
+                                footprint,
+                                np.tile(pose, (poses.shape[0], 1)),
+                                target_footprint,
+                                poses,
+                            )
+                            <= 0.0
+                        )
+                        for poses in pose_sequences
+                    ):
+                        reason = "occluder_target_collision"
+                    if reason is not None:
+                        _record_rejection(rejection_reasons, reason)
+                        continue
+
+                    visibility = raycast_visibility(
+                        base_occupied | context_current | mask,
+                        grid,
+                        sensor_pose=sensor,
+                    )
+                    sequences = tuple(
+                        footprint_visibility_sequence(
+                            target_footprint,
+                            poses,
+                            visibility,
+                            grid,
+                        )
+                        for poses in pose_sequences
+                    )
+                    if any(
+                        bool(sequence[0])
+                        or not bool(sequence[-1])
+                        or not has_continuous_emergence(
+                            sequence,
+                            min_visible_frames=visible_frames,
+                        )
+                        for sequence in sequences
+                    ):
+                        _record_rejection(
+                            rejection_reasons,
+                            "occluder_multilos_visibility_invalid",
+                        )
+                        continue
+
+                    pose32 = pose.astype(np.float32)
+                    occluder = {
+                        "occluder_id": "occluder-"
+                        + stable_digest(
+                            occluder_type,
+                            proposal_index,
+                            "joint_multi_los_envelope_v1",
+                            *(f"{value:.9f}" for value in pose32),
+                            f"{length_m:.9f}",
+                            f"{width_m:.9f}",
+                            size=12,
+                        ),
+                        "type": occluder_type,
+                        "pose": [float(value) for value in pose32],
+                        "length_m": float(length_m),
+                        "width_m": float(width_m),
+                        "geometry_source": "generator_config",
+                        "placement_strategy": "joint_multi_los_envelope_v1",
+                        "normal_offset_m": float(offset),
+                        "proposal_index": proposal_index,
+                        "hidden_los_count": len(pose_sequences),
+                        "center_alpha": float(alpha),
+                        "yaw_source_index": yaw_index,
+                    }
+                    return (
+                        OccluderPlacement(
+                            occluder=occluder,
+                            footprint=footprint,
+                            pose=pose32,
+                            mask=mask.copy(),
+                            attempt=attempts,
+                            rejection_reasons=dict(
+                                sorted(rejection_reasons.items())
+                            ),
+                        ),
+                        tuple(sequence.copy() for sequence in sequences),
+                    )
+
+    raise OccluderSamplingError(
+        "occluder_multilos_unavailable",
+        attempts=attempts,
+        rejection_reasons=rejection_reasons,
+    )
+
+
 def sample_environment_occluder(
     *,
     static_occupancy: Any,

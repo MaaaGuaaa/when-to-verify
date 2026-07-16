@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -222,16 +224,27 @@ def extract_base_state_index(
     split: str,
     grid: GridSpec,
     stride_s: float = 0.6,
+    workers: int = 1,
 ) -> BaseStateExtraction:
     """Extract and combine one split without losing per-recording provenance."""
     if not recordings:
         raise ThorDataError("recordings must not be empty")
-    results = [
-        extract_base_states(
-            recording, split=split, grid=grid, stride_s=stride_s
-        )
-        for recording in sorted(recordings, key=lambda item: item.recording_id)
-    ]
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ThorDataError("workers must be a positive integer")
+    ordered = tuple(sorted(recordings, key=lambda item: item.recording_id))
+    extract_one = partial(
+        extract_base_states,
+        split=split,
+        grid=grid,
+        stride_s=stride_s,
+    )
+    if workers == 1 or len(ordered) == 1:
+        results = [extract_one(recording) for recording in ordered]
+    else:
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(ordered))
+        ) as executor:
+            results = list(executor.map(extract_one, ordered))
     base_states = tuple(
         sorted(
             (state for result in results for state in result.base_states),

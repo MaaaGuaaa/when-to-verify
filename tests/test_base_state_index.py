@@ -9,13 +9,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.contracts import build_grid_spec, validate_base_state, validate_oracle_context
 from src.datasets.thor_adapter import DynamicObjectTrack, RecordingIndex
 from src.utils.config import load_config
 
 
-def _recording(duration_s: float = 6.0) -> RecordingIndex:
+def _recording(
+    duration_s: float = 6.0,
+    *,
+    recording_id: str = "toy-recording",
+) -> RecordingIndex:
     timestamps = np.arange(0.0, duration_s + 1e-9, 0.2, dtype=np.float64)
     robot_pose = np.column_stack(
         (timestamps, np.zeros_like(timestamps), np.zeros_like(timestamps))
@@ -23,8 +28,8 @@ def _recording(duration_s: float = 6.0) -> RecordingIndex:
     robot_twist = np.tile(
         np.array([1.0, 0.0], dtype=np.float32), (timestamps.size, 1)
     )
-    human_id = "toy-recording::Helmet_1"
-    carried_id = "toy-recording::LO1"
+    human_id = f"{recording_id}::Helmet_1"
+    carried_id = f"{recording_id}::LO1"
     human = DynamicObjectTrack(
         object_id=human_id,
         source_body_name="Helmet_1",
@@ -58,15 +63,15 @@ def _recording(duration_s: float = 6.0) -> RecordingIndex:
         provenance={"geometry_source": "qtm_marker_p95"},
     )
     return RecordingIndex(
-        recording_id="toy-recording",
-        session_id="toy-session",
+        recording_id=recording_id,
+        session_id=f"{recording_id}-session",
         timestamps=timestamps,
         robot_pose=robot_pose,
         robot_twist=robot_twist,
         robot_segment_ids=np.zeros(timestamps.shape, dtype=np.int32),
         dynamic_objects={human_id: human, carried_id: carried},
         static_map=None,
-        source_file="THOR-Magni_toy-recording.csv",
+        source_file=f"THOR-Magni_{recording_id}.csv",
         dt_s=0.2,
     )
 
@@ -126,6 +131,71 @@ def test_empty_dynamic_base_states_are_accepted_not_rejected():
     assert len(result.base_states) == 3
     assert result.summary["rejected_count"] == 0
     assert result.summary["empty_dynamic_count"] == 3
+
+
+def test_parallel_base_state_extraction_matches_serial():
+    from src.datasets.base_state_index import extract_base_state_index
+
+    recordings = [
+        _recording(recording_id="parallel-a"),
+        _recording(recording_id="parallel-b"),
+    ]
+    grid = build_grid_spec(load_config())
+    serial = extract_base_state_index(
+        recordings,
+        split="train",
+        grid=grid,
+        stride_s=0.6,
+        workers=1,
+    )
+    parallel = extract_base_state_index(
+        recordings,
+        split="train",
+        grid=grid,
+        stride_s=0.6,
+        workers=2,
+    )
+
+    assert parallel.summary == serial.summary
+    assert [state.state_id for state in parallel.base_states] == [
+        state.state_id for state in serial.base_states
+    ]
+    for actual, expected in zip(parallel.base_states, serial.base_states):
+        assert actual.dynamic_object_ids == expected.dynamic_object_ids
+        assert actual.visible_dynamic_object_specs == expected.visible_dynamic_object_specs
+        assert np.array_equal(actual.robot_history, expected.robot_history)
+        assert actual.visible_dynamic_object_history.keys() == (
+            expected.visible_dynamic_object_history.keys()
+        )
+        for object_id in actual.visible_dynamic_object_history:
+            assert np.array_equal(
+                actual.visible_dynamic_object_history[object_id],
+                expected.visible_dynamic_object_history[object_id],
+            )
+    for actual, expected in zip(
+        parallel.oracle_contexts, serial.oracle_contexts
+    ):
+        assert actual.base_state_id == expected.base_state_id
+        assert actual.dynamic_object_specs == expected.dynamic_object_specs
+        assert actual.dynamic_object_future.keys() == expected.dynamic_object_future.keys()
+        for object_id in actual.dynamic_object_future:
+            assert np.array_equal(
+                actual.dynamic_object_future[object_id],
+                expected.dynamic_object_future[object_id],
+            )
+
+
+def test_base_state_extraction_rejects_nonpositive_workers():
+    from src.datasets.base_state_index import extract_base_state_index
+    from src.datasets.thor_adapter import ThorDataError
+
+    with pytest.raises(ThorDataError, match="workers must be a positive integer"):
+        extract_base_state_index(
+            [_recording()],
+            split="train",
+            grid=build_grid_spec(load_config()),
+            workers=0,
+        )
 
 
 def test_observed_objects_do_not_depend_on_future_availability():
@@ -263,3 +333,5 @@ def test_extract_base_states_cli_writes_v2_artifacts(tmp_path):
         "unknown_dynamic": 0,
     }
     assert "accepted_count=3" in completed.stdout
+    assert "workers_requested=8" in completed.stdout
+    assert "workers_used=1" in completed.stdout

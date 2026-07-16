@@ -12,6 +12,8 @@ import argparse
 import json
 import math
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import yaml
@@ -28,6 +30,18 @@ from src.datasets.thor_adapter import (  # noqa: E402
     write_recording_indexes,
 )
 from src.utils.config import load_config  # noqa: E402
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a positive integer"
+        ) from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _reject_json_constant(value: str) -> None:
@@ -154,6 +168,7 @@ def main() -> int:
         type=int,
         help="Explicit smoke-test limit after deterministic source ordering.",
     )
+    parser.add_argument("--workers", type=_positive_integer, default=8)
     args = parser.parse_args()
 
     _load_data_config(args.config)
@@ -168,15 +183,18 @@ def main() -> int:
     sources = _resolve_sources(rows, args.raw_root)
     if args.limit is not None:
         sources = sources[: args.limit]
-    recordings = [
-        load_thor_recording(
-            source,
-            dt_s=args.dt_s,
-            max_gap_s=args.max_gap_s,
-            dynamic_object_config=base_config["dynamic_objects"],
-        )
-        for source in sources
-    ]
+    worker_count = min(args.workers, len(sources))
+    load_one = partial(
+        load_thor_recording,
+        dt_s=args.dt_s,
+        max_gap_s=args.max_gap_s,
+        dynamic_object_config=base_config["dynamic_objects"],
+    )
+    if worker_count == 1:
+        recordings = [load_one(source) for source in sources]
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            recordings = list(executor.map(load_one, sources))
     paths = write_recording_indexes(
         recordings,
         split=args.split,
@@ -184,6 +202,8 @@ def main() -> int:
     )
     print(f"manifest={paths['manifest']}")
     print(f"split={args.split}")
+    print(f"workers_requested={args.workers}")
+    print(f"workers_used={worker_count}")
     print(f"recording_count={len(recordings)}")
     print(f"robot_sample_count={sum(r.timestamps.size for r in recordings)}")
     print(

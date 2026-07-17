@@ -1,0 +1,9 @@
+dataset: thor
+evaluation_scope: unseen_recording_within_known_sessions
+grouping_unit: recording_id
+recording_overlap_policy: forbidden
+session_overlap_policy: allowed_reported
+participant_overlap_policy: unavailable
+seed: 42
+raw_root: ../data/raw/thor_magni/THOR_MAGNI/CSVs_Scenarios
+assignment_manifest: ../data/manifests/sop01_split_manifest.json

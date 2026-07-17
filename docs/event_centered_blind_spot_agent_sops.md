@@ -26,7 +26,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 ### 1.2 第一版必须完成
 
 - 2D BEV、差速运动学、通用动态对象、矩形/柱状遮挡和结构性 FOV 盲区
-- 按 recording/participant 先切分，再在各 split 内独立建 snippet、base state 和样本
+- 按冻结 split policy 先切分，再在各 split 内独立建 snippet、base state 和样本
 - 六类配对事件、隐藏风险 GT、occupancy baseline、轨迹条件风险模型和校准
 - scenario bank、验证动作、验证后重规划、净验证价值 `G*` 和价值模型
 - `execute / verify / reject` 离线或轻量 2D 闭环
@@ -60,7 +60,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 | 局部 `+x` | 机器人当前前方 |
 | 局部 `+y` | 机器人当前左侧 |
 | 长度/角度 | 米 / 弧度 |
-| 历史窗口 | `K=8`、`dt=0.2 s`、总长 `1.6 s` |
+| 历史窗口 | `K=8`、`dt=0.2 s`，含当前点时覆盖 `-1.4...0.0 s` |
 | 未来窗口 | `T=15`、`dt=0.2 s`、总长 `3.0 s` |
 | BEV 范围 | `[-8, 8] m × [-8, 8] m` |
 | BEV 分辨率 | `0.1 m`，`H=W=160` |
@@ -464,7 +464,9 @@ flowchart LR
 ### 验收
 
 - `pytest tests/test_split_manager.py tests/test_split_leakage.py -q` 全部通过
-- recording/session/participant 交集均为 0
+- 通用默认策略要求 recording/session/可用 participant 交集均为 0
+- THÖR 显式采用 `unseen_recording_within_known_sessions`：recording 交集为 0、
+  recording-day session overlap 完整枚举且允许、participant 标记 unavailable
 - 相同输入与 seed 重跑 manifest 字节级一致
 - 任意 group 不被拆分
 - 比例偏差在 group 粒度可实现范围内，并报告实际比例
@@ -565,19 +567,29 @@ python scripts/00_make_splits.py \
 - [ ] 对 robot/object 轨迹按 0.2 s 网格重采样；跨度过大的 gap 不插值
 - [ ] 每 0.5–1.0 s 提取一个窗口完整的 base state
 - [ ] 将 observed 与 oracle 字段写入不同对象/文件
-- [ ] 在每个 split 和 `object_type` 内独立滑窗提取 3–5 s snippet
+- [ ] 在每个 split 和 `object_type` 内独立提取固定 4.4 s、23 点 snippet：
+      `history_steps=8`、`current_index=7`、`future_steps=15`、`dt=0.2 s`
 - [ ] snippet 归一化到首点 `(0,0)`、初始运动方向 `+x`
+- [ ] `positions/velocities` 固定 float32 `[23,2]`，`headings` 固定 float32 `[23]`，
+      全部 finite；缺少布局字段或旧 16 点/3.0 s library 必须明确失败
+- [ ] 只使用真实连续轨迹；禁止重复 current、反向/理想外推或跨 gap 插值；短 segment
+      记录 `insufficient_contiguous_duration`
 - [ ] 按对象类型过滤速度、加速度、缺失、时间断裂和 footprint 重叠；暂时静止不是删除整条对象轨迹的理由
-- [ ] 输出速度、加速度、曲率、duration 和 rejection reason 统计
+- [ ] 输出重采样前后速度、加速度、曲率以及分 split/type 的
+      candidate/accepted/rejected/rejection reason 统计
+- [ ] library、summary、manifest 写入
+      `motion_snippet_layout_version=history8_current7_future15_v1` 和新
+      `split_manifest_digest`
 - [ ] 运行 source overlap audit
 
 ### 验收
 
 - 最低 base states `≥2,000`，理想 `≥10,000`
 - 最低 snippets `≥1,000`，理想 `≥5,000`
-- train/calibration/val/test 的 recording、participant 和 snippet source object 交集为 0
-- 无 NaN/Inf，shape/dtype 与 schema 一致
-- 重采样后的速度分布与原始分布差异有量化报告，不出现系统性单位错误
+- train/calibration/val/test 的 recording 和 snippet source object 交集为 0；THÖR
+  session overlap 必须报告但允许，participant 不得伪造
+- 无 NaN/Inf；snippet shape/dtype 精确为 `[23,2]/[23]` float32
+- 重采样前后的速度、加速度和曲率差异有量化报告，不出现系统性单位错误
 - `human` snippet 速度范围 `0.3–2.0 m/s`；其他类型速度下限 `0.05 m/s`，所有类型加速度不超过各自配置阈值
 - 随机抽取 50 条 robot/object/snippet 轨迹人工检查，并覆盖每个实际出现的对象类型
 
@@ -683,6 +695,9 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       重新分类；生成的 target ID 必须确定、不得与上下文对象 ID 冲突，并另存
       `source_object_id` 作为 provenance
 - [ ] 对目标 snippet 做 SE(2) 和 `0.8–1.2` 时间缩放
+- [ ] 固定切片 `history=transformed_poses[0:8]`、`current=transformed_poses[7]`、
+      `future=transformed_poses[8:23]`；冲突 source anchor 必须为
+      `1.4+conflict_time_s`，禁止直接使用 `conflict_time_s`
 - [ ] 横穿方向与轨迹法向夹角默认 `<35°`
 - [ ] 使用对象真实 circle/rectangle footprint 与逐帧 yaw 检查不穿墙、
       速度/加速度、当前不可见、未来进入局部图和当前不重叠
@@ -1310,7 +1325,9 @@ python scripts/08_generate_verification_dataset.py \
 - split 必须先于 snippet、base state、event 和 sample 生成
 - calibration 统计量只能由 calibration split 拟合
 - signature 标准化只能由 train split 拟合
-- 同一 recording、participant、snippet、pair group 和 seed namespace 不跨 split
+- 同一 recording、snippet source object、snippet、pair group 和 seed namespace 不跨
+  split；通用数据集继续隔离可用 participant，THÖR participant unavailable 且 session
+  overlap 仅按已批准 policy 枚举后允许
 - 所有 baseline 使用相同 split manifest
 
 ### 23.2 Oracle 泄漏

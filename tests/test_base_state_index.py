@@ -16,6 +16,19 @@ from src.datasets.thor_adapter import DynamicObjectTrack, RecordingIndex
 from src.utils.config import load_config
 
 
+def _split_provenance() -> dict[str, object]:
+    return {
+        "split_manifest_digest": "0123456789abcdef0123456789abcdef",
+        "evaluation_scope": "unseen_recording_within_known_sessions",
+        "grouping_unit": "recording_id",
+        "field_policies": {
+            "recording": "forbidden",
+            "session": "allowed_reported",
+            "participant": "unavailable",
+        },
+    }
+
+
 def _recording(
     duration_s: float = 6.0,
     *,
@@ -268,7 +281,11 @@ def test_base_and_oracle_artifacts_keep_dynamic_provenance_separate(tmp_path):
     result = extract_base_states(
         _recording(), split="train", grid=grid, stride_s=0.6
     )
-    paths = write_base_state_extraction(result, tmp_path / "base-index")
+    paths = write_base_state_extraction(
+        result,
+        tmp_path / "base-index",
+        split_provenance=_split_provenance(),
+    )
 
     assert paths["base_states"].name == "base_states"
     assert paths["oracle_contexts"].name == "oracle_contexts"
@@ -290,6 +307,10 @@ def test_base_and_oracle_artifacts_keep_dynamic_provenance_separate(tmp_path):
         "toy-recording::Helmet_1",
         "toy-recording::LO1",
     ]
+    assert manifest_rows[0]["split_provenance"] == _split_provenance()
+    assert oracle_rows[0]["split_provenance"] == _split_provenance()
+    summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+    assert summary["split_provenance"] == _split_provenance()
 
 
 def test_extract_base_states_cli_writes_v2_artifacts(tmp_path):
@@ -299,6 +320,7 @@ def test_extract_base_states_cli_writes_v2_artifacts(tmp_path):
         [_recording()],
         split="train",
         output_dir=tmp_path / "indexes/train",
+        split_provenance=_split_provenance(),
     )
     root = Path(__file__).resolve().parents[1]
     completed = subprocess.run(
@@ -332,6 +354,44 @@ def test_extract_base_states_cli_writes_v2_artifacts(tmp_path):
         "human": 1,
         "unknown_dynamic": 0,
     }
+    assert summary["split_provenance"] == _split_provenance()
     assert "accepted_count=3" in completed.stdout
     assert "workers_requested=8" in completed.stdout
     assert "workers_used=1" in completed.stdout
+
+
+def test_extract_base_states_cli_rejects_mixed_split_digests(tmp_path):
+    from src.datasets.thor_adapter import write_recording_indexes
+
+    for split in ("train", "calibration", "val", "test"):
+        provenance = _split_provenance()
+        if split == "test":
+            provenance["split_manifest_digest"] = "f" * 32
+        write_recording_indexes(
+            [_recording(recording_id=f"{split}-recording")],
+            split=split,
+            output_dir=tmp_path / f"indexes/{split}",
+            split_provenance=provenance,
+        )
+    root = Path(__file__).resolve().parents[1]
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/03_extract_base_states.py"),
+            "--config",
+            str(root / "configs/data_thor.yaml"),
+            "--all-splits",
+            "--recording-dir",
+            str(tmp_path / "indexes"),
+            "--output-dir",
+            str(tmp_path / "states"),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "different split provenance" in completed.stderr

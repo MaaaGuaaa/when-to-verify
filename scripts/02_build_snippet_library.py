@@ -25,10 +25,15 @@ from src.datasets.snippet_library import (  # noqa: E402
     load_snippet_library,
     write_snippet_artifacts,
 )
-from src.datasets.split_manager import SPLIT_NAMES, SplitLeakageError  # noqa: E402
+from src.datasets.split_manager import (  # noqa: E402
+    SPLIT_NAMES,
+    SplitAuditPolicy,
+    SplitLeakageError,
+)
 from src.datasets.thor_adapter import (  # noqa: E402
     ThorDataError,
     load_recording_indexes_from_dir,
+    load_recording_split_provenance,
 )
 from src.utils.config import load_config  # noqa: E402
 
@@ -75,7 +80,7 @@ def main() -> int:
         type=Path,
         default=_ROOT / "outputs/snippets",
     )
-    parser.add_argument("--duration-s", type=float, default=3.0)
+    parser.add_argument("--duration-s", type=float, default=4.4)
     parser.add_argument("--stride-s", type=float, default=1.0)
     parser.add_argument("--workers", type=_positive_integer, default=8)
     args = parser.parse_args()
@@ -85,6 +90,9 @@ def main() -> int:
     recordings = load_recording_indexes_from_dir(
         args.recording_dir / args.split,
         expected_split=args.split,
+    )
+    split_provenance = load_recording_split_provenance(
+        args.recording_dir / args.split
     )
     expected_dt = float(base_config["bev"]["history_dt_s"])
     if float(base_config["bev"]["future_dt_s"]) != expected_dt:
@@ -108,6 +116,7 @@ def main() -> int:
                     thresholds["max_acceleration_mps2"]
                 ),
                 workers=args.workers,
+                split_provenance=split_provenance,
             )
         )
 
@@ -117,8 +126,25 @@ def main() -> int:
             path = args.output_dir / split / object_type / "snippet_library.npz"
             if path.is_file():
                 existing.append(load_snippet_library(path))
-    report = audit_snippet_source_overlap([*existing, *libraries])
-    if report["total_overlap_count"]:
+    field_policies = split_provenance["field_policies"]
+    audit_policy = SplitAuditPolicy(
+        evaluation_scope=str(split_provenance["evaluation_scope"]),
+        required_fields=("recording", "session"),
+        allowed_overlap_fields=(
+            ("session",)
+            if field_policies.get("session") == "allowed_reported"
+            else ()
+        ),
+        unavailable_fields=(
+            ("participant",)
+            if field_policies.get("participant") == "unavailable"
+            else ()
+        ),
+    )
+    report = audit_snippet_source_overlap(
+        [*existing, *libraries], policy=audit_policy
+    )
+    if report["disallowed_overlap_count"]:
         raise SplitLeakageError("snippet source overlap detected")
     paths = [
         write_snippet_artifacts(
@@ -149,7 +175,18 @@ def main() -> int:
         "total_rejected_count="
         f"{sum(int(item.summary['rejected_count']) for item in libraries)}"
     )
-    print(f"source_overlap_count={report['total_overlap_count']}")
+    print(
+        "detected_source_overlap_count="
+        f"{report['detected_overlap_count']}"
+    )
+    print(
+        "allowed_session_overlap_count="
+        f"{report['allowed_overlap_count']}"
+    )
+    print(
+        "disallowed_source_overlap_count="
+        f"{report['disallowed_overlap_count']}"
+    )
     return 0
 
 

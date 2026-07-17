@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from src.contracts import (
     validate_oracle_context,
 )
 from src.geometry.transforms import transform_poses_global_to_local
+from src.datasets.split_manager import validate_split_provenance
 from src.utils.seeding import stable_digest
 
 from .thor_adapter import RecordingIndex, ThorDataError, validate_recording_index
@@ -319,11 +321,15 @@ def _json_bytes(payload: object, *, lines: bool = False) -> bytes:
 
 
 def write_base_state_extraction(
-    extraction: BaseStateExtraction, output_dir: str | Path
+    extraction: BaseStateExtraction,
+    output_dir: str | Path,
+    *,
+    split_provenance: Mapping[str, object],
 ) -> dict[str, Path]:
     """Atomically write observable and oracle artifacts to separate trees."""
     if len(extraction.base_states) != len(extraction.oracle_contexts):
         raise ThorDataError("base state and oracle context counts must match")
+    provenance = validate_split_provenance(split_provenance)
     pairs = sorted(
         zip(extraction.base_states, extraction.oracle_contexts),
         key=lambda pair: pair[0].state_id,
@@ -357,6 +363,7 @@ def write_base_state_extraction(
                     "dynamic_object_ids": list(state.dynamic_object_ids),
                     "timestamp": state.timestamp,
                     "base_state_file": f"base_states/{state.state_id}.npz",
+                    "split_provenance": provenance,
                 }
             )
             oracle_manifest.append(
@@ -372,9 +379,14 @@ def write_base_state_extraction(
                     "oracle_context_file": (
                         f"oracle_contexts/{oracle.base_state_id}.npz"
                     ),
+                    "split_provenance": provenance,
                 }
             )
-        summary = {"schema_version": SCHEMA_VERSION, **extraction.summary}
+        summary = {
+            "schema_version": SCHEMA_VERSION,
+            **extraction.summary,
+            "split_provenance": provenance,
+        }
         (staging / "base_state_manifest.jsonl").write_bytes(
             _json_bytes(base_manifest, lines=True)
         )

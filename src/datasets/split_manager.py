@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -77,6 +78,16 @@ class SplitResult:
     manifest_digest: str
 
 
+@dataclass(frozen=True)
+class SplitAuditPolicy:
+    """Explicit provenance coverage and overlap semantics for one evaluation."""
+
+    evaluation_scope: str = "strict_group_isolation"
+    required_fields: tuple[str, ...] = ()
+    allowed_overlap_fields: tuple[str, ...] = ()
+    unavailable_fields: tuple[str, ...] = ()
+
+
 class _UnionFind:
     def __init__(self, size: int) -> None:
         self.parent = list(range(size))
@@ -112,13 +123,70 @@ def _audit_values(row: Mapping[str, object], aliases: tuple[str, ...]) -> set[st
     return values
 
 
+def _validate_audit_policy(policy: SplitAuditPolicy) -> None:
+    if (
+        not isinstance(policy.evaluation_scope, str)
+        or not policy.evaluation_scope
+    ):
+        raise SplitIndexError("evaluation_scope must be a non-empty string")
+    configured: dict[str, set[str]] = {}
+    for name in (
+        "required_fields",
+        "allowed_overlap_fields",
+        "unavailable_fields",
+    ):
+        values = getattr(policy, name)
+        if not isinstance(values, tuple):
+            raise SplitIndexError(f"{name} must be a tuple")
+        if any(not isinstance(value, str) for value in values):
+            raise SplitIndexError(f"{name} entries must be strings")
+        value_set = set(values)
+        if len(value_set) != len(values):
+            raise SplitIndexError(f"{name} entries must be unique")
+        unknown = value_set - set(_AUDIT_FIELD_ALIASES)
+        if unknown:
+            raise SplitIndexError(
+                f"{name} contains unknown audit fields: "
+                + ", ".join(sorted(unknown))
+            )
+        configured[name] = value_set
+    if configured["allowed_overlap_fields"] & configured["unavailable_fields"]:
+        raise SplitIndexError(
+            "allowed_overlap_fields and unavailable_fields must not overlap"
+        )
+    if configured["required_fields"] & configured["unavailable_fields"]:
+        raise SplitIndexError(
+            "required_fields and unavailable_fields must not overlap"
+        )
+
+
+def _field_policies(policy: SplitAuditPolicy) -> dict[str, str]:
+    allowed = set(policy.allowed_overlap_fields)
+    unavailable = set(policy.unavailable_fields)
+    return {
+        field: (
+            "unavailable"
+            if field in unavailable
+            else "allowed_reported"
+            if field in allowed
+            else "forbidden"
+        )
+        for field in _AUDIT_FIELD_ALIASES
+    }
+
+
 def audit_split_leakage(
     records: Sequence[Mapping[str, object]],
+    *,
+    policy: SplitAuditPolicy | None = None,
 ) -> dict[str, object]:
     """Return deterministic cross-split overlaps for source provenance fields."""
+    effective_policy = policy or SplitAuditPolicy()
+    _validate_audit_policy(effective_policy)
     values_by_field: dict[str, dict[str, set[str]]] = {
         field: {} for field in _AUDIT_FIELD_ALIASES
     }
+    rows_with_values = {field: 0 for field in _AUDIT_FIELD_ALIASES}
     for index, row in enumerate(records):
         if not isinstance(row, Mapping):
             raise SplitIndexError(f"row {index} must be a mapping")
@@ -130,40 +198,102 @@ def audit_split_leakage(
                 f"row {index} split must be one of " + ", ".join(SPLIT_NAMES)
             )
         for field, aliases in _AUDIT_FIELD_ALIASES.items():
-            for value in _audit_values(row, aliases):
+            values = _audit_values(row, aliases)
+            if values:
+                rows_with_values[field] += 1
+            for value in values:
                 values_by_field[field].setdefault(value, set()).add(split)
 
     field_reports: dict[str, dict[str, object]] = {}
-    total_overlap_count = 0
+    detected_overlap_count = 0
+    allowed_overlap_count = 0
+    disallowed_overlap_count = 0
+    field_policies = _field_policies(effective_policy)
     for field in _AUDIT_FIELD_ALIASES:
         overlaps = [
             {"value": value, "splits": sorted(splits)}
             for value, splits in sorted(values_by_field[field].items())
             if len(splits) > 1
         ]
-        total_overlap_count += len(overlaps)
+        overlap_count = len(overlaps)
+        detected_overlap_count += overlap_count
+        if field_policies[field] == "allowed_reported":
+            allowed_overlap_count += overlap_count
+        else:
+            disallowed_overlap_count += overlap_count
         field_reports[field] = {
-            "overlap_count": len(overlaps),
+            "overlap_count": overlap_count,
             "overlaps": overlaps,
         }
+    row_count = len(records)
+    required_fields = set(effective_policy.required_fields)
+    field_coverage = {}
+    missing_required_row_count = 0
+    for field in _AUDIT_FIELD_ALIASES:
+        populated = rows_with_values[field]
+        missing = row_count - populated
+        if field in required_fields:
+            missing_required_row_count += missing
+        if field_policies[field] == "unavailable":
+            coverage_status = "unavailable"
+        elif missing == 0:
+            coverage_status = "complete"
+        elif field in required_fields:
+            coverage_status = "incomplete"
+        elif populated:
+            coverage_status = "partial"
+        else:
+            coverage_status = "unavailable"
+        field_coverage[field] = {
+            "row_count": row_count,
+            "rows_with_values": populated,
+            "missing_row_count": missing,
+            "unique_value_count": len(values_by_field[field]),
+            "status": coverage_status,
+        }
+    if missing_required_row_count:
+        status = "provenance_incomplete"
+    elif disallowed_overlap_count:
+        status = "leakage_detected"
+    else:
+        status = "ok"
     return {
-        "status": "ok" if total_overlap_count == 0 else "leakage_detected",
-        "total_overlap_count": total_overlap_count,
+        "status": status,
+        "evaluation_scope": effective_policy.evaluation_scope,
+        "total_overlap_count": detected_overlap_count,
+        "detected_overlap_count": detected_overlap_count,
+        "allowed_overlap_count": allowed_overlap_count,
+        "disallowed_overlap_count": disallowed_overlap_count,
+        "missing_required_row_count": missing_required_row_count,
+        "field_policies": field_policies,
+        "field_coverage": field_coverage,
         "fields": field_reports,
     }
 
 
 def assert_no_split_leakage(
     records: Sequence[Mapping[str, object]],
+    *,
+    policy: SplitAuditPolicy | None = None,
 ) -> dict[str, object]:
     """Return the clean report or raise with all leaking provenance fields."""
-    report = audit_split_leakage(records)
-    if report["total_overlap_count"]:
+    report = audit_split_leakage(records, policy=policy)
+    if report["missing_required_row_count"]:
+        missing_fields = [
+            field
+            for field in _AUDIT_FIELD_ALIASES
+            if report["field_coverage"][field]["status"] == "incomplete"
+        ]
+        raise SplitLeakageError(
+            "missing required provenance: " + ", ".join(missing_fields)
+        )
+    if report["disallowed_overlap_count"]:
         fields = report["fields"]
         leaking_fields = [
             field
             for field in _AUDIT_FIELD_ALIASES
             if fields[field]["overlap_count"]
+            and report["field_policies"][field] != "allowed_reported"
         ]
         raise SplitLeakageError(
             "cross-split leakage detected for: " + ", ".join(leaking_fields)
@@ -269,6 +399,63 @@ def _validate_json_value(value: object, path: str) -> None:
     raise SplitIndexError(f"{path} has unsupported type {type(value).__name__}")
 
 
+def validate_split_provenance(
+    provenance: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate and detach the split identity propagated to downstream data."""
+    if not isinstance(provenance, Mapping):
+        raise SplitIndexError("split provenance must be a mapping")
+    required = {
+        "split_manifest_digest",
+        "evaluation_scope",
+        "grouping_unit",
+        "field_policies",
+    }
+    missing = required - set(provenance)
+    if missing:
+        raise SplitIndexError(
+            "split provenance missing required field(s): "
+            + ", ".join(sorted(missing))
+        )
+    digest = provenance["split_manifest_digest"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{32}", digest) is None:
+        raise SplitIndexError(
+            "split_manifest_digest must be a lowercase BLAKE2b-128 hex digest"
+        )
+    for name in ("evaluation_scope", "grouping_unit"):
+        value = provenance[name]
+        if not isinstance(value, str) or not value:
+            raise SplitIndexError(f"{name} must be a non-empty string")
+    policies = provenance["field_policies"]
+    if not isinstance(policies, Mapping):
+        raise SplitIndexError("field_policies must be a mapping")
+    required_policies = {"recording", "session", "participant"}
+    missing_policies = required_policies - set(policies)
+    if missing_policies:
+        raise SplitIndexError(
+            "field_policies missing required field(s): "
+            + ", ".join(sorted(missing_policies))
+        )
+    allowed_policies = {"forbidden", "allowed_reported", "unavailable"}
+    if any(
+        not isinstance(field, str) or policy not in allowed_policies
+        for field, policy in policies.items()
+    ):
+        raise SplitIndexError(
+            "field_policies values must be forbidden, allowed_reported, or unavailable"
+        )
+    _validate_json_value(provenance, "split_provenance")
+    return json.loads(
+        json.dumps(
+            provenance,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+
+
 def _validate_source_index(
     records: Sequence[Mapping[str, object]], seed: int
 ) -> None:
@@ -354,6 +541,133 @@ def _group_quotas(group_count: int, ratios: Mapping[str, float]) -> dict[str, in
     for split in remainder_order[:remaining]:
         quotas[split] += 1
     return quotas
+
+
+def freeze_preassigned_split(
+    records: Sequence[Mapping[str, object]],
+    split_by_recording: Mapping[str, str],
+    *,
+    seed: int,
+    policy: SplitAuditPolicy,
+) -> SplitResult:
+    """Freeze an externally approved recording assignment with full audit."""
+    _validate_audit_policy(policy)
+    _validate_source_index(records, seed)
+    if not isinstance(split_by_recording, Mapping):
+        raise SplitIndexError("split_by_recording must be a mapping")
+    assignments: dict[str, str] = {}
+    for recording_id, split in split_by_recording.items():
+        if not isinstance(recording_id, str) or not recording_id:
+            raise SplitIndexError("assignment recording ids must be non-empty strings")
+        if split not in SPLIT_NAMES:
+            raise SplitIndexError(
+                "assignment splits must be one of " + ", ".join(SPLIT_NAMES)
+            )
+        assignments[recording_id] = split
+
+    ordered = [dict(row) for row in sorted(records, key=_canonical_row)]
+    recording_ids: list[str] = []
+    for row in ordered:
+        recording_id = row.get("recording_id")
+        if not isinstance(recording_id, str) or not recording_id:
+            raise SplitIndexError("every preassigned row needs a recording_id")
+        recording_ids.append(recording_id)
+    if len(recording_ids) != len(set(recording_ids)):
+        raise SplitIndexError("preassigned recording ids must be unique")
+    metadata_ids = set(recording_ids)
+    assignment_ids = set(assignments)
+    if metadata_ids != assignment_ids:
+        missing = sorted(metadata_ids - assignment_ids)
+        extra = sorted(assignment_ids - metadata_ids)
+        details = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if extra:
+            details.append("extra=" + ",".join(extra))
+        raise SplitIndexError("assignment id mismatch: " + "; ".join(details))
+
+    field_policies = _field_policies(policy)
+    participant_unavailable = field_policies["participant"] == "unavailable"
+    manifest: list[dict[str, object]] = []
+    for row in ordered:
+        recording_id = str(row["recording_id"])
+        split = assignments[recording_id]
+        participant_check = (
+            "unavailable"
+            if participant_unavailable or not _participant_ids(row)
+            else "available"
+        )
+        manifest.append(
+            {
+                **row,
+                "group_id": (
+                    f"group-{stable_digest('recording', recording_id, size=12)}"
+                ),
+                "split": split,
+                "seed_namespace": f"split/{split}/generator",
+                "generator_seed": derive_seed(
+                    seed, "split", split, "generator"
+                ),
+                "participant_check": participant_check,
+                "evaluation_scope": policy.evaluation_scope,
+                "grouping_unit": "recording_id",
+                "recording_overlap_policy": field_policies["recording"],
+                "session_overlap_policy": field_policies["session"],
+                "participant_overlap_policy": field_policies["participant"],
+                "schema_version": SCHEMA_VERSION,
+            }
+        )
+    manifest.sort(key=_canonical_row)
+    frozen_manifest = tuple(manifest)
+    overlap_report = assert_no_split_leakage(
+        frozen_manifest, policy=policy
+    )
+    manifest_payload = serialize_manifest(frozen_manifest)
+    manifest_digest = hashlib.blake2b(
+        manifest_payload, digest_size=16
+    ).hexdigest()
+    record_count = len(frozen_manifest)
+    split_statistics = {
+        split: {
+            "record_count": sum(
+                row["split"] == split for row in frozen_manifest
+            ),
+            "actual_record_ratio": (
+                sum(row["split"] == split for row in frozen_manifest)
+                / record_count
+            ),
+        }
+        for split in SPLIT_NAMES
+    }
+    summary: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "seed": seed,
+        "evaluation_scope": policy.evaluation_scope,
+        "grouping_unit": "recording_id",
+        "field_policies": field_policies,
+        "source_record_count": record_count,
+        "connected_group_count": record_count,
+        "participant_check": (
+            "unavailable"
+            if participant_unavailable
+            else "available"
+            if all(
+                row["participant_check"] == "available"
+                for row in frozen_manifest
+            )
+            else "unavailable"
+        ),
+        "manifest_digest": manifest_digest,
+        "split_statistics": split_statistics,
+    }
+    overlap_report["schema_version"] = SCHEMA_VERSION
+    overlap_report["manifest_digest"] = manifest_digest
+    return SplitResult(
+        manifest=frozen_manifest,
+        summary=summary,
+        overlap_report=overlap_report,
+        manifest_digest=manifest_digest,
+    )
 
 
 def make_split_manifest(

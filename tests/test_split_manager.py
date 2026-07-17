@@ -12,6 +12,67 @@ import sys
 import pytest
 
 
+def _split_provenance() -> dict[str, object]:
+    return {
+        "split_manifest_digest": "0123456789abcdef0123456789abcdef",
+        "evaluation_scope": "unseen_recording_within_known_sessions",
+        "grouping_unit": "recording_id",
+        "field_policies": {
+            "recording": "forbidden",
+            "session": "allowed_reported",
+            "participant": "unavailable",
+        },
+    }
+
+
+def test_split_provenance_validation_returns_detached_canonical_mapping():
+    from src.datasets.split_manager import validate_split_provenance
+
+    source = _split_provenance()
+    validated = validate_split_provenance(source)
+
+    assert validated == source
+    assert validated is not source
+    assert validated["field_policies"] is not source["field_policies"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda value: value.pop("split_manifest_digest"),
+            "split_manifest_digest",
+        ),
+        (
+            lambda value: value.__setitem__(
+                "split_manifest_digest", "not-a-blake2b-digest"
+            ),
+            "split_manifest_digest",
+        ),
+        (
+            lambda value: value.__setitem__("score", float("nan")),
+            "NaN/Inf",
+        ),
+        (
+            lambda value: value["field_policies"].__setitem__(
+                "session", "silently_allowed"
+            ),
+            "field_policies",
+        ),
+    ],
+)
+def test_split_provenance_validation_rejects_incomplete_or_invalid_payloads(
+    mutate, message
+):
+    from src.datasets.split_manager import SplitIndexError, validate_split_provenance
+
+    provenance = _split_provenance()
+    mutate(provenance)
+
+    with pytest.raises(SplitIndexError, match=message):
+        validate_split_provenance(provenance)
+
+
 def test_shared_recording_and_participant_form_one_connected_group():
     from src.datasets.split_manager import make_split_manifest
 
@@ -93,6 +154,83 @@ def test_manifest_bytes_are_independent_of_input_order_for_same_seed():
     reverse = make_split_manifest(list(reversed(records)), seed=17)
 
     assert serialize_manifest(forward.manifest) == serialize_manifest(reverse.manifest)
+
+
+def test_preassigned_recording_split_preserves_assignment_and_policy():
+    from src.datasets.split_manager import (
+        SplitAuditPolicy,
+        freeze_preassigned_split,
+        serialize_manifest,
+    )
+
+    records = [
+        {
+            "recording_id": f"recording-{split}",
+            "session_id": "120522",
+            "source_path": f"Scenario_1/recording-{split}.csv",
+        }
+        for split in ("train", "calibration", "val", "test")
+    ]
+    assignments = {
+        f"recording-{split}": split
+        for split in ("train", "calibration", "val", "test")
+    }
+    policy = SplitAuditPolicy(
+        evaluation_scope="unseen_recording_within_known_sessions",
+        required_fields=("recording", "session", "seed_namespace"),
+        allowed_overlap_fields=("session",),
+        unavailable_fields=("participant",),
+    )
+
+    forward = freeze_preassigned_split(
+        records, assignments, seed=42, policy=policy
+    )
+    reverse = freeze_preassigned_split(
+        list(reversed(records)), assignments, seed=42, policy=policy
+    )
+
+    assert serialize_manifest(forward.manifest) == serialize_manifest(
+        reverse.manifest
+    )
+    assert {
+        row["recording_id"]: row["split"] for row in forward.manifest
+    } == assignments
+    assert {row["evaluation_scope"] for row in forward.manifest} == {
+        "unseen_recording_within_known_sessions"
+    }
+    assert {row["session_overlap_policy"] for row in forward.manifest} == {
+        "allowed_reported"
+    }
+    assert {row["participant_check"] for row in forward.manifest} == {
+        "unavailable"
+    }
+    assert forward.summary["source_record_count"] == 4
+    assert forward.summary["grouping_unit"] == "recording_id"
+    assert forward.summary["split_statistics"] == {
+        split: {"record_count": 1, "actual_record_ratio": 0.25}
+        for split in ("train", "calibration", "val", "test")
+    }
+    assert forward.overlap_report["allowed_overlap_count"] == 1
+    assert forward.overlap_report["disallowed_overlap_count"] == 0
+
+
+def test_preassigned_recording_split_requires_exact_assignment_ids():
+    from src.datasets.split_manager import (
+        SplitAuditPolicy,
+        SplitIndexError,
+        freeze_preassigned_split,
+    )
+
+    policy = SplitAuditPolicy(required_fields=("recording", "session"))
+    records = [{"recording_id": "recording-a", "session_id": "120522"}]
+
+    with pytest.raises(SplitIndexError, match="assignment id mismatch"):
+        freeze_preassigned_split(
+            records,
+            {"recording-b": "train"},
+            seed=42,
+            policy=policy,
+        )
 
 
 def test_each_split_has_an_independent_seed_namespace():

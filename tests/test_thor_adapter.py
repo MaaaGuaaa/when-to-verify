@@ -14,6 +14,19 @@ import numpy as np
 import pytest
 
 
+def _split_provenance() -> dict[str, object]:
+    return {
+        "split_manifest_digest": "0123456789abcdef0123456789abcdef",
+        "evaluation_scope": "unseen_recording_within_known_sessions",
+        "grouping_unit": "recording_id",
+        "field_policies": {
+            "recording": "forbidden",
+            "session": "allowed_reported",
+            "participant": "unavailable",
+        },
+    }
+
+
 _BODIES = (
     "DARKO_Robot",
     "Helmet_1",
@@ -43,6 +56,7 @@ def _write_toy_thor_csv(
     qtm_geometry_without_time_tail: bool = False,
     nonincreasing_qtm_frame_index: int | None = None,
     malformed_auxiliary_time_tail: bool = False,
+    curved_motion: bool = False,
 ) -> Path:
     marker_names = tuple(f"LO1 - {index}" for index in range(1, 5))
     header = ["Frame", "Time"]
@@ -79,9 +93,16 @@ def _write_toy_thor_csv(
             timestamp = raw_index * 0.1
             if gap_after_s is not None and timestamp > gap_after_s:
                 timestamp += 0.5
+            robot_y = 0.25 * timestamp**2 if curved_motion else 0.0
+            helmet_1_x = 2.0 + timestamp if curved_motion else 2.0
+            helmet_1_y = (
+                0.25 * timestamp**2
+                if curved_motion
+                else 0.5 * timestamp
+            )
             positions_m = {
-                "DARKO_Robot": (timestamp, 0.0),
-                "Helmet_1": (2.0, 0.5 * timestamp),
+                "DARKO_Robot": (timestamp, robot_y),
+                "Helmet_1": (helmet_1_x, helmet_1_y),
                 "Helmet_6": (2.5, 0.4 * timestamp),
                 "LO1": (3.0 + 0.2 * timestamp, 1.5),
                 "Storage_Cart": (4.0, 2.0),
@@ -361,6 +382,31 @@ def test_recording_index_round_trip_uses_no_pickle(tmp_path):
         assert actual.provenance == expected.provenance
 
 
+def test_recording_artifacts_stamp_validated_split_provenance(tmp_path):
+    from src.datasets.thor_adapter import (
+        load_thor_recording,
+        write_recording_indexes,
+    )
+
+    recording = load_thor_recording(
+        _write_toy_thor_csv(tmp_path / "THOR-Magni_provenance.csv")
+    )
+    paths = write_recording_indexes(
+        [recording],
+        split="train",
+        output_dir=tmp_path / "indexes/train",
+        split_provenance=_split_provenance(),
+    )
+
+    rows = [
+        json.loads(line)
+        for line in paths["manifest"].read_text(encoding="utf-8").splitlines()
+    ]
+    summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+    assert rows[0]["split_provenance"] == _split_provenance()
+    assert summary["split_provenance"] == _split_provenance()
+
+
 def test_validate_recording_index_rejects_nonfinite_object_pose(tmp_path):
     from src.datasets.thor_adapter import (
         ThorDataError,
@@ -406,44 +452,98 @@ def test_resampling_keeps_large_time_gaps_in_separate_segments(tmp_path):
     assert set(track.segment_ids.tolist()) == {0, 1}
     assert recording.resampling_report["robot_speed_p50_delta_mps"] < 1e-6
     assert recording.resampling_report["dynamic_object_speed_p50_delta_mps"] < 1e-6
+    assert recording.resampling_report[
+        "raw_robot_acceleration_p50_mps2"
+    ] < 1e-6
+    assert recording.resampling_report[
+        "resampled_robot_abs_curvature_p50_per_m"
+    ] < 1e-6
+
+
+def test_resampling_reports_speed_acceleration_and_curvature_quantiles(tmp_path):
+    from src.datasets.thor_adapter import load_thor_recording
+
+    recording = load_thor_recording(
+        _write_toy_thor_csv(
+            tmp_path / "THOR-Magni_curved.csv", curved_motion=True
+        ),
+        dt_s=0.2,
+        max_gap_s=0.3,
+    )
+    report = recording.resampling_report
+
+    units = {
+        "speed": "mps",
+        "acceleration": "mps2",
+        "abs_curvature": "per_m",
+    }
+    for scope in ("robot", "dynamic_object"):
+        for stage in ("raw", "resampled"):
+            for metric, unit in units.items():
+                assert report[
+                    f"{stage}_{scope}_{metric}_sample_count"
+                ] > 0
+                for quantile in ("p05", "p50", "p95"):
+                    value = report[
+                        f"{stage}_{scope}_{metric}_{quantile}_{unit}"
+                    ]
+                    assert math.isfinite(value)
+        for metric, unit in units.items():
+            for quantile in ("p05", "p50", "p95"):
+                assert math.isfinite(
+                    report[
+                        f"{scope}_{metric}_{quantile}_delta_{unit}"
+                    ]
+                )
+
+    assert report["raw_robot_acceleration_p50_mps2"] > 0.1
+    assert report["raw_robot_abs_curvature_p95_per_m"] > 0.0
+    assert report["raw_dynamic_object_acceleration_p95_mps2"] > 0.1
+    assert report["raw_dynamic_object_abs_curvature_p95_per_m"] > 0.0
 
 
 def test_index_recordings_cli_selects_only_requested_split(tmp_path):
+    from src.datasets.split_manager import (
+        SplitAuditPolicy,
+        freeze_preassigned_split,
+        write_split_artifacts,
+    )
     from src.datasets.thor_adapter import load_recording_indexes_from_dir
 
     train_a_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_train_a.csv")
     train_b_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_train_b.csv")
     test_csv = _write_toy_thor_csv(tmp_path / "THOR-Magni_test.csv")
-    split_manifest = tmp_path / "split_manifest.jsonl"
-    split_manifest.write_text(
-        "".join(
-            json.dumps(row) + "\n"
-            for row in (
-                {
-                    "recording_id": "train_a",
-                    "session_id": "session-train-a",
-                    "participant_ids": ["Helmet_1"],
-                    "source_path": str(train_a_csv),
-                    "split": "train",
-                },
-                {
-                    "recording_id": "train_b",
-                    "session_id": "session-train-b",
-                    "participant_ids": ["Helmet_1"],
-                    "source_path": str(train_b_csv),
-                    "split": "train",
-                },
-                {
-                    "recording_id": "test",
-                    "session_id": "session-test",
-                    "participant_ids": ["Helmet_1"],
-                    "source_path": str(test_csv),
-                    "split": "test",
-                },
-            )
-        ),
-        encoding="utf-8",
+    rows = (
+        {
+            "recording_id": "train_a",
+            "session_id": "session-train-a",
+            "source_path": str(train_a_csv),
+        },
+        {
+            "recording_id": "train_b",
+            "session_id": "session-train-b",
+            "source_path": str(train_b_csv),
+        },
+        {
+            "recording_id": "test",
+            "session_id": "session-test",
+            "source_path": str(test_csv),
+        },
     )
+    policy = SplitAuditPolicy(
+        evaluation_scope="unseen_recording_within_known_sessions",
+        required_fields=("recording", "session", "seed_namespace"),
+        allowed_overlap_fields=("session",),
+        unavailable_fields=("participant",),
+    )
+    split_result = freeze_preassigned_split(
+        rows,
+        {"train_a": "train", "train_b": "train", "test": "test"},
+        seed=42,
+        policy=policy,
+    )
+    split_paths = write_split_artifacts(split_result, tmp_path / "split")
+    split_manifest = split_paths["manifest"]
     root = Path(__file__).resolve().parents[1]
     completed = subprocess.run(
         [
@@ -477,9 +577,48 @@ def test_index_recordings_cli_selects_only_requested_split(tmp_path):
         "train_b",
     ]
     assert all(len(recording.dynamic_objects) == 5 for recording in restored)
+    recording_summary = json.loads(
+        (tmp_path / "indexes/train/summary.json").read_text(encoding="utf-8")
+    )
+    assert recording_summary["split_provenance"] == {
+        "split_manifest_digest": split_result.manifest_digest,
+        "evaluation_scope": "unseen_recording_within_known_sessions",
+        "grouping_unit": "recording_id",
+        "field_policies": split_result.summary["field_policies"],
+    }
     assert "dynamic_object_track_count=10" in completed.stdout
     assert "workers_requested=2" in completed.stdout
     assert "workers_used=2" in completed.stdout
+
+    split_summary = json.loads(
+        split_paths["summary"].read_text(encoding="utf-8")
+    )
+    split_summary["manifest_digest"] = "0" * 32
+    split_paths["summary"].write_text(
+        json.dumps(split_summary, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    stale = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/01_index_recordings.py"),
+            "--config",
+            str(root / "configs/data_thor.yaml"),
+            "--split",
+            "train",
+            "--split-manifest",
+            str(split_manifest),
+            "--raw-root",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "stale-indexes"),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stale.returncode != 0
+    assert "split manifest digest does not match" in stale.stderr
 
 
 def test_index_recordings_cli_rejects_nonpositive_workers():

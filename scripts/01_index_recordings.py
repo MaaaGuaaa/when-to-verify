@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -22,7 +23,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.datasets.split_manager import SPLIT_NAMES  # noqa: E402
+from src.datasets.split_manager import (  # noqa: E402
+    SPLIT_NAMES,
+    validate_split_provenance,
+)
 from src.datasets.thor_adapter import (  # noqa: E402
     ThorDataError,
     load_thor_recording,
@@ -79,6 +83,32 @@ def _read_split_rows(path: Path, split: str) -> list[dict[str, object]]:
     if not rows:
         raise ThorDataError(f"split manifest has no rows for {split!r}")
     return sorted(rows, key=lambda row: str(row.get("recording_id", "")))
+
+
+def _load_split_provenance(manifest_path: Path) -> dict[str, object]:
+    summary_path = manifest_path.parent / "split_summary.json"
+    try:
+        summary = json.loads(
+            summary_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as error:
+        raise ThorDataError(f"invalid split summary: {error}") from error
+    if not isinstance(summary, dict):
+        raise ThorDataError("split summary must be an object")
+    actual_digest = hashlib.blake2b(
+        manifest_path.read_bytes(), digest_size=16
+    ).hexdigest()
+    if summary.get("manifest_digest") != actual_digest:
+        raise ThorDataError("split manifest digest does not match split summary")
+    return validate_split_provenance(
+        {
+            "split_manifest_digest": actual_digest,
+            "evaluation_scope": summary.get("evaluation_scope"),
+            "grouping_unit": summary.get("grouping_unit"),
+            "field_policies": summary.get("field_policies"),
+        }
+    )
 
 
 def _discover_csvs(raw_root: Path) -> dict[str, Path]:
@@ -179,6 +209,7 @@ def main() -> int:
         raise ThorDataError("--max-gap-s must be finite and at least --dt-s")
     if args.limit is not None and args.limit < 1:
         raise ThorDataError("--limit must be positive")
+    split_provenance = _load_split_provenance(args.split_manifest)
     rows = _read_split_rows(args.split_manifest, args.split)
     sources = _resolve_sources(rows, args.raw_root)
     if args.limit is not None:
@@ -199,6 +230,7 @@ def main() -> int:
         recordings,
         split=args.split,
         output_dir=args.output_dir / args.split,
+        split_provenance=split_provenance,
     )
     print(f"manifest={paths['manifest']}")
     print(f"split={args.split}")

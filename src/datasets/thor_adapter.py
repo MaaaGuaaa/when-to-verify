@@ -15,10 +15,12 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 
 from src.contracts import SCHEMA_VERSION, validate_dynamic_object_spec
+from src.datasets.split_manager import validate_split_provenance
 from src.utils.config import load_config
 
 
@@ -306,10 +308,12 @@ def write_recording_indexes(
     *,
     split: str,
     output_dir: str | Path,
+    split_provenance: Mapping[str, object],
 ) -> dict[str, Path]:
     """Atomically write one split's recording indexes and provenance manifest."""
     if split not in {"train", "calibration", "val", "test"}:
         raise ThorDataError("split must be train, calibration, val, or test")
+    provenance = validate_split_provenance(split_provenance)
     ordered = sorted(recordings, key=lambda item: item.recording_id)
     if not ordered:
         raise ThorDataError("recordings must not be empty")
@@ -347,6 +351,7 @@ def write_recording_indexes(
                     "recording_index_file": filename,
                     "sample_count": int(recording.timestamps.size),
                     "resampling_report": recording.resampling_report,
+                    "split_provenance": provenance,
                 }
             )
         manifest = "".join(
@@ -363,6 +368,7 @@ def write_recording_indexes(
             "dynamic_object_track_count": sum(
                 len(recording.dynamic_objects) for recording in ordered
             ),
+            "split_provenance": provenance,
         }
         (staging / "recording_manifest.jsonl").write_text(
             manifest, encoding="utf-8"
@@ -387,6 +393,7 @@ def load_recording_indexes_from_dir(
 ) -> tuple[RecordingIndex, ...]:
     """Load a split directory strictly through its recording manifest."""
     directory_path = Path(directory)
+    provenance = load_recording_split_provenance(directory_path)
     manifest_path = directory_path / "recording_manifest.jsonl"
     rows: list[dict[str, object]] = []
     with manifest_path.open("r", encoding="utf-8") as handle:
@@ -405,6 +412,8 @@ def load_recording_indexes_from_dir(
                 raise ThorDataError("recording manifest split mismatch")
             if row.get("schema_version") != SCHEMA_VERSION:
                 raise ThorDataError("recording manifest schema_version mismatch")
+            if row.get("split_provenance") != provenance:
+                raise ThorDataError("recording manifest split provenance mismatch")
             rows.append(row)
     if not rows:
         raise ThorDataError("recording manifest must not be empty")
@@ -422,6 +431,26 @@ def load_recording_indexes_from_dir(
             raise ThorDataError("recording id does not match its manifest row")
         recordings.append(recording)
     return tuple(recordings)
+
+
+def load_recording_split_provenance(
+    directory: str | Path,
+) -> dict[str, object]:
+    """Load the mandatory split identity from one recording-index summary."""
+    summary_path = Path(directory) / "summary.json"
+    try:
+        summary = json.loads(
+            summary_path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except json.JSONDecodeError as error:
+        raise ThorDataError(f"invalid recording summary: {error}") from error
+    if not isinstance(summary, dict):
+        raise ThorDataError("recording summary must be an object")
+    try:
+        return validate_split_provenance(summary.get("split_provenance"))
+    except (TypeError, ValueError) as error:
+        raise ThorDataError(f"invalid recording split provenance: {error}") from error
 
 
 def parse_recording_id(path: str | Path) -> str:
@@ -508,30 +537,86 @@ def _gradient(values: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
     return np.gradient(values, timestamps, axis=0)
 
 
-def _speed_quantiles(
+def _kinematic_samples(
     timestamps: np.ndarray,
     positions: np.ndarray,
     segment_ids: np.ndarray,
-) -> dict[str, float | int]:
-    joined = _speed_samples(timestamps, positions, segment_ids)
-    return _quantiles(joined)
-
-
-def _speed_samples(
-    timestamps: np.ndarray,
-    positions: np.ndarray,
-    segment_ids: np.ndarray,
-) -> np.ndarray:
-    speeds: list[np.ndarray] = []
+) -> dict[str, np.ndarray]:
+    samples: dict[str, list[np.ndarray]] = {
+        "speed": [],
+        "acceleration": [],
+        "abs_curvature": [],
+    }
     for segment_id in np.unique(segment_ids):
         mask = segment_ids == segment_id
         if np.count_nonzero(mask) < 2:
             continue
-        velocity = _gradient(positions[mask], timestamps[mask])
-        speeds.append(np.linalg.norm(velocity, axis=1))
-    if not speeds:
-        return np.empty((0,), dtype=np.float64)
-    return np.concatenate(speeds)
+        segment_time = timestamps[mask]
+        velocity = _gradient(positions[mask], segment_time)
+        speed = np.linalg.norm(velocity, axis=1)
+        acceleration = np.linalg.norm(
+            _gradient(velocity, segment_time), axis=1
+        )
+        heading = np.unwrap(np.arctan2(velocity[:, 1], velocity[:, 0]))
+        heading_rate = _gradient(heading, segment_time)
+        curvature = np.zeros_like(speed)
+        moving = speed > 1e-6
+        curvature[moving] = np.abs(heading_rate[moving]) / speed[moving]
+        samples["speed"].append(speed)
+        samples["acceleration"].append(acceleration)
+        samples["abs_curvature"].append(curvature)
+    return {
+        metric: (
+            np.concatenate(values)
+            if values
+            else np.empty((0,), dtype=np.float64)
+        )
+        for metric, values in samples.items()
+    }
+
+
+def _kinematic_quantiles(
+    timestamps: np.ndarray,
+    positions: np.ndarray,
+    segment_ids: np.ndarray,
+) -> dict[str, dict[str, float | int]]:
+    return {
+        metric: _quantiles(samples)
+        for metric, samples in _kinematic_samples(
+            timestamps, positions, segment_ids
+        ).items()
+    }
+
+
+def _append_kinematic_report(
+    report: dict[str, float | int],
+    *,
+    scope: str,
+    raw: Mapping[str, Mapping[str, float | int]],
+    resampled: Mapping[str, Mapping[str, float | int]],
+) -> None:
+    units = {
+        "speed": "mps",
+        "acceleration": "mps2",
+        "abs_curvature": "per_m",
+    }
+    for metric, unit in units.items():
+        report[f"raw_{scope}_{metric}_sample_count"] = int(
+            raw[metric]["sample_count"]
+        )
+        report[f"resampled_{scope}_{metric}_sample_count"] = int(
+            resampled[metric]["sample_count"]
+        )
+        for quantile in ("p05", "p50", "p95"):
+            raw_value = float(raw[metric][quantile])
+            resampled_value = float(resampled[metric][quantile])
+            report[f"raw_{scope}_{metric}_{quantile}_{unit}"] = raw_value
+            report[
+                f"resampled_{scope}_{metric}_{quantile}_{unit}"
+            ] = resampled_value
+            report[
+                f"{scope}_{metric}_{quantile}_delta_{unit}"
+            ] = abs(resampled_value - raw_value)
 
 
 def _quantiles(samples: np.ndarray) -> dict[str, float | int]:
@@ -1022,10 +1107,10 @@ def load_thor_recording(
     raw_robot_segments = np.zeros(robot_time.shape, dtype=np.int32)
     for segment_id, segment in enumerate(_segment_slices(robot_time, max_gap_s)):
         raw_robot_segments[segment] = segment_id
-    raw_speed = _speed_quantiles(
+    raw_robot_kinematics = _kinematic_quantiles(
         robot_time, robot_position, raw_robot_segments
     )
-    resampled_speed = _speed_quantiles(
+    resampled_robot_kinematics = _kinematic_quantiles(
         timestamps, position, robot_segments
     )
     resampling_report: dict[str, float | int] = {
@@ -1036,23 +1121,31 @@ def load_thor_recording(
         ),
         "ignored_auxiliary_row_count": ignored_auxiliary_row_count,
         "conflicting_duplicate_qtm_row_count": 0,
-        "raw_robot_sample_count": raw_speed["sample_count"],
-        "resampled_robot_sample_count": resampled_speed["sample_count"],
+        "raw_robot_sample_count": raw_robot_kinematics["speed"][
+            "sample_count"
+        ],
+        "resampled_robot_sample_count": resampled_robot_kinematics["speed"][
+            "sample_count"
+        ],
     }
-    for quantile in ("p05", "p50", "p95"):
-        resampling_report[f"raw_robot_speed_{quantile}_mps"] = raw_speed[
-            quantile
-        ]
-        resampling_report[f"resampled_robot_speed_{quantile}_mps"] = (
-            resampled_speed[quantile]
-        )
-        resampling_report[f"robot_speed_{quantile}_delta_mps"] = abs(
-            float(resampled_speed[quantile]) - float(raw_speed[quantile])
-        )
+    _append_kinematic_report(
+        resampling_report,
+        scope="robot",
+        raw=raw_robot_kinematics,
+        resampled=resampled_robot_kinematics,
+    )
 
     dynamic_objects: dict[str, DynamicObjectTrack] = {}
-    raw_object_speeds: list[np.ndarray] = []
-    resampled_object_speeds: list[np.ndarray] = []
+    raw_object_kinematics: dict[str, list[np.ndarray]] = {
+        "speed": [],
+        "acceleration": [],
+        "abs_curvature": [],
+    }
+    resampled_object_kinematics: dict[str, list[np.ndarray]] = {
+        "speed": [],
+        "acceleration": [],
+        "abs_curvature": [],
+    }
     rejection_reasons = {
         "insufficient_samples": 0,
         "no_resampleable_segment": 0,
@@ -1115,30 +1208,42 @@ def load_thor_recording(
                 "orientation_source_counts": orientation_counts,
             },
         )
-        raw_object_speeds.append(
-            _speed_samples(source_time, source_position, raw_object_segments)
-        )
-        resampled_object_speeds.append(
-            _speed_samples(object_time, object_position, object_segments)
-        )
+        for metric, samples in _kinematic_samples(
+            source_time, source_position, raw_object_segments
+        ).items():
+            raw_object_kinematics[metric].append(samples)
+        for metric, samples in _kinematic_samples(
+            object_time, object_position, object_segments
+        ).items():
+            resampled_object_kinematics[metric].append(samples)
 
-    raw_object_speed = _quantiles(
-        np.concatenate(raw_object_speeds)
-        if raw_object_speeds
-        else np.empty((0,), dtype=np.float64)
-    )
-    resampled_object_speed = _quantiles(
-        np.concatenate(resampled_object_speeds)
-        if resampled_object_speeds
-        else np.empty((0,), dtype=np.float64)
-    )
+    raw_object_quantiles = {
+        metric: _quantiles(
+            np.concatenate(values)
+            if values
+            else np.empty((0,), dtype=np.float64)
+        )
+        for metric, values in raw_object_kinematics.items()
+    }
+    resampled_object_quantiles = {
+        metric: _quantiles(
+            np.concatenate(values)
+            if values
+            else np.empty((0,), dtype=np.float64)
+        )
+        for metric, values in resampled_object_kinematics.items()
+    }
     resampling_report.update(
         {
             "raw_dynamic_object_count": len(selected) - 1,
             "indexed_dynamic_object_count": len(dynamic_objects),
             "rejected_dynamic_object_count": sum(rejection_reasons.values()),
-            "raw_dynamic_object_sample_count": raw_object_speed["sample_count"],
-            "resampled_dynamic_object_sample_count": resampled_object_speed[
+            "raw_dynamic_object_sample_count": raw_object_quantiles["speed"][
+                "sample_count"
+            ],
+            "resampled_dynamic_object_sample_count": resampled_object_quantiles[
+                "speed"
+            ][
                 "sample_count"
             ],
             **{
@@ -1147,17 +1252,12 @@ def load_thor_recording(
             },
         }
     )
-    for quantile in ("p05", "p50", "p95"):
-        resampling_report[f"raw_dynamic_object_speed_{quantile}_mps"] = (
-            raw_object_speed[quantile]
-        )
-        resampling_report[
-            f"resampled_dynamic_object_speed_{quantile}_mps"
-        ] = resampled_object_speed[quantile]
-        resampling_report[f"dynamic_object_speed_{quantile}_delta_mps"] = abs(
-            float(resampled_object_speed[quantile])
-            - float(raw_object_speed[quantile])
-        )
+    _append_kinematic_report(
+        resampling_report,
+        scope="dynamic_object",
+        raw=raw_object_quantiles,
+        resampled=resampled_object_quantiles,
+    )
 
     session_id = recording_id.split("_", 1)[0]
     recording = RecordingIndex(

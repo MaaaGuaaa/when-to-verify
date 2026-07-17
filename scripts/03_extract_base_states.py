@@ -27,6 +27,7 @@ from src.datasets.split_manager import SPLIT_NAMES  # noqa: E402
 from src.datasets.thor_adapter import (  # noqa: E402
     ThorDataError,
     load_recording_indexes_from_dir,
+    load_recording_split_provenance,
 )
 from src.utils.config import load_config  # noqa: E402
 
@@ -92,6 +93,15 @@ def main() -> int:
         )
         for split in splits
     }
+    provenance_by_split = {
+        split: load_recording_split_provenance(args.recording_dir / split)
+        for split in splits
+    }
+    provenance_digests = {
+        value["split_manifest_digest"] for value in provenance_by_split.values()
+    }
+    if len(provenance_digests) != 1:
+        raise ThorDataError("recording splits use different split provenance")
     if any(
         abs(recording.dt_s - expected_dt) > 1e-9
         for recordings in loaded.values()
@@ -109,7 +119,9 @@ def main() -> int:
             workers=args.workers,
         )
         paths = write_base_state_extraction(
-            extraction, args.output_dir / split
+            extraction,
+            args.output_dir / split,
+            split_provenance=provenance_by_split[split],
         )
         accepted = int(extraction.summary["accepted_count"])
         total += accepted

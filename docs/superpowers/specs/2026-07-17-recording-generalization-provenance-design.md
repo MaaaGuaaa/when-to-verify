@@ -17,10 +17,12 @@ five recording-day sessions occur in more than one split, while the old split
 audit reports zero session overlap because there were no session values to
 audit.
 
-The numerical SOP-03 conversion is otherwise usable: recording trajectories,
-typed dynamic objects, footprints, base states, oracle contexts, and snippets
-passed their existing numerical and schema checks. The defect is the ambiguity
-and incomplete reporting of the evaluation scope and split provenance.
+The recording trajectories, typed dynamic objects, footprints, base states,
+and oracle contexts passed their existing numerical and schema checks. The
+existing snippet library is not usable by SOP-05/06, however: its 3.0 s,
+16-point layout represents only one current point plus 15 future points and
+contains no measured target history. The defects to fix are therefore both the
+ambiguous split provenance and the insufficient snippet time layout.
 
 ## Scientific Decision
 
@@ -44,6 +46,25 @@ Paper claims and handoffs must describe the test split as unseen recordings
 from known recording-day sessions. They must not claim generalization to unseen
 days, sessions, or participants.
 
+The frozen MotionSnippet layout is:
+
+```text
+motion_snippet_layout_version: history8_current7_future15_v1
+sample_count: 23
+history_steps: 8
+future_steps: 15
+current_index: 7
+sample_dt_s: 0.2
+duration_s: 4.4
+```
+
+Indices 0--7 are measured history at -1.4 through 0.0 s, index 7 is the
+current target state, and indices 8--22 are measured future at 0.2 through
+3.0 s. Positions and velocities are float32 `[23, 2]`; headings are float32
+`[23]`; all values are finite. No repeated-current padding, reverse
+extrapolation, idealized history, trajectory extrapolation, or interpolation
+across a configured time gap is permitted.
+
 ## Contract Changes
 
 The default generic split behavior remains strict: recording, session, and
@@ -65,6 +86,12 @@ and does not receive fabricated identifiers.
 A passing report therefore contains the five detected session overlaps and
 zero disallowed overlaps. An empty set of session values can never be reported
 as a successful session audit.
+
+Every production snippet library, NPZ metadata block, summary, and source
+manifest row carries the complete layout above and `split_manifest_digest`.
+Production loaders reject missing layout metadata, a non-23-point array, a
+duration other than 4.4 s, or a split digest mismatch. There is no implicit
+reader for the former 16-point/3.0 s artifact.
 
 ## Components and Data Flow
 
@@ -101,21 +128,37 @@ is enumerated deterministically.
 SOP-03 is regenerated into a new versioned output directory without modifying
 the old run. All four splits consume the enriched frozen manifest. Recording
 indexes, base states, oracle contexts, and typed snippet libraries are rebuilt
-with the same numerical configuration and eight Slurm CPUs.
+with eight Slurm CPUs. Snippets use the frozen 23-point/4.4 s layout; the old
+3.0 s output must not be allowed to finish as the production run.
 
 Every SOP-03 summary and manifest records the new split digest and evaluation
-scope. Because the recording assignment and numerical configuration remain
-unchanged, accepted counts and arrays are expected to remain identical; this
-is verified rather than assumed. Any mismatch is reported and investigated
-before the new run is accepted.
+scope. Recording-index and base-state counts should remain stable, but snippet
+candidate, accepted, and rejected counts are expected to change because 4.4 s
+of contiguous measured motion is now required. The change is quantified by
+split and object type, including explicit insufficient-duration and time-gap
+rejections; it is never silently treated as numerical parity.
 
-### SOP-04 provenance
+### SOP-04 relationship
 
-The SOP-04 canonical trajectory bank is independent of SOP-03 split contents.
-It is regenerated under the combined code commit so that its code provenance
-is current. Serial-versus-parallel determinism, query-map invariants, and
-artifact checksums are revalidated. No state-specific split digest is attached
-to the canonical bank.
+The SOP-04 canonical trajectory bank is independent of SOP-03 split contents
+and is not rebuilt solely because the snippet layout changed. Its existing
+serial-versus-parallel determinism and query-map validation remain valid. No
+state-specific split digest is attached to the canonical bank.
+
+### SOP-05 handoff
+
+SOP-03 supplies measured source motion only; it does not generate events or do
+event-level SE(2) placement. SOP-05 consumes the transformed 23 poses as:
+
+```text
+history = transformed_poses[0:8]
+current = transformed_poses[7]
+future = transformed_poses[8:23]
+source_anchor_time = 1.4 + conflict_time_s
+```
+
+Using `conflict_time_s` directly as the source anchor would shift every event
+1.4 s too early and is forbidden.
 
 ## Files in Scope
 
@@ -136,6 +179,8 @@ split contract remains documented as the default.
 - Reject incomplete metadata coverage before any trajectory processing starts.
 - Reject recording, snippet-source, pair-group, or seed-namespace overlap.
 - Preserve and report the five allowed session overlaps.
+- Reject old, incomplete, or mixed MotionSnippet layouts explicitly.
+- Count short contiguous tracks and every other rejected candidate by reason.
 - Stop on a contract/version mismatch; do not support two implicit formats.
 - Record every rejected recording or sample with an explicit reason.
 
@@ -147,15 +192,18 @@ Verification follows this order:
    an explicitly allowed session overlap is reported without being rejected.
 2. Existing strict-policy leakage tests continue to reject session overlap.
 3. Toy metadata and split fixtures prove deterministic, byte-identical output.
-4. A 10-recording Slurm smoke run checks schema, shape, dtype, finite values,
-   deterministic IDs, policy propagation, and numerical parity.
+4. A 10-recording Slurm smoke run checks schema, `[23,2]/[23]` shapes,
+   float32 dtypes, finite values, no-gap/no-extrapolation behavior,
+   deterministic IDs/digests, and policy propagation.
 5. The 52-recording Slurm rebuild checks 52/52 session coverage, 37/5/5/5 split
    counts, zero recording overlap, five reported allowed session overlaps, zero
    disallowed overlap, and a new deterministic split digest.
 6. SOP-03 checks base-state/oracle alignment, observed-oracle separation,
-   typed footprint semantics, source overlap, NaN/Inf, and accepted counts.
-7. SOP-04 checks all trajectory/query-map invariants and serial/8-worker exact
-   equality.
+   typed footprint semantics, source overlap, NaN/Inf, layout metadata,
+   candidate/accepted/rejected counts, and at least 1,000 accepted snippets.
+7. Raw-versus-resampled speed, acceleration, and curvature distributions are
+   quantified; 50 deterministic robot/object/snippet examples covering every
+   present object type receive recorded visual/manual review.
 8. The repository test suite passes on Slurm before the implementation commit.
 
 ## Artifact Policy
@@ -163,7 +211,9 @@ Verification follows this order:
 The old SOP-03 and SOP-04 outputs remain read-only provenance. New artifacts
 use distinct run IDs and include code commit, configuration digest, source
 split digest, evaluation scope, policy, Slurm resources, counts, checksums, and
-audit results. Generated outputs remain ignored by Git and are not committed.
+audit results. The SOP-03 run additionally records the MotionSnippet layout,
+array digests, rejection report, and 50-example review selection. Generated
+outputs remain ignored by Git and are not committed.
 
 ## Known Limitation
 
@@ -171,3 +221,8 @@ This policy intentionally permits recording-day session overlap. It provides
 no evidence for unseen-session/day or unseen-participant generalization. That
 limitation must be carried into SOP-05 through SOP-16 manifests, evaluation
 reports, and paper wording.
+
+Requiring 4.4 s of contiguous measured target motion may substantially reduce
+the snippet population relative to the old 3.0 s run. Production acceptance
+still requires at least 1,000 total snippets (5,000 preferred); falling below
+the minimum is a reported blocker, not permission to pad or extrapolate.

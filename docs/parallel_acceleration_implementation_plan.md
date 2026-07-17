@@ -17,7 +17,7 @@
 ```text
 THÖR-MAGNI 原始轨迹
     ↓
-按 recording/participant 分组切分
+按冻结 policy 做 recording-level 切分与 provenance audit
     ↓
 按 split/type 隔离的真实 MotionSnippet libraries
     ↓
@@ -249,7 +249,7 @@ class VerificationSample:
     metadata: dict
 ```
 
-动态对象 schema v2 冻结为 `human`、`carried_object`、`unknown_dynamic`。数据适配器保留所有有效非机器人 BODY，以 `recording_id::body_name` 作为对象 ID；split 的 human participant 分组语义保持独立。`human` 使用配置圆 footprint，非人对象优先使用 QTM marker P95 矩形估计并在无有效 marker 时回退配置。snippet 必须按 `snippets/<split>/<object_type>/` 隔离；schema v1 序列化产物全部重建，不做静默兼容。
+动态对象 schema v2 冻结为 `human`、`carried_object`、`unknown_dynamic`。数据适配器保留所有有效非机器人 BODY，以 `recording_id::body_name` 作为对象 ID。THÖR split 固定评测未见 recording/已知 recording-day session：recording 和 source object 不跨 split，session 重叠逐项报告，participant identity 标记 unavailable。`human` 使用配置圆 footprint，非人对象优先使用 QTM marker P95 矩形估计并在无有效 marker 时回退配置。snippet 必须按 `snippets/<split>/<object_type>/` 隔离；旧序列化产物全部重建，不做静默兼容。
 
 ## 3.2 固定 tensor 约定
 
@@ -419,7 +419,7 @@ project/
 2. 解析所有非机器人 BODY 的 pose/marker，分类为
    `human/carried_object/unknown_dynamic`；
 3. 统一时间戳并重采样；
-4. 按 recording/session/participant 分组切分；
+4. 按冻结的 recording assignment 切分；THÖR session overlap 允许但必须报告；
 5. 提取 base states；
 6. 按 split/type 提取真实 `MotionSnippet`；
 7. 输出速度、加速度、曲率、footprint/orientation source 和 rejection 统计。
@@ -429,7 +429,7 @@ project/
 ```text
 原始 recordings
     ↓
-按 recording_id / participant_id 分组
+按 recording_id 冻结；补齐官方 recording-day session provenance
     ↓
 train / calibration / val / test
     ↓
@@ -442,11 +442,16 @@ train / calibration / val / test
 
 ## 6.3 Snippet 过滤
 
-建议提取 3—5 秒动态对象片段；速度阈值按 object type 读取 schema v2 配置：
+生产片段固定为 4.4 秒、23 个真实采样点；速度阈值按 object type 读取 schema v2 配置：
 
 ```yaml
-min_duration_s: 3.0
-max_duration_s: 5.0
+motion_snippet_layout_version: history8_current7_future15_v1
+duration_s: 4.4
+sample_dt_s: 0.2
+sample_count: 23
+history_steps: 8
+current_index: 7
+future_steps: 15
 human_min_speed_mps: 0.30
 nonhuman_min_speed_mps: 0.05
 max_speed_mps: 2.00
@@ -454,15 +459,17 @@ max_gap_s: 0.3
 max_accel_mps2: 2.50
 ```
 
-每个 snippet 保存 object type、相对 pose/yaw、速度、footprint spec、source object
-ID、recording 和可用的 participant provenance。
+索引 `0:8` 为 `-1.4...0.0 s` 的真实历史，索引 7 为当前，索引 `8:23` 为
+`0.2...3.0 s` 的真实未来。每个 snippet 保存 object type、相对 pose/yaw、速度、
+footprint spec、source recording/session/object、完整布局和新 split digest。禁止补点、
+外推、跨 gap 插值；旧 16 点/3.0 s library 由 loader 明确拒绝。
 
 ## 6.4 理想结果
 
 - 有效 base states ≥ 10,000；
 - 有效 human snippets 理想 ≥ 5,000；非人 snippets 按实际数量独立报告；
 - train/test snippet 来源完全隔离；
-- 重采样后的速度分布与原始数据基本一致；
+- 重采样前后的速度、加速度和曲率分布均有量化报告；
 - 坐标变换可逆误差 < 1e-4；
 - 无 NaN、无严重时间断裂。
 
@@ -471,7 +478,7 @@ ID、recording 和可用的 participant provenance。
 - base states ≥ 2,000；
 - snippets ≥ 1,000；
 - 能画出 50 条机器人/typed dynamic-object 轨迹进行人工检查；
-- split 泄漏检测为 0。
+- recording/source-object/disallowed overlap 为 0；THÖR session overlap 枚举后允许。
 
 ## 6.6 降级方案
 
@@ -491,6 +498,8 @@ ID、recording 和可用的 participant provenance。
 - 在候选轨迹上选冲突时刻和冲突点；
 - 放置矩形墙体、货架、柱子或结构性 blind sector；
 - 对目标 snippet 做 SE(2) 变换和有限时间缩放；主分布默认 human target；
+- 固定使用 `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，并令
+  `source_anchor_time=1.4+conflict_time_s`；不得直接使用 `conflict_time_s`；
 - 从完整 `target_type_policy` 解析白名单和三类归一化权重，并把稳定 digest 写入事件
   manifest；非人 target 只能由显式扩展配置启用；
 - 直接使用 snippet 冻结的 type/spec；生成的 target ID 必须确定且不与上下文 ID
@@ -1481,7 +1490,7 @@ python -m evaluation.plot_pareto \
 
 - 主分布 human 运动片段来自真实数据，其他动态对象也保留真实轨迹和 footprint；
 - 配对反事实样本；
-- held-out participant/recording；
+- held-out recording（已知 recording-day session）；
 - 参数 OOD 测试；
 - 少量自然真实片段 sanity check；
 - 报告生成器限制。

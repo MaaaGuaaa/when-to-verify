@@ -60,8 +60,10 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 | 局部 `+x` | 机器人当前前方 |
 | 局部 `+y` | 机器人当前左侧 |
 | 长度/角度 | 米 / 弧度 |
-| 历史窗口 | `K=8`、`dt=0.2 s`、总长 `1.6 s` |
+| 历史窗口 | `K=8`、`dt=0.2 s`、名义宽度 `1.6 s`，采样点跨度 `1.4 s` |
 | 未来窗口 | `T=15`、`dt=0.2 s`、总长 `3.0 s` |
+| 主生产 MotionSnippet | `23` 点、`dt=0.2 s`、跨度 `4.4 s`、`current_index=7`，布局 `history8_current7_future15_v1` |
+| 主生产 time scale | 固定 `1.0`；不做时间重采样或轨迹外推 |
 | BEV 范围 | `[-8, 8] m × [-8, 8] m` |
 | BEV 分辨率 | `0.1 m`，`H=W=160` |
 | 机器人尺寸 | `0.70 m × 0.55 m`，膨胀 `0.15 m` |
@@ -565,8 +567,15 @@ python scripts/00_make_splits.py \
 - [ ] 对 robot/object 轨迹按 0.2 s 网格重采样；跨度过大的 gap 不插值
 - [ ] 每 0.5–1.0 s 提取一个窗口完整的 base state
 - [ ] 将 observed 与 oracle 字段写入不同对象/文件
-- [ ] 在每个 split 和 `object_type` 内独立滑窗提取 3–5 s snippet
+- [ ] 在每个 split 和 `object_type` 内独立滑窗提取固定 `4.4 s / 23` 点主生产
+      snippet；`poses[0:8]` 为真实历史、`poses[7]` 为当前、`poses[8:23]` 为未来
 - [ ] snippet 归一化到首点 `(0,0)`、初始运动方向 `+x`
+- [ ] 在 library、summary 和 manifest 冻结
+      `motion_snippet_layout_version=history8_current7_future15_v1`、
+      `history_steps=8/current_index=7/future_steps=15/sample_dt_s=0.2/duration_s=4.4`
+- [ ] 不为 time-scale 增强扩展 source window；不得生成 28 点/5.4 s 主生产 snippet
+- [ ] loader 明确拒绝旧 16 点/3.0 s、缺 layout 字段、时间窗不完整或需要外推的 library，
+      不得补点或双版本兼容
 - [ ] 按对象类型过滤速度、加速度、缺失、时间断裂和 footprint 重叠；暂时静止不是删除整条对象轨迹的理由
 - [ ] 输出速度、加速度、曲率、duration 和 rejection reason 统计
 - [ ] 运行 source overlap audit
@@ -577,6 +586,10 @@ python scripts/00_make_splits.py \
 - 最低 snippets `≥1,000`，理想 `≥5,000`
 - train/calibration/val/test 的 recording、participant 和 snippet source object 交集为 0
 - 无 NaN/Inf，shape/dtype 与 schema 一致
+- 所有生产 snippet 的 positions/velocities 为 `float32[23,2]`、headings 为
+  `float32[23]`，layout metadata 与数组逐项一致
+- 相同输入与 seed 重跑 snippet ID、manifest 和数组 digest 一致；artifact 记录修复后的
+  session-safe split digest
 - 重采样后的速度分布与原始分布差异有量化报告，不出现系统性单位错误
 - `human` snippet 速度范围 `0.3–2.0 m/s`；其他类型速度下限 `0.05 m/s`，所有类型加速度不超过各自配置阈值
 - 随机抽取 50 条 robot/object/snippet 轨迹人工检查，并覆盖每个实际出现的对象类型
@@ -585,7 +598,7 @@ python scripts/00_make_splits.py \
 
 ```bash
 python scripts/01_index_recordings.py --config configs/data_thor.yaml --split train
-python scripts/02_build_snippet_library.py --config configs/data_thor.yaml --split train
+python scripts/02_build_snippet_library.py --config configs/data_thor.yaml --split train --duration-s 4.4
 python scripts/03_extract_base_states.py --config configs/data_thor.yaml --all-splits
 ```
 
@@ -672,8 +685,8 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 环境/混合事件采用单层联合候选：先按 wall/shelf/pillar 参数沿法向放置并验证
       遮挡物，再根据遮挡物法向侧条件化 typed snippet；一次 attempt 只计一个完整候选
 - [ ] `joint_occluder_first_v2` 先用 seeded 高可行前缀：最小 pillar、offset quantile
-      `0.3/0.4`、angle multiplier `0/0.25/0.5/0.7`、time-scale quantile
-      `0/0.16/0.25/0.5`、最晚 conflict-time；每个模板紧邻相反侧 fallback，再进入
+      `0.3/0.4`、angle multiplier `0/0.25/0.5/0.7`、最晚 conflict-time；8 个
+      `(offset, angle)` 模板各自紧邻相反侧 fallback，共 16 个候选，再进入
       wall/shelf/pillar 通用分层候选；禁用 pillar 时跳过前缀，不得套用到其他类型
 - [ ] 验证遮挡物不与机器人 swept volume 相交；先加密 SE(2) 轨迹并做真实 footprint
       signed clearance，再以保守运动上界递归认证帧间连续净空，栅格接触不得直接判碰撞
@@ -688,7 +701,16 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 直接使用 snippet 冻结的 `object_type` 与 footprint spec，不得按原始 name/role
       重新分类；生成的 target ID 必须确定、不得与上下文对象 ID 冲突，并另存
       `source_object_id` 作为 provenance
-- [ ] 对目标 snippet 做 SE(2) 和 `0.8–1.2` 时间缩放
+- [ ] 对目标 snippet 只做 SE(2)；主生产 `time_scale_range` 必须为 `[1.0,1.0]`，其他值
+      立即报契约错误，collision/temporal-safe 只通过真实窗口内的冲突锚点变化生成
+- [ ] source current 固定为 index `7`（`1.4 s`）；未来冲突 `τ*` 的 source anchor time
+      固定为 `1.4 + τ*`，禁止沿用 `τ*` 导致整体错位
+- [ ] 从同一条真实 23 点 snippet 和同一个变换生成 `history_poses[K,3]` 与
+      `future_poses[T,3]`；`current_pose == history_poses[-1]`，任何一侧不得重复或外推
+- [ ] 将 SOP05→06 target motion 保存为版本化 generated-event shard：history/future 分别
+      为 `float32[8,3]`/`float32[15,3]`，显式保存 `target_current_pose: float32[3]`；冻结
+      event/world/base/trajectory/target/source/policy join identity、layout 和 digest，不得只靠
+      临时 Python 对象跨阶段传递
 - [ ] 横穿方向与轨迹法向夹角默认 `<35°`
 - [ ] 使用对象真实 circle/rectangle footprint 与逐帧 yaw 检查不穿墙、
       速度/加速度、当前不可见、未来进入局部图和当前不重叠
@@ -697,9 +719,15 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### 验收
 
-- 当前机器人到隐藏目标历史位置的视线被截断或位于 FOV 外
+- `history_poses.shape == (8,3)`、`future_poses.shape == (15,3)`，均为 float32、finite，
+  且 current 与 history 最后一帧逐元素一致
+- generated-event target future/spec 与同 target ID 的 OracleWorld future/spec 逐元素一致，
+  identity/digest 可唯一 join，且每个 generated event 恰好一条 target-motion record
+- 当前帧隐藏目标的 footprint 被遮挡或位于 FOV 外；过去帧允许真实可见，并必须按逐帧
+  robot pose/遮挡/FOV 产生可审计 visibility history
 - 目标未来从遮挡边界连续出现
-- 目标轨迹与静态/新遮挡物无相交
+- 目标完整 history/current/future 真实 footprint 与静态/新遮挡物无相交
+- 冲突锚点与 temporal offset 不访问 snippet 的 `[0,4.4 s]` 之外；不足时明确拒绝
 - 遮挡物与候选轨迹 swept volume 无相交
 - 同 seed 生成相同事件
 - `attempt_acceptance_rate = accepted / complete_joint_candidates_attempted`，最低 `≥50%`，
@@ -744,24 +772,35 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 生成 near-miss，最小安全间隔目标 `0.05–0.35 m`
 - [ ] 生成 temporal-safe，时间偏移 `±0.8–1.5 s`
 - [ ] 生成 spatial-safe，横向间隔目标 `0.5–1.0 m`
-- [ ] 空间变体以当前隐藏位姿为枢轴对完整 snippet/yaw 做刚性旋转；必要时先沿盲区
+- [ ] 空间变体以当前隐藏位姿为枢轴对完整 23 点 history/current/future 和 yaw 做刚性
+      旋转；必要时先沿盲区
       射线向后做配置上限内的刚性平移，且每个变体重新验证物理与可见性
 - [ ] temporal-safe 只使用独立配置的冻结偏移序列重设冲突锚点，不外推，并验证空间
-      路径相交但同步 footprint 不相交
+      路径相交但同步 footprint 不相交；每个时间变体同步重建 target history 和 future
 - [ ] 环境遮挡 six-pack 采用联合搜索：优先冲突锚点连续消费完整 16 候选高可行前缀，
       再用单个配置内矩形同时遮住 collision/temporal-safe 的两条当前 LOS；共同遮挡物
-      必须避开机器人、上下文、静态图和两条目标轨迹，并让两条目标都连续出现
+      必须避开静态图、机器人完整 history/future swept volume、上下文对象完整
+      history/future 和两条目标完整 history/future，并让两条目标都连续出现
 - [ ] 生成 irrelevant-hidden，确保有隐藏目标且同步 signed clearance `≥1.5 m`
-- [ ] 生成 empty-blind-spot，只移除 `target_dynamic_object_id`，保留其他动态对象
+- [ ] 生成 empty-blind-spot，从 renderer history/spec/current 与 OracleWorld future/spec
+      同时只移除 `target_dynamic_object_id`，保留其他动态对象；removed-target provenance
+      只进入模型输入之外的 audit manifest；删除后必须重新运行 renderer，不得复用其他
+      variant 的 occupancy、last-seen、age 或 state channels
 - [ ] 允许训练使用部分配对，但最低包含 collision、empty-blind-spot，以及
       near-miss/temporal-safe/spatial-safe 中至少一种；输出固定 coverage mask 和缺失原因
 - [ ] 严格 paired evaluation 只使用完整 six-pack
 - [ ] 六类共享 `pair_group_id` 和固定几何 ID
 - [ ] 同一 pair 保持 target object type、footprint spec 和 source object ID 不变
+- [ ] target/pair ID 只依赖共享母事件身份，不含 variant history；world/sample ID 纳入各自
+      variant history/future digest
 - [ ] 主训练/paired evaluation 中，非目标动态对象在全部 variant 保持不变且不形成
       collision/near miss；否则拒绝或标为 `multi_object_context`，仅用于自然/OOD 分析
 - [ ] 对 K 个历史时刻逐帧 ray cast，生成 visible/free/occupied/unknown
 - [ ] 渲染所有动态对象的逐帧 circle/rectangle footprint 和 yaw
+- [ ] 核心 renderer 只接收 BaseState、净化前 scene history/spec、静态/程序化 occupancy 与
+      sensor config；函数签名禁止 OracleContext、OracleWorld 和任何 future 参数
+- [ ] renderer metadata 使用冻结白名单，禁止生成时间、world/target ID、对象列表和
+      visibility truth；robot velocity/yaw-rate 按 SI 单位 float32 全图广播
 - [ ] 更新 last-seen occupancy 和 age map
 - [ ] 断言 unknown 与 visible 互斥、visible free 与 occupied 互斥
 - [ ] 断言模型输入仅从可见模拟传感器内容生成
@@ -779,6 +818,11 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - 环境 six-pack 单独报告请求级成功率、母候选数、配对候选数、遮挡候选数和内部候选
   接受率，不得与 SOP-05 原始事件接受率混为同一指标
 - `current_visible_*`、`unobservable`、age map 满足不变量
+- 固定 BaseState、scene history/spec、static/programmatic occupancy 和 sensor config，仅改变
+  dynamic future/future dynamic occupancy 后，BEV history、state channels 和安全 metadata
+  必须逐元素/字节级不变
+- 过去可见的 target history 可更新 last-seen/age；历史隐藏 footprint 与当前隐藏 target
+  可参与 ray casting 内部 total occupancy，但不得进入模型 occupancy 输入或 metadata
 - 任何 RiskSample 输入中无法检索到 hidden future 或 oracle occupancy
 
 ### 最低规模

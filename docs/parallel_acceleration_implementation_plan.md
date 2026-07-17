@@ -422,7 +422,9 @@ project/
 4. 按 recording/session/participant 分组切分；
 5. 提取 base states；
 6. 按 split/type 提取真实 `MotionSnippet`；
-7. 输出速度、加速度、曲率、footprint/orientation source 和 rejection 统计。
+7. 主生产 snippet 固定为 `history8_current7_future15_v1`：23 点、`dt=0.2 s`、跨度
+   `4.4 s`、`current_index=7`；
+8. 输出速度、加速度、曲率、footprint/orientation source、layout 和 rejection 统计。
 
 ## 6.2 严格切分流程
 
@@ -442,11 +444,16 @@ train / calibration / val / test
 
 ## 6.3 Snippet 过滤
 
-建议提取 3—5 秒动态对象片段；速度阈值按 object type 读取 schema v2 配置：
+主生产动态对象片段冻结为 4.4 秒；速度阈值按 object type 读取 schema v2 配置：
 
 ```yaml
-min_duration_s: 3.0
-max_duration_s: 5.0
+motion_snippet_layout_version: history8_current7_future15_v1
+duration_s: 4.4
+sample_dt_s: 0.2
+sample_count: 23
+history_steps: 8
+current_index: 7
+future_steps: 15
 human_min_speed_mps: 0.30
 nonhuman_min_speed_mps: 0.05
 max_speed_mps: 2.00
@@ -454,8 +461,12 @@ max_gap_s: 0.3
 max_accel_mps2: 2.50
 ```
 
-每个 snippet 保存 object type、相对 pose/yaw、速度、footprint spec、source object
-ID、recording 和可用的 participant provenance。
+每个 snippet 保存 object type、23 点相对 pose/yaw、速度、footprint spec、source object
+ID、recording 和可用的 participant provenance。`poses[0:8]` 是真实历史，`poses[7]` 是
+当前，`poses[8:23]` 是未来；不得通过重复、反向外推或理想轨迹补齐。library、summary
+和 manifest 必须记录 layout 与修复后的 session-safe split digest；旧 16 点/3.0 s library
+明确拒绝，不做双版本兼容。SOP03 不为下游 time-scale 增强扩展 source window，也不生成
+28 点/5.4 s 主生产变体。
 
 ## 6.4 理想结果
 
@@ -465,6 +476,8 @@ ID、recording 和可用的 participant provenance。
 - 重采样后的速度分布与原始数据基本一致；
 - 坐标变换可逆误差 < 1e-4；
 - 无 NaN、无严重时间断裂。
+- 所有主生产 snippet 为 23 点 float32 finite 数组，layout metadata 与数组一致；
+- 相同输入与 seed 重跑 snippet ID、manifest 和数组 digest 一致。
 
 ## 6.5 最低验收
 
@@ -488,15 +501,27 @@ ID、recording 和可用的 participant provenance。
 ## 7.1 任务
 
 - 接收 `BaseState`、`LocalTrajectory`、typed `MotionSnippet`；
+- 只接受 `history8_current7_future15_v1`；以 source index `7` 为当前，未来冲突锚点的
+  source time 为 `1.4 + conflict_time_s`；
 - 在候选轨迹上选冲突时刻和冲突点；
 - 放置矩形墙体、货架、柱子或结构性 blind sector；
-- 对目标 snippet 做 SE(2) 变换和有限时间缩放；主分布默认 human target；
+- 对目标 snippet 只做 SE(2) 变换；主生产 `time_scale_range=[1.0,1.0]`，不做时间重采样，
+  主分布默认 human target；
+- 用同一条真实 snippet 和同一个变换同时生成 target `history_poses[K,3]` 与
+  `future_poses[T,3]`，禁止任一侧外推；
+- 以 `event_target_motion_history8_future15_v1` generated-event shard 保存 target
+  history/current/future、event/world/base/trajectory/target/source/policy join identity、
+  layout/digest，使 SOP06 可独立重跑；shard future/spec 必须与同 target ID 的 OracleWorld
+  future/spec 逐元素一致；
 - 从完整 `target_type_policy` 解析白名单和三类归一化权重，并把稳定 digest 写入事件
   manifest；非人 target 只能由显式扩展配置启用；
 - 直接使用 snippet 冻结的 type/spec；生成的 target ID 必须确定且不与上下文 ID
   冲突，原 `source_object_id` 独立保留用于 provenance；
 - 生成六类配对事件；
-- 渲染历史可见 BEV、不可观测 mask、last-seen 和 age map；
+- 对空间/时间配对变体同步变换完整 target history/current/future；empty 同时从历史渲染
+  输入和 oracle future 移除 target；
+- 通过不接收 OracleContext、OracleWorld 或 future 的核心 renderer，渲染历史可见 BEV、
+  不可观测 mask、last-seen 和 age map；
 - 输出完整 `OracleWorld`。
 
 ## 7.2 六类事件
@@ -527,13 +552,21 @@ empty_blind_spot: 0.10
 
 - 遮挡物不能和机器人候选轨迹扫掠体碰撞；
 - 当前机器人到隐藏目标动态对象的视线必须被遮挡或落在结构性盲区；
+- target 过去可见的真实帧允许进入 last-seen/age，隐藏历史和当前隐藏 footprint 不得写入
+  模型 occupancy；隐藏 footprint 可参与内部 ray casting；固定当前渲染输入时，仅改变
+  dynamic future/future dynamic occupancy 不得改变任何 renderer 输出；
+- 程序化遮挡物必须避开静态图、机器人和上下文对象完整 history/future swept footprint，
+  以及 collision/temporal-safe 两条目标完整 history/future；
 - 所有动态对象的真实 circle/rectangle footprint 轨迹不能穿墙；
 - 对象速度/加速度必须满足所属 type 的配置范围；
 - 不同成对样本只改变必要因素，如时间偏移或横向距离；
-- empty 只移除 `target_dynamic_object_id`，其他动态对象保持不变；
+- empty 从 renderer history/spec/current 和 OracleWorld future/spec 同时只移除
+  `target_dynamic_object_id`，其他动态对象保持不变，并从删除后的 scene 重新渲染全部
+  occupancy、last-seen、age 和 state channels；
 - 主 paired 样本中非目标动态对象不得形成 collision/near miss；否则拒绝或标记为
   `multi_object_context`，仅进入自然/OOD 分析；
-- 事件必须有固定 `pair_group_id`。
+- 事件必须有固定 `pair_group_id`；target/pair ID 依赖共享母事件身份，variant-specific
+  history/future 只进入对应 world/sample ID。
 
 ## 7.4 理想结果
 
@@ -1371,6 +1404,7 @@ python -m scripts.prepare_splits \
 
 python -m scripts.extract_snippets \
   --split train \
+  --duration-s 4.4 \
   --config configs/thor.yaml
 
 python -m scripts.build_risk_dataset \

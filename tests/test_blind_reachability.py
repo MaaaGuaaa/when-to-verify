@@ -131,6 +131,26 @@ def test_candidate_preserves_unwrapped_heading_difference_across_branch_cut() ->
     )
 
 
+def test_candidate_builds_ordinary_oblique_direction_with_stable_bytes() -> None:
+    desired_direction = np.random.default_rng(1).normal(size=(8, 2))[7]
+    kwargs = {
+        "conflict_point": [1.0, 1.0],
+        "source_current_xy": [0.0, 0.0],
+        "source_anchor_xy": [1.0, 0.0],
+        "desired_crossing_direction": desired_direction,
+        "identity": _identity(),
+    }
+
+    first = build_reachability_candidate(**kwargs)
+    second = build_reachability_candidate(**kwargs)
+
+    assert first.candidate_id == second.candidate_id
+    np.testing.assert_array_equal(
+        first.desired_crossing_direction, second.desired_crossing_direction
+    )
+    assert np.linalg.norm(first.desired_crossing_direction) == pytest.approx(1.0)
+
+
 def test_crossing_schedule_has_frozen_order_count_and_unit_directions() -> None:
     directions = scheduled_crossing_directions(
         np.array([2.0, 0.0], dtype=np.float32),
@@ -516,6 +536,7 @@ def test_candidate_builder_rejects_bad_vectors_or_degenerate_geometry(
         {"current_xy": np.ones(3)},
         {"source_delta_xy": np.zeros(2)},
         {"desired_crossing_direction": np.zeros(2)},
+        {"desired_crossing_direction": np.array([2.0, 0.0])},
     ],
 )
 def test_candidate_dataclass_rejects_invalid_fields(changes: dict[str, object]) -> None:

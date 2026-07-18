@@ -86,6 +86,7 @@ def _snippet(
         snippet_id=f"train-{object_type}-snippet-fixed",
         split="train",
         source_recording_id="source-recording",
+        source_session_id="source-session",
         source_object_id="source-recording::misleading-Helmet-name",
         object_type=object_type,
         footprint=footprint,
@@ -573,6 +574,7 @@ def _base_inputs():
             object_type="human",
             snippets=(snippet,),
             summary={"split": "train", "accepted_count": 1},
+            split_provenance={"split": "train"},
         )
     }
     return config, grid, base_state, oracle_context, trajectory, libraries
@@ -2184,6 +2186,7 @@ def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
             object_type="carried_object",
             snippets=(rectangle,),
             summary={"split": "train", "accepted_count": 1},
+            split_provenance={"split": "train"},
         )
     }
     report = generate_events(

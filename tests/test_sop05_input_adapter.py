@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from src.contracts import (
+    SCHEMA_VERSION,
     BaseState,
     GridSpec,
     OracleContext,
@@ -25,7 +26,6 @@ from src.generation.sop05_input_adapter import (
 )
 
 
-SCHEMA_VERSION = "2.0.0"
 SPLIT_DIGEST = "0123456789abcdef0123456789abcdef"
 SOP03_COMMIT = "1" * 40
 SOP04_COMMIT = "2" * 40
@@ -65,11 +65,40 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _snippet_array_sha256(
+    positions: np.ndarray,
+    velocities: np.ndarray,
+    headings: np.ndarray,
+) -> str:
+    digest = hashlib.sha256()
+    for name, array in (
+        ("positions", positions),
+        ("velocities", velocities),
+        ("headings", headings),
+    ):
+        contiguous = np.ascontiguousarray(array)
+        digest.update(name.encode("ascii") + b"\0")
+        digest.update(str(contiguous.dtype).encode("ascii") + b"\0")
+        digest.update(
+            json.dumps(list(contiguous.shape), separators=(",", ":")).encode(
+                "ascii"
+            )
+            + b"\0"
+        )
+        digest.update(contiguous.tobytes(order="C"))
+    return digest.hexdigest()
+
+
 def _split_provenance() -> dict[str, object]:
     return {
         "evaluation_scope": "fixture_unseen_recording",
         "grouping_unit": "recording_id",
         "split_manifest_digest": SPLIT_DIGEST,
+        "field_policies": {
+            "recording": "forbidden",
+            "session": "allowed_reported",
+            "participant": "unavailable",
+        },
     }
 
 
@@ -141,6 +170,7 @@ def _write_snippet_library(
                 "snippet_id": snippet_id,
                 "split": "train",
                 "source_recording_id": "recording-a",
+                "source_session_id": "fixture-session",
                 "source_object_id": f"recording-a::{object_type}",
                 "object_type": object_type,
                 "footprint": footprint,
@@ -164,6 +194,7 @@ def _write_snippet_library(
                 "object_type": object_type,
                 "snippet_id": snippet_id,
                 "source_recording_id": "recording-a",
+                "source_session_id": "fixture-session",
                 "source_object_id": f"recording-a::{object_type}",
                 "footprint": footprint,
                 "sample_count": declared,
@@ -186,10 +217,24 @@ def _write_snippet_library(
         metadata_rows = []
         source_rows = []
 
+    array_digest = _snippet_array_sha256(positions, velocities, headings)
+    summary["array_sha256"] = array_digest
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "object_type": object_type,
         "summary": summary,
+        "split_provenance": _split_provenance(),
+        "split_manifest_digest": SPLIT_DIGEST,
+        "array_sha256": array_digest,
+        "motion_snippet_layout_version": summary[
+            "motion_snippet_layout_version"
+        ],
+        "sample_count": summary["sample_count"],
+        "history_steps": summary["history_steps"],
+        "future_steps": summary["future_steps"],
+        "current_index": summary["current_index"],
+        "sample_dt_s": summary["sample_dt_s"],
+        "duration_s": summary["duration_s"],
         "snippets": metadata_rows,
     }
     np.savez(

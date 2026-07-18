@@ -67,6 +67,7 @@ def _snippet() -> MotionSnippet:
         snippet_id="train-human-snippet-paired",
         split="train",
         source_recording_id="source-recording",
+        source_session_id="source-session",
         source_object_id="source-recording::paired-human",
         object_type="human",
         footprint={"kind": "circle", "radius_m": 0.30},
@@ -136,6 +137,7 @@ def _paired_source_inputs():
             object_type="human",
             snippets=(snippet,),
             summary={"split": "train", "accepted_count": 1},
+            split_provenance={"split": "train"},
         )
     }
     return config, grid, base_state, oracle_context, trajectory, snippet, libraries

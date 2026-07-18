@@ -60,6 +60,16 @@ def _nonnegative_int(text: str) -> int:
     return value
 
 
+def _lower_sha256(text: str) -> str:
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise argparse.ArgumentTypeError(
+            "must be 64 lowercase hexadecimal characters"
+        )
+    return text
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -69,6 +79,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sop03-root", type=Path, required=True)
     parser.add_argument("--sop04-root", type=Path, required=True)
+    parser.add_argument(
+        "--sop04-handoff-digest",
+        type=_lower_sha256,
+        required=True,
+        help=(
+            "Trusted external SOP-04 v2 handoff SHA-256 supplied outside "
+            "the artifact directory."
+        ),
+    )
     parser.add_argument("--split", choices=SPLIT_NAMES, required=True)
     parser.add_argument(
         "--base-config", type=Path, default=_ROOT / "configs/base.yaml"
@@ -106,6 +125,7 @@ def main() -> int:
     request = Sop05RunRequest(
         sop03_root=args.sop03_root,
         sop04_root=args.sop04_root,
+        sop04_external_handoff_digest_sha256=args.sop04_handoff_digest,
         split=args.split,
         base_config_path=args.base_config,
         generator_config_path=args.generator_config,

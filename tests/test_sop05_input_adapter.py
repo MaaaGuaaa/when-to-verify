@@ -30,6 +30,8 @@ SPLIT_DIGEST = "0123456789abcdef0123456789abcdef"
 SOP03_COMMIT = "1" * 40
 SOP04_COMMIT = "2" * 40
 LAYOUT_VERSION = "history8_current7_future15_v1"
+SOP04_BANK_VERSION = "sop04_audited_bank_v2"
+SOP04_POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
 
 def _json_write(path: Path, value: object) -> None:
@@ -386,14 +388,20 @@ def _write_sop03_bundle(
 def _trajectory_summary(grid: GridSpec) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
+        "trajectory_bank_version": SOP04_BANK_VERSION,
+        "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
         "accepted_count": 21,
         "candidate_count": 21,
         "rejected_count": 0,
         "acceptance_rate": 1.0,
         "array_dtype": "float32",
         "trajectory_steps": 15,
+        "dt_s": 0.2,
+        "first_pose_time_s": 0.2,
+        "last_pose_time_s": 3.0,
         "grid_height": grid.height,
         "grid_width": grid.width,
+        "grid_resolution_m": grid.resolution_m,
         "meets_minimum_acceptance_rate": True,
         "minimum_acceptance_rate": 0.7,
         "braking_deceleration_mps2": 1.0,
@@ -407,7 +415,11 @@ def _trajectory_summary(grid: GridSpec) -> dict[str, object]:
 
 
 def _refresh_sop04_checksums(root: Path) -> None:
-    excluded = {"audit_report.json", "artifact_checksums.sha256"}
+    excluded = {
+        "audit_report.json",
+        "artifact_checksums.sha256",
+        "external_handoff_digest.sha256",
+    }
     files = sorted(
         path
         for path in root.iterdir()
@@ -422,8 +434,31 @@ def _refresh_sop04_checksums(root: Path) -> None:
     audit = _json_read(audit_path)
     assert isinstance(audit, dict)
     audit["checksum_manifest_sha256"] = _sha256(manifest)
-    audit["artifact_file_count"] = len(files)
+    audit["checksummed_payload_file_count"] = len(files)
     _json_write(audit_path, audit)
+    envelope = hashlib.sha256()
+    envelope.update(b"sop04_audited_bank_v2_external_handoff\0")
+    envelope.update(manifest.read_bytes())
+    envelope.update(b"\0")
+    envelope.update(audit_path.read_bytes())
+    (root / "external_handoff_digest.sha256").write_text(
+        f"{envelope.hexdigest()}  sop04_audited_bank_v2_envelope\n",
+        encoding="utf-8",
+    )
+
+
+def _sop04_handoff_digest(root: Path) -> str:
+    return (root / "external_handoff_digest.sha256").read_text(
+        encoding="utf-8"
+    ).split()[0]
+
+
+def _load_sop04(root: Path, grid: GridSpec):
+    return load_sop04_trajectory_bank(
+        root,
+        grid,
+        expected_external_handoff_digest_sha256=_sop04_handoff_digest(root),
+    )
 
 
 def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
@@ -445,14 +480,29 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
     for index, trajectory_id in enumerate(ids):
         is_stop = trajectory_id == "stop"
         velocity = 0.0 if is_stop else 0.2 + 0.01 * index
+        omega = 0.4 if index == 0 else 0.0
         controls[index, :, 0] = np.float32(velocity)
-        poses[index, :, 0] = np.arange(15, dtype=np.float32) * np.float32(
-            velocity * 0.2
-        )
+        controls[index, :, 1] = np.float32(omega)
+        times = np.arange(1, 16, dtype=np.float64) * 0.2
+        if omega == 0.0:
+            poses[index, :, 0] = (velocity * times).astype(np.float32)
+        else:
+            yaw = omega * times
+            poses[index, :, 0] = ((velocity / omega) * np.sin(yaw)).astype(
+                np.float32
+            )
+            poses[index, :, 1] = (
+                (velocity / omega) * (1.0 - np.cos(yaw))
+            ).astype(np.float32)
+            poses[index, :, 2] = yaw.astype(np.float32)
         metadata = {
             "dt_s": 0.2,
+            "first_pose_time_s": 0.2,
+            "last_pose_time_s": 3.0,
+            "trajectory_steps": 15,
+            "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
             "v": velocity,
-            "omega": 0.0,
+            "omega": omega,
             "is_stop": is_stop,
             "is_reverse": False,
             "braking_deceleration_mps2": 1.0,
@@ -464,9 +514,14 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
                 "array_index": index,
                 "trajectory_id": trajectory_id,
                 "trajectory_steps": 15,
+                "trajectory_bank_version": SOP04_BANK_VERSION,
+                "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
+                "dt_s": 0.2,
+                "first_pose_time_s": 0.2,
+                "last_pose_time_s": 3.0,
                 "query_map_shape": [grid.height, grid.width],
                 "v_mps": velocity,
-                "omega_radps": 0.0,
+                "omega_radps": omega,
                 "is_stop": is_stop,
                 "is_reverse": False,
                 "task_cost": 0.0,
@@ -480,6 +535,8 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
     }
     metadata = {
         "schema_version": SCHEMA_VERSION,
+        "trajectory_bank_version": SOP04_BANK_VERSION,
+        "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
         "summary": embedded_summary,
         "trajectory_ids": ids,
         "trajectory_metadata": trajectory_metadata,
@@ -497,21 +554,34 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
     )
     _jsonl_write(root / "trajectory_manifest.jsonl", manifest_rows)
     _json_write(root / "summary.json", external_summary)
-    (root / "slurm-fixture.out").write_text("producer complete\n", encoding="utf-8")
     _json_write(
         root / "audit_report.json",
         {
             "status": "ok",
             "schema_version": SCHEMA_VERSION,
-            "code_commit": SOP04_COMMIT,
+            "trajectory_bank_version": SOP04_BANK_VERSION,
+            "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
             "trajectory_count": count,
-            "forward_trajectory_count": count - 1,
-            "stop_trajectory_count": 1,
+            "trajectory_steps": 15,
+            "dt_s": 0.2,
+            "first_pose_time_s": 0.2,
+            "last_pose_time_s": 3.0,
+            "artifact_reload_validation": "passed",
             "shape_dtype_finite_validation": "passed_all",
+            "future_endpoint_kinematics": "passed_all",
             "query_map_invariants": "passed_all",
             "manifest_array_alignment": "passed_all",
+            "summary_npz_alignment": "passed_all",
+            "checksum_verification": "passed_all",
+            "determinism_reference_exact_match": True,
             "serial_parallel_exact_match": True,
             "checksum_file": "artifact_checksums.sha256",
+            "bank_semantic_digest_sha256": "b" * 64,
+            "provenance": {
+                "canonical_shared_bank": True,
+                "code_commit": SOP04_COMMIT,
+                "config": "configs/base.yaml",
+            },
         },
     )
     _refresh_sop04_checksums(root)
@@ -756,17 +826,148 @@ def test_sop04_adapter_builds_local_trajectories_by_manifest_index(
 ) -> None:
     _, root = producer_roots
 
-    bank = load_sop04_trajectory_bank(root, grid)
+    bank = _load_sop04(root, grid)
 
     assert len(bank.trajectories) == 21
     assert bank.trajectories[0].trajectory_id == "trajectory-00"
     assert bank.trajectories[-1].trajectory_id == "stop"
     assert tuple(bank.by_id) == tuple(item.trajectory_id for item in bank.trajectories)
     assert bank.producer_evidence.code_commit == SOP04_COMMIT
-    assert bank.producer_evidence.completion_policy == "sop04_audited_bank_v1"
+    assert bank.producer_evidence.completion_policy == SOP04_BANK_VERSION
+    assert bank.trajectory_bank_version == SOP04_BANK_VERSION
+    assert bank.pose_time_layout_version == SOP04_POSE_TIME_LAYOUT_VERSION
+    np.testing.assert_array_equal(
+        bank.pose_time_offsets_s,
+        (np.arange(15, dtype=np.float64) + 1.0) * 0.2,
+    )
     for trajectory in bank.trajectories:
         assert trajectory.poses.flags.owndata
         assert trajectory.swept_mask.flags.owndata
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("trajectory_bank_version", "sop04_audited_bank_v1"),
+        ("pose_time_layout_version", "legacy_t0_to_horizon_minus_dt_v0"),
+        ("first_pose_time_s", 0.0),
+        ("last_pose_time_s", 2.8),
+        ("dt_s", None),
+    ],
+)
+def test_sop04_adapter_rejects_stale_or_incomplete_time_contract(
+    producer_roots: tuple[Path, Path],
+    grid: GridSpec,
+    key: str,
+    value: object,
+) -> None:
+    _, root = producer_roots
+    audit_path = root / "audit_report.json"
+    audit = _json_read(audit_path)
+    assert isinstance(audit, dict)
+    audit[key] = value
+    _json_write(audit_path, audit)
+    _refresh_sop04_checksums(root)
+
+    with pytest.raises(Sop05InputError, match="version|time|layout|dt"):
+        _load_sop04(root, grid)
+
+
+def test_sop04_adapter_rejects_t0_poses_resealed_under_v2_labels(
+    producer_roots: tuple[Path, Path], grid: GridSpec
+) -> None:
+    _, root = producer_roots
+    path = root / "trajectory_bank.npz"
+    with np.load(path, allow_pickle=False) as payload:
+        arrays = {key: payload[key].copy() for key in payload.files}
+    arrays["poses"][:, :, 0] -= arrays["controls"][:, :, 0] * np.float32(0.2)
+    np.savez(path, **arrays)
+    _refresh_sop04_checksums(root)
+
+    with pytest.raises(Sop05InputError, match="future endpoint"):
+        _load_sop04(root, grid)
+
+
+def test_sop04_adapter_rejects_external_handoff_digest_tamper(
+    producer_roots: tuple[Path, Path], grid: GridSpec
+) -> None:
+    _, root = producer_roots
+    expected = _sop04_handoff_digest(root)
+    (root / "external_handoff_digest.sha256").write_text(
+        f"{'0' * 64}  sop04_audited_bank_v2_envelope\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Sop05InputError, match="external handoff"):
+        load_sop04_trajectory_bank(
+            root,
+            grid,
+            expected_external_handoff_digest_sha256=expected,
+        )
+
+
+def test_sop04_adapter_rejects_coherently_resealed_bundle_against_trusted_handoff(
+    producer_roots: tuple[Path, Path], grid: GridSpec
+) -> None:
+    _, root = producer_roots
+    trusted = _sop04_handoff_digest(root)
+    audit_path = root / "audit_report.json"
+    audit = _json_read(audit_path)
+    assert isinstance(audit, dict)
+    audit["bank_semantic_digest_sha256"] = "c" * 64
+    _json_write(audit_path, audit)
+    _refresh_sop04_checksums(root)
+
+    with pytest.raises(Sop05InputError, match="trusted handoff"):
+        load_sop04_trajectory_bank(
+            root,
+            grid,
+            expected_external_handoff_digest_sha256=trusted,
+        )
+
+
+def test_sop04_adapter_rejects_extra_checksummed_payload(
+    producer_roots: tuple[Path, Path], grid: GridSpec
+) -> None:
+    _, root = producer_roots
+    (root / "extra.json").write_text("{}\n", encoding="utf-8")
+    _refresh_sop04_checksums(root)
+
+    with pytest.raises(Sop05InputError, match="exactly the v2 core"):
+        _load_sop04(root, grid)
+
+
+@pytest.mark.parametrize("layer", ["summary", "npz", "manifest"])
+def test_sop04_adapter_rejects_old_layout_token_at_every_artifact_layer(
+    producer_roots: tuple[Path, Path],
+    grid: GridSpec,
+    layer: str,
+) -> None:
+    _, root = producer_roots
+    old = "legacy_t0_to_horizon_minus_dt_v0"
+    if layer == "summary":
+        summary_path = root / "summary.json"
+        summary = _json_read(summary_path)
+        assert isinstance(summary, dict)
+        summary["pose_time_layout_version"] = old
+        _json_write(summary_path, summary)
+    elif layer == "npz":
+        path = root / "trajectory_bank.npz"
+        with np.load(path, allow_pickle=False) as payload:
+            arrays = {key: payload[key].copy() for key in payload.files}
+        metadata = json.loads(str(arrays["meta_json"]))
+        metadata["pose_time_layout_version"] = old
+        arrays["meta_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
+        np.savez(path, **arrays)
+    else:
+        path = root / "trajectory_manifest.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["pose_time_layout_version"] = old
+        _jsonl_write(path, rows)
+    _refresh_sop04_checksums(root)
+
+    with pytest.raises(Sop05InputError, match="layout"):
+        _load_sop04(root, grid)
 
 
 @pytest.mark.parametrize("case", ["duplicate", "gap", "out-of-range"])
@@ -786,7 +987,7 @@ def test_sop04_adapter_rejects_invalid_manifest_array_index(
     _refresh_sop04_checksums(root)
 
     with pytest.raises(Sop05InputError, match="array_index"):
-        load_sop04_trajectory_bank(root, grid)
+        _load_sop04(root, grid)
 
 
 def test_sop04_adapter_rejects_query_shape_or_tta_invariant(
@@ -801,7 +1002,7 @@ def test_sop04_adapter_rejects_query_shape_or_tta_invariant(
     _refresh_sop04_checksums(root)
 
     with pytest.raises(Sop05InputError, match="TTA"):
-        load_sop04_trajectory_bank(root, grid)
+        _load_sop04(root, grid)
 
 
 def test_sop04_adapter_rejects_external_summary_drift(
@@ -816,7 +1017,7 @@ def test_sop04_adapter_rejects_external_summary_drift(
     _refresh_sop04_checksums(root)
 
     with pytest.raises(Sop05InputError, match="embedded summary"):
-        load_sop04_trajectory_bank(root, grid)
+        _load_sop04(root, grid)
 
 
 @pytest.mark.parametrize(
@@ -844,7 +1045,7 @@ def test_sop04_adapter_requires_audited_bank_readiness(
     _json_write(path, audit)
 
     with pytest.raises(Sop05InputError, match=message):
-        load_sop04_trajectory_bank(root, grid)
+        _load_sop04(root, grid)
 
 
 def test_sop04_adapter_rejects_commit_mismatch(
@@ -861,7 +1062,7 @@ def test_sop04_adapter_rejects_commit_mismatch(
     _refresh_sop04_checksums(root)
 
     with pytest.raises(Sop05InputError, match="commit"):
-        load_sop04_trajectory_bank(root, grid)
+        _load_sop04(root, grid)
 
 
 def test_stable_pair_schedule_ignores_manifest_and_bank_order_and_builtin_hash(
@@ -871,7 +1072,7 @@ def test_stable_pair_schedule_ignores_manifest_and_bank_order_and_builtin_hash(
 ) -> None:
     sop03_root, sop04_root = producer_roots
     sop03 = load_sop03_split_inputs(sop03_root, "train", grid)
-    sop04 = load_sop04_trajectory_bank(sop04_root, grid)
+    sop04 = _load_sop04(sop04_root, grid)
     first = build_stable_pair_schedule(
         sop03,
         sop04,
@@ -922,7 +1123,7 @@ def test_stable_pair_schedule_rejects_nonphysical_arguments(
 ) -> None:
     sop03_root, sop04_root = producer_roots
     sop03 = load_sop03_split_inputs(sop03_root, "train", grid)
-    sop04 = load_sop04_trajectory_bank(sop04_root, grid)
+    sop04 = _load_sop04(sop04_root, grid)
 
     with pytest.raises((TypeError, ValueError), match=message):
         build_stable_pair_schedule(sop03, sop04, **kwargs)
@@ -933,7 +1134,7 @@ def test_stable_pair_schedule_truncates_limits_to_available_inputs(
 ) -> None:
     sop03_root, sop04_root = producer_roots
     sop03 = load_sop03_split_inputs(sop03_root, "train", grid)
-    sop04 = load_sop04_trajectory_bank(sop04_root, grid)
+    sop04 = _load_sop04(sop04_root, grid)
 
     schedule = build_stable_pair_schedule(
         sop03,

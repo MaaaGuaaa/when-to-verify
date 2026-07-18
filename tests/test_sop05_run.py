@@ -54,6 +54,11 @@ _CLEAN_SOURCE_IDENTITY = {
     "worktree_state": "clean",
     "dirty_tree_sha256": None,
 }
+_SOP04_HANDOFF_DIGEST = "e" * 64
+_SOP04_OFFSETS_DIGEST = (
+    "1287220ad6fb1eec96bc41662ab61e2e443b1927f9fed0a4f6d3325aed2027db"
+)
+_SOP04_BANK_SEMANTIC_DIGEST = "d" * 64
 
 
 def _sut():
@@ -91,7 +96,7 @@ def _assert_outer_checksums(root: Path) -> dict[str, str]:
 def _evidence(root: Path, digit: str) -> ProducerEvidence:
     completion_policies = {
         "1": "sop03_complete_marker_v1",
-        "2": "sop04_audited_bank_v1",
+        "2": "sop04_audited_bank_v2",
     }
     return ProducerEvidence(
         root=root,
@@ -191,6 +196,7 @@ def _request(module, tmp_path: Path, **overrides):
     values = {
         "sop03_root": tmp_path / "sop03",
         "sop04_root": tmp_path / "sop04",
+        "sop04_external_handoff_digest_sha256": _SOP04_HANDOFF_DIGEST,
         "split": "train",
         "base_config_path": ROOT / "configs/base.yaml",
         "generator_config_path": ROOT / "configs/generator_train.yaml",
@@ -234,6 +240,15 @@ def _install_preflight_inputs(
         trajectories=(object(),),
         by_id={"trajectory-a": object()},
         producer_evidence=_evidence(resolved_sop04_root, "2"),
+        trajectory_bank_version="sop04_audited_bank_v2",
+        pose_time_layout_version="future_endpoints_dt_to_horizon_v1",
+        pose_time_offsets_s=tuple(
+            float(value)
+            for value in (np.arange(15, dtype=np.float64) + 1.0) * 0.2
+        ),
+        pose_time_offsets_sha256=_SOP04_OFFSETS_DIGEST,
+        bank_semantic_digest_sha256=_SOP04_BANK_SEMANTIC_DIGEST,
+        external_handoff_digest_sha256=_SOP04_HANDOFF_DIGEST,
     )
     calls = {"sop03": 0, "sop04": 0, "schedule": 0}
 
@@ -245,11 +260,21 @@ def _install_preflight_inputs(
         assert checksum_workers == 2
         return sop03
 
-    def load_sop04(root, grid, *, checksum_workers):
+    def load_sop04(
+        root,
+        grid,
+        *,
+        expected_external_handoff_digest_sha256,
+        checksum_workers,
+    ):
         calls["sop04"] += 1
         assert Path(root) == resolved_sop04_root
         assert grid.history_steps == 8 and grid.future_steps == 15
         assert checksum_workers == 2
+        assert (
+            expected_external_handoff_digest_sha256
+            == _SOP04_HANDOFF_DIGEST
+        )
         return sop04
 
     def schedule(loaded_sop03, loaded_sop04, **kwargs):
@@ -675,10 +700,45 @@ def test_prepare_is_read_only_and_freezes_ranked_pair_schedule(
     assert summary["run_id"].startswith("sop05-run-")
     assert prepared.input_lock["sop03"]["code_commit"] == "1" * 40
     assert prepared.input_lock["sop04"]["code_commit"] == "2" * 40
+    assert prepared.input_lock["version"] == "sop05_input_lock_v2"
+    assert prepared.input_lock["sop04"] == {
+        "code_commit": "2" * 40,
+        "checksum_manifest_sha256": "2" * 64,
+        "audit_sha256": "a" * 64,
+        "completion_policy": "sop04_audited_bank_v2",
+        "trajectory_bank_version": "sop04_audited_bank_v2",
+        "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+        "trajectory_steps": 15,
+        "dt_s": 0.2,
+        "first_pose_time_s": 0.2,
+        "last_pose_time_s": 3.0,
+        "pose_time_offsets_sha256": _SOP04_OFFSETS_DIGEST,
+        "bank_semantic_digest_sha256": _SOP04_BANK_SEMANTIC_DIGEST,
+        "external_handoff_digest_sha256": _SOP04_HANDOFF_DIGEST,
+    }
     assert "payload_checksums" not in prepared.input_lock["sop03"]
     assert "payload_checksums" not in prepared.input_lock["sop04"]
     assert not request.output_dir.exists()
     assert not list(tmp_path.glob(".run.staging-*"))
+
+
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [None, "e" * 63, "E" * 64, "g" * 64],
+)
+def test_prepare_rejects_invalid_trusted_sop04_handoff_digest(
+    tmp_path: Path,
+    invalid_digest: object,
+) -> None:
+    module = _sut()
+    request = _request(
+        module,
+        tmp_path,
+        sop04_external_handoff_digest_sha256=invalid_digest,
+    )
+
+    with pytest.raises(module.Sop05RunError, match="SOP-04.*handoff digest"):
+        module.prepare_sop05_run(request)
 
 
 def test_scientific_run_identity_ignores_workers_and_resolved_input_roots(
@@ -740,6 +800,15 @@ def test_run_identity_binds_only_the_total_selection_contract(
                 prepared.sop04.producer_evidence.checksum_manifest_sha256
             ),
             "audit_sha256": prepared.sop04.producer_evidence.audit_sha256,
+            "trajectory_bank_version": "sop04_audited_bank_v2",
+            "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+            "trajectory_steps": 15,
+            "dt_s": 0.2,
+            "first_pose_time_s": 0.2,
+            "last_pose_time_s": 3.0,
+            "pose_time_offsets_sha256": _SOP04_OFFSETS_DIGEST,
+            "bank_semantic_digest_sha256": _SOP04_BANK_SEMANTIC_DIGEST,
+            "external_handoff_digest_sha256": _SOP04_HANDOFF_DIGEST,
         },
         "selection": prepared.input_lock["selection"],
         "base_config_sha256": prepared.base_config_sha256,

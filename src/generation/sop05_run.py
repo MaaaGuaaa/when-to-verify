@@ -37,6 +37,9 @@ from src.generation.event_target_motion_shard import (
 )
 from src.generation.sop05_input_adapter import (
     ProducerEvidence,
+    SOP04_COMPLETION_POLICY,
+    SOP04_POSE_TIME_LAYOUT_VERSION,
+    SOP04_TRAJECTORY_BANK_VERSION,
     Sop03SplitInputs,
     Sop04TrajectoryBank,
     build_stable_pair_schedule,
@@ -60,6 +63,7 @@ from src.utils.config import load_config
 SOP05_RUN_VERSION = SOP05_RUN_PRODUCER_VERSION
 SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v2"
 SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v2"
+SOP05_INPUT_LOCK_VERSION = "sop05_input_lock_v2"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_IDENTITY_VERSION = "sop05_producer_source_identity_v1"
 _EVENT_KIND_WEIGHTS = dict(
@@ -75,6 +79,7 @@ class Sop05RunError(ValueError):
 class Sop05RunRequest:
     sop03_root: Path
     sop04_root: Path
+    sop04_external_handoff_digest_sha256: str
     split: str
     base_config_path: Path
     generator_config_path: Path
@@ -435,6 +440,15 @@ def _validate_request(request: Sop05RunRequest) -> None:
         raise Sop05RunError("events_per_pair must be a multiple of 10")
     if not isinstance(request.split, str) or not request.split:
         raise Sop05RunError("split must be a non-empty string")
+    digest = request.sop04_external_handoff_digest_sha256
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise Sop05RunError(
+            "trusted SOP-04 external handoff digest must be 64 lowercase hex"
+        )
 
 
 def _evidence_payload(evidence: ProducerEvidence) -> dict[str, object]:
@@ -457,6 +471,56 @@ def _evidence_identity(evidence: ProducerEvidence) -> dict[str, str]:
         "code_commit": evidence.code_commit,
         "checksum_manifest_sha256": evidence.checksum_manifest_sha256,
         "audit_sha256": evidence.audit_sha256,
+    }
+
+
+def _sop04_evidence_payload(sop04: Sop04TrajectoryBank) -> dict[str, object]:
+    expected_offsets = (
+        np.arange(15, dtype=np.float64) + 1.0
+    ) * 0.2
+    observed_offsets = np.asarray(sop04.pose_time_offsets_s, dtype=np.float64)
+    if (
+        sop04.trajectory_bank_version != SOP04_TRAJECTORY_BANK_VERSION
+        or sop04.pose_time_layout_version != SOP04_POSE_TIME_LAYOUT_VERSION
+        or observed_offsets.shape != (15,)
+        or not np.array_equal(observed_offsets, expected_offsets)
+    ):
+        raise Sop05RunError("SOP-04 corrected future-time contract mismatch")
+    digests = {
+        "pose_time_offsets_sha256": sop04.pose_time_offsets_sha256,
+        "bank_semantic_digest_sha256": sop04.bank_semantic_digest_sha256,
+        "external_handoff_digest_sha256": (
+            sop04.external_handoff_digest_sha256
+        ),
+    }
+    for name, value in digests.items():
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise Sop05RunError(f"SOP-04 {name} is invalid")
+    if sop04.producer_evidence.completion_policy != SOP04_COMPLETION_POLICY:
+        raise Sop05RunError("SOP-04 completion policy mismatch")
+    return {
+        **_evidence_payload(sop04.producer_evidence),
+        "trajectory_bank_version": SOP04_TRAJECTORY_BANK_VERSION,
+        "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
+        "trajectory_steps": 15,
+        "dt_s": 0.2,
+        "first_pose_time_s": 0.2,
+        "last_pose_time_s": 3.0,
+        **digests,
+    }
+
+
+def _sop04_evidence_identity(
+    evidence: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in evidence.items()
+        if key != "completion_policy"
     }
 
 
@@ -496,8 +560,17 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
     sop04 = load_sop04_trajectory_bank(
         request.sop04_root,
         grid,
+        expected_external_handoff_digest_sha256=(
+            request.sop04_external_handoff_digest_sha256
+        ),
         checksum_workers=request.checksum_workers,
     )
+    sop04_evidence = _sop04_evidence_payload(sop04)
+    if (
+        sop04_evidence["external_handoff_digest_sha256"]
+        != request.sop04_external_handoff_digest_sha256
+    ):
+        raise Sop05RunError("SOP-04 trusted external handoff digest mismatch")
     raw_schedule = build_stable_pair_schedule(
         sop03,
         sop04,
@@ -544,10 +617,10 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
         for item in schedule
     ]
     input_lock = {
-        "version": "sop05_input_lock_v1",
+        "version": SOP05_INPUT_LOCK_VERSION,
         "split": request.split,
         "sop03": _evidence_payload(sop03.producer_evidence),
-        "sop04": _evidence_payload(sop04.producer_evidence),
+        "sop04": sop04_evidence,
         "selection": {
             "seed": request.seed,
             "max_base_states": request.max_base_states,
@@ -574,7 +647,7 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
         "producer_source_identity": producer_source_identity,
         "split": request.split,
         "sop03": _evidence_identity(sop03.producer_evidence),
-        "sop04": _evidence_identity(sop04.producer_evidence),
+        "sop04": _sop04_evidence_identity(sop04_evidence),
         "selection": input_lock["selection"],
         "base_config_sha256": base_config_sha256,
         "generator_config_sha256": generator_config_sha256,

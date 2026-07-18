@@ -37,6 +37,8 @@ def _argv(tmp_path: Path, *extra: str) -> list[str]:
         str(tmp_path / "sop03"),
         "--sop04-root",
         str(tmp_path / "sop04"),
+        "--sop04-handoff-digest",
+        "e" * 64,
         "--split",
         "train",
         "--base-config",
@@ -101,6 +103,7 @@ def test_cli_executes_once_and_forwards_positive_worker_count(
     assert request.checksum_workers == 4
     assert request.events_per_pair == 10
     assert request.sop03_root == tmp_path / "sop03"
+    assert request.sop04_external_handoff_digest_sha256 == "e" * 64
     assert request.git_executable == tmp_path / "git"
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
@@ -197,6 +200,27 @@ def test_cli_rejects_nonpositive_workers_before_loading_inputs(
     )
     argv = _argv(tmp_path)
     argv[argv.index("--workers") + 1] = "0"
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("digest", ["e" * 63, "E" * 64, "g" * 64])
+def test_cli_rejects_noncanonical_sop04_handoff_digest_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    digest: str,
+) -> None:
+    cli = _load_cli()
+    monkeypatch.setattr(
+        cli,
+        "execute_sop05_run",
+        lambda request: pytest.fail("invalid CLI must not load inputs"),
+    )
+    argv = _argv(tmp_path)
+    argv[argv.index("--sop04-handoff-digest") + 1] = digest
     monkeypatch.setattr(sys, "argv", argv)
 
     with pytest.raises(SystemExit) as exc_info:

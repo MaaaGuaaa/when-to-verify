@@ -43,7 +43,27 @@ from .dynamic_object_transplant import (
     footprint_from_spec,
     normalize_target_type_policy,
     sample_motion_snippet,
+    transplant_reachability_candidate,
     transplant_snippet,
+)
+from .blind_reachability import (
+    BLIND_REACHABILITY_ALGORITHM_VERSION,
+    ReachabilityIdentity,
+    build_reachability_candidate,
+    candidate_queries_mask,
+    scheduled_crossing_directions,
+    triage_chord,
+)
+from .blind_region import (
+    build_blind_region,
+    build_footprint_center_mask,
+    check_exact_hidden_pose,
+)
+from .causal_occluder import (
+    build_causal_occluder_context,
+    build_causal_occluder_schedule,
+    normalize_causal_occluder_config,
+    propose_causal_occluder,
 )
 from .event_target_motion_shard import (
     EVENT_TARGET_MOTION_LAYOUT_VERSION,
@@ -72,10 +92,15 @@ from .structural_blindspot import (
     footprint_visibility_sequence,
     has_continuous_emergence,
 )
+from .robot_sweep_cache import (
+    RobotSweepCache,
+    prepare_robot_collision_sweep_bundle,
+)
 
 
 _EVENT_TYPES = ("environment", "structural", "mixed")
-SOP05_GENERATOR_ALGORITHM_VERSION = "joint_occluder_first_v4"
+SOP05_GENERATOR_ALGORITHM_VERSION = BLIND_REACHABILITY_ALGORITHM_VERSION
+SOP05_GENERATOR_SCHEMA_VERSION = "3.0.0"
 _GENERATED_EVENT_ID_DOMAIN = "sop05-generated-event-lineage-id-v1"
 _GENERATED_EVENT_IDENTITY_VERSION = "sop05_generated_event_lineage_v1"
 _WORLD_ID_DOMAIN = "sop05-generated-world-id-v1"
@@ -272,16 +297,15 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         raise GeneratorConfigError("generator config must be a mapping")
     expected = {
         "schema_version",
+        "production_event_kind",
         "target_type_policy",
-        "event_type_weights",
         "conflict_time_range_s",
         "max_local_curvature_per_m",
         "crossing_angle_max_deg",
         "time_scale_range",
-        "max_resample_attempts",
         "min_contiguous_visible_frames",
         "occluders",
-        "structural_fov",
+        "blind_reachability",
     }
     if set(config) != expected:
         unknown = sorted(set(config) - expected)
@@ -289,17 +313,56 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         raise GeneratorConfigError(
             f"generator config keys mismatch; unknown={unknown}, missing={missing}"
         )
-    if config["schema_version"] != SCHEMA_VERSION:
+    if config["schema_version"] != SOP05_GENERATOR_SCHEMA_VERSION:
         raise GeneratorConfigError(
-            f"schema_version must be {SCHEMA_VERSION}"
+            f"schema_version must be {SOP05_GENERATOR_SCHEMA_VERSION}"
         )
+    if config["production_event_kind"] != "environment":
+        raise GeneratorConfigError(
+            "production_event_kind must be environment"
+        )
+    blind = config["blind_reachability"]
+    blind_expected = {
+        "algorithm_version",
+        "obstacle_proposals_per_trajectory",
+        "interaction_range_m",
+        "bearing_bin_count",
+        "yaw_step_deg",
+        "crossing_angle_step_deg",
+        "minimum_shadow_center_cells",
+        "chord_deviation_fastpath_m",
+        "unresolved_exact_fallback_per_anchor",
+    }
+    if not isinstance(blind, Mapping) or set(blind) != blind_expected:
+        raise GeneratorConfigError(
+            "blind_reachability keys do not match the frozen v5 schema"
+        )
+    if blind["algorithm_version"] != SOP05_GENERATOR_ALGORITHM_VERSION:
+        raise GeneratorConfigError(
+            "blind_reachability.algorithm_version must be "
+            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
+        )
+    occluders = config["occluders"]
+    occluder_expected = {"types", "wall", "shelf", "pillar"}
+    if not isinstance(occluders, Mapping) or set(occluders) != occluder_expected:
+        raise GeneratorConfigError("occluders keys mismatch for the v5 schema")
     try:
         policy = (
             config["target_type_policy"]
             if isinstance(config["target_type_policy"], TargetTypePolicy)
             else normalize_target_type_policy(config["target_type_policy"])
         )
-        occluders = normalize_occluder_config(config["occluders"])
+        causal_occluders = normalize_causal_occluder_config(
+            {
+                **occluders,
+                "interaction_range_m": blind["interaction_range_m"],
+                "bearing_bin_count": blind["bearing_bin_count"],
+                "yaw_step_deg": blind["yaw_step_deg"],
+                "minimum_shadow_center_cells": blind[
+                    "minimum_shadow_center_cells"
+                ],
+            }
+        )
     except (TypeError, ValueError) as exc:
         raise GeneratorConfigError(str(exc)) from exc
     max_curvature = _finite_real(
@@ -321,12 +384,27 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
     )
     if time_scale_range != (1.0, 1.0):
         raise GeneratorConfigError("time_scale_range must equal [1.0, 1.0]")
+    crossing_step = _finite_real(
+        blind["crossing_angle_step_deg"],
+        name="blind_reachability.crossing_angle_step_deg",
+    )
+    if not 0.0 < crossing_step <= crossing_angle:
+        raise GeneratorConfigError(
+            "blind_reachability.crossing_angle_step_deg must be positive "
+            "and no greater than crossing_angle_max_deg"
+        )
+    chord_deviation = _finite_real(
+        blind["chord_deviation_fastpath_m"],
+        name="blind_reachability.chord_deviation_fastpath_m",
+    )
+    if chord_deviation < 0.0:
+        raise GeneratorConfigError(
+            "blind_reachability.chord_deviation_fastpath_m must be non-negative"
+        )
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
+        "production_event_kind": "environment",
         "target_type_policy": policy,
-        "event_type_weights": _normalize_event_weights(
-            config["event_type_weights"]
-        ),
         "conflict_time_range_s": _range_pair(
             config["conflict_time_range_s"],
             name="conflict_time_range_s",
@@ -336,17 +414,33 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         "max_local_curvature_per_m": max_curvature,
         "crossing_angle_max_deg": crossing_angle,
         "time_scale_range": time_scale_range,
-        "max_resample_attempts": _positive_integer(
-            config["max_resample_attempts"], name="max_resample_attempts"
-        ),
         "min_contiguous_visible_frames": _positive_integer(
             config["min_contiguous_visible_frames"],
             name="min_contiguous_visible_frames",
         ),
-        "occluders": occluders,
-        "structural_fov": _normalize_structural_config(
-            config["structural_fov"]
-        ),
+        "occluders": {
+            key: causal_occluders[key]
+            for key in ("types", "wall", "shelf", "pillar")
+        },
+        "blind_reachability": {
+            "algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+            "obstacle_proposals_per_trajectory": _positive_integer(
+                blind["obstacle_proposals_per_trajectory"],
+                name="blind_reachability.obstacle_proposals_per_trajectory",
+            ),
+            "interaction_range_m": causal_occluders["interaction_range_m"],
+            "bearing_bin_count": causal_occluders["bearing_bin_count"],
+            "yaw_step_deg": causal_occluders["yaw_step_deg"],
+            "crossing_angle_step_deg": crossing_step,
+            "minimum_shadow_center_cells": causal_occluders[
+                "minimum_shadow_center_cells"
+            ],
+            "chord_deviation_fastpath_m": chord_deviation,
+            "unresolved_exact_fallback_per_anchor": _positive_integer(
+                blind["unresolved_exact_fallback_per_anchor"],
+                name="blind_reachability.unresolved_exact_fallback_per_anchor",
+            ),
+        },
     }
 
 
@@ -363,22 +457,18 @@ def load_generator_config(path: str | Path) -> dict[str, object]:
 def _jsonable_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
     policy = config["target_type_policy"]
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
+        "production_event_kind": "environment",
         "target_type_policy": policy.as_dict(),
-        "event_type_weights": dict(config["event_type_weights"]),
         "conflict_time_range_s": list(config["conflict_time_range_s"]),
         "max_local_curvature_per_m": config["max_local_curvature_per_m"],
         "crossing_angle_max_deg": config["crossing_angle_max_deg"],
         "time_scale_range": list(config["time_scale_range"]),
-        "max_resample_attempts": config["max_resample_attempts"],
         "min_contiguous_visible_frames": config[
             "min_contiguous_visible_frames"
         ],
         "occluders": {
             "types": list(config["occluders"]["types"]),
-            "normal_offset_range_m": list(
-                config["occluders"]["normal_offset_range_m"]
-            ),
             **{
                 kind: {
                     "length_range_m": list(
@@ -391,17 +481,11 @@ def _jsonable_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
                 for kind in ("wall", "shelf", "pillar")
             },
         },
-        "structural_fov": {
-            "forward_fov_deg": list(
-                config["structural_fov"]["forward_fov_deg"]
+        "blind_reachability": {
+            **config["blind_reachability"],
+            "interaction_range_m": list(
+                config["blind_reachability"]["interaction_range_m"]
             ),
-            "range_m": list(config["structural_fov"]["range_m"]),
-            "optional_blind_sectors": [
-                dict(sector)
-                for sector in config["structural_fov"][
-                    "optional_blind_sectors"
-                ]
-            ],
         },
     }
 
@@ -1252,6 +1336,712 @@ def _rejection_stage(reason: str) -> str:
     return "target_conditioning"
 
 
+def _causal_config(config: Mapping[str, Any]) -> dict[str, object]:
+    blind = config["blind_reachability"]
+    return {
+        **config["occluders"],
+        "interaction_range_m": blind["interaction_range_m"],
+        "bearing_bin_count": blind["bearing_bin_count"],
+        "yaw_step_deg": blind["yaw_step_deg"],
+        "minimum_shadow_center_cells": blind["minimum_shadow_center_cells"],
+    }
+
+
+def _ordered_policy_snippets(
+    libraries: Mapping[str, SnippetLibrary],
+    *,
+    split: str,
+    policy: TargetTypePolicy,
+) -> tuple[object, ...]:
+    snippets = []
+    for object_type in policy.whitelist:
+        if policy.weights[object_type] <= 0.0:
+            continue
+        library = libraries.get(object_type)
+        if not isinstance(library, SnippetLibrary) or not library.snippets:
+            raise TransplantError("snippet_library_missing")
+        if library.object_type != object_type:
+            raise TransplantError("snippet_library_type_mismatch")
+        for snippet in library.snippets:
+            if snippet.object_type != object_type:
+                raise TransplantError("snippet_library_type_mismatch")
+            if snippet.split != split:
+                raise TransplantError("snippet_split_mismatch")
+            snippets.append(snippet)
+    return tuple(sorted(snippets, key=lambda item: item.snippet_id))
+
+
+def _trajectory_geometry_at_index(
+    trajectory: LocalTrajectory,
+    *,
+    index: int,
+    conflict_time_s: float,
+    max_curvature: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    poses = np.asarray(trajectory.poses)
+    previous = poses[max(0, index - 1), :2].astype(np.float64)
+    following = poses[min(poses.shape[0] - 1, index + 1), :2].astype(np.float64)
+    tangent = following - previous
+    tangent_norm = float(np.linalg.norm(tangent))
+    if tangent_norm <= 1e-9:
+        raise _EventRejection("conflict_tangent_degenerate")
+    tangent /= tangent_norm
+    if 0 < index < poses.shape[0] - 1:
+        before = poses[index, :2].astype(np.float64) - poses[index - 1, :2]
+        after = poses[index + 1, :2].astype(np.float64) - poses[index, :2]
+        if min(float(np.linalg.norm(before)), float(np.linalg.norm(after))) <= 1e-9:
+            raise _EventRejection("conflict_tangent_degenerate")
+        if (
+            _menger_curvature_lower_bound_float32(
+                poses[index - 1 : index + 2, :2]
+            )
+            > max_curvature
+        ):
+            raise _EventRejection("conflict_curvature")
+    expected_time = float(index + 1) * 0.2
+    if not np.isclose(conflict_time_s, expected_time, rtol=0.0, atol=1e-12):
+        raise ValueError("trajectory conflict time metadata is misaligned")
+    return tangent, np.asarray([-tangent[1], tangent[0]], dtype=np.float64)
+
+
+def _circumscribed_radius(footprint: Footprint) -> float:
+    if hasattr(footprint, "radius_m"):
+        return float(footprint.radius_m)
+    return 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
+
+
+def _build_v5_event(
+    *,
+    accepted: Mapping[str, Any],
+    event_index: int,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    trajectory: LocalTrajectory,
+    grid,
+    policy: TargetTypePolicy,
+    generator_digest: str,
+) -> GeneratedEvent:
+    target = accepted["target"]
+    placement = accepted["placement"]
+    visibility_sequence = accepted["visibility_sequence"]
+    target_visibility_history = accepted["target_visibility_history"]
+    conflict_index = int(accepted["conflict_index"])
+    conflict_time_s = float(accepted["conflict_time_s"])
+    attempt_seed = int(accepted["attempt_seed"])
+    proposal_index = int(accepted["proposal_index"])
+    history_array_digest = compute_motion_array_digest(
+        target.history_poses, field_name="target_history_poses"
+    )
+    future_array_digest = compute_motion_array_digest(
+        target.future_poses, field_name="target_future_poses"
+    )
+    generated_event_id = compute_generated_event_id(
+        generator_algorithm_version=SOP05_GENERATOR_ALGORITHM_VERSION,
+        generator_config_digest=generator_digest,
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+        event_index=event_index,
+        attempt_index=proposal_index,
+        attempt_seed=attempt_seed,
+        event_kind="environment",
+        conflict_index=conflict_index,
+        conflict_time_s=conflict_time_s,
+        target_dynamic_object_id=target.target_dynamic_object_id,
+        source_snippet_id=target.snippet_id,
+        source_object_id=target.source_object_id,
+        object_type=target.object_type,
+        footprint_spec=target.footprint_spec,
+        footprint_spec_digest=target.footprint_spec_digest,
+        target_type_policy_digest=policy.digest,
+        layout_version=EVENT_TARGET_MOTION_LAYOUT_VERSION,
+    )
+    world_id = compute_generated_world_id(
+        generator_algorithm_version=SOP05_GENERATOR_ALGORITHM_VERSION,
+        generator_config_digest=generator_digest,
+        generated_event_id=generated_event_id,
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+        event_kind="environment",
+        target_dynamic_object_id=target.target_dynamic_object_id,
+        source_snippet_id=target.snippet_id,
+        source_object_id=target.source_object_id,
+        object_type=target.object_type,
+        footprint_spec=target.footprint_spec,
+        footprint_spec_digest=target.footprint_spec_digest,
+        target_type_policy_digest=policy.digest,
+        layout_version=EVENT_TARGET_MOTION_LAYOUT_VERSION,
+        history_array_digest=history_array_digest,
+        current_pose=target.current_pose,
+        future_array_digest=future_array_digest,
+    )
+    target_motion_record = create_event_target_motion_record(
+        generated_event_id=generated_event_id,
+        world_id=world_id,
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+        target_dynamic_object_id=target.target_dynamic_object_id,
+        source_snippet_id=target.snippet_id,
+        source_object_id=target.source_object_id,
+        object_type=target.object_type,
+        footprint_spec=target.footprint_spec,
+        footprint_spec_digest=target.footprint_spec_digest,
+        target_type_policy_digest=policy.digest,
+        history_poses=target.history_poses,
+        current_pose=target.current_pose,
+        future_poses=target.future_poses,
+    )
+    dynamic_trajectories = {
+        object_id: oracle_context.dynamic_object_future[object_id].copy()
+        for object_id in sorted(oracle_context.dynamic_object_future)
+    }
+    dynamic_specs = {
+        object_id: dict(oracle_context.dynamic_object_specs[object_id])
+        for object_id in sorted(oracle_context.dynamic_object_specs)
+    }
+    dynamic_trajectories[target.target_dynamic_object_id] = target.future_poses.copy()
+    dynamic_specs[target.target_dynamic_object_id] = dict(target.footprint_spec)
+    decision = accepted["decision"]
+    candidate = accepted["candidate"]
+    exact = accepted["exact"]
+    metadata = {
+        **build_event_target_motion_world_metadata(target_motion_record),
+        "schema_version": SCHEMA_VERSION,
+        "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+        "event_kind": "environment",
+        "dynamic_object_snippet_id": target.snippet_id,
+        "target_type_policy": policy.as_dict(),
+        "generator_config_digest": generator_digest,
+        "conflict_time_s": conflict_time_s,
+        "conflict_index": conflict_index,
+        "event_slot_index": event_index,
+        "attempt_index": proposal_index,
+        "target_provenance": target.provenance,
+        "visibility_sequence": [bool(value) for value in visibility_sequence],
+        "target_visibility_history": [
+            bool(value) for value in target_visibility_history
+        ],
+        "target_visibility_history_layout": (
+            "target_visibility_history8_current7_v1"
+        ),
+        "context_dynamic_object_ids": sorted(
+            oracle_context.dynamic_object_future
+        ),
+        "causal_occluder_proposal_id": decision.proposal_id,
+        "blind_region_id": accepted["region"].region_digest,
+        "reachability_candidate_id": candidate.candidate_id,
+        "reachability_transform_id": target.provenance["transform_id"],
+        "exact_validation_id": exact.result_digest,
+    }
+    world = OracleWorld(
+        world_id=world_id,
+        base_state_id=base_state.state_id,
+        static_occupancy=accepted["world_occupancy"].astype(np.float32),
+        dynamic_object_trajectories=dynamic_trajectories,
+        dynamic_object_specs=dynamic_specs,
+        occluders=(dict(placement.occluder),),
+        blind_spot_config={
+            "kind": "environment",
+            "occluder_ids": [placement.occluder["occluder_id"]],
+            "blind_region_digest": accepted["region"].region_digest,
+        },
+        random_seed=attempt_seed,
+        metadata=metadata,
+    )
+    validate_event_target_motion_world_join(target_motion_record, world, grid)
+    return GeneratedEvent(
+        generated_event_id=generated_event_id,
+        event_kind="environment",
+        world=world,
+        target=target,
+        target_motion_record=target_motion_record,
+        visibility_sequence=visibility_sequence,
+        target_visibility_history=target_visibility_history,
+        conflict_time_s=conflict_time_s,
+        conflict_index=conflict_index,
+    )
+
+
+def _generate_v5_events(
+    *,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    trajectory: LocalTrajectory,
+    snippet_libraries: Mapping[str, SnippetLibrary],
+    base_config: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+    seed: int,
+    event_count: int,
+    attempt_index_start: int,
+) -> EventGenerationReport:
+    grid = build_grid_spec(base_config)
+    validate_base_state(base_state, grid)
+    validate_oracle_context(oracle_context, grid)
+    if base_state.state_id != oracle_context.base_state_id:
+        raise ValueError("base_state and oracle_context ids must match")
+    desired_count = _positive_integer(event_count, name="event_count")
+    proposal_budget = int(
+        normalized["blind_reachability"]["obstacle_proposals_per_trajectory"]
+    )
+    if not 0 <= attempt_index_start < proposal_budget:
+        raise ValueError("attempt_index_start must lie within obstacle proposal budget")
+
+    static_occupancy = (
+        np.zeros((grid.height, grid.width), dtype=np.bool_)
+        if base_state.static_map_local is None
+        else np.asarray(base_state.static_map_local != 0, dtype=np.bool_)
+    )
+    if base_state.static_map_local is not None and not np.isfinite(
+        np.asarray(base_state.static_map_local)
+    ).all():
+        raise ValueError("static occupancy must contain only finite values")
+    base_context_footprints = _footprints_for_specs(
+        base_state.visible_dynamic_object_specs
+    )
+    current_context = np.zeros((grid.height, grid.width), dtype=np.bool_)
+    for object_id in sorted(base_context_footprints):
+        current_context |= rasterize_footprint(
+            base_context_footprints[object_id],
+            base_state.visible_dynamic_object_history[object_id][-1],
+            grid,
+        )
+    context_footprints = _footprints_for_specs(oracle_context.dynamic_object_specs)
+    context_sweeps = tuple(
+        OccluderCollisionSweep(
+            footprint=context_footprints[object_id],
+            poses=np.vstack(
+                (
+                    oracle_context.dynamic_object_history[object_id],
+                    oracle_context.dynamic_object_future[object_id],
+                )
+            ),
+            rejection_reason="occluder_context_collision",
+        )
+        for object_id in sorted(context_footprints)
+    )
+    robot_cfg = base_config["robot"]
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(robot_cfg["length_m"], robot_cfg["width_m"]),
+        robot_cfg["inflation_m"],
+    )
+    future_dt_s = float(base_config["bev"]["future_dt_s"])
+    sweep_cache = RobotSweepCache()
+    sweep_bundle = prepare_robot_collision_sweep_bundle(
+        base_state,
+        trajectory,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=future_dt_s,
+        cache=sweep_cache,
+    )
+    causal_config = _causal_config(normalized)
+    causal_context = build_causal_occluder_context(
+        static_occupancy=static_occupancy,
+        current_context_occupancy=current_context,
+        interaction_poses=trajectory.poses,
+        sensor_pose=base_state.robot_history[-1].astype(np.float64),
+        grid=grid,
+        config=causal_config,
+    )
+    proposal_schedule = build_causal_occluder_schedule(
+        config=causal_config,
+        max_candidates=proposal_budget,
+        seed=int(seed),
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+    )
+    policy: TargetTypePolicy = normalized["target_type_policy"]
+    snippets = _ordered_policy_snippets(
+        snippet_libraries, split=base_state.split, policy=policy
+    )
+    offsets = np.asarray(
+        trajectory.metadata.get("pose_time_offsets_s"), dtype=np.float64
+    )
+    if offsets.shape != (grid.future_steps,) or not np.isfinite(offsets).all():
+        raise ValueError("trajectory pose_time_offsets_s contract invalid")
+    conflict_range = normalized["conflict_time_range_s"]
+    eligible_indices = tuple(
+        int(index)
+        for index in np.flatnonzero(
+            (offsets >= conflict_range[0] - 1e-12)
+            & (offsets <= conflict_range[1] + 1e-12)
+            & (np.arange(offsets.size) <= 14)
+        )
+    )
+    if not eligible_indices:
+        raise ValueError("no aligned conflict time is available")
+
+    counters = {
+        "obstacle_proposal_count": 0,
+        "obstacle_proposal_rejected_count": 0,
+        "obstacle_proposal_passed_count": 0,
+        "transform_candidate_count": 0,
+        "transform_rejected_count": 0,
+        "chord_certified_count": 0,
+        "chord_unresolved_count": 0,
+        "exact_validation_count": 0,
+        "exact_validation_accepted_count": 0,
+        "exact_validation_rejected_count": 0,
+    }
+    rejection_reasons: dict[str, int] = {}
+    proposal_ids: list[str] = []
+    candidate_ids: list[str] = []
+    transform_ids: list[str] = []
+    exact_validation_ids: list[str] = []
+    accepted_candidates: list[dict[str, Any]] = []
+    center_masks: dict[tuple[str, str, bytes], object] = {}
+    unresolved_by_anchor: dict[tuple[str, str, int], int] = {}
+
+    for parameters in proposal_schedule[attempt_index_start:]:
+        counters["obstacle_proposal_count"] += 1
+        decision = propose_causal_occluder(
+            causal_context,
+            collision_sweeps=(*sweep_bundle.collision_sweeps, *context_sweeps),
+            config=causal_config,
+            parameters=parameters,
+            seed=int(seed),
+            base_state_id=base_state.state_id,
+            trajectory_id=trajectory.trajectory_id,
+        )
+        proposal_ids.append(decision.proposal_id)
+        if decision.accepted is None:
+            counters["obstacle_proposal_rejected_count"] += 1
+            reason = decision.rejection_reason or "causal_occluder_rejected"
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            continue
+        counters["obstacle_proposal_passed_count"] += 1
+        region = build_blind_region(base_state, decision, grid=grid)
+        for snippet in snippets:
+            footprint_spec = {
+                "object_type": snippet.object_type,
+                "footprint": dict(snippet.footprint),
+            }
+            footprint_payload = json.dumps(
+                footprint_spec,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            footprint_digest = stable_digest(footprint_payload, size=16)
+            footprint = footprint_from_spec(footprint_spec)
+            source_current = snippet.positions[7].astype(np.float64)
+            for conflict_index in eligible_indices:
+                conflict_time_s = float(offsets[conflict_index])
+                try:
+                    _tangent, normal = _trajectory_geometry_at_index(
+                        trajectory,
+                        index=conflict_index,
+                        conflict_time_s=conflict_time_s,
+                        max_curvature=normalized["max_local_curvature_per_m"],
+                    )
+                except _EventRejection as exc:
+                    rejection_reasons[exc.reason] = (
+                        rejection_reasons.get(exc.reason, 0) + 1
+                    )
+                    continue
+                source_anchor = snippet.positions[8 + conflict_index].astype(
+                    np.float64
+                )
+                source_delta = source_anchor - source_current
+                directions_by_side = (
+                    (
+                        -1,
+                        scheduled_crossing_directions(
+                            -normal,
+                            maximum_angle_deg=normalized[
+                                "crossing_angle_max_deg"
+                            ],
+                            angle_step_deg=normalized["blind_reachability"][
+                                "crossing_angle_step_deg"
+                            ],
+                        ),
+                    ),
+                    (
+                        1,
+                        scheduled_crossing_directions(
+                            normal,
+                            maximum_angle_deg=normalized[
+                                "crossing_angle_max_deg"
+                            ],
+                            angle_step_deg=normalized["blind_reachability"][
+                                "crossing_angle_step_deg"
+                            ],
+                        ),
+                    ),
+                )
+                angle_steps = int(
+                    round(
+                        normalized["crossing_angle_max_deg"]
+                        / normalized["blind_reachability"][
+                            "crossing_angle_step_deg"
+                        ]
+                    )
+                )
+                angle_offsets = np.arange(-angle_steps, angle_steps + 1) * float(
+                    normalized["blind_reachability"][
+                        "crossing_angle_step_deg"
+                    ]
+                )
+                for crossing_side, directions in directions_by_side:
+                    for angle_offset, direction in zip(angle_offsets, directions):
+                        counters["transform_candidate_count"] += 1
+                        if (
+                            not np.isfinite(source_delta).all()
+                            or float(np.linalg.norm(source_delta)) <= 1e-9
+                        ):
+                            counters["transform_rejected_count"] += 1
+                            rejection_reasons["invalid_source_anchor"] = (
+                                rejection_reasons.get("invalid_source_anchor", 0)
+                                + 1
+                            )
+                            continue
+                        identity = ReachabilityIdentity(
+                            base_state_id=base_state.state_id,
+                            trajectory_id=trajectory.trajectory_id,
+                            source_snippet_id=snippet.snippet_id,
+                            conflict_index=conflict_index,
+                            conflict_time_s=conflict_time_s,
+                            crossing_side=crossing_side,
+                            angle_offset_deg=float(angle_offset),
+                        )
+                        candidate = build_reachability_candidate(
+                            conflict_point=trajectory.poses[
+                                conflict_index, :2
+                            ].astype(np.float64),
+                            source_current_xy=source_current,
+                            source_anchor_xy=source_anchor,
+                            desired_crossing_direction=direction,
+                            identity=identity,
+                        )
+                        candidate_ids.append(candidate.candidate_id)
+                        yaw = float(snippet.headings[7]) + candidate.rotation_rad
+                        mask_key = (
+                            region.region_digest,
+                            footprint_digest,
+                            np.asarray(yaw, dtype=">f8").tobytes(),
+                        )
+                        center_mask = center_masks.get(mask_key)
+                        if center_mask is None:
+                            center_mask = build_footprint_center_mask(
+                                region,
+                                footprint_spec=footprint_spec,
+                                footprint_spec_digest=footprint_digest,
+                                yaw_bin_rad=yaw,
+                            )
+                            center_masks[mask_key] = center_mask
+                        if not candidate_queries_mask(
+                            candidate, center_mask.center_mask, grid
+                        ):
+                            counters["transform_rejected_count"] += 1
+                            rejection_reasons["no_arc_mask_intersection"] = (
+                                rejection_reasons.get(
+                                    "no_arc_mask_intersection", 0
+                                )
+                                + 1
+                            )
+                            continue
+                        chord = triage_chord(
+                            candidate,
+                            obstacle_occupancy=region.total_current_occupancy,
+                            grid=grid,
+                            footprint_radius_m=_circumscribed_radius(footprint),
+                            chord_deviation_bound_m=normalized[
+                                "blind_reachability"
+                            ]["chord_deviation_fastpath_m"],
+                        )
+                        if chord.outcome == "certified_clear":
+                            counters["chord_certified_count"] += 1
+                        else:
+                            counters["chord_unresolved_count"] += 1
+                            anchor_key = (
+                                decision.proposal_id,
+                                snippet.snippet_id,
+                                conflict_index,
+                            )
+                            used = unresolved_by_anchor.get(anchor_key, 0)
+                            if used >= normalized["blind_reachability"][
+                                "unresolved_exact_fallback_per_anchor"
+                            ]:
+                                rejection_reasons[
+                                    "chord_unresolved_fallback_exhausted"
+                                ] = rejection_reasons.get(
+                                    "chord_unresolved_fallback_exhausted", 0
+                                ) + 1
+                                continue
+                            unresolved_by_anchor[anchor_key] = used + 1
+
+                        counters["exact_validation_count"] += 1
+                        attempt_seed = derive_seed(
+                            int(seed),
+                            decision.proposal_id,
+                            candidate.candidate_id,
+                        )
+                        try:
+                            target = transplant_reachability_candidate(
+                                snippet,
+                                candidate=candidate,
+                                future_dt_s=future_dt_s,
+                                future_steps=grid.future_steps,
+                                target_type_policy_digest=policy.digest,
+                                seed=attempt_seed,
+                                context_object_ids=tuple(
+                                    oracle_context.dynamic_object_future
+                                ),
+                            )
+                            transform_ids.append(target.provenance["transform_id"])
+                            exact = check_exact_hidden_pose(
+                                region,
+                                footprint_spec=target.footprint_spec,
+                                footprint_spec_digest=target.footprint_spec_digest,
+                                pose=target.current_pose.astype(np.float64),
+                            )
+                            exact_validation_ids.append(exact.result_digest)
+                            if not exact.accepted:
+                                raise _EventRejection(
+                                    exact.rejection_reason
+                                    or "exact_hidden_pose_rejected"
+                                )
+                            target_footprint = _validate_target_physics(
+                                target,
+                                base_state=base_state,
+                                oracle_context=oracle_context,
+                                base_config=base_config,
+                            )
+                            placement = validate_environment_occluder_target(
+                                decision.accepted,
+                                target_history_poses=target.history_poses,
+                                target_future_poses=target.future_poses,
+                                target_footprint=target_footprint,
+                                grid=grid,
+                            )
+                            clearances = trajectory_signed_clearances(
+                                robot_footprint,
+                                trajectory.poses,
+                                target_footprint,
+                                target.future_poses,
+                            )
+                            if not bool(clearances[conflict_index] <= 0.0):
+                                raise _EventRejection(
+                                    "target_not_same_index_collision_mother"
+                                )
+                            visibility_sequence = footprint_visibility_sequence(
+                                target_footprint,
+                                np.vstack(
+                                    (target.current_pose, target.future_poses)
+                                ),
+                                region.visibility_mask,
+                                grid,
+                            )
+                            if bool(visibility_sequence[0]) or not (
+                                has_continuous_emergence(
+                                    visibility_sequence,
+                                    min_visible_frames=normalized[
+                                        "min_contiguous_visible_frames"
+                                    ],
+                                )
+                                and bool(visibility_sequence[-1])
+                            ):
+                                raise _EventRejection(
+                                    "environment_visibility_invalid"
+                                )
+                            target_visibility_history = _target_visibility_history(
+                                event_kind="environment",
+                                static_occupancy=static_occupancy,
+                                placement=placement,
+                                grid=grid,
+                                base_state=base_state,
+                                oracle_context=oracle_context,
+                                context_footprints=context_footprints,
+                                target=target,
+                                target_footprint=target_footprint,
+                                structural=None,
+                            )
+                            if bool(target_visibility_history[-1]):
+                                raise _EventRejection(
+                                    "target_visibility_seam_invalid"
+                                )
+                        except (_EventRejection, TransplantError, OccluderSamplingError) as exc:
+                            counters["exact_validation_rejected_count"] += 1
+                            reason = getattr(exc, "reason", str(exc))
+                            rejection_reasons[reason] = (
+                                rejection_reasons.get(reason, 0) + 1
+                            )
+                            continue
+                        counters["exact_validation_accepted_count"] += 1
+                        accepted_candidates.append(
+                            {
+                                "decision": decision,
+                                "region": region,
+                                "candidate": candidate,
+                                "exact": exact,
+                                "target": target,
+                                "placement": placement,
+                                "visibility_sequence": visibility_sequence,
+                                "target_visibility_history": (
+                                    target_visibility_history
+                                ),
+                                "conflict_index": conflict_index,
+                                "conflict_time_s": conflict_time_s,
+                                "proposal_index": parameters.proposal_index,
+                                "attempt_seed": attempt_seed,
+                                "world_occupancy": (
+                                    static_occupancy | placement.mask
+                                ),
+                            }
+                        )
+
+    accepted_candidates.sort(
+        key=lambda item: (
+            item["decision"].proposal_id,
+            item["candidate"].candidate_id,
+            item["target"].provenance["transform_id"],
+        )
+    )
+    generator_digest = _generator_digest(normalized)
+    selected = accepted_candidates[:desired_count]
+    events = tuple(
+        _build_v5_event(
+            accepted=item,
+            event_index=event_index,
+            base_state=base_state,
+            oracle_context=oracle_context,
+            trajectory=trajectory,
+            grid=grid,
+            policy=policy,
+            generator_digest=generator_digest,
+        )
+        for event_index, item in enumerate(selected)
+    )
+    cache_stats = sweep_cache.stats
+    summary = {
+        "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
+        "seed": int(seed),
+        "requested_event_count": desired_count,
+        "accepted_count": len(events),
+        "rejected_count": counters["exact_validation_rejected_count"],
+        "unaccepted_event_count": desired_count - len(events),
+        "attempt_index_start": attempt_index_start,
+        "attempt_index_stop_exclusive": proposal_budget,
+        "rejection_reasons": dict(sorted(rejection_reasons.items())),
+        **counters,
+        "proposal_ids": tuple(proposal_ids),
+        "reachability_candidate_ids": tuple(candidate_ids),
+        "reachability_transform_ids": tuple(transform_ids),
+        "exact_validation_ids": tuple(exact_validation_ids),
+        "robot_sweep_cache": {
+            "size": cache_stats.size,
+            "hits": cache_stats.hits,
+            "misses": cache_stats.misses,
+            "builds": cache_stats.builds,
+        },
+        "target_type_policy": policy.as_dict(),
+        "target_type_policy_digest": policy.digest,
+        "generator_config_digest": generator_digest,
+        "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+        "production_event_kind": "environment",
+    }
+    return EventGenerationReport(events=events, summary=summary)
+
+
 def generate_events(
     *,
     base_state: BaseState,
@@ -1264,573 +2054,23 @@ def generate_events(
     event_count: int,
     attempt_index_start: int = 0,
 ) -> EventGenerationReport:
-    """Generate worlds, optionally resuming one event's candidate prefix."""
+    """Generate environment mothers with the blind-reachability-first v5 path."""
 
     normalized = _as_normalized_generator_config(generator_config)
-    grid = build_grid_spec(base_config)
-    validate_base_state(base_state, grid)
-    validate_oracle_context(oracle_context, grid)
-    if base_state.state_id != oracle_context.base_state_id:
-        raise ValueError("base_state and oracle_context ids must match")
     if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)):
         raise TypeError("seed must be an integer")
-    desired_count = _positive_integer(event_count, name="event_count")
     if isinstance(attempt_index_start, (bool, np.bool_)) or not isinstance(
         attempt_index_start, (int, np.integer)
     ):
         raise TypeError("attempt_index_start must be an integer")
-    attempt_index_start = int(attempt_index_start)
-    maximum_attempts = int(normalized["max_resample_attempts"])
-    if not 0 <= attempt_index_start < maximum_attempts:
-        raise ValueError(
-            "attempt_index_start must lie within max_resample_attempts"
-        )
-    if attempt_index_start != 0 and desired_count != 1:
-        raise ValueError(
-            "nonzero attempt_index_start requires event_count == 1"
-        )
-    event_type_schedule = build_event_type_schedule(
-        normalized["event_type_weights"],
-        event_count=desired_count,
-        rng=make_rng(
-            int(seed),
-            base_state.state_id,
-            trajectory.trajectory_id,
-            "event_type_schedule",
-        ),
+    return _generate_v5_events(
+        base_state=base_state,
+        oracle_context=oracle_context,
+        trajectory=trajectory,
+        snippet_libraries=snippet_libraries,
+        base_config=base_config,
+        normalized=normalized,
+        seed=int(seed),
+        event_count=event_count,
+        attempt_index_start=int(attempt_index_start),
     )
-    static_occupancy = (
-        np.zeros((grid.height, grid.width), dtype=np.float32)
-        if base_state.static_map_local is None
-        else np.asarray(base_state.static_map_local, dtype=np.float32)
-    )
-    if not np.isfinite(static_occupancy).all():
-        raise ValueError("static occupancy must contain only finite values")
-    context_footprints = _footprints_for_specs(oracle_context.dynamic_object_specs)
-    context_current = _context_current_occupancy(
-        oracle_context, grid=grid, context_footprints=context_footprints
-    )
-    context_trajectories = {
-        object_id: np.vstack(
-            (
-                oracle_context.dynamic_object_history[object_id],
-                oracle_context.dynamic_object_future[object_id],
-            )
-        )
-        for object_id in sorted(context_footprints)
-    }
-    robot_cfg = base_config["robot"]
-    robot_footprint = inflate_footprint(
-        RectangleFootprint(robot_cfg["length_m"], robot_cfg["width_m"]),
-        robot_cfg["inflation_m"],
-    )
-    base_occluder_collision_sweeps = (
-        OccluderCollisionSweep(
-            footprint=robot_footprint,
-            poses=np.vstack((base_state.robot_history, trajectory.poses)),
-            rejection_reason="occluder_robot_swept_overlap",
-        ),
-        *(
-            OccluderCollisionSweep(
-                footprint=context_footprints[object_id],
-                poses=context_trajectories[object_id],
-                rejection_reason="occluder_context_collision",
-            )
-            for object_id in sorted(context_footprints)
-        ),
-    )
-    generator_digest = _generator_digest(normalized)
-    policy: TargetTypePolicy = normalized["target_type_policy"]
-    events = []
-    rejection_reasons: dict[str, int] = {}
-    occluder_candidate_rejection_reasons: dict[str, int] = {}
-    by_object_type: dict[str, dict[str, object]] = {}
-    by_footprint_kind: dict[str, dict[str, object]] = {}
-    by_geometry_source: dict[str, dict[str, object]] = {}
-    event_kind_counts = {event_type: 0 for event_type in _EVENT_TYPES}
-    requested_event_kind_counts = {
-        event_type: event_type_schedule.count(event_type)
-        for event_type in _EVENT_TYPES
-    }
-    by_event_kind = {
-        event_type: {
-            "requested": requested_event_kind_counts[event_type],
-            "attempted": 0,
-            "accepted": 0,
-            "rejection_reasons": {},
-            "rejection_stage_counts": {
-                "occluder_geometry": 0,
-                "target_conditioning": 0,
-                "visibility": 0,
-            },
-        }
-        for event_type in _EVENT_TYPES
-    }
-    rejection_stage_counts = {
-        "occluder_geometry": 0,
-        "target_conditioning": 0,
-        "visibility": 0,
-    }
-    complete_joint_candidates_attempted = 0
-
-    for event_index in range(desired_count):
-        event_kind = event_type_schedule[event_index]
-        joint_schedule = (
-            build_joint_occluder_schedule(
-                types=normalized["occluders"]["types"],
-                max_candidates=normalized["max_resample_attempts"],
-                rng=make_rng(
-                    int(seed),
-                    base_state.state_id,
-                    trajectory.trajectory_id,
-                    event_index,
-                    "joint_occluder_schedule",
-                ),
-            )
-            if event_kind in {"environment", "mixed"}
-            else ()
-        )
-        structural_schedule = (
-            _structural_candidates(
-                normalized["structural_fov"],
-                make_rng(
-                    int(seed),
-                    base_state.state_id,
-                    trajectory.trajectory_id,
-                    event_index,
-                    "structural_candidate_schedule",
-                ),
-            )
-            if event_kind in {"structural", "mixed"}
-            else ()
-        )
-        accepted = False
-        for attempt_index in range(
-            attempt_index_start, normalized["max_resample_attempts"]
-        ):
-            complete_joint_candidates_attempted += 1
-            by_event_kind[event_kind]["attempted"] += 1
-            target = None
-            joint_parameters = (
-                joint_schedule[attempt_index]
-                if event_kind in {"environment", "mixed"}
-                else None
-            )
-            structural_candidate = (
-                structural_schedule[attempt_index % len(structural_schedule)]
-                if event_kind in {"structural", "mixed"}
-                else None
-            )
-            attempt_seed = derive_seed(
-                int(seed),
-                base_state.state_id,
-                trajectory.trajectory_id,
-                event_index,
-                attempt_index,
-            )
-            rng = make_rng(
-                int(seed),
-                base_state.state_id,
-                trajectory.trajectory_id,
-                event_index,
-                attempt_index,
-            )
-            reason = None
-            try:
-                (
-                    conflict_index,
-                    conflict_time_s,
-                    conflict_point,
-                    _tangent,
-                    normal,
-                ) = _trajectory_geometry(
-                    trajectory,
-                    dt_s=float(base_config["bev"]["future_dt_s"]),
-                    conflict_range=normalized["conflict_time_range_s"],
-                    rng=rng,
-                    max_curvature=normalized["max_local_curvature_per_m"],
-                    conflict_time_quantile=(
-                        None
-                        if joint_parameters is None
-                        else joint_parameters.conflict_time_quantile
-                    ),
-                )
-                placement = None
-                geometry_candidate = None
-                if joint_parameters is not None:
-                    geometry_candidate = propose_environment_occluder_geometry(
-                        static_occupancy=static_occupancy,
-                        grid=grid,
-                        sensor_pose=np.zeros(3, dtype=np.float64),
-                        conflict_point=conflict_point,
-                        trajectory_normal=normal,
-                        collision_sweeps=base_occluder_collision_sweeps,
-                        config=normalized["occluders"],
-                        parameters=joint_parameters,
-                        proposal_index=attempt_index,
-                    )
-                snippet = sample_motion_snippet(
-                    snippet_libraries,
-                    split=base_state.split,
-                    policy=policy,
-                    rng=rng,
-                )
-                if joint_parameters is None:
-                    crossing_direction = _rotated_direction(
-                        normal,
-                        max_angle_deg=normalized["crossing_angle_max_deg"],
-                        rng=rng,
-                    )
-                else:
-                    crossing_direction = _joint_crossing_direction(
-                        normal,
-                        joint_parameters,
-                        max_angle_deg=normalized["crossing_angle_max_deg"],
-                    )
-                target = transplant_snippet(
-                    snippet,
-                    conflict_point=conflict_point,
-                    conflict_time_s=conflict_time_s,
-                    crossing_direction=crossing_direction,
-                    time_scale=1.0,
-                    future_dt_s=float(base_config["bev"]["future_dt_s"]),
-                    future_steps=grid.future_steps,
-                    base_state_id=base_state.state_id,
-                    trajectory_id=trajectory.trajectory_id,
-                    target_type_policy_digest=policy.digest,
-                    seed=attempt_seed,
-                    context_object_ids=tuple(oracle_context.dynamic_object_future),
-                )
-                target_footprint = _validate_target_physics(
-                    target,
-                    base_state=base_state,
-                    oracle_context=oracle_context,
-                    base_config=base_config,
-                )
-                if geometry_candidate is not None:
-                    geometry_candidate = align_environment_occluder_to_target_los(
-                        geometry_candidate,
-                        static_occupancy=static_occupancy,
-                        grid=grid,
-                        sensor_pose=np.zeros(3, dtype=np.float64),
-                        trajectory_normal=normal,
-                        target_current_pose=target.current_pose,
-                        collision_sweeps=(
-                            *base_occluder_collision_sweeps,
-                            OccluderCollisionSweep(
-                                footprint=target_footprint,
-                                poses=np.vstack(
-                                    (
-                                        target.history_poses,
-                                        target.future_poses,
-                                    )
-                                ),
-                                rejection_reason=(
-                                    "occluder_target_collision"
-                                ),
-                            ),
-                        ),
-                    )
-                    placement = validate_environment_occluder_target(
-                        geometry_candidate,
-                        target_history_poses=target.history_poses,
-                        target_future_poses=target.future_poses,
-                        target_footprint=target_footprint,
-                        grid=grid,
-                    )
-                robot_target_clearances = trajectory_signed_clearances(
-                    robot_footprint,
-                    trajectory.poses,
-                    target_footprint,
-                    target.future_poses,
-                )
-                if not np.any(robot_target_clearances <= 0.0):
-                    raise _EventRejection("target_not_collision_mother")
-                (
-                    visibility_sequence,
-                    placement,
-                    structural,
-                    world_occupancy,
-                ) = _visibility_for_event(
-                    event_kind=event_kind,
-                    static_occupancy=static_occupancy,
-                    context_current_occupancy=context_current,
-                    grid=grid,
-                    sensor_pose=base_state.robot_history[-1],
-                    target=target,
-                    target_footprint=target_footprint,
-                    trajectory=trajectory,
-                    robot_footprint=robot_footprint,
-                    conflict_point=conflict_point,
-                    normal=normal,
-                    oracle_context=oracle_context,
-                    generator_config=normalized,
-                    rng=rng,
-                    structural_candidate=structural_candidate,
-                    precomputed_placement=placement,
-                )
-                target_visibility_history = _target_visibility_history(
-                    event_kind=event_kind,
-                    static_occupancy=static_occupancy,
-                    placement=placement,
-                    grid=grid,
-                    base_state=base_state,
-                    oracle_context=oracle_context,
-                    context_footprints=context_footprints,
-                    target=target,
-                    target_footprint=target_footprint,
-                    structural=structural,
-                )
-                if (
-                    bool(target_visibility_history[7])
-                    or bool(visibility_sequence[0])
-                    or target_visibility_history[7] != visibility_sequence[0]
-                ):
-                    raise _EventRejection("target_visibility_seam_invalid")
-                if placement is not None:
-                    _merge_reason_counts(
-                        occluder_candidate_rejection_reasons,
-                        placement.rejection_reasons,
-                    )
-                dynamic_trajectories = {
-                    object_id: oracle_context.dynamic_object_future[object_id].copy()
-                    for object_id in sorted(oracle_context.dynamic_object_future)
-                }
-                dynamic_specs = {
-                    object_id: dict(oracle_context.dynamic_object_specs[object_id])
-                    for object_id in sorted(oracle_context.dynamic_object_specs)
-                }
-                dynamic_trajectories[target.target_dynamic_object_id] = (
-                    target.future_poses.copy()
-                )
-                dynamic_specs[target.target_dynamic_object_id] = dict(
-                    target.footprint_spec
-                )
-                occluders = () if placement is None else (dict(placement.occluder),)
-                blind_spot_config = {
-                    "kind": event_kind,
-                    "structural": (
-                        None if structural is None else structural.as_dict()
-                    ),
-                    "occluder_ids": [
-                        occluder["occluder_id"] for occluder in occluders
-                    ],
-                }
-                history_array_digest = compute_motion_array_digest(
-                    target.history_poses, field_name="target_history_poses"
-                )
-                future_array_digest = compute_motion_array_digest(
-                    target.future_poses, field_name="target_future_poses"
-                )
-                generated_event_id = compute_generated_event_id(
-                    generator_algorithm_version=SOP05_GENERATOR_ALGORITHM_VERSION,
-                    generator_config_digest=generator_digest,
-                    base_state_id=base_state.state_id,
-                    trajectory_id=trajectory.trajectory_id,
-                    event_index=event_index,
-                    attempt_index=attempt_index,
-                    attempt_seed=attempt_seed,
-                    event_kind=event_kind,
-                    conflict_index=conflict_index,
-                    conflict_time_s=conflict_time_s,
-                    target_dynamic_object_id=target.target_dynamic_object_id,
-                    source_snippet_id=target.snippet_id,
-                    source_object_id=target.source_object_id,
-                    object_type=target.object_type,
-                    footprint_spec=target.footprint_spec,
-                    footprint_spec_digest=target.footprint_spec_digest,
-                    target_type_policy_digest=policy.digest,
-                    layout_version=EVENT_TARGET_MOTION_LAYOUT_VERSION,
-                )
-                world_id = compute_generated_world_id(
-                    generator_algorithm_version=SOP05_GENERATOR_ALGORITHM_VERSION,
-                    generator_config_digest=generator_digest,
-                    generated_event_id=generated_event_id,
-                    base_state_id=base_state.state_id,
-                    trajectory_id=trajectory.trajectory_id,
-                    event_kind=event_kind,
-                    target_dynamic_object_id=target.target_dynamic_object_id,
-                    source_snippet_id=target.snippet_id,
-                    source_object_id=target.source_object_id,
-                    object_type=target.object_type,
-                    footprint_spec=target.footprint_spec,
-                    footprint_spec_digest=target.footprint_spec_digest,
-                    target_type_policy_digest=policy.digest,
-                    layout_version=EVENT_TARGET_MOTION_LAYOUT_VERSION,
-                    history_array_digest=history_array_digest,
-                    current_pose=target.current_pose,
-                    future_array_digest=future_array_digest,
-                )
-                target_motion_record = create_event_target_motion_record(
-                    generated_event_id=generated_event_id,
-                    world_id=world_id,
-                    base_state_id=base_state.state_id,
-                    trajectory_id=trajectory.trajectory_id,
-                    target_dynamic_object_id=target.target_dynamic_object_id,
-                    source_snippet_id=target.snippet_id,
-                    source_object_id=target.source_object_id,
-                    object_type=target.object_type,
-                    footprint_spec=target.footprint_spec,
-                    footprint_spec_digest=target.footprint_spec_digest,
-                    target_type_policy_digest=policy.digest,
-                    history_poses=target.history_poses,
-                    current_pose=target.current_pose,
-                    future_poses=target.future_poses,
-                )
-                if (
-                    target_motion_record.history_array_digest
-                    != history_array_digest
-                    or target_motion_record.future_array_digest
-                    != future_array_digest
-                ):
-                    raise RuntimeError("target motion digest construction mismatch")
-                metadata = {
-                    **build_event_target_motion_world_metadata(
-                        target_motion_record
-                    ),
-                    "schema_version": SCHEMA_VERSION,
-                    "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
-                    "event_kind": event_kind,
-                    "dynamic_object_snippet_id": (
-                        target_motion_record.source_snippet_id
-                    ),
-                    "target_type_policy": policy.as_dict(),
-                    "generator_config_digest": generator_digest,
-                    "conflict_time_s": conflict_time_s,
-                    "conflict_index": conflict_index,
-                    "event_slot_index": event_index,
-                    "attempt_index": attempt_index,
-                    "target_provenance": target.provenance,
-                    "visibility_sequence": [
-                        bool(value) for value in visibility_sequence
-                    ],
-                    "target_visibility_history": [
-                        bool(value) for value in target_visibility_history
-                    ],
-                    "target_visibility_history_layout": (
-                        "target_visibility_history8_current7_v1"
-                    ),
-                    "context_dynamic_object_ids": sorted(
-                        oracle_context.dynamic_object_future
-                    ),
-                    "occluder_candidate_rejection_reasons": (
-                        {} if placement is None else placement.rejection_reasons
-                    ),
-                }
-                world = OracleWorld(
-                    world_id=world_id,
-                    base_state_id=base_state.state_id,
-                    static_occupancy=world_occupancy.astype(np.float32),
-                    dynamic_object_trajectories=dynamic_trajectories,
-                    dynamic_object_specs=dynamic_specs,
-                    occluders=occluders,
-                    blind_spot_config=blind_spot_config,
-                    random_seed=int(attempt_seed),
-                    metadata=metadata,
-                )
-                validate_event_target_motion_world_join(
-                    target_motion_record, world, grid
-                )
-                event = GeneratedEvent(
-                    generated_event_id=generated_event_id,
-                    event_kind=event_kind,
-                    world=world,
-                    target=target,
-                    target_motion_record=target_motion_record,
-                    visibility_sequence=visibility_sequence,
-                    target_visibility_history=target_visibility_history,
-                    conflict_time_s=conflict_time_s,
-                    conflict_index=conflict_index,
-                )
-                events.append(event)
-                event_kind_counts[event_kind] += 1
-                accepted = True
-            except _EventRejection as exc:
-                reason = exc.reason
-                _merge_reason_counts(
-                    occluder_candidate_rejection_reasons,
-                    exc.occluder_candidate_rejection_reasons,
-                )
-            except TransplantError as exc:
-                reason = exc.reason
-            except OccluderSamplingError as exc:
-                reason = exc.reason
-                _merge_reason_counts(
-                    occluder_candidate_rejection_reasons,
-                    exc.rejection_reasons,
-                )
-
-            object_type, footprint_kind, geometry_source = _bucket_key(target)
-            _update_bucket(
-                by_object_type,
-                object_type,
-                accepted=accepted,
-                reason=reason,
-            )
-            _update_bucket(
-                by_footprint_kind,
-                footprint_kind,
-                accepted=accepted,
-                reason=reason,
-            )
-            _update_bucket(
-                by_geometry_source,
-                geometry_source,
-                accepted=accepted,
-                reason=reason,
-            )
-            if accepted:
-                by_event_kind[event_kind]["accepted"] += 1
-                break
-            stage = _rejection_stage(reason)
-            rejection_stage_counts[stage] += 1
-            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
-            kind_reasons = by_event_kind[event_kind]["rejection_reasons"]
-            kind_reasons[reason] = kind_reasons.get(reason, 0) + 1
-            by_event_kind[event_kind]["rejection_stage_counts"][stage] += 1
-        if not accepted:
-            continue
-
-    rejected_count = complete_joint_candidates_attempted - len(events)
-    attempt_acceptance_rate = (
-        len(events) / complete_joint_candidates_attempted
-        if complete_joint_candidates_attempted
-        else 0.0
-    )
-    request_acceptance_rate = len(events) / desired_count
-    summary = {
-        "schema_version": SCHEMA_VERSION,
-        "seed": int(seed),
-        "requested_event_count": desired_count,
-        "complete_joint_candidates_attempted": complete_joint_candidates_attempted,
-        "attempted_count": complete_joint_candidates_attempted,
-        "joint_candidate_attempted_count": complete_joint_candidates_attempted,
-        "attempt_index_start": attempt_index_start,
-        "attempt_index_stop_exclusive": (
-            attempt_index_start + complete_joint_candidates_attempted
-            if desired_count == 1
-            else None
-        ),
-        "accepted_count": len(events),
-        "rejected_count": rejected_count,
-        "acceptance_rate": request_acceptance_rate,
-        "attempt_acceptance_rate": attempt_acceptance_rate,
-        "request_acceptance_rate": request_acceptance_rate,
-        "unaccepted_event_count": desired_count - len(events),
-        "rejection_reasons": dict(sorted(rejection_reasons.items())),
-        "rejection_stage_counts": rejection_stage_counts,
-        "occluder_candidate_rejection_reasons": dict(
-            sorted(occluder_candidate_rejection_reasons.items())
-        ),
-        "requested_event_kind_counts": requested_event_kind_counts,
-        "event_kind_counts": event_kind_counts,
-        "by_event_kind": _summarize_event_kind_buckets(by_event_kind),
-        "by_object_type": _sort_buckets(by_object_type),
-        "by_footprint_kind": _sort_buckets(by_footprint_kind),
-        "by_geometry_source": _sort_buckets(by_geometry_source),
-        "target_type_policy": policy.as_dict(),
-        "target_type_policy_digest": policy.digest,
-        "generator_config_digest": generator_digest,
-        "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
-    }
-    return EventGenerationReport(events=tuple(events), summary=summary)

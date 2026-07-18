@@ -109,6 +109,56 @@ def _snippet(
     )
 
 
+def _exact_safe_curve_snippet() -> MotionSnippet:
+    """Real 23-sample curve whose future bends around a blocked chord."""
+
+    snippet = _snippet()
+    relative_times = (np.arange(23, dtype=np.float64) - 7.0) * 0.2
+    conflict_time_s = 2.2
+    lateral_acceleration = 0.8
+    initial_lateral_velocity = lateral_acceleration * conflict_time_s
+    lateral = np.where(
+        relative_times <= 0.0,
+        initial_lateral_velocity * relative_times,
+        np.where(
+            relative_times <= conflict_time_s,
+            lateral_acceleration
+            * relative_times
+            * (conflict_time_s - relative_times),
+            -initial_lateral_velocity
+            * (relative_times - conflict_time_s)
+            + 1.1 * (relative_times - conflict_time_s) ** 2,
+        ),
+    )
+    lateral_velocity = np.where(
+        relative_times <= 0.0,
+        initial_lateral_velocity,
+        np.where(
+            relative_times <= conflict_time_s,
+            lateral_acceleration
+            * (conflict_time_s - 2.0 * relative_times),
+            -initial_lateral_velocity
+            + 2.2 * (relative_times - conflict_time_s),
+        ),
+    )
+    positions = np.column_stack((0.8 * relative_times, lateral))
+    positions -= positions[0]
+    velocities = np.column_stack(
+        (np.full(23, 0.8, dtype=np.float64), lateral_velocity)
+    )
+    headings = np.arctan2(velocities[:, 1], velocities[:, 0])
+    return replace(
+        snippet,
+        snippet_id="train-human-snippet-exact-safe-curve",
+        positions=positions.astype(np.float32),
+        velocities=velocities.astype(np.float32),
+        headings=headings.astype(np.float32),
+        mean_speed_mps=1.5,
+        max_acceleration_mps2=2.2,
+        mean_abs_curvature_per_m=0.5,
+    )
+
+
 def _reachability_candidate(
     snippet: MotionSnippet,
     *,
@@ -488,22 +538,16 @@ def test_reachability_transplant_rejects_nonfinite_snippet() -> None:
 
 def _generator_config(event_kind: str = "structural") -> dict:
     return {
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
+        "production_event_kind": "environment",
         "target_type_policy": _policy(),
-        "event_type_weights": {
-            "environment": float(event_kind == "environment"),
-            "structural": float(event_kind == "structural"),
-            "mixed": float(event_kind == "mixed"),
-        },
         "conflict_time_range_s": [1.8, 1.8],
         "max_local_curvature_per_m": 1.0,
         "crossing_angle_max_deg": 35.0,
         "time_scale_range": [1.0, 1.0],
-        "max_resample_attempts": 32,
         "min_contiguous_visible_frames": 2,
         "occluders": {
             "types": ["pillar"],
-            "normal_offset_range_m": [0.8, 1.2],
             "wall": {
                 "length_range_m": [1.0, 1.4],
                 "width_range_m": [0.2, 0.3],
@@ -517,13 +561,16 @@ def _generator_config(event_kind: str = "structural") -> dict:
                 "width_range_m": [0.4, 0.5],
             },
         },
-        "structural_fov": {
-            "forward_fov_deg": [160.0],
-            "range_m": [6.0],
-            "optional_blind_sectors": [
-                {"center_deg": -90.0, "width_deg": 110.0},
-                {"center_deg": 90.0, "width_deg": 110.0},
-            ],
+        "blind_reachability": {
+            "algorithm_version": "blind_reachability_first_v1",
+            "obstacle_proposals_per_trajectory": 8,
+            "interaction_range_m": [1.0, 4.0],
+            "bearing_bin_count": 12,
+            "yaw_step_deg": 30.0,
+            "crossing_angle_step_deg": 5.0,
+            "minimum_shadow_center_cells": 32,
+            "chord_deviation_fastpath_m": 0.15,
+            "unresolved_exact_fallback_per_anchor": 16,
         },
     }
 
@@ -568,6 +615,17 @@ def _base_inputs():
     trajectory = build_local_trajectory(
         candidate, config, braking_deceleration_mps2=1.0
     )
+    trajectory = replace(
+        trajectory,
+        metadata={
+            **trajectory.metadata,
+            "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+            "pose_time_offsets_s": (
+                (np.arange(grid.future_steps, dtype=np.float64) + 1.0)
+                * float(config["bev"]["future_dt_s"])
+            ).tolist(),
+        },
+    )
     snippet = _snippet()
     libraries = {
         "human": SnippetLibrary(
@@ -578,6 +636,26 @@ def _base_inputs():
         )
     }
     return config, grid, base_state, oracle_context, trajectory, libraries
+
+
+def _v5_mother_inputs():
+    config, grid, base, oracle, trajectory, libraries = _base_inputs()
+    libraries = {
+        "human": replace(
+            libraries["human"], snippets=(_exact_safe_curve_snippet(),)
+        )
+    }
+    generator_config = _generator_config("environment")
+    generator_config["conflict_time_range_s"] = [2.2, 2.2]
+    return (
+        config,
+        grid,
+        base,
+        oracle,
+        trajectory,
+        libraries,
+        normalize_generator_config(generator_config),
+    )
 
 
 def _constant_curvature_trajectory(config: dict, *, radius_m: float):
@@ -1013,7 +1091,7 @@ def test_event_and_world_identity_known_vectors_are_mapping_order_stable() -> No
     }
 
     generated_event_id = event_sampler_module.compute_generated_event_id(**lineage)
-    assert generated_event_id == "event-8a376f991cfa77c88dda2c4d74724b05"
+    assert generated_event_id == "event-cbd68044b3190d1d2b31155948acdbd3"
     assert generated_event_id == event_sampler_module._build_generated_event_id(
         **lineage
     )
@@ -1023,7 +1101,7 @@ def test_event_and_world_identity_known_vectors_are_mapping_order_stable() -> No
 
     world_identity = _canonical_world_identity_inputs(lineage, generated_event_id)
     world_id = event_sampler_module.compute_generated_world_id(**world_identity)
-    assert world_id == "world-1c7e0b43bcc58f287741f306c0ee1ef4"
+    assert world_id == "world-181da4381b01b5c9479abe775edbb199"
     assert world_id == event_sampler_module._build_world_id(**world_identity)
     assert world_id == event_sampler_module._build_world_id(
         **{**world_identity, "footprint_spec": reordered_spec}
@@ -1178,22 +1256,74 @@ def test_mother_event_lineage_is_motion_invariant_while_world_and_record_identit
     assert mother_record.record_digest != variant_record.record_digest
 
 
-def test_generator_configs_freeze_human_only_policy_and_603010_mix() -> None:
+def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
+    expected_keys = {
+        "schema_version",
+        "production_event_kind",
+        "target_type_policy",
+        "conflict_time_range_s",
+        "max_local_curvature_per_m",
+        "crossing_angle_max_deg",
+        "time_scale_range",
+        "min_contiguous_visible_frames",
+        "occluders",
+        "blind_reachability",
+    }
     for filename in ("generator_train.yaml", "generator_test.yaml"):
         config = load_generator_config(ROOT / "configs" / filename)
+        assert set(config) == expected_keys
+        assert config["schema_version"] == "3.0.0"
+        assert config["production_event_kind"] == "environment"
         assert config["target_type_policy"].whitelist == ("human",)
         assert config["target_type_policy"].weights == {
             "human": 1.0,
             "carried_object": 0.0,
             "unknown_dynamic": 0.0,
         }
-        assert config["event_type_weights"] == {
-            "environment": 0.6,
-            "structural": 0.3,
-            "mixed": 0.1,
-        }
         assert config["time_scale_range"] == (1.0, 1.0)
+        assert config["blind_reachability"]["algorithm_version"] == (
+            "blind_reachability_first_v1"
+        )
+        assert config["blind_reachability"][
+            "obstacle_proposals_per_trajectory"
+        ] == 64
+        assert "normal_offset_range_m" not in config["occluders"]
         assert len(config["target_type_policy"].digest) == 32
+
+
+@pytest.mark.parametrize(
+    "obsolete_key",
+    ("event_type_weights", "max_resample_attempts", "structural_fov"),
+)
+def test_generator_config_rejects_each_v4_top_level_key(
+    obsolete_key: str,
+) -> None:
+    config = _generator_config()
+    config[obsolete_key] = {}
+
+    with pytest.raises(GeneratorConfigError, match="keys mismatch"):
+        normalize_generator_config(config)
+
+
+def test_generator_config_rejects_v4_normal_offset_key() -> None:
+    config = _generator_config()
+    config["occluders"]["normal_offset_range_m"] = [0.5, 1.5]
+
+    with pytest.raises(GeneratorConfigError, match="occluders keys mismatch"):
+        normalize_generator_config(config)
+
+
+def test_generator_config_freezes_v5_algorithm_token() -> None:
+    config = _generator_config()
+    config["blind_reachability"]["algorithm_version"] = "future_algorithm"
+
+    with pytest.raises(GeneratorConfigError, match="algorithm_version"):
+        normalize_generator_config(config)
+
+    assert (
+        event_sampler_module.SOP05_GENERATOR_ALGORITHM_VERSION
+        == "blind_reachability_first_v1"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1332,17 +1462,17 @@ def test_float32_curvature_check_preserves_degenerate_tangent_rejection(
 
 
 def test_generated_event_carries_canonical_target_motion_record_and_world_join() -> None:
-    config, grid, base, oracle, trajectory, libraries = _base_inputs()
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
     report = generate_events(
         base_state=base,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
-        generator_config=normalize_generator_config(
-            _generator_config("structural")
-        ),
-        seed=23,
+        generator_config=generator_config,
+        seed=20260716,
         event_count=1,
     )
 
@@ -1383,7 +1513,8 @@ def test_generated_event_carries_canonical_target_motion_record_and_world_join()
     assert metadata["target_future_array_digest"] == record.future_array_digest
     assert metadata["target_motion_record_digest"] == record.record_digest
     assert metadata["event_slot_index"] == 0
-    assert metadata["attempt_index"] == 0
+    assert isinstance(metadata["attempt_index"], int)
+    assert metadata["attempt_index"] >= 0
     assert metadata["target_current_pose"] == [
         float(value) for value in record.current_pose
     ]
@@ -1402,17 +1533,17 @@ def test_generated_event_carries_canonical_target_motion_record_and_world_join()
 def test_real_generated_event_batch_round_trips_through_strict_motion_shard(
     tmp_path: Path,
 ) -> None:
-    config, grid, base, oracle, trajectory, libraries = _base_inputs()
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
     report = generate_events(
         base_state=base,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
-        generator_config=normalize_generator_config(
-            _generator_config("structural")
-        ),
-        seed=23,
+        generator_config=generator_config,
+        seed=20260716,
         event_count=2,
     )
     assert len(report.events) == 2
@@ -1456,8 +1587,9 @@ def test_real_generated_event_batch_round_trips_through_strict_motion_shard(
 def test_same_seed_generated_event_shards_are_byte_identical(
     tmp_path: Path,
 ) -> None:
-    config, grid, base, oracle, trajectory, libraries = _base_inputs()
-    generator_config = normalize_generator_config(_generator_config("structural"))
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
 
     def generate_and_write(output: Path):
         report = generate_events(
@@ -1467,7 +1599,7 @@ def test_same_seed_generated_event_shards_are_byte_identical(
             snippet_libraries=libraries,
             base_config=config,
             generator_config=generator_config,
-            seed=23,
+            seed=20260716,
             event_count=2,
         )
         assert len(report.events) == 2
@@ -1509,8 +1641,9 @@ def test_same_seed_generated_event_shards_are_byte_identical(
 
 
 def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> None:
-    config, grid, base, oracle, trajectory, libraries = _base_inputs()
-    generator_config = normalize_generator_config(_generator_config("structural"))
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
 
     first = generate_events(
         base_state=base,
@@ -1519,7 +1652,7 @@ def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> 
         snippet_libraries=libraries,
         base_config=config,
         generator_config=generator_config,
-        seed=23,
+        seed=20260716,
         event_count=1,
     )
     second = generate_events(
@@ -1529,7 +1662,7 @@ def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> 
         snippet_libraries=libraries,
         base_config=config,
         generator_config=generator_config,
-        seed=23,
+        seed=20260716,
         event_count=1,
     )
 
@@ -1592,9 +1725,10 @@ def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> 
             repeated.world.dynamic_object_trajectories[object_id],
         )
     assert first.summary == second.summary
-    assert first.summary["by_object_type"]["human"]["accepted"] == 1
-    assert first.summary["by_footprint_kind"]["circle"]["accepted"] == 1
-    assert first.summary["by_geometry_source"]["marker_extent_p95"]["accepted"] == 1
+    assert first.summary["exact_validation_accepted_count"] >= 1
+    assert first.summary["reachability_candidate_ids"]
+    assert first.summary["reachability_transform_ids"]
+    assert first.summary["exact_validation_ids"]
 
 
 def test_target_visibility_history_recomputes_moving_sensor_and_context_per_frame(
@@ -1777,17 +1911,19 @@ def test_environment_occluder_receives_complete_robot_and_context_sweeps(
 ) -> None:
     config, _, base, oracle, trajectory, libraries = _base_inputs()
     raw_generator_config = _generator_config("environment")
-    raw_generator_config["max_resample_attempts"] = 1
+    raw_generator_config["blind_reachability"][
+        "obstacle_proposals_per_trajectory"
+    ] = 1
     captured: list[tuple[object, ...]] = []
-    real_propose = event_sampler_module.propose_environment_occluder_geometry
+    real_propose = event_sampler_module.propose_causal_occluder
 
-    def capture_sweeps(**kwargs: object):
+    def capture_sweeps(context, **kwargs: object):
         captured.append(tuple(kwargs.get("collision_sweeps", ())))
-        return real_propose(**kwargs)
+        return real_propose(context, **kwargs)
 
     monkeypatch.setattr(
         event_sampler_module,
-        "propose_environment_occluder_geometry",
+        "propose_causal_occluder",
         capture_sweeps,
     )
 
@@ -1805,15 +1941,23 @@ def test_environment_occluder_receives_complete_robot_and_context_sweeps(
     assert len(captured) == 1
     assert [sweep.rejection_reason for sweep in captured[0]] == [
         "occluder_robot_swept_overlap",
+        "occluder_robot_swept_overlap",
+        "occluder_robot_swept_overlap",
         "occluder_context_collision",
     ]
     np.testing.assert_array_equal(
-        captured[0][0].poses,
-        np.vstack((base.robot_history, trajectory.poses)),
+        captured[0][0].dense_poses[0],
+        base.robot_history[0],
+    )
+    np.testing.assert_array_equal(
+        captured[0][0].dense_poses[-1], captured[0][1].dense_poses[0]
+    )
+    np.testing.assert_array_equal(
+        captured[0][1].dense_poses[-1], captured[0][2].dense_poses[0]
     )
     context_id = next(iter(oracle.dynamic_object_specs))
     np.testing.assert_array_equal(
-        captured[0][1].poses,
+        captured[0][3].poses,
         np.vstack(
             (
                 oracle.dynamic_object_history[context_id],
@@ -1821,7 +1965,39 @@ def test_environment_occluder_receives_complete_robot_and_context_sweeps(
             )
         ),
     )
-    assert all(sweep.poses.shape == (23, 3) for sweep in captured[0])
+    assert captured[0][3].poses.shape == (23, 3)
+
+
+def test_generate_events_aborts_on_unexpected_orchestration_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries = _base_inputs()
+    generator_config = _generator_config("environment")
+    generator_config["blind_reachability"][
+        "obstacle_proposals_per_trajectory"
+    ] = 1
+
+    def fail_unexpectedly(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("unexpected orchestration failure")
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "propose_causal_occluder",
+        fail_unexpectedly,
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected orchestration failure"):
+        generate_events(
+            base_state=base,
+            oracle_context=oracle,
+            trajectory=trajectory,
+            snippet_libraries=libraries,
+            base_config=config,
+            generator_config=generator_config,
+            seed=19,
+            event_count=1,
+        )
 
 
 def test_target_physics_rejects_static_collision_only_between_early_history_frames(
@@ -1954,8 +2130,10 @@ def test_impossible_world_exhausts_finite_retries_with_explicit_reason() -> None
         base,
         static_map_local=np.ones_like(base.static_map_local, dtype=np.float32),
     )
-    raw_generator_config = _generator_config("structural")
-    raw_generator_config["max_resample_attempts"] = 3
+    raw_generator_config = _generator_config("environment")
+    raw_generator_config["blind_reachability"][
+        "obstacle_proposals_per_trajectory"
+    ] = 3
     report = generate_events(
         base_state=impossible,
         oracle_context=oracle,
@@ -1968,294 +2146,160 @@ def test_impossible_world_exhausts_finite_retries_with_explicit_reason() -> None
     )
 
     assert report.events == ()
-    assert report.summary["attempted_count"] == 3
+    assert report.summary["obstacle_proposal_count"] == 3
     assert report.summary["accepted_count"] == 0
-    assert report.summary["rejected_count"] == 3
-    assert report.summary["rejection_reasons"] == {"target_static_collision": 3}
-    assert report.summary["by_object_type"]["human"]["rejected"] == 3
-    structural_summary = report.summary["by_event_kind"]["structural"]
-    assert structural_summary == {
-        "requested": 1,
-        "attempted": 3,
-        "accepted": 0,
-        "rejected": 3,
-        "request_acceptance_rate": 0.0,
-        "attempt_acceptance_rate": 0.0,
-        "rejection_reasons": {"target_static_collision": 3},
-        "rejection_stage_counts": {
-            "occluder_geometry": 0,
-            "target_conditioning": 3,
-            "visibility": 0,
-        },
-    }
+    assert report.summary["obstacle_proposal_passed_count"] == 0
+    assert report.summary["obstacle_proposal_rejected_count"] == 3
+    assert sum(report.summary["rejection_reasons"].values()) == 3
 
 
-def test_summary_uses_complete_joint_attempt_denominator_and_reconciles_buckets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config, _, base, oracle, trajectory, libraries = _base_inputs()
-    raw_generator_config = _generator_config("structural")
-    raw_generator_config["max_resample_attempts"] = 3
-    real_trajectory_geometry = event_sampler_module._trajectory_geometry
-    geometry_call_count = 0
-
-    def reject_first_two_candidates(*args: object, **kwargs: object):
-        nonlocal geometry_call_count
-        geometry_call_count += 1
-        if geometry_call_count <= 2:
-            raise event_sampler_module._EventRejection("forced_before_target")
-        return real_trajectory_geometry(*args, **kwargs)
-
-    def controlled_footprint_visibility(
-        footprint,
-        poses: np.ndarray,
-        visibility_mask: np.ndarray,
-        grid,
-    ) -> np.ndarray:
-        del footprint, visibility_mask, grid
-        pose_count = np.asarray(poses).shape[0]
-        if pose_count == 16:
-            return np.asarray([False] + [True] * 15, dtype=bool)
-        assert pose_count == 1
-        return np.asarray([False], dtype=bool)
-
-    monkeypatch.setattr(
-        event_sampler_module,
-        "_trajectory_geometry",
-        reject_first_two_candidates,
+def test_v5_summary_reconciles_each_candidate_layer() -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
     )
-    monkeypatch.setattr(
-        event_sampler_module,
-        "footprint_visibility_sequence",
-        controlled_footprint_visibility,
-    )
-
     report = generate_events(
         base_state=base,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
-        generator_config=normalize_generator_config(raw_generator_config),
-        seed=43,
+        generator_config=generator_config,
+        seed=20260716,
         event_count=1,
     )
 
     assert len(report.events) == 1
     summary = report.summary
-    assert summary["complete_joint_candidates_attempted"] == 3
-    assert summary["attempted_count"] == 3
-    assert summary["joint_candidate_attempted_count"] == 3
-    assert summary["accepted_count"] == 1
-    assert summary["rejected_count"] == 2
-    assert summary["attempt_acceptance_rate"] == pytest.approx(1.0 / 3.0)
-    assert summary["request_acceptance_rate"] == 1.0
-    assert summary["acceptance_rate"] == summary["request_acceptance_rate"]
-    assert summary["rejection_reasons"] == {"forced_before_target": 2}
-
-    assigned_keys = {
-        "by_object_type": "human",
-        "by_footprint_kind": "circle",
-        "by_geometry_source": "marker_extent_p95",
-    }
-    for dimension, assigned_key in assigned_keys.items():
-        buckets = summary[dimension]
-        assert sum(bucket["attempted"] for bucket in buckets.values()) == 3
-        assert buckets["unassigned"] == {
-            "attempted": 2,
-            "accepted": 0,
-            "rejected": 2,
-            "attempt_acceptance_rate": 0.0,
-            "rejection_reasons": {"forced_before_target": 2},
-        }
-        assert buckets[assigned_key] == {
-            "attempted": 1,
-            "accepted": 1,
-            "rejected": 0,
-            "attempt_acceptance_rate": 1.0,
-            "rejection_reasons": {},
-        }
+    assert summary["obstacle_proposal_count"] == (
+        summary["obstacle_proposal_rejected_count"]
+        + summary["obstacle_proposal_passed_count"]
+    )
+    assert summary["transform_candidate_count"] == (
+        summary["transform_rejected_count"]
+        + summary["chord_certified_count"]
+        + summary["chord_unresolved_count"]
+    )
+    assert summary["exact_validation_count"] == (
+        summary["exact_validation_rejected_count"]
+        + summary["exact_validation_accepted_count"]
+    )
 
 
 def test_generate_events_resumes_absolute_candidate_index_without_reseeding(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, _, base, oracle, trajectory, libraries = _base_inputs()
-    raw_generator_config = _generator_config("structural")
-    raw_generator_config["max_resample_attempts"] = 3
+    impossible = replace(
+        base,
+        static_map_local=np.ones_like(base.static_map_local, dtype=np.float32),
+    )
+    raw_generator_config = _generator_config("environment")
+    raw_generator_config["blind_reachability"][
+        "obstacle_proposals_per_trajectory"
+    ] = 3
     normalized = normalize_generator_config(raw_generator_config)
-    real_trajectory_geometry = event_sampler_module._trajectory_geometry
-    geometry_call_count = 0
-
-    def reject_first_two_candidates(*args: object, **kwargs: object):
-        nonlocal geometry_call_count
-        geometry_call_count += 1
-        if geometry_call_count <= 2:
-            raise event_sampler_module._EventRejection("forced_before_target")
-        return real_trajectory_geometry(*args, **kwargs)
-
-    def controlled_footprint_visibility(
-        footprint,
-        poses: np.ndarray,
-        visibility_mask: np.ndarray,
-        grid,
-    ) -> np.ndarray:
-        del footprint, visibility_mask, grid
-        pose_count = np.asarray(poses).shape[0]
-        if pose_count == 16:
-            return np.asarray([False] + [True] * 15, dtype=bool)
-        assert pose_count == 1
-        return np.asarray([False], dtype=bool)
-
-    monkeypatch.setattr(
-        event_sampler_module,
-        "_trajectory_geometry",
-        reject_first_two_candidates,
-    )
-    monkeypatch.setattr(
-        event_sampler_module,
-        "footprint_visibility_sequence",
-        controlled_footprint_visibility,
-    )
     uninterrupted = generate_events(
-        base_state=base,
+        base_state=impossible,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
         generator_config=normalized,
-        seed=43,
+        seed=31,
         event_count=1,
     )
-    assert uninterrupted.summary["attempted_count"] == 3
-    assert len(uninterrupted.events) == 1
-
-    monkeypatch.setattr(
-        event_sampler_module,
-        "_trajectory_geometry",
-        real_trajectory_geometry,
-    )
+    assert uninterrupted.summary["obstacle_proposal_count"] == 3
+    assert uninterrupted.events == ()
     resumed = generate_events(
-        base_state=base,
+        base_state=impossible,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
         generator_config=normalized,
-        seed=43,
+        seed=31,
         event_count=1,
         attempt_index_start=2,
     )
 
     assert resumed.summary["attempt_index_start"] == 2
     assert resumed.summary["attempt_index_stop_exclusive"] == 3
-    assert resumed.summary["attempted_count"] == 1
-    assert len(resumed.events) == 1
-    expected = uninterrupted.events[0]
-    actual = resumed.events[0]
-    assert actual.generated_event_id == expected.generated_event_id
-    assert actual.world.world_id == expected.world.world_id
-    assert actual.world.metadata["attempt_index"] == 2
-    np.testing.assert_array_equal(
-        actual.target.history_poses,
-        expected.target.history_poses,
-    )
-    np.testing.assert_array_equal(
-        actual.target.future_poses,
-        expected.target.future_poses,
-    )
+    assert resumed.summary["obstacle_proposal_count"] == 1
+    assert resumed.events == ()
+    assert resumed.summary["proposal_ids"] == uninterrupted.summary[
+        "proposal_ids"
+    ][2:]
 
 
 def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
-    config, grid, base, oracle, trajectory, _ = _base_inputs()
-    rectangle = _snippet(
+    config, grid, _, _, _, _ = _base_inputs()
+    rectangle = replace(
+        _exact_safe_curve_snippet(),
         object_type="carried_object",
         footprint={"kind": "rectangle", "length_m": 1.2, "width_m": 0.2},
     )
-    policy_config = _generator_config("structural")
-    policy_config["target_type_policy"] = {
-        "whitelist": ["carried_object"],
-        "weights": {
-            "human": 0.0,
-            "carried_object": 1.0,
-            "unknown_dynamic": 0.0,
-        },
-    }
-    libraries = {
-        "carried_object": SnippetLibrary(
-            object_type="carried_object",
-            snippets=(rectangle,),
-            summary={"split": "train", "accepted_count": 1},
-            split_provenance={"split": "train"},
-        )
-    }
-    report = generate_events(
-        base_state=base,
-        oracle_context=oracle,
-        trajectory=trajectory,
-        snippet_libraries=libraries,
-        base_config=config,
-        generator_config=normalize_generator_config(policy_config),
-        seed=37,
-        event_count=1,
+    candidate = _reachability_candidate(rectangle, conflict_index=10)
+    target = transplant_reachability_candidate(
+        rectangle,
+        **_reachability_transplant_kwargs(candidate),
     )
-
-    assert len(report.events) == 1
-    event = report.events[0]
     target_mask = rasterize_footprint_sweep(
         RectangleFootprint(1.2, 0.2),
-        np.vstack((event.target.current_pose, event.target.future_poses)),
+        np.vstack((target.current_pose, target.future_poses)),
         grid,
     )
     assert target_mask.any()
-    assert np.unique(np.round(event.target.future_poses[:, 2], decimals=5)).size > 1
+    assert np.unique(np.round(target.future_poses[:, 2], decimals=5)).size > 1
 
 
-def test_environment_generation_uses_single_layer_joint_attempts() -> None:
+def test_environment_generation_uses_blind_reachability_first_mother() -> None:
     config, _, base, oracle, trajectory, libraries = _base_inputs()
+    exact_safe = _exact_safe_curve_snippet()
+    libraries = {
+        "human": replace(libraries["human"], snippets=(exact_safe,))
+    }
+    generator_config = _generator_config("environment")
+    generator_config["conflict_time_range_s"] = [2.2, 2.2]
     report = generate_events(
         base_state=base,
         oracle_context=oracle,
         trajectory=trajectory,
         snippet_libraries=libraries,
         base_config=config,
-        generator_config=load_generator_config(
-            ROOT / "configs" / "generator_train.yaml"
-        ),
+        generator_config=normalize_generator_config(generator_config),
         seed=20260716,
         event_count=1,
     )
 
     assert len(report.events) == 1
-    assert report.summary["generator_algorithm_version"] == "joint_occluder_first_v4"
-    assert report.summary["joint_candidate_attempted_count"] == report.summary[
-        "attempted_count"
-    ]
-    assert report.summary["attempt_acceptance_rate"] >= 0.5
-    assert report.summary["rejection_stage_counts"] == {
-        "occluder_geometry": 0,
-        "target_conditioning": 0,
-        "visibility": 0,
-    }
-    environment_summary = report.summary["by_event_kind"]["environment"]
-    assert environment_summary["requested"] == 1
-    assert environment_summary["attempted"] == report.summary["attempted_count"]
-    assert environment_summary["accepted"] == 1
-    assert environment_summary["rejected"] == environment_summary["attempted"] - 1
-    assert environment_summary["request_acceptance_rate"] == 1.0
-    assert environment_summary["attempt_acceptance_rate"] == pytest.approx(
-        1.0 / environment_summary["attempted"]
+    assert report.summary["generator_algorithm_version"] == (
+        "blind_reachability_first_v1"
     )
-    assert sum(environment_summary["rejection_stage_counts"].values()) == (
-        environment_summary["rejected"]
+    assert report.summary["obstacle_proposal_count"] == (
+        report.summary["obstacle_proposal_rejected_count"]
+        + report.summary["obstacle_proposal_passed_count"]
     )
+    assert report.summary["transform_candidate_count"] == (
+        report.summary["chord_certified_count"]
+        + report.summary["chord_unresolved_count"]
+        + report.summary["transform_rejected_count"]
+    )
+    assert report.summary["exact_validation_count"] == (
+        report.summary["exact_validation_accepted_count"]
+        + report.summary["exact_validation_rejected_count"]
+    )
+    assert report.summary["chord_unresolved_count"] > 0
+    assert report.summary["exact_validation_accepted_count"] > 0
     event = report.events[0]
     assert event.world.metadata["generator_algorithm_version"] == (
-        "joint_occluder_first_v4"
+        "blind_reachability_first_v1"
     )
     assert event.world.occluders[0]["placement_strategy"] == (
-        "joint_occluder_first_v2"
+        "causal_free_space_schedule_v1"
     )
+    assert event.world.metadata["causal_occluder_proposal_id"]
+    assert event.world.metadata["reachability_candidate_id"]
+    assert event.world.metadata["reachability_transform_id"]
+    assert event.world.metadata["exact_validation_id"]
     robot_footprint = inflate_footprint(
         RectangleFootprint(
             config["robot"]["length_m"], config["robot"]["width_m"]
@@ -2271,18 +2315,10 @@ def test_environment_generation_uses_single_layer_joint_attempts() -> None:
     assert float(np.min(clearances)) <= 0.0
 
 
-def test_environment_physics_prefix_accepts_first_candidate_for_fixture_batch() -> None:
-    config, _, base, oracle, trajectory, libraries = _base_inputs()
-    generator_config = load_generator_config(
-        ROOT / "configs" / "generator_train.yaml"
+def test_environment_mother_collects_then_stably_selects_fixture_batch() -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
     )
-    generator_config["event_type_weights"] = {
-        "environment": 1.0,
-        "structural": 0.0,
-        "mixed": 0.0,
-    }
-    generator_config["max_resample_attempts"] = 1
-
     report = generate_events(
         base_state=base,
         oracle_context=oracle,
@@ -2295,12 +2331,14 @@ def test_environment_physics_prefix_accepts_first_candidate_for_fixture_batch() 
     )
 
     assert len(report.events) == 4
-    assert report.summary["attempted_count"] == 4
-    assert report.summary["attempt_acceptance_rate"] == 1.0
-    assert report.summary["rejection_reasons"] == {}
+    assert report.summary["exact_validation_accepted_count"] >= 4
     assert all(event.conflict_time_s == 2.2 for event in report.events)
-    occluder_poses = {
-        tuple(np.round(event.world.occluders[0]["pose"], decimals=4))
+    selection_keys = [
+        (
+            event.world.metadata["causal_occluder_proposal_id"],
+            event.world.metadata["reachability_candidate_id"],
+            event.world.metadata["reachability_transform_id"],
+        )
         for event in report.events
-    }
-    assert len(occluder_poses) >= 3
+    ]
+    assert selection_keys == sorted(selection_keys)

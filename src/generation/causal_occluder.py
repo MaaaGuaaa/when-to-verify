@@ -1043,17 +1043,15 @@ def propose_causal_occluder(
             rejection_reason="occluder_no_useful_shadow",
         )
 
-    proposal_parameters = MappingProxyType(
-        {
-            field_name: getattr(parameters, field_name)
-            for field_name in parameters.__dataclass_fields__
-        }
+    proposal_parameters = tuple(
+        (field_name, getattr(parameters, field_name))
+        for field_name in parameters.__dataclass_fields__
     )
     metadata = {
         "occluder_id": proposal_id,
         "proposal_id": proposal_id,
         "type": parameters.occluder_type,
-        "pose": [float(value) for value in pose],
+        "pose": tuple(float(value) for value in pose),
         "length_m": float(length_m),
         "width_m": float(width_m),
         "geometry_source": "generator_config",

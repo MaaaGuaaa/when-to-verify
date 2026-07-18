@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 from dataclasses import FrozenInstanceError, fields, replace
 
 import numpy as np
@@ -608,9 +609,9 @@ def test_accepted_candidate_uses_direct_anchor_bearing_range_yaw_and_dimensions(
     assert candidate.footprint.width_m == 0.375
     assert candidate.proposal_index == parameters.proposal_index
     assert candidate.occluder["placement_strategy"] == "causal_free_space_schedule_v1"
-    assert candidate.occluder["proposal_parameters"] == {
-        field.name: getattr(parameters, field.name) for field in fields(parameters)
-    }
+    assert candidate.occluder["proposal_parameters"] == tuple(
+        (field.name, getattr(parameters, field.name)) for field in fields(parameters)
+    )
     assert candidate.occluder["proposal_id"] == decision.proposal_id
     assert candidate.occluder["occluder_id"] == decision.proposal_id
     assert candidate.occluder["schedule_version"] == (
@@ -619,6 +620,45 @@ def test_accepted_candidate_uses_direct_anchor_bearing_range_yaw_and_dimensions(
     assert candidate.occluder["proposal_version"] == (
         causal_occluder.CAUSAL_OCCLUDER_PROPOSAL_VERSION
     )
+
+
+def test_accepted_metadata_is_recursively_immutable() -> None:
+    decision = _propose(_proposal_context())
+    assert decision.accepted is not None
+    metadata = decision.accepted.occluder
+
+    with pytest.raises(TypeError):
+        metadata["pose"][0] = 99.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        metadata["proposal_parameters"][0] = ("proposal_index", 99)  # type: ignore[index]
+
+    def assert_immutable_nested(value) -> None:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return
+        assert isinstance(value, tuple)
+        for nested in value:
+            assert_immutable_nested(nested)
+
+    for value in metadata.values():
+        assert_immutable_nested(value)
+
+
+def test_accepted_metadata_is_standard_json_encodable_after_top_level_copy() -> None:
+    parameters = _parameters(dimension_quantile=0.5)
+    decision = _propose(
+        _proposal_context(),
+        parameters=parameters,
+    )
+    assert decision.accepted is not None
+    payload = dict(decision.accepted.occluder)
+
+    encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
+    decoded = json.loads(encoded)
+
+    assert decoded["pose"] == [2.0, 0.0, 0.5 * np.pi]
+    assert decoded["proposal_parameters"] == [
+        [field.name, getattr(parameters, field.name)] for field in fields(parameters)
+    ]
 
 
 def test_proposal_id_is_stable_and_binds_every_scientific_identity_input() -> None:

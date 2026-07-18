@@ -17,11 +17,12 @@ from src.contracts import GridSpec, RiskSample, SCHEMA_VERSION
 from src.datasets.risk_dataset import validate_risk_sample_for_publication
 from src.datasets.split_manager import (
     SplitAuditPolicy,
+    SplitLeakageError,
     assert_no_split_leakage,
 )
 
 
-RISK_SHARD_LAYOUT_VERSION = "risk_shard_npz_jsonl_v1"
+RISK_SHARD_LAYOUT_VERSION = "risk_shard_npz_jsonl_v2"
 
 _PAYLOAD_NAME = "samples.npz"
 _MANIFEST_NAME = "metadata.jsonl"
@@ -53,8 +54,10 @@ _MANIFEST_KEYS = frozenset(
         "pair_group_id",
         "event_type",
         "trajectory_id",
+        "base_recording_id",
+        "base_session_id",
         "source_recording_id",
-        "session_id",
+        "source_session_id",
         "source_snippet_id",
         "seed_namespace",
         "metadata",
@@ -93,7 +96,19 @@ _META_KEYS = frozenset(
 # THÖR evaluation keeps sessions known while holding out recordings.  Session
 # overlap is therefore visible in the report but is not leakage.  Recording,
 # snippet, pair-group, and seed identity remain strict cross-split boundaries.
-_THOR_RISK_SPLIT_POLICY = SplitAuditPolicy(
+_THOR_BASE_IDENTITY_POLICY = SplitAuditPolicy(
+    evaluation_scope="base_unseen_recording_within_known_sessions",
+    required_fields=("recording", "session"),
+    allowed_overlap_fields=("session",),
+    unavailable_fields=("participant",),
+)
+_THOR_COMBINED_IDENTITY_POLICY = SplitAuditPolicy(
+    evaluation_scope="global_recording_identity_across_base_and_source_roles",
+    required_fields=("recording", "session"),
+    allowed_overlap_fields=("session",),
+    unavailable_fields=("participant",),
+)
+_THOR_SOURCE_IDENTITY_POLICY = SplitAuditPolicy(
     evaluation_scope="unseen_recording_within_known_sessions",
     required_fields=(
         "recording",
@@ -165,7 +180,7 @@ def _digest_bytes(domain: bytes, payload: bytes) -> str:
 
 
 def _manifest_digest(rows: Sequence[Mapping[str, object]]) -> str:
-    return _digest_bytes(b"risk-shard-manifest-v1\0", _serialize_jsonl(rows))
+    return _digest_bytes(b"risk-shard-manifest-v2\0", _serialize_jsonl(rows))
 
 
 def _canonical_audit_records(
@@ -187,7 +202,7 @@ def _canonical_audit_records(
 
 def _audit_context_digest(records: Sequence[Mapping[str, object]]) -> str:
     return _digest_bytes(
-        b"risk-shard-audit-context-v1\0",
+        b"risk-shard-audit-context-v2\0",
         _serialize_jsonl(records),
     )
 
@@ -219,6 +234,107 @@ def _provenance_value(
     return next(iter(values))
 
 
+def _identity_audit_rows(
+    records: Sequence[Mapping[str, object]],
+    *,
+    identity: str,
+) -> tuple[dict[str, object], ...]:
+    if identity not in {"base", "source"}:  # pragma: no cover - private contract
+        raise ValueError("identity must be base or source")
+    rows: list[dict[str, object]] = []
+    for index, record in enumerate(records):
+        split = _require_nonempty_string(
+            record.get("split"), name=f"split_audit_records[{index}].split"
+        )
+        normalized: dict[str, object] = {
+            "split": split,
+            "recording_id": _require_nonempty_string(
+                record.get(f"{identity}_recording_id"),
+                name=f"{identity}_recording_id provenance",
+            ),
+            "session_id": _require_nonempty_string(
+                record.get(f"{identity}_session_id"),
+                name=f"{identity}_session_id provenance",
+            ),
+        }
+        if identity == "source":
+            normalized.update(
+                {
+                    "source_snippet_id": _require_nonempty_string(
+                        record.get("source_snippet_id"),
+                        name="source_snippet_id provenance",
+                    ),
+                    "pair_group_id": _require_nonempty_string(
+                        record.get("pair_group_id"),
+                        name="pair_group_id provenance",
+                    ),
+                    "seed_namespace": _require_nonempty_string(
+                        record.get("seed_namespace"),
+                        name="seed_namespace provenance",
+                    ),
+                }
+            )
+        rows.append(normalized)
+    return tuple(rows)
+
+
+def _identity_leakage_report(
+    records: Sequence[Mapping[str, object]],
+    *,
+    identity: str,
+    policy: SplitAuditPolicy,
+) -> dict[str, object]:
+    normalized = _identity_audit_rows(records, identity=identity)
+    try:
+        return assert_no_split_leakage(normalized, policy=policy)
+    except SplitLeakageError as exc:
+        message = str(exc).replace("recording", f"{identity} recording")
+        message = message.replace("session", f"{identity} session")
+        raise SplitLeakageError(message) from exc
+
+
+def _combined_identity_leakage_report(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    expanded = tuple(
+        identity_row
+        for identity in ("base", "source")
+        for identity_row in _identity_audit_rows(records, identity=identity)
+    )
+    return assert_no_split_leakage(
+        expanded, policy=_THOR_COMBINED_IDENTITY_POLICY
+    )
+
+
+def _dual_identity_leakage_report(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    base = _identity_leakage_report(
+        records, identity="base", policy=_THOR_BASE_IDENTITY_POLICY
+    )
+    source = _identity_leakage_report(
+        records, identity="source", policy=_THOR_SOURCE_IDENTITY_POLICY
+    )
+    combined = _combined_identity_leakage_report(records)
+    source_common_overlap_count = sum(
+        source["fields"][field]["overlap_count"]
+        for field in ("snippet", "pair_group", "seed_namespace")
+    )
+    return {
+        "status": "ok",
+        "evaluation_scope": "dual_base_source_unseen_recording_v1",
+        "detected_overlap_count": (
+            combined["detected_overlap_count"] + source_common_overlap_count
+        ),
+        "allowed_overlap_count": combined["allowed_overlap_count"],
+        "disallowed_overlap_count": 0,
+        "missing_required_row_count": 0,
+        "base_identity": base,
+        "source_identity": source,
+        "combined_identity": combined,
+    }
+
+
 def _manifest_row(
     sample: RiskSample,
     *,
@@ -231,15 +347,25 @@ def _manifest_row(
     provenance = metadata.get("provenance")
     if not isinstance(provenance, Mapping):
         raise ValueError("missing required provenance: provenance")
-    recording_id = _provenance_value(
+    base_recording_id = _provenance_value(
         provenance,
-        ("source_recording_id", "recording_id"),
-        name="recording",
+        ("base_recording_id",),
+        name="base_recording_id provenance",
     )
-    session_id = _provenance_value(
+    base_session_id = _provenance_value(
         provenance,
-        ("session_id", "source_session_id"),
-        name="session",
+        ("base_session_id",),
+        name="base_session_id provenance",
+    )
+    source_recording_id = _provenance_value(
+        provenance,
+        ("source_recording_id",),
+        name="source_recording_id provenance",
+    )
+    source_session_id = _provenance_value(
+        provenance,
+        ("source_session_id",),
+        name="source_session_id provenance",
     )
     snippet_id = _provenance_value(
         provenance,
@@ -265,8 +391,10 @@ def _manifest_row(
         "pair_group_id": sample.pair_group_id,
         "event_type": sample.event_type,
         "trajectory_id": trajectory_id,
-        "source_recording_id": recording_id,
-        "session_id": session_id,
+        "base_recording_id": base_recording_id,
+        "base_session_id": base_session_id,
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_snippet_id": snippet_id,
         "seed_namespace": seed_namespace,
         "metadata": metadata,
@@ -355,7 +483,7 @@ def _semantic_digest(
         "array_layout": _array_layout(arrays),
     }
     digest = hashlib.sha256()
-    digest.update(b"risk-shard-semantic-v1\0")
+    digest.update(b"risk-shard-semantic-v2\0")
     header_bytes = _canonical_json(header).encode("utf-8")
     digest.update(len(header_bytes).to_bytes(8, "big"))
     digest.update(header_bytes)
@@ -432,7 +560,10 @@ def _validate_summary(summary: object) -> dict[str, object]:
             f"got {summary.get('schema_version')!r}"
         )
     if summary.get("layout_version") != RISK_SHARD_LAYOUT_VERSION:
-        raise ValueError("summary layout_version mismatch")
+        raise ValueError(
+            "unsupported risk shard layout: "
+            f"{summary.get('layout_version')!r}"
+        )
     return summary
 
 
@@ -682,9 +813,7 @@ def write_risk_shard(
         for index, sample in enumerate(ordered)
     )
     external_audit = _canonical_audit_records(split_audit_records)
-    leakage_report = assert_no_split_leakage(
-        (*rows, *external_audit), policy=_THOR_RISK_SPLIT_POLICY
-    )
+    leakage_report = _dual_identity_leakage_report((*rows, *external_audit))
     audit_digest = _audit_context_digest(external_audit)
     manifest_digest = _manifest_digest(rows)
     arrays = _build_numeric_arrays(ordered)
@@ -823,9 +952,7 @@ def load_risk_shard(
     audit_digest = _audit_context_digest(external_audit)
     if summary["audit_context_digest"] != audit_digest:
         raise ValueError("split audit context digest mismatch")
-    leakage_report = assert_no_split_leakage(
-        (*rows, *external_audit), policy=_THOR_RISK_SPLIT_POLICY
-    )
+    leakage_report = _dual_identity_leakage_report((*rows, *external_audit))
     if summary["leakage_report"] != leakage_report:
         raise ValueError("split leakage report mismatch")
 

@@ -257,23 +257,19 @@ def _install_success_dependencies(
 
     def fake_adapter(**kwargs):
         calls["adapter"].append(kwargs)
-        return SimpleNamespace(
-            event_id=kwargs["mother_record"].generated_event_id,
-            variant_kind=kwargs["variant"].variant_kind,
-            pair_group_id=f"pair-{kwargs['mother_record'].generated_event_id}",
+        event = kwargs["mother_event"]
+        built = tuple(
+            SimpleNamespace(
+                sample_id=(
+                    f"sample-{event.generated_event_id}-{variant.variant_kind}"
+                ),
+                collision_label=int(variant.variant_kind == "collision"),
+                near_miss=int(variant.variant_kind == "near_miss"),
+            )
+            for variant in kwargs["group"].variants
         )
-
-    def fake_build(source, *, base_config, risk_config):
-        index = len(calls["samples"])
-        collision = int(source.variant_kind == "collision")
-        near_miss = int(source.variant_kind == "near_miss")
-        sample = SimpleNamespace(
-            sample_id=f"sample-{source.event_id}-{source.variant_kind}",
-            collision_label=collision,
-            near_miss=near_miss,
-        )
-        calls["samples"].append(sample)
-        return sample
+        calls["samples"].extend(built)
+        return built
 
     def fake_write(samples, path, *, grid, expected_sample_count):
         calls["writer"].append((tuple(samples), path, grid, expected_sample_count))
@@ -289,9 +285,8 @@ def _install_success_dependencies(
 
     monkeypatch.setattr(module, "generate_paired_variants", fake_generate)
     monkeypatch.setattr(
-        module, "build_risk_input_from_sop06_variant", fake_adapter
+        module, "build_risk_samples_from_sop06_group", fake_adapter
     )
-    monkeypatch.setattr(module, "build_risk_sample", fake_build)
     monkeypatch.setattr(module, "write_risk_shard", fake_write)
     monkeypatch.setattr(module, "load_risk_shard", fake_load)
     monkeypatch.setattr(
@@ -327,23 +322,19 @@ def test_run_stably_rebuilds_partial_groups_and_writes_verified_shard(
     report = cli_module.run_risk_dataset(request)
 
     assert calls["pair_events"] == ["event-a", "event-b"]
-    assert [call["variant"].variant_kind for call in calls["adapter"]] == [
-        "collision",
-        "near_miss",
-        "empty_blind_spot",
-        "collision",
-        "near_miss",
-        "empty_blind_spot",
+    assert [call["group"].pair_group_id for call in calls["adapter"]] == [
+        "pair-event-a",
+        "pair-event-b",
     ]
     assert all(
-        call["expected_paired_config_digest"] == "paired-digest"
+        call["paired_config"].digest == "paired-digest"
         for call in calls["adapter"]
     )
-    assert all(call["source_session_id"].startswith("session-") for call in calls["adapter"])
     assert all(
-        call["seed_namespace"].startswith("sop07/train/seed-17/")
+        call["source_snippet"].source_session_id.startswith("session-")
         for call in calls["adapter"]
     )
+    assert all(call["dataset_seed"] == 17 for call in calls["adapter"])
     assert calls["writer"][0][3] == 6
     assert report == {
         "schema_version": "3.0.0",
@@ -498,7 +489,7 @@ def test_unexpected_adapter_exception_is_not_swallowed(
     def crash(**kwargs):
         raise RuntimeError("adapter programming defect")
 
-    monkeypatch.setattr(cli_module, "build_risk_input_from_sop06_variant", crash)
+    monkeypatch.setattr(cli_module, "build_risk_samples_from_sop06_group", crash)
 
     with pytest.raises(RuntimeError, match="programming defect"):
         cli_module.run_risk_dataset(request)

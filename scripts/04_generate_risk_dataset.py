@@ -20,8 +20,7 @@ if str(_ROOT) not in sys.path:
 
 from src.contracts import ContractError, SCHEMA_VERSION, build_grid_spec  # noqa: E402
 from src.datasets.risk_dataset import (  # noqa: E402
-    build_risk_input_from_sop06_variant,
-    build_risk_sample,
+    build_risk_samples_from_sop06_group,
 )
 from src.datasets.shard_writer import (  # noqa: E402
     load_risk_shard,
@@ -47,7 +46,7 @@ from src.utils.config import ConfigError, load_config  # noqa: E402
 from src.utils.seeding import derive_seed  # noqa: E402
 
 
-SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v1"
+SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v2"
 
 
 class RiskDatasetRunError(ValueError):
@@ -425,35 +424,25 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
             continue
         groups.append(group)
         accepted_sources.append((event, snippet))
-        seed_namespace = (
-            f"sop07/{request.split}/seed-{request.seed}/"
-            f"{event.generated_event_id}"
-        )
-        for variant in group.variants:
-            try:
-                source = build_risk_input_from_sop06_variant(
-                    mother_record=record,
-                    mother_world=event.world,
-                    variant=variant,
-                    base_state=base_state,
-                    trajectory=trajectory,
-                    oracle_context=oracle_context,
-                    base_config=base_config,
-                    expected_paired_config_digest=paired_config.digest,
-                    source_session_id=snippet.source_session_id,
-                    seed_namespace=seed_namespace,
-                )
-                sample = build_risk_sample(
-                    source,
-                    base_config=base_config,
-                    risk_config=base_config["risk_gt"],
-                )
-            except (TypeError, ValueError) as exc:
-                raise RiskDatasetRunError(
-                    "failed to assemble risk sample for "
-                    f"{event.generated_event_id}/{variant.variant_kind}: {exc}"
-                ) from exc
-            samples.append(sample)
+        try:
+            group_samples = build_risk_samples_from_sop06_group(
+                group=group,
+                mother_event=event,
+                source_snippet=snippet,
+                base_state=base_state,
+                trajectory=trajectory,
+                oracle_context=oracle_context,
+                base_config=base_config,
+                paired_config=paired_config,
+                risk_config=base_config["risk_gt"],
+                dataset_seed=request.seed,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RiskDatasetRunError(
+                "failed to atomically assemble risk samples for "
+                f"{event.generated_event_id}: {exc}"
+            ) from exc
+        samples.extend(group_samples)
 
     sample_values = tuple(samples)
     if len(sample_values) != request.expected_sample_count:

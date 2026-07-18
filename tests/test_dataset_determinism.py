@@ -12,6 +12,7 @@ import pytest
 from src.contracts import GridSpec, RiskSample, SCHEMA_VERSION
 from src.datasets import shard_writer
 from src.datasets.shard_writer import (
+    RISK_SHARD_LAYOUT_VERSION,
     LoadedRiskShard,
     load_risk_shard,
     write_risk_shard,
@@ -38,16 +39,22 @@ def _sample(
     split: str = "train",
     value: float = 1.0,
     collision: bool = False,
-    recording_id: str | None = None,
-    session_id: str = "session-shared",
+    base_recording_id: str | None = None,
+    base_session_id: str = "base-session-shared",
+    source_recording_id: str | None = None,
+    source_session_id: str = "source-session-shared",
     snippet_id: str | None = None,
     pair_group_id: str | None = None,
     seed_namespace: str | None = None,
 ) -> RiskSample:
     grid = _grid()
     provenance = {
-        "source_recording_id": recording_id or f"recording-{sample_id}",
-        "session_id": session_id,
+        "base_recording_id": base_recording_id or f"base-recording-{sample_id}",
+        "base_session_id": base_session_id,
+        "source_recording_id": (
+            source_recording_id or f"source-recording-{sample_id}"
+        ),
+        "source_session_id": source_session_id,
         "dynamic_object_snippet_id": snippet_id or f"snippet-{sample_id}",
         "seed_namespace": seed_namespace or f"seed/{split}/{sample_id}",
     }
@@ -113,8 +120,10 @@ def _canonical_json(value: object) -> str:
 def _external_audit_row(**updates: str) -> dict[str, str]:
     row = {
         "split": "test",
-        "source_recording_id": "recording-external",
-        "session_id": "session-shared",
+        "base_recording_id": "base-recording-external",
+        "base_session_id": "base-session-shared",
+        "source_recording_id": "source-recording-external",
+        "source_session_id": "source-session-shared",
         "source_snippet_id": "snippet-external",
         "pair_group_id": "pair-external",
         "seed_namespace": "seed/test/external",
@@ -232,6 +241,22 @@ def test_loader_rejects_old_schema_shards(tmp_path: Path, old_schema: str) -> No
         load_risk_shard(tmp_path / "shard", grid=_grid())
 
 
+def test_layout_v2_is_frozen_and_loader_rejects_v1(tmp_path: Path) -> None:
+    assert RISK_SHARD_LAYOUT_VERSION == "risk_shard_npz_jsonl_v2"
+    paths = write_risk_shard(
+        (_sample("sample-a"),),
+        tmp_path / "shard",
+        grid=_grid(),
+        expected_sample_count=1,
+    )
+    summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+    summary["layout_version"] = "risk_shard_npz_jsonl_v1"
+    paths["summary"].write_text(_canonical_json(summary) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported risk shard layout"):
+        load_risk_shard(tmp_path / "shard", grid=_grid())
+
+
 @pytest.mark.parametrize("tamper", ["content", "dtype", "shape", "metadata"])
 def test_loader_fails_closed_on_tampering(tmp_path: Path, tamper: str) -> None:
     paths = write_risk_shard(
@@ -299,8 +324,10 @@ def test_loader_rejects_unexpected_partial_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "missing_key",
     [
+        "base_recording_id",
+        "base_session_id",
         "source_recording_id",
-        "session_id",
+        "source_session_id",
         "dynamic_object_snippet_id",
         "seed_namespace",
     ],
@@ -339,21 +366,42 @@ def test_session_overlap_is_allowed_and_reported(tmp_path: Path) -> None:
     )
 
     assert loaded.leakage_report["status"] == "ok"
-    assert loaded.leakage_report["field_policies"]["session"] == "allowed_reported"
-    assert loaded.leakage_report["fields"]["session"]["overlap_count"] == 1
-    assert loaded.leakage_report["allowed_overlap_count"] == 1
+    for identity in ("base_identity", "source_identity"):
+        report = loaded.leakage_report[identity]
+        assert report["field_policies"]["session"] == "allowed_reported"
+        assert report["fields"]["session"]["overlap_count"] == 1
+    assert loaded.leakage_report["combined_identity"]["fields"]["session"][
+        "overlap_count"
+    ] == 2
+    assert loaded.leakage_report["allowed_overlap_count"] == 2
     assert loaded.leakage_report["disallowed_overlap_count"] == 0
 
 
 @pytest.mark.parametrize(
     ("field", "external_key", "external_value"),
     [
-        ("recording", "source_recording_id", "recording-sample-a"),
+        ("base recording", "base_recording_id", "base-recording-sample-a"),
+        (
+            "source recording",
+            "source_recording_id",
+            "source-recording-sample-a",
+        ),
+        (
+            "recording",
+            "source_recording_id",
+            "base-recording-sample-a",
+        ),
+        (
+            "recording",
+            "base_recording_id",
+            "source-recording-sample-a",
+        ),
         ("snippet", "source_snippet_id", "snippet-sample-a"),
         ("pair_group", "pair_group_id", "pair-sample-a"),
+        ("seed_namespace", "seed_namespace", "seed/train/sample-a"),
     ],
 )
-def test_recording_snippet_and_pair_overlap_are_forbidden(
+def test_dual_recording_snippet_and_pair_overlap_are_forbidden(
     tmp_path: Path,
     field: str,
     external_key: str,

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 import json
 import math
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any, Mapping
 
 import numpy as np
@@ -27,30 +27,47 @@ from src.contracts import (
     build_grid_spec,
     validate_risk_sample,
 )
-from src.generation.dynamic_object_transplant import footprint_from_spec
-from src.generation.event_sampler import SOP05_GENERATOR_ALGORITHM_VERSION
-from src.generation.event_target_motion_shard import EventTargetMotionRecord
+from src.generation.dynamic_object_transplant import (
+    TransplantError,
+    TransplantedDynamicObject,
+    footprint_from_spec,
+    transplant_snippet,
+)
+from src.datasets.snippet_library import MOTION_SNIPPET_LAYOUT, MotionSnippet
+from src.generation.event_sampler import (
+    SOP05_GENERATOR_ALGORITHM_VERSION,
+    GeneratedEvent,
+)
 from src.generation.observation_renderer import (
     RENDERER_LAYOUT_VERSION,
+    RenderedObservation,
     render_observation,
 )
 from src.generation.paired_variants import (
     JOINT_ENVIRONMENT_PAIR_VERSION,
     PAIRED_GENERATOR_ALGORITHM_VERSION,
     PAIRED_GROUP_CONTRACT_VERSION,
+    PairedEventGroup,
     PairedVariant,
+    PairedVariantConfig,
+    normalize_paired_variant_config,
 )
 from src.generation.risk_gt import (
     RISK_GT_VERSION,
+    RiskGroundTruth,
     compute_hidden_risk_gt,
     resolve_no_object_clearance_sentinel,
 )
-from src.generation.sop06_pipeline import render_sop06_paired_variant
+from src.generation.sop06_pipeline import render_sop06_partial_pair_group
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
+    Footprint,
     RectangleFootprint,
     inflate_footprint,
     rasterize_footprint,
+    signed_clearance,
+    trajectory_signed_clearances,
+    wrap_angle,
 )
 from src.utils.seeding import stable_digest
 
@@ -86,7 +103,7 @@ _FORBIDDEN_METADATA_KEY_TOKENS = (
     "dynamic_object_trajectories",
     "hidden_object_ids",
 )
-_RISK_INPUT_ADAPTER_VERSION = "sop06_variant_to_risk_input_v1"
+_RISK_INPUT_ADAPTER_VERSION = "sop06_group_to_risk_samples_v2"
 
 
 @dataclass(frozen=True)
@@ -121,47 +138,50 @@ def _canonical_config_digest(config: Mapping[str, object]) -> str:
     return stable_digest(payload, size=16)
 
 
-def _validate_formal_sop06_variant_identity(
-    mother_world: OracleWorld,
-    variant: PairedVariant,
-) -> None:
-    if not isinstance(mother_world.metadata, Mapping):
-        raise ValueError("mother_world metadata must be a mapping")
-    if not isinstance(variant.world.metadata, Mapping):
-        raise ValueError("paired world metadata must be a mapping")
-    for label, metadata in (
-        ("mother", mother_world.metadata),
-        ("paired variant", variant.world.metadata),
-    ):
-        joint_version = metadata.get("joint_pair_generator_algorithm_version")
-        if joint_version is not None:
-            if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
-                raise ValueError(
-                    f"{label} uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}"
-                )
-            raise ValueError(f"{label} contains unsupported joint identity")
-    if mother_world.metadata.get("generator_algorithm_version") != (
-        SOP05_GENERATOR_ALGORITHM_VERSION
-    ):
-        raise ValueError(
-            "mother generator_algorithm_version must equal "
-            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
-        )
-    metadata = variant.world.metadata
-    if metadata.get("paired_generator_algorithm_version") != (
-        PAIRED_GENERATOR_ALGORITHM_VERSION
-    ):
-        raise ValueError(
-            "paired_generator_algorithm_version must equal "
-            f"{PAIRED_GENERATOR_ALGORITHM_VERSION}"
-        )
-    if metadata.get("pair_group_contract_version") != (
-        PAIRED_GROUP_CONTRACT_VERSION
-    ):
-        raise ValueError(
-            "pair_group_contract_version must equal "
-            f"{PAIRED_GROUP_CONTRACT_VERSION}"
-        )
+def _canonical_paired_config(value: PairedVariantConfig) -> PairedVariantConfig:
+    if not isinstance(value, PairedVariantConfig):
+        raise TypeError("paired_config must be a PairedVariantConfig")
+    try:
+        normalized = normalize_paired_variant_config(value.as_dict())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("canonical paired config validation failed") from exc
+    if normalized != value:
+        raise ValueError("paired_config differs from its canonical paired config")
+    return normalized
+
+
+def _deep_owned_copy(value: Any) -> Any:
+    """Deep-copy a formal input graph while preserving ndarray write flags."""
+
+    memo: dict[int, object] = {}
+    seen: set[int] = set()
+
+    def seed_arrays(item: Any) -> None:
+        item_id = id(item)
+        if item_id in seen:
+            return
+        seen.add(item_id)
+        if isinstance(item, np.ndarray):
+            owned = np.array(item, dtype=item.dtype, order="K", copy=True)
+            if not item.flags.writeable:
+                owned.setflags(write=False)
+            memo[item_id] = owned
+            return
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                seed_arrays(key)
+                seed_arrays(child)
+            return
+        if isinstance(item, (tuple, list, set, frozenset)):
+            for child in item:
+                seed_arrays(child)
+            return
+        if is_dataclass(item) and not isinstance(item, type):
+            for field in fields(item):
+                seed_arrays(getattr(item, field.name))
+
+    seed_arrays(value)
+    return deepcopy(value, memo)
 
 
 def _copy_sop06_scene_history(
@@ -179,6 +199,7 @@ def _copy_sop06_scene_history(
             order="C",
             copy=True,
         )
+        histories[object_id].setflags(write=False)
         specs[object_id] = deepcopy(
             base_state.visible_dynamic_object_specs[object_id]
         )
@@ -198,6 +219,7 @@ def _copy_sop06_scene_history(
         histories[object_id] = np.array(
             history, dtype=np.float32, order="C", copy=True
         )
+        histories[object_id].setflags(write=False)
         specs[object_id] = deepcopy(spec)
     if variant.target is not None:
         target_id = variant.target.target_dynamic_object_id
@@ -209,126 +231,394 @@ def _copy_sop06_scene_history(
             order="C",
             copy=True,
         )
+        histories[target_id].setflags(write=False)
         specs[target_id] = deepcopy(variant.target.footprint_spec)
     return histories, specs
 
 
-def build_risk_input_from_sop06_variant(
+def _validate_formal_inputs(
     *,
-    mother_record: EventTargetMotionRecord,
-    mother_world: OracleWorld,
-    variant: PairedVariant,
+    group: PairedEventGroup,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
     base_state: BaseState,
     trajectory: LocalTrajectory,
     oracle_context: OracleContext,
-    base_config: Mapping[str, object],
-    expected_paired_config_digest: str,
-    source_session_id: str,
-    seed_namespace: str,
-) -> RiskBuildInput:
-    """Adapt one formally validated SOP06 variant without leaking label future."""
-
-    if not isinstance(mother_record, EventTargetMotionRecord):
-        raise TypeError("mother_record must be an EventTargetMotionRecord")
-    if not isinstance(mother_world, OracleWorld):
-        raise TypeError("mother_world must be an OracleWorld")
-    if not isinstance(variant, PairedVariant):
-        raise TypeError("variant must be a PairedVariant")
+    paired_config: PairedVariantConfig,
+    dataset_seed: int,
+) -> tuple[str, int, int]:
+    if not isinstance(group, PairedEventGroup):
+        raise TypeError("group must be a PairedEventGroup")
+    if not isinstance(mother_event, GeneratedEvent):
+        raise TypeError("mother_event must be a GeneratedEvent")
+    if not isinstance(source_snippet, MotionSnippet):
+        raise TypeError("source_snippet must be a MotionSnippet")
     if not isinstance(base_state, BaseState):
         raise TypeError("base_state must be a BaseState")
     if not isinstance(trajectory, LocalTrajectory):
         raise TypeError("trajectory must be a LocalTrajectory")
     if not isinstance(oracle_context, OracleContext):
         raise TypeError("oracle_context must be an OracleContext")
-    if not isinstance(base_config, Mapping):
-        raise TypeError("base_config must be a mapping")
-    config = dict(base_config)
-    if config.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
-    source_session_id = _require_nonempty_string(
-        source_session_id, name="source_session_id"
-    )
-    seed_namespace = _require_nonempty_string(
-        seed_namespace, name="seed_namespace"
-    )
-    if trajectory.trajectory_id != mother_record.trajectory_id:
-        raise ValueError("trajectory_id does not match mother record")
-    _validate_formal_sop06_variant_identity(mother_world, variant)
+    if not isinstance(paired_config, PairedVariantConfig):
+        raise TypeError("paired_config must be a PairedVariantConfig")
+    if isinstance(dataset_seed, (bool, np.bool_)) or not isinstance(
+        dataset_seed, (Integral, np.integer)
+    ):
+        raise TypeError("dataset_seed must be a non-negative integer")
+    dataset_seed = int(dataset_seed)
+    if dataset_seed < 0:
+        raise ValueError("dataset_seed must be a non-negative integer")
 
-    # This is the authoritative SOP06 validation/render boundary.  It checks
-    # record/world/context joins, trusted config identity, retired versions,
-    # paired lineage, target history/future digests, and skeleton equality.
-    render_sop06_paired_variant(
-        mother_record=mother_record,
-        mother_world=mother_world,
-        variant=variant,
-        base_state=base_state,
-        oracle_context=oracle_context,
-        config=config,
-        expected_paired_config_digest=expected_paired_config_digest,
+    record = mother_event.target_motion_record
+    target = mother_event.target
+    if mother_event.generated_event_id != record.generated_event_id:
+        raise ValueError("mother event/record generated_event_id mismatch")
+    if not isinstance(mother_event.world, OracleWorld):
+        raise TypeError("mother event world must be an OracleWorld")
+    if not isinstance(target, TransplantedDynamicObject):
+        raise TypeError("mother event target must be a TransplantedDynamicObject")
+    if trajectory.trajectory_id != record.trajectory_id:
+        raise ValueError("trajectory_id does not match mother record")
+    if record.base_state_id != base_state.state_id:
+        raise ValueError("base_state_id does not match mother record")
+    if oracle_context.base_state_id != base_state.state_id:
+        raise ValueError("oracle_context/base_state IDs must match")
+    if source_snippet.split != base_state.split:
+        raise ValueError("source snippet split differs from base split")
+    identity_fields = (
+        (source_snippet.snippet_id, record.source_snippet_id, "snippet"),
+        (source_snippet.source_object_id, record.source_object_id, "source object"),
+        (source_snippet.object_type, record.object_type, "object type"),
+        (target.snippet_id, record.source_snippet_id, "mother target snippet"),
+        (target.source_object_id, record.source_object_id, "mother target source object"),
+        (target.object_type, record.object_type, "mother target object type"),
     )
+    for actual, expected, label in identity_fields:
+        if actual != expected:
+            raise ValueError(f"{label} identity mismatch")
+    if source_snippet.footprint != record.footprint_spec.get("footprint"):
+        raise ValueError("source snippet footprint differs from mother record")
+    if target.footprint_spec != record.footprint_spec:
+        raise ValueError("mother target footprint differs from mother record")
+    target_provenance = target.provenance
+    if not isinstance(target_provenance, Mapping):
+        raise TypeError("mother target provenance must be a mapping")
+    source_recording_id = _require_nonempty_string(
+        source_snippet.source_recording_id, name="source recording"
+    )
+    _require_nonempty_string(
+        source_snippet.source_session_id, name="source session"
+    )
+    if target_provenance.get("source_recording_id") != source_recording_id:
+        raise ValueError("source recording differs from mother target provenance")
+    base_recording_id = _require_nonempty_string(
+        base_state.recording_id, name="base recording"
+    )
+    if not isinstance(oracle_context.metadata, Mapping):
+        raise TypeError("oracle_context metadata must be a mapping")
+    if oracle_context.metadata.get("source_recording_id") != base_recording_id:
+        raise ValueError("oracle_context/base recording identity mismatch")
+    base_session_id = _require_nonempty_string(
+        base_state.metadata.get("session_id"), name="base session"
+    )
+    sample_count = int(MOTION_SNIPPET_LAYOUT["sample_count"])
+    for name, array, shape in (
+        ("positions", source_snippet.positions, (sample_count, 2)),
+        ("velocities", source_snippet.velocities, (sample_count, 2)),
+        ("headings", source_snippet.headings, (sample_count,)),
+    ):
+        if not isinstance(array, np.ndarray):
+            raise TypeError(f"source snippet {name} must be an np.ndarray")
+        if array.dtype != np.float32 or array.shape != shape:
+            raise ValueError(f"source snippet {name} shape/dtype mismatch")
+        if not np.isfinite(array).all():
+            raise ValueError(f"source snippet {name} contains NaN/Inf")
+    if source_snippet.duration_s != float(MOTION_SNIPPET_LAYOUT["duration_s"]):
+        raise ValueError("source snippet duration violates the frozen layout")
+    if not isinstance(source_snippet.provenance, dict):
+        raise TypeError("source snippet provenance must be a dict")
+    snippet_scalars = (
+        source_snippet.start_timestamp,
+        source_snippet.duration_s,
+        source_snippet.mean_speed_mps,
+        source_snippet.max_acceleration_mps2,
+        source_snippet.mean_abs_curvature_per_m,
+    )
+    if not all(
+        not isinstance(value, (bool, np.bool_))
+        and isinstance(value, Real)
+        and math.isfinite(float(value))
+        for value in snippet_scalars
+    ):
+        raise ValueError("source snippet statistics must be finite")
+
+    current_index = target_provenance.get("source_current_index")
+    expected_current_index = int(MOTION_SNIPPET_LAYOUT["current_index"])
+    if type(current_index) is not int or current_index != expected_current_index:
+        raise ValueError("mother target source_current_index mismatch")
+    current_xy = target_provenance.get("candidate_current_xy")
+    if not isinstance(current_xy, (list, tuple)) or len(current_xy) != 2:
+        raise ValueError("mother target candidate_current_xy must contain two values")
+    current_xy_array = np.asarray(current_xy, dtype=np.float64)
+    if not np.isfinite(current_xy_array).all():
+        raise ValueError("mother target candidate_current_xy must be finite")
+    rotation_rad = _finite_float(
+        target_provenance.get("rotation_rad"),
+        name="mother target rotation_rad",
+    )
+    cosine = math.cos(rotation_rad)
+    sine = math.sin(rotation_rad)
+    rotation = np.asarray(
+        [[cosine, -sine], [sine, cosine]], dtype=np.float64
+    )
+    positions64 = source_snippet.positions.astype(np.float64)
+    transformed_xy = (
+        (positions64 - positions64[current_index]) @ rotation.T
+        + current_xy_array
+    )
+    transformed_headings = (
+        source_snippet.headings.astype(np.float64) + rotation_rad
+    )
+    reconstructed = np.column_stack(
+        (transformed_xy, transformed_headings)
+    ).astype(np.float32)
+    target_poses = np.ascontiguousarray(
+        np.vstack((target.history_poses, target.future_poses)), dtype=np.float32
+    )
+    record_poses = np.ascontiguousarray(
+        np.vstack((record.history_poses, record.future_poses)), dtype=np.float32
+    )
+    if not np.array_equal(reconstructed, target_poses):
+        raise ValueError("source snippet motion does not reconstruct mother target")
+    if not np.array_equal(reconstructed, record_poses):
+        raise ValueError("source snippet motion does not reconstruct mother record")
+    if not np.array_equal(reconstructed[current_index], target.current_pose) or not (
+        np.array_equal(reconstructed[current_index], record.current_pose)
+    ):
+        raise ValueError("source snippet current pose differs from mother identity")
+
+    if paired_config.schema_version != SCHEMA_VERSION:
+        raise ValueError(f"paired_config schema_version must be {SCHEMA_VERSION}")
+    if paired_config.paired_generator_algorithm_version != (
+        PAIRED_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError("paired_config generator version mismatch")
+    if paired_config.group_contract_version != PAIRED_GROUP_CONTRACT_VERSION:
+        raise ValueError("paired_config group contract version mismatch")
+    if paired_config.digest != group.paired_config_digest:
+        raise ValueError("paired_config digest differs from group")
+    mother_metadata = mother_event.world.metadata
+    if not isinstance(mother_metadata, Mapping):
+        raise TypeError("mother world metadata must be a mapping")
+    joint_version = mother_metadata.get("joint_pair_generator_algorithm_version")
+    if joint_version is not None:
+        if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
+            raise ValueError(f"mother uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}")
+        raise ValueError("mother contains unsupported joint-pair identity")
+    if mother_metadata.get("generator_algorithm_version") != (
+        SOP05_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError(
+            "mother generator_algorithm_version must equal "
+            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
+        )
+    transplant_seed = target.provenance.get("seed")
+    if type(transplant_seed) is not int or transplant_seed < 0:
+        raise ValueError("mother target transplant seed must be a non-negative integer")
+    paired_seeds = {variant.world.metadata.get("paired_seed") for variant in group.variants}
+    if len(paired_seeds) != 1:
+        raise ValueError("formal SOP06 group must have one paired seed")
+    paired_seed = next(iter(paired_seeds))
+    if type(paired_seed) is not int or paired_seed < 0:
+        raise ValueError("paired seed must be a non-negative integer")
+    return base_session_id, transplant_seed, paired_seed
+
+
+def _owned_oracle_world(world: OracleWorld) -> OracleWorld:
+    static = np.array(world.static_occupancy, dtype=np.float32, order="C", copy=True)
+    static.setflags(write=False)
+    trajectories: dict[str, np.ndarray] = {}
+    for object_id, value in world.dynamic_object_trajectories.items():
+        owned = np.array(value, dtype=np.float32, order="C", copy=True)
+        owned.setflags(write=False)
+        trajectories[object_id] = owned
+    return OracleWorld(
+        world_id=world.world_id,
+        base_state_id=world.base_state_id,
+        static_occupancy=static,
+        dynamic_object_trajectories=trajectories,
+        dynamic_object_specs=deepcopy(world.dynamic_object_specs),
+        occluders=tuple(deepcopy(item) for item in world.occluders),
+        blind_spot_config=deepcopy(world.blind_spot_config),
+        random_seed=world.random_seed,
+        metadata=deepcopy(world.metadata),
+    )
+
+
+def _trajectory_primitive(trajectory: LocalTrajectory) -> dict[str, float]:
+    if (
+        not isinstance(trajectory.controls, np.ndarray)
+        or trajectory.controls.ndim != 2
+        or trajectory.controls.shape[1] != 2
+        or trajectory.controls.dtype != np.float32
+        or not np.isfinite(trajectory.controls).all()
+    ):
+        raise ValueError("trajectory controls violate the primitive contract")
+    v = _finite_float(trajectory.metadata.get("v"), name="trajectory metadata v")
+    omega = _finite_float(
+        trajectory.metadata.get("omega"), name="trajectory metadata omega"
+    )
+    expected = np.asarray([v, omega], dtype=np.float32)
+    if not np.allclose(trajectory.controls, expected, rtol=0.0, atol=1e-7):
+        raise ValueError("trajectory controls differ from metadata primitive")
+    return {"v_mps": v, "omega_radps": omega}
+
+
+def _occluder_audit(world: OracleWorld) -> list[dict[str, object]]:
+    audit: list[dict[str, object]] = []
+    required = (
+        "occluder_id",
+        "type",
+        "pose",
+        "length_m",
+        "width_m",
+        "placement_strategy",
+    )
+    for index, raw in enumerate(world.occluders):
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"occluders[{index}] must be a mapping")
+        item = {key: deepcopy(raw.get(key)) for key in required}
+        for key in ("occluder_id", "type", "placement_strategy"):
+            _require_nonempty_string(item[key], name=f"occluders[{index}].{key}")
+        pose = item["pose"]
+        if not isinstance(pose, (list, tuple)) or len(pose) != 3:
+            raise ValueError(f"occluders[{index}].pose must contain three values")
+        item["pose"] = [
+            _finite_float(value, name=f"occluders[{index}].pose") for value in pose
+        ]
+        for key in ("length_m", "width_m"):
+            item[key] = _finite_float(item[key], name=f"occluders[{index}].{key}")
+            if item[key] <= 0.0:
+                raise ValueError(f"occluders[{index}].{key} must be positive")
+        audit.append(item)
+    return audit
+
+
+def _build_formal_source(
+    *,
+    variant: PairedVariant,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    paired_config: PairedVariantConfig,
+    risk_config: Mapping[str, object],
+    dataset_seed: int,
+    base_session_id: str,
+    transplant_seed: int,
+    paired_seed: int,
+) -> RiskBuildInput:
+    record = mother_event.target_motion_record
     blind_spot_config = variant.world.blind_spot_config
     if not isinstance(blind_spot_config, Mapping) or (
         blind_spot_config.get("kind") != "environment"
     ):
-        raise ValueError("formal v5 risk adapter requires an environment variant")
-
+        raise ValueError("formal SOP07 adapter requires an environment variant")
     histories, specs = _copy_sop06_scene_history(
         base_state=base_state,
         oracle_context=oracle_context,
         variant=variant,
     )
+    world = _owned_oracle_world(variant.world)
     pair_group_id = _require_nonempty_string(
         variant.world.metadata.get("pair_group_id"), name="pair_group_id"
     )
-    target_footprint = mother_record.footprint_spec.get("footprint")
+    target_footprint = record.footprint_spec.get("footprint")
     if not isinstance(target_footprint, Mapping):
         raise ValueError("mother target footprint must be a mapping")
     target_footprint_kind = _require_nonempty_string(
         target_footprint.get("kind"), name="target_footprint_kind"
     )
-    base_config_digest = _canonical_config_digest(config)
-    sample_id = f"{base_state.split}-" + stable_digest(
-        _RISK_INPUT_ADAPTER_VERSION,
-        pair_group_id,
-        base_state.state_id,
-        trajectory.trajectory_id,
-        variant.variant_kind,
-        variant.world.world_id,
-        expected_paired_config_digest,
-        base_config_digest,
-        seed_namespace,
-        size=12,
+    base_config_digest = _canonical_config_digest(base_config)
+    risk_config_digest = _canonical_config_digest(risk_config)
+    snippet_motion_digest = stable_digest(
+        source_snippet.snippet_id,
+        source_snippet.start_timestamp,
+        source_snippet.positions.tobytes(order="C"),
+        source_snippet.velocities.tobytes(order="C"),
+        source_snippet.headings.tobytes(order="C"),
+        size=16,
     )
+    occluders = _occluder_audit(world)
+    trajectory_primitive = _trajectory_primitive(trajectory)
+    seed_namespace = (
+        f"sop07/{base_state.split}/seed-{dataset_seed}/"
+        f"{mother_event.generated_event_id}"
+    )
+    identity = (
+        _RISK_INPUT_ADAPTER_VERSION,
+        base_state.split,
+        base_state.recording_id,
+        base_session_id,
+        base_state.state_id,
+        source_snippet.source_recording_id,
+        source_snippet.source_session_id,
+        source_snippet.source_object_id,
+        source_snippet.snippet_id,
+        snippet_motion_digest,
+        mother_event.generated_event_id,
+        mother_event.world.world_id,
+        record.target_dynamic_object_id,
+        record.target_type_policy_digest,
+        trajectory.trajectory_id,
+        pair_group_id,
+        variant.variant_kind,
+        world.world_id,
+        transplant_seed,
+        paired_seed,
+        dataset_seed,
+        paired_config.digest,
+        base_config_digest,
+        risk_config_digest,
+        json.dumps(
+            trajectory_primitive, sort_keys=True, separators=(",", ":")
+        ),
+        json.dumps(occluders, sort_keys=True, separators=(",", ":")),
+    )
+    sample_id = f"{base_state.split}-" + stable_digest(*identity, size=12)
     provenance = _canonical_metadata_copy(
         {
             "risk_input_adapter_version": _RISK_INPUT_ADAPTER_VERSION,
-            "source_recording_id": base_state.recording_id,
-            "session_id": source_session_id,
-            "source_snippet_id": mother_record.source_snippet_id,
-            "source_object_id": mother_record.source_object_id,
+            "base_recording_id": base_state.recording_id,
+            "base_session_id": base_session_id,
+            "source_recording_id": source_snippet.source_recording_id,
+            "source_session_id": source_snippet.source_session_id,
+            "source_snippet_id": source_snippet.snippet_id,
+            "source_object_id": source_snippet.source_object_id,
+            "source_snippet_motion_digest": snippet_motion_digest,
             "seed_namespace": seed_namespace,
-            "target_object_type": mother_record.object_type,
+            "sop05_transplant_seed": transplant_seed,
+            "sop06_paired_seed": paired_seed,
+            "sop07_dataset_seed": dataset_seed,
+            "target_object_type": record.object_type,
             "target_footprint_kind": target_footprint_kind,
-            "target_type_policy_digest": (
-                mother_record.target_type_policy_digest
-            ),
+            "target_type_policy_digest": record.target_type_policy_digest,
             "blind_spot_type": blind_spot_config["kind"],
-            "generator_algorithm_version": (
-                mother_world.metadata["generator_algorithm_version"]
-            ),
+            "blind_region_digest": blind_spot_config.get("blind_region_digest"),
+            "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
             "paired_generator_algorithm_version": (
-                variant.world.metadata[
-                    "paired_generator_algorithm_version"
-                ]
+                PAIRED_GENERATOR_ALGORITHM_VERSION
             ),
-            "pair_group_contract_version": (
-                variant.world.metadata["pair_group_contract_version"]
-            ),
-            "paired_config_digest": expected_paired_config_digest,
+            "pair_group_contract_version": PAIRED_GROUP_CONTRACT_VERSION,
+            "paired_config_digest": paired_config.digest,
             "base_config_digest": base_config_digest,
+            "risk_config_digest": risk_config_digest,
             "variant_kind": variant.variant_kind,
-            "variant_random_seed": variant.world.random_seed,
+            "world_id": world.world_id,
+            "trajectory_primitive": trajectory_primitive,
+            "occluders": occluders,
         },
         name="provenance",
     )
@@ -337,27 +627,20 @@ def build_risk_input_from_sop06_variant(
         if variant.target is None
         else (variant.target.target_dynamic_object_id,)
     )
-    source = RiskBuildInput(
+    return RiskBuildInput(
         sample_id=sample_id,
         pair_group_id=pair_group_id,
         event_type=variant.variant_kind,
         base_state=base_state,
         trajectory=trajectory,
-        oracle_world=variant.world,
-        observed_static_occupancy=np.array(
-            variant.world.static_occupancy,
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        ),
+        oracle_world=world,
+        observed_static_occupancy=world.static_occupancy,
         scene_dynamic_history=histories,
         scene_dynamic_specs=specs,
         hidden_object_ids=hidden_object_ids,
         sensor_config=None,
         provenance=provenance,
     )
-    _validate_source_join(source)
-    return source
 
 
 def _require_nonempty_string(value: Any, *, name: str) -> str:
@@ -493,17 +776,23 @@ def _validate_source_join(source: RiskBuildInput) -> None:
     history_ids = set(source.scene_dynamic_history)
     spec_ids = set(source.scene_dynamic_specs)
     world_ids = set(source.oracle_world.dynamic_object_trajectories)
-    if history_ids != spec_ids or history_ids != world_ids:
-        raise ValueError("scene history/spec IDs must match oracle_world object IDs")
-    for object_id in sorted(history_ids):
+    if history_ids != spec_ids or not world_ids.issubset(history_ids):
+        raise ValueError(
+            "scene history/spec IDs must contain oracle_world object IDs"
+        )
+    if set(source.oracle_world.dynamic_object_specs) != world_ids:
+        raise ValueError("oracle_world trajectory/spec IDs must match")
+    for object_id in sorted(world_ids):
         if source.scene_dynamic_specs[object_id] != source.oracle_world.dynamic_object_specs[
             object_id
         ]:
             raise ValueError("scene and oracle_world footprint specs must match")
     if not isinstance(source.hidden_object_ids, tuple):
         raise TypeError("hidden_object_ids must be an explicit tuple")
-    if not set(source.hidden_object_ids).issubset(history_ids):
-        raise ValueError("hidden_object_ids must have current history and specs")
+    if not set(source.hidden_object_ids).issubset(world_ids):
+        raise ValueError(
+            "hidden_object_ids must have history, specs, and oracle trajectories"
+        )
 
 
 def _validate_declared_hidden_visibility(
@@ -622,33 +911,454 @@ def validate_risk_sample_for_publication(
             raise ValueError("empty hidden set requires the grid-diagonal sentinel")
 
 
-def build_risk_sample(
+def _robot_footprint(base_config: Mapping[str, object]) -> Footprint:
+    robot_config = base_config.get("robot")
+    if not isinstance(robot_config, Mapping):
+        raise TypeError("base_config.robot must be a mapping")
+    return inflate_footprint(
+        RectangleFootprint(
+            robot_config.get("length_m"),
+            robot_config.get("width_m"),
+        ),
+        robot_config.get("inflation_m"),
+    )
+
+
+def _assert_target_reconstruction(
+    actual: TransplantedDynamicObject,
+    expected: TransplantedDynamicObject,
+    *,
+    kind: str,
+) -> None:
+    scalar_fields = (
+        "target_dynamic_object_id",
+        "source_object_id",
+        "snippet_id",
+        "object_type",
+        "footprint_spec",
+        "footprint_spec_digest",
+        "provenance",
+    )
+    if any(getattr(actual, name) != getattr(expected, name) for name in scalar_fields):
+        raise ValueError(f"{kind} target does not reconstruct from the real snippet")
+    for name in ("history_poses", "current_pose", "future_poses"):
+        if not np.array_equal(getattr(actual, name), getattr(expected, name)):
+            raise ValueError(f"{kind} target does not reconstruct from the real snippet")
+
+
+def _reconstruct_spatial_target(
+    variant: PairedVariant,
+    *,
+    mother_event: GeneratedEvent,
+) -> TransplantedDynamicObject:
+    metadata = variant.world.metadata.get("paired_transform")
+    if not isinstance(metadata, Mapping) or set(metadata) != {
+        "kind",
+        "radial_shift_m",
+        "signed_arc_offset_m",
+        "rotation_rad",
+    }:
+        raise ValueError(
+            f"{variant.variant_kind} paired_transform metadata is invalid"
+        )
+    if metadata.get("kind") != "hidden_pose_pivot_v1":
+        raise ValueError(
+            f"{variant.variant_kind} paired_transform kind is invalid"
+        )
+    radial = _finite_float(
+        metadata.get("radial_shift_m"),
+        name=f"{variant.variant_kind} paired_transform radial_shift_m",
+    )
+    signed_arc = _finite_float(
+        metadata.get("signed_arc_offset_m"),
+        name=f"{variant.variant_kind} paired_transform signed_arc_offset_m",
+    )
+    declared_angle = _finite_float(
+        metadata.get("rotation_rad"),
+        name=f"{variant.variant_kind} paired_transform rotation_rad",
+    )
+
+    mother_target = mother_event.target
+    future_path = np.vstack(
+        (mother_target.current_pose, mother_target.future_poses)
+    ).astype(np.float64)
+    pivot = future_path[0, :2].copy()
+    conflict_index = min(
+        mother_event.conflict_index + 1, future_path.shape[0] - 1
+    )
+    pivot_radius = float(
+        np.linalg.norm(future_path[conflict_index, :2] - pivot)
+    )
+    if pivot_radius <= 1e-6:
+        pivot_radius = float(
+            np.max(np.linalg.norm(future_path[:, :2] - pivot, axis=1))
+        )
+    if pivot_radius <= 1e-6:
+        raise ValueError("spatial paired target pivot is degenerate")
+    sensor_distance = float(np.linalg.norm(pivot))
+    if sensor_distance <= 1e-6:
+        raise ValueError("spatial paired target blind ray is degenerate")
+    ray_direction = pivot / sensor_distance
+    angle = signed_arc / pivot_radius
+    if not math.isclose(declared_angle, angle, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            f"{variant.variant_kind} paired transform rotation is inconsistent"
+        )
+    cosine = np.cos(angle)
+    sine = np.sin(angle)
+    rotation = np.asarray(
+        [[cosine, -sine], [sine, cosine]], dtype=np.float64
+    )
+    poses = np.vstack(
+        (mother_target.history_poses, mother_target.future_poses)
+    ).astype(np.float64)
+    poses[:, :2] = (
+        (poses[:, :2] - pivot) @ rotation.T
+        + pivot
+        + radial * ray_direction
+    )
+    poses[:, 2] = wrap_angle(poses[:, 2] + angle)
+    poses = poses.astype(np.float32)
+    transform = {
+        "kind": "hidden_pose_pivot_v1",
+        "radial_shift_m": radial,
+        "signed_arc_offset_m": signed_arc,
+        "rotation_rad": angle,
+    }
+    return replace(
+        mother_target,
+        history_poses=poses[: mother_target.history_poses.shape[0]],
+        current_pose=poses[mother_target.history_poses.shape[0] - 1].copy(),
+        future_poses=poses[mother_target.history_poses.shape[0] :],
+        provenance={**mother_target.provenance, "paired_transform": transform},
+    )
+
+
+def _reconstruct_temporal_target(
+    variant: PairedVariant,
+    *,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    future_dt_s: float,
+) -> TransplantedDynamicObject:
+    metadata = variant.world.metadata.get("paired_transform")
+    if not isinstance(metadata, Mapping) or set(metadata) != {
+        "kind",
+        "temporal_offset_s",
+        "mother_conflict_time_s",
+        "variant_conflict_time_s",
+    }:
+        raise ValueError("temporal_safe paired_transform metadata is invalid")
+    if metadata.get("kind") != "temporal_offset_v1":
+        raise ValueError("temporal_safe paired_transform kind is invalid")
+    offset = _finite_float(
+        metadata.get("temporal_offset_s"),
+        name="temporal_safe paired_transform temporal_offset_s",
+    )
+    mother_time = _finite_float(
+        metadata.get("mother_conflict_time_s"),
+        name="temporal_safe paired_transform mother_conflict_time_s",
+    )
+    variant_time = _finite_float(
+        metadata.get("variant_conflict_time_s"),
+        name="temporal_safe paired_transform variant_conflict_time_s",
+    )
+    if not math.isclose(
+        mother_time,
+        mother_event.conflict_time_s,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ) or not math.isclose(
+        variant_time,
+        mother_event.conflict_time_s + offset,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("temporal_safe conflict-time transform is inconsistent")
+    provenance = mother_event.target.provenance
+    crossing_direction = provenance.get(
+        "desired_crossing_direction", provenance.get("crossing_direction")
+    )
+    try:
+        expected = transplant_snippet(
+            source_snippet,
+            conflict_point=provenance["conflict_point"],
+            conflict_time_s=variant_time,
+            crossing_direction=crossing_direction,
+            time_scale=provenance["time_scale"],
+            future_dt_s=future_dt_s,
+            future_steps=trajectory.poses.shape[0],
+            base_state_id=mother_event.world.base_state_id,
+            trajectory_id=trajectory.trajectory_id,
+            target_type_policy_digest=provenance["target_type_policy_digest"],
+            seed=provenance["seed"],
+            context_object_ids=tuple(oracle_context.dynamic_object_future),
+        )
+    except (KeyError, TypeError, ValueError, TransplantError) as exc:
+        raise ValueError(
+            "temporal_safe target does not reconstruct from the real snippet"
+        ) from exc
+    return replace(
+        expected,
+        target_dynamic_object_id=mother_event.target.target_dynamic_object_id,
+        provenance={
+            **expected.provenance,
+            "paired_transform": {
+                "kind": "temporal_offset_v1",
+                "temporal_offset_s": offset,
+                "mother_conflict_time_s": mother_event.conflict_time_s,
+            },
+        },
+    )
+
+
+def _validate_variant_semantics(
+    variant: PairedVariant,
+    *,
     source: RiskBuildInput,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    oracle_context: OracleContext,
+    labels: RiskGroundTruth,
+    robot_footprint: Footprint,
+    future_dt_s: float,
+    paired_config: PairedVariantConfig,
+) -> None:
+    kind = variant.variant_kind
+    transform_values = (
+        variant.temporal_offset_s,
+        variant.lateral_offset_m,
+        variant.radial_shift_m,
+        variant.rotation_rad,
+    )
+    if variant.target is None:
+        if kind != "empty_blind_spot":
+            raise ValueError("only empty_blind_spot may omit its target")
+        if any(value is not None for value in transform_values):
+            raise ValueError("empty_blind_spot transform fields must be empty")
+        if any(
+            value is not None
+            for value in (
+                variant.clearance_sequence_m,
+                variant.min_clearance_m,
+                variant.time_to_min_clearance_s,
+            )
+        ):
+            raise ValueError("empty_blind_spot clearance fields must be empty")
+        if labels.has_hidden_target or labels.collision_label or labels.near_miss:
+            raise ValueError("empty_blind_spot labels must be empty-safe")
+        if variant.world.metadata.get("min_clearance_m") is not None or (
+            variant.world.metadata.get("time_to_min_clearance_s") is not None
+        ):
+            raise ValueError("empty_blind_spot clearance metadata must be empty")
+        transform = variant.world.metadata.get("paired_transform")
+        if transform != {
+            "kind": "target_removal",
+            "removed_target_dynamic_object_id": (
+                mother_event.target.target_dynamic_object_id
+            ),
+        }:
+            raise ValueError("empty_blind_spot target-removal transform mismatch")
+        return
+
+    if kind == "collision":
+        if variant.world.metadata.get("paired_transform") != {
+            "kind": "collision_mother"
+        }:
+            raise ValueError("collision mother transform metadata mismatch")
+        _assert_target_reconstruction(
+            variant.target, mother_event.target, kind=kind
+        )
+    elif kind == "temporal_safe":
+        _assert_target_reconstruction(
+            variant.target,
+            _reconstruct_temporal_target(
+                variant,
+                mother_event=mother_event,
+                source_snippet=source_snippet,
+                trajectory=source.trajectory,
+                oracle_context=oracle_context,
+                future_dt_s=future_dt_s,
+            ),
+            kind=kind,
+        )
+    elif kind in {"near_miss", "spatial_safe", "irrelevant_hidden"}:
+        _assert_target_reconstruction(
+            variant.target,
+            _reconstruct_spatial_target(variant, mother_event=mother_event),
+            kind=kind,
+        )
+
+    target_id = variant.target.target_dynamic_object_id
+    target_footprint = footprint_from_spec(variant.target.footprint_spec)
+    actual = trajectory_signed_clearances(
+        robot_footprint,
+        source.trajectory.poses,
+        target_footprint,
+        source.oracle_world.dynamic_object_trajectories[target_id],
+    )
+    declared = variant.clearance_sequence_m
+    if (
+        not isinstance(declared, np.ndarray)
+        or declared.shape != actual.shape
+        or not np.isfinite(declared).all()
+        or not np.allclose(declared, actual, rtol=0.0, atol=1e-6)
+    ):
+        raise ValueError(f"{kind} clearance sequence differs from actual geometry")
+    minimum_index = int(np.argmin(actual))
+    minimum = float(actual[minimum_index])
+    time_to_minimum = float((minimum_index + 1) * future_dt_s)
+    if not math.isclose(
+        _finite_float(variant.min_clearance_m, name=f"{kind} min_clearance_m"),
+        minimum,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(f"{kind} min_clearance_m differs from actual geometry")
+    if not math.isclose(
+        _finite_float(
+            variant.time_to_min_clearance_s,
+            name=f"{kind} time_to_min_clearance_s",
+        ),
+        time_to_minimum,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(f"{kind} time_to_min_clearance_s differs from actual geometry")
+    metadata = variant.world.metadata
+    if metadata.get("min_clearance_m") != variant.min_clearance_m or metadata.get(
+        "time_to_min_clearance_s"
+    ) != variant.time_to_min_clearance_s:
+        raise ValueError(f"{kind} clearance metadata mismatch")
+    if not math.isclose(labels.min_clearance, minimum, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"{kind} risk label differs from actual geometry")
+
+    if kind == "collision":
+        if labels.collision_label != 1:
+            raise ValueError("collision variant must collide")
+        if any(value is not None for value in transform_values):
+            raise ValueError("collision variant must not carry a paired transform")
+    elif kind == "near_miss":
+        lower, upper = paired_config.near_miss_clearance_range_m
+        if labels.collision_label or labels.near_miss != 1 or not lower <= minimum <= upper:
+            raise ValueError("near_miss variant violates its clearance semantics")
+        lateral = _finite_float(
+            variant.lateral_offset_m, name="near_miss lateral_offset_m"
+        )
+        _finite_float(variant.radial_shift_m, name="near_miss radial_shift_m")
+        _finite_float(variant.rotation_rad, name="near_miss rotation_rad")
+        if lateral <= 0.0 or variant.temporal_offset_s is not None:
+            raise ValueError("near_miss must carry a nonzero spatial transform")
+    elif kind == "temporal_safe":
+        offset = _finite_float(
+            variant.temporal_offset_s, name="temporal_safe temporal_offset_s"
+        )
+        if not any(
+            math.isclose(offset, candidate, rel_tol=0.0, abs_tol=1e-9)
+            for candidate in paired_config.temporal_offset_candidates_s
+        ):
+            raise ValueError("temporal_safe offset is absent from paired_config")
+        if labels.collision_label:
+            raise ValueError("temporal_safe variant must not collide")
+        if any(value is not None for value in transform_values[1:]):
+            raise ValueError("temporal_safe must carry only a temporal transform")
+        paths_intersect = any(
+            signed_clearance(
+                robot_footprint,
+                robot_pose,
+                target_footprint,
+                target_pose,
+            )
+            <= 0.0
+            for robot_pose in source.trajectory.poses
+            for target_pose in variant.target.future_poses
+        )
+        if not paths_intersect:
+            raise ValueError("temporal_safe spatial paths must intersect")
+    elif kind in {"spatial_safe", "irrelevant_hidden"}:
+        lateral = _finite_float(
+            variant.lateral_offset_m, name=f"{kind} lateral_offset_m"
+        )
+        _finite_float(variant.radial_shift_m, name=f"{kind} radial_shift_m")
+        _finite_float(variant.rotation_rad, name=f"{kind} rotation_rad")
+        if lateral <= 0.0 or variant.temporal_offset_s is not None:
+            raise ValueError(f"{kind} must carry a nonzero spatial transform")
+        if labels.collision_label:
+            raise ValueError(f"{kind} variant must not collide")
+        if kind == "spatial_safe":
+            lower, upper = paired_config.spatial_safe_clearance_range_m
+            if not lower <= minimum <= upper:
+                raise ValueError("spatial_safe clearance is outside its configured range")
+        elif minimum < paired_config.irrelevant_min_clearance_m:
+            raise ValueError("irrelevant_hidden clearance is below its configured minimum")
+    else:  # pragma: no cover - formal SOP06 renderer rejects unknown kinds first
+        raise ValueError(f"unsupported formal paired variant: {kind}")
+
+    transform_metadata = metadata.get("paired_transform")
+    if not isinstance(transform_metadata, Mapping):
+        raise ValueError(f"{kind} paired_transform metadata must be a mapping")
+    if kind == "temporal_safe":
+        if not math.isclose(
+            _finite_float(
+                transform_metadata.get("temporal_offset_s"),
+                name="temporal_safe paired_transform temporal_offset_s",
+            ),
+            float(variant.temporal_offset_s),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("temporal_safe transform metadata mismatch")
+    elif kind in {"near_miss", "spatial_safe", "irrelevant_hidden"}:
+        signed_arc = _finite_float(
+            transform_metadata.get("signed_arc_offset_m"),
+            name=f"{kind} paired_transform signed_arc_offset_m",
+        )
+        radial = _finite_float(
+            transform_metadata.get("radial_shift_m"),
+            name=f"{kind} paired_transform radial_shift_m",
+        )
+        rotation = _finite_float(
+            transform_metadata.get("rotation_rad"),
+            name=f"{kind} paired_transform rotation_rad",
+        )
+        if not (
+            math.isclose(
+                abs(signed_arc),
+                float(variant.lateral_offset_m),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                radial,
+                float(variant.radial_shift_m),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                rotation,
+                float(variant.rotation_rad),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(f"{kind} transform metadata mismatch")
+
+
+def _build_risk_sample_from_rendered(
+    source: RiskBuildInput,
+    rendered: RenderedObservation,
     *,
     base_config: Mapping[str, object],
-    risk_config: Mapping[str, object],
+    normalized_risk: Mapping[str, object],
+    formal_variant: PairedVariant | None = None,
+    paired_config: PairedVariantConfig | None = None,
+    mother_event: GeneratedEvent | None = None,
+    source_snippet: MotionSnippet | None = None,
+    oracle_context: OracleContext | None = None,
 ) -> RiskSample:
-    """Render history-only inputs and independently compute oracle-future labels."""
-
-    if not isinstance(source, RiskBuildInput):
-        raise TypeError("source must be a RiskBuildInput")
-    if not isinstance(base_config, Mapping):
-        raise TypeError("base_config must be a mapping")
-    base_config_dict = dict(base_config)
-    if base_config_dict.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
-    normalized_risk = _normalized_risk_config(risk_config)
-    grid = build_grid_spec(base_config_dict)
-    _validate_source_join(source)
-
-    rendered = render_observation(
-        source.base_state,
-        scene_dynamic_history=source.scene_dynamic_history,
-        scene_dynamic_specs=source.scene_dynamic_specs,
-        static_occupancy=source.observed_static_occupancy,
-        sensor_config=source.sensor_config,
-        config=base_config_dict,
-    )
+    grid = build_grid_spec(dict(base_config))
     if not np.array_equal(
         source.observed_static_occupancy,
         source.oracle_world.static_occupancy,
@@ -660,17 +1370,8 @@ def build_risk_sample(
         grid=grid,
     )
 
-    robot_config = base_config_dict.get("robot")
-    if not isinstance(robot_config, Mapping):
-        raise TypeError("base_config.robot must be a mapping")
-    robot_footprint = inflate_footprint(
-        RectangleFootprint(
-            robot_config.get("length_m"),
-            robot_config.get("width_m"),
-        ),
-        robot_config.get("inflation_m"),
-    )
-    bev_config = base_config_dict.get("bev")
+    robot_footprint = _robot_footprint(base_config)
+    bev_config = base_config.get("bev")
     if not isinstance(bev_config, Mapping):
         raise TypeError("base_config.bev must be a mapping")
     labels = compute_hidden_risk_gt(
@@ -684,6 +1385,28 @@ def build_risk_sample(
         sigma_time_s=normalized_risk["sigma_time_s"],
         near_miss_distance_m=normalized_risk["near_miss_distance_m"],
     )
+    if formal_variant is not None:
+        if any(
+            value is None
+            for value in (
+                paired_config,
+                mother_event,
+                source_snippet,
+                oracle_context,
+            )
+        ):  # pragma: no cover - private call contract
+            raise RuntimeError("formal variant validation requires formal context")
+        _validate_variant_semantics(
+            formal_variant,
+            source=source,
+            mother_event=mother_event,
+            source_snippet=source_snippet,
+            oracle_context=oracle_context,
+            labels=labels,
+            robot_footprint=robot_footprint,
+            future_dt_s=float(bev_config.get("future_dt_s")),
+            paired_config=paired_config,
+        )
     trajectory_channels = build_trajectory_channels(source.trajectory, grid)
     metadata = {
         "schema_version": SCHEMA_VERSION,
@@ -733,3 +1456,156 @@ def build_risk_sample(
     )
     validate_risk_sample_for_publication(sample, grid)
     return sample
+
+
+def build_risk_sample(
+    source: RiskBuildInput,
+    *,
+    base_config: Mapping[str, object],
+    risk_config: Mapping[str, object],
+) -> RiskSample:
+    """Render a general history-only source and compute its hidden-risk labels."""
+
+    if not isinstance(source, RiskBuildInput):
+        raise TypeError("source must be a RiskBuildInput")
+    if not isinstance(base_config, Mapping):
+        raise TypeError("base_config must be a mapping")
+    base_config_dict = dict(base_config)
+    if base_config_dict.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
+    normalized_risk = _normalized_risk_config(risk_config)
+    _validate_source_join(source)
+    rendered = render_observation(
+        source.base_state,
+        scene_dynamic_history=source.scene_dynamic_history,
+        scene_dynamic_specs=source.scene_dynamic_specs,
+        static_occupancy=source.observed_static_occupancy,
+        sensor_config=source.sensor_config,
+        config=base_config_dict,
+    )
+    return _build_risk_sample_from_rendered(
+        source,
+        rendered,
+        base_config=base_config_dict,
+        normalized_risk=normalized_risk,
+    )
+
+
+def build_risk_samples_from_sop06_group(
+    *,
+    group: PairedEventGroup,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    paired_config: PairedVariantConfig,
+    risk_config: Mapping[str, object],
+    dataset_seed: int,
+) -> tuple[RiskSample, ...]:
+    """Atomically validate, render once, and assemble one formal SOP06 group."""
+
+    if not isinstance(base_config, Mapping):
+        raise TypeError("base_config must be a mapping")
+    for value, expected_type, name in (
+        (group, PairedEventGroup, "group"),
+        (mother_event, GeneratedEvent, "mother_event"),
+        (source_snippet, MotionSnippet, "source_snippet"),
+        (base_state, BaseState, "base_state"),
+        (trajectory, LocalTrajectory, "trajectory"),
+        (oracle_context, OracleContext, "oracle_context"),
+    ):
+        if not isinstance(value, expected_type):
+            raise TypeError(f"{name} must be a {expected_type.__name__}")
+    paired_config = _canonical_paired_config(paired_config)
+
+    # Own one immutable-in-practice snapshot before the formal renderer sees
+    # anything.  External array/dict mutation can therefore affect neither the
+    # rendered observation nor the later oracle-label branch.
+    (
+        group,
+        mother_event,
+        source_snippet,
+        base_state,
+        trajectory,
+        oracle_context,
+        base_config_dict,
+        risk_config_snapshot,
+    ) = _deep_owned_copy(
+        (
+            group,
+            mother_event,
+            source_snippet,
+            base_state,
+            trajectory,
+            oracle_context,
+            dict(base_config),
+            risk_config,
+        )
+    )
+    if base_config_dict.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
+    normalized_risk = _normalized_risk_config(risk_config_snapshot)
+
+    base_session_id, transplant_seed, paired_seed = _validate_formal_inputs(
+        group=group,
+        mother_event=mother_event,
+        source_snippet=source_snippet,
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle_context,
+        paired_config=paired_config,
+        dataset_seed=dataset_seed,
+    )
+
+    # This is deliberately the sole formal SOP06 validation/render boundary.
+    # Its returned observations are consumed below without a per-variant rerender.
+    rendered_group = render_sop06_partial_pair_group(
+        group=group,
+        mother_record=mother_event.target_motion_record,
+        mother_world=mother_event.world,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        config=base_config_dict,
+        expected_paired_config_digest=paired_config.digest,
+    )
+    if rendered_group.variant_kinds != tuple(
+        variant.variant_kind for variant in group.variants
+    ) or len(rendered_group.observations) != len(group.variants):
+        raise RuntimeError("formal SOP06 renderer returned misaligned observations")
+
+    samples: list[RiskSample] = []
+    for variant, rendered in zip(
+        group.variants, rendered_group.observations, strict=True
+    ):
+        source = _build_formal_source(
+            variant=variant,
+            mother_event=mother_event,
+            source_snippet=source_snippet,
+            base_state=base_state,
+            trajectory=trajectory,
+            oracle_context=oracle_context,
+            base_config=base_config_dict,
+            paired_config=paired_config,
+            risk_config=normalized_risk,
+            dataset_seed=int(dataset_seed),
+            base_session_id=base_session_id,
+            transplant_seed=transplant_seed,
+            paired_seed=paired_seed,
+        )
+        _validate_source_join(source)
+        samples.append(
+            _build_risk_sample_from_rendered(
+                source,
+                rendered,
+                base_config=base_config_dict,
+                normalized_risk=normalized_risk,
+                formal_variant=variant,
+                paired_config=paired_config,
+                mother_event=mother_event,
+                source_snippet=source_snippet,
+                oracle_context=oracle_context,
+            )
+        )
+    return tuple(samples)

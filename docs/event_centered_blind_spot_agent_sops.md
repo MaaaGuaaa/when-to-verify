@@ -1345,7 +1345,7 @@ python scripts/08_generate_verification_dataset.py \
 
 - 所有模块使用机器人当前局部坐标
 - 所有角度为弧度；配置中的 degree 必须在边界显式转换一次
-- 所有 future index 到时间统一使用 `tau=k*future_dt`
+- 所有零基 future index 到时间统一使用 `tau=(k+1)*future_dt`；`k=0` 是首个未来端点，当前位姿 `q0@t=0` 不占用 future 数组
 - grid x/y、row/column 映射只定义一次
 - 机器人和所有动态对象轨迹必须在相同时间网格比较
 

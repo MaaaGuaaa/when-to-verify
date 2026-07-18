@@ -75,6 +75,20 @@ def test_future_endpoint_time_contract_is_central_and_breaking():
     assert POSE_TIME_LAYOUT_VERSION == "future_endpoints_dt_to_horizon_v1"
 
 
+def test_authoritative_docs_use_future_endpoint_time_index():
+    authoritative_docs = (
+        "docs/event_centered_blind_spot_implementation_spec.md",
+        "docs/parallel_acceleration_implementation_plan.md",
+        "docs/event_centered_blind_spot_agent_sops.md",
+    )
+    for relative_path in authoritative_docs:
+        contents = (_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "`tau=k*future_dt`" not in contents, relative_path
+
+    agent_sops = (_ROOT / authoritative_docs[-1]).read_text(encoding="utf-8")
+    assert "`tau=(k+1)*future_dt`" in agent_sops
+
+
 # --- Oracle-leakage guard ------------------------------------------------------
 def test_model_input_classes_have_no_oracle_fields():
     for cls in MODEL_INPUT_CLASSES:

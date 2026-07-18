@@ -126,6 +126,7 @@ _PROVENANCE_KEYS = frozenset(
         "motion_snippet_layout_version",
         "snippet_id",
         "source_recording_id",
+        "source_session_id",
         "source_object_id",
         "source_body_name",
         "raw_role",
@@ -437,6 +438,12 @@ def _require_nonempty_string(value: object, *, label: str) -> str:
     return value
 
 
+def _require_nonblank_source_string(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-blank string")
+    return value
+
+
 def _validate_source_identity(value: object) -> None:
     identity = _require_mapping(value, label="SOP05 producer source identity")
     _require_exact_keys(
@@ -618,7 +625,11 @@ def _validate_target_provenance(
                 raise ValueError(f"target_provenance {key} mismatch")
         elif observed != expected:
             raise ValueError(f"target_provenance {key} mismatch")
-    for key in ("source_recording_id", "geometry_source", "orientation_source"):
+    for key in ("source_recording_id", "source_session_id"):
+        _require_nonblank_source_string(
+            copied.get(key), label=f"target_provenance {key}"
+        )
+    for key in ("geometry_source", "orientation_source"):
         _require_nonempty_string(copied.get(key), label=f"target_provenance {key}")
     for key in ("source_body_name", "raw_role"):
         value = copied.get(key)
@@ -704,6 +715,7 @@ def _validate_generated_identity(
     event_kind: str,
     conflict_index: int,
     conflict_time_s: float,
+    target_provenance: Mapping[str, object],
 ) -> int:
     generator_algorithm_version = _require_nonempty_string(
         metadata.get("generator_algorithm_version"),
@@ -726,6 +738,14 @@ def _validate_generated_identity(
         metadata.get("attempt_index"), label="attempt_index"
     )
     attempt_seed = _nonnegative_int(world.random_seed, label="random_seed")
+    source_recording_id = _require_nonblank_source_string(
+        target_provenance.get("source_recording_id"),
+        label="target_provenance source_recording_id",
+    )
+    source_session_id = _require_nonblank_source_string(
+        target_provenance.get("source_session_id"),
+        label="target_provenance source_session_id",
+    )
 
     expected_event_id = compute_generated_event_id(
         generator_algorithm_version=generator_algorithm_version,
@@ -740,6 +760,8 @@ def _validate_generated_identity(
         conflict_time_s=conflict_time_s,
         target_dynamic_object_id=record.target_dynamic_object_id,
         source_snippet_id=record.source_snippet_id,
+        source_recording_id=source_recording_id,
+        source_session_id=source_session_id,
         source_object_id=record.source_object_id,
         object_type=record.object_type,
         footprint_spec=record.footprint_spec,
@@ -761,6 +783,8 @@ def _validate_generated_identity(
         event_kind=event_kind,
         target_dynamic_object_id=record.target_dynamic_object_id,
         source_snippet_id=record.source_snippet_id,
+        source_recording_id=source_recording_id,
+        source_session_id=source_session_id,
         source_object_id=record.source_object_id,
         object_type=record.object_type,
         footprint_spec=record.footprint_spec,
@@ -841,6 +865,9 @@ def restore_generated_event(
     ) > 1e-9:
         raise ValueError("conflict index/time mismatch")
 
+    raw_target_provenance = _require_mapping(
+        metadata.get("target_provenance"), label="target_provenance"
+    )
     attempt_seed = _validate_generated_identity(
         record,
         world,
@@ -848,6 +875,7 @@ def restore_generated_event(
         event_kind=event_kind,
         conflict_index=conflict_index,
         conflict_time_s=conflict_time_s,
+        target_provenance=raw_target_provenance,
     )
 
     target_policy = _require_mapping(
@@ -900,7 +928,7 @@ def restore_generated_event(
 
     provenance = _validate_target_provenance(
         record,
-        metadata.get("target_provenance"),
+        raw_target_provenance,
         conflict_time_s=conflict_time_s,
         conflict_index=conflict_index,
         attempt_seed=attempt_seed,

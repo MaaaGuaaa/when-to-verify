@@ -40,6 +40,7 @@ def _identity(**changes: object) -> ReachabilityIdentity:
         "base_state_id": "base-001",
         "trajectory_id": "trajectory-002",
         "source_snippet_id": "snippet-003",
+        "source_session_id": "session-004",
         "conflict_index": 5,
         "conflict_time_s": 1.4,
         "crossing_side": 1,
@@ -62,7 +63,7 @@ def _candidate(**changes: object) -> ReachabilityCandidate:
 
 
 def test_versions_are_frozen() -> None:
-    assert BLIND_REACHABILITY_ALGORITHM_VERSION == "blind_reachability_first_v1"
+    assert BLIND_REACHABILITY_ALGORITHM_VERSION == "blind_reachability_first_v2"
     assert REACHABLE_ARC_SCHEDULE_VERSION == "reachable_arc_schedule_v1"
 
 
@@ -277,6 +278,7 @@ def test_candidate_id_is_repeatable_and_does_not_call_builtin_hash(
         {"base_state_id": "base-other"},
         {"trajectory_id": "trajectory-other"},
         {"source_snippet_id": "snippet-other"},
+        {"source_session_id": "session-other"},
         {"conflict_index": 6},
         {"conflict_time_s": 1.6},
         {"crossing_side": -1},
@@ -290,6 +292,14 @@ def test_candidate_id_binds_every_identity_field(
     changed = _candidate(identity=_identity(**changed_identity))
 
     assert changed.candidate_id != baseline.candidate_id
+
+
+@pytest.mark.parametrize("source_session_id", ["", "   ", None, 23])
+def test_reachability_identity_rejects_invalid_source_session_id(
+    source_session_id: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="source_session_id"):
+        _identity(source_session_id=source_session_id)
 
 
 def test_candidate_id_binds_exact_float64_geometry() -> None:

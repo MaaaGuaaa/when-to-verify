@@ -47,7 +47,7 @@ def _record_and_world(
     event_index: int = 0,
     event_kind: str = "environment",
     *,
-    generator_algorithm_version: str = "blind_reachability_first_v1",
+    generator_algorithm_version: str = "blind_reachability_first_v2",
 ):
     from src.generation.dynamic_object_transplant import (
         MOTION_SNIPPET_LAYOUT_VERSION,
@@ -82,6 +82,8 @@ def _record_and_world(
     target_dynamic_object_id = f"target-loader-fixture-{suffix}"
     source_snippet_id = f"snippet-loader-fixture-{suffix}"
     source_object_id = "recording::person"
+    source_recording_id = "recording"
+    source_session_id = "session-loader-fixture"
     footprint_spec_digest = compute_footprint_spec_digest(spec)
     generated_event_id = compute_generated_event_id(
         generator_algorithm_version=generator_algorithm_version,
@@ -97,6 +99,8 @@ def _record_and_world(
         target_dynamic_object_id=target_dynamic_object_id,
         source_snippet_id=source_snippet_id,
         source_object_id=source_object_id,
+        source_recording_id=source_recording_id,
+        source_session_id=source_session_id,
         object_type="human",
         footprint_spec=spec,
         footprint_spec_digest=footprint_spec_digest,
@@ -113,6 +117,8 @@ def _record_and_world(
         target_dynamic_object_id=target_dynamic_object_id,
         source_snippet_id=source_snippet_id,
         source_object_id=source_object_id,
+        source_recording_id=source_recording_id,
+        source_session_id=source_session_id,
         object_type="human",
         footprint_spec=spec,
         footprint_spec_digest=footprint_spec_digest,
@@ -143,14 +149,15 @@ def _record_and_world(
         future_poses=future,
     )
     provenance = {
-        "transform_algorithm_version": "reachability_candidate_se2_v1",
+        "transform_algorithm_version": "reachability_candidate_se2_v2",
         "transform_id": f"transform-loader-fixture-{suffix}",
         "reachability_candidate_id": f"candidate-loader-fixture-{suffix}",
-        "reachability_algorithm_version": "blind_reachability_first_v1",
+        "reachability_algorithm_version": "blind_reachability_first_v2",
         "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
         "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
-        "source_recording_id": "recording",
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": record.source_object_id,
         "source_body_name": "person",
         "raw_role": "person",
@@ -560,7 +567,7 @@ def _write_complete_publication(
         "target_type_policy": target_type_policy,
         "target_type_policy_digest": target_type_policy_digest,
         "generator_config_digest": generator_config_digest,
-        "generator_algorithm_version": "blind_reachability_first_v1",
+        "generator_algorithm_version": "blind_reachability_first_v2",
         "production_event_kind": "environment",
     }
     (root / "pair_generation_reports.jsonl").write_text(
@@ -644,7 +651,7 @@ def _write_complete_publication(
             "schema_version": "3.0.0",
             "target_type_policy_digest": target_type_policy_digest,
             "generator_config_digest": generator_config_digest,
-            "generator_algorithm_version": "blind_reachability_first_v1",
+            "generator_algorithm_version": "blind_reachability_first_v2",
             "production_event_kind": "environment",
         },
     }
@@ -872,11 +879,17 @@ def test_restore_generated_event_recovers_full_audited_event() -> None:
         assert array.flags.owndata
 
 
-def test_restore_generated_event_rejects_old_generator_algorithm() -> None:
+@pytest.mark.parametrize(
+    "old_version",
+    ("joint_occluder_first_v4", "blind_reachability_first_v1"),
+)
+def test_restore_generated_event_rejects_old_generator_algorithm(
+    old_version: str,
+) -> None:
     from src.generation.sop05_output_loader import restore_generated_event
 
     record, world = _record_and_world(
-        generator_algorithm_version="joint_occluder_first_v4"
+        generator_algorithm_version=old_version
     )
 
     with pytest.raises(ValueError, match="generator_algorithm_version"):
@@ -1087,6 +1100,33 @@ def test_restore_generated_event_rejects_target_provenance_seed_drift() -> None:
     metadata["target_provenance"] = provenance
 
     with pytest.raises(ValueError, match="seed"):
+        restore_generated_event(
+            record, replace(world, metadata=metadata), grid=_grid()
+        )
+
+
+@pytest.mark.parametrize(
+    "tamper", ["missing", "changed", "blank", "whitespace"]
+)
+def test_restore_generated_event_rejects_source_session_provenance_drift(
+    tamper: str,
+) -> None:
+    from src.generation.sop05_output_loader import restore_generated_event
+
+    record, world = _record_and_world()
+    metadata = dict(world.metadata)
+    provenance = dict(metadata["target_provenance"])
+    if tamper == "missing":
+        provenance.pop("source_session_id")
+    elif tamper == "changed":
+        provenance["source_session_id"] = "session-tampered"
+    elif tamper == "blank":
+        provenance["source_session_id"] = ""
+    else:
+        provenance["source_session_id"] = "   "
+    metadata["target_provenance"] = provenance
+
+    with pytest.raises(ValueError, match="source_session_id|canonical event identity"):
         restore_generated_event(
             record, replace(world, metadata=metadata), grid=_grid()
         )

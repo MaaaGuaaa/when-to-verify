@@ -180,7 +180,7 @@ def test_sop05_generation_contract_versions_are_exact() -> None:
         "sop05_diversity_total_selection_v1"
     )
     assert module.SOP05_GENERATOR_ALGORITHM_VERSION == (
-        "blind_reachability_first_v1"
+        "blind_reachability_first_v2"
     )
     assert identity.SOP05_PUBLICATION_IDENTITY_VERSION == (
         "sop05_publication_semantic_digest_v2"
@@ -391,6 +391,8 @@ def _generated_event(
     target_id = f"target-{event_id}"
     source_snippet_id = f"snippet-{event_id}"
     source_object_id = "recording::human"
+    source_recording_id = "recording"
+    source_session_id = "session-a"
     policy = target_type_policy or {
         "whitelist": ["human"],
         "weights": {
@@ -418,6 +420,8 @@ def _generated_event(
             target_dynamic_object_id=target_id,
             source_snippet_id=source_snippet_id,
             source_object_id=source_object_id,
+            source_recording_id=source_recording_id,
+            source_session_id=source_session_id,
             object_type="human",
             footprint_spec=spec,
             footprint_spec_digest=spec_digest,
@@ -434,6 +438,8 @@ def _generated_event(
             target_dynamic_object_id=target_id,
             source_snippet_id=source_snippet_id,
             source_object_id=source_object_id,
+            source_recording_id=source_recording_id,
+            source_session_id=source_session_id,
             object_type="human",
             footprint_spec=spec,
             footprint_spec_digest=spec_digest,
@@ -479,7 +485,8 @@ def _generated_event(
     )
     provenance = {
         "snippet_id": record.source_snippet_id,
-        "source_recording_id": "recording",
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": record.source_object_id,
         "source_body_name": "human",
         "raw_role": "human",
@@ -511,14 +518,15 @@ def _generated_event(
     transform_id = f"transform-{event_id}"
     exact_validation_id = f"exact-{event_id}"
     provenance = {
-        "transform_algorithm_version": "reachability_candidate_se2_v1",
+        "transform_algorithm_version": "reachability_candidate_se2_v2",
         "transform_id": transform_id,
         "reachability_candidate_id": candidate_id,
-        "reachability_algorithm_version": "blind_reachability_first_v1",
+        "reachability_algorithm_version": "blind_reachability_first_v2",
         "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
         "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
-        "source_recording_id": "recording",
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": record.source_object_id,
         "source_body_name": "human",
         "raw_role": "human",
@@ -696,6 +704,43 @@ def _report(
             "production_event_kind": "environment",
         },
     )
+
+
+@pytest.mark.parametrize("tamper", ["missing", "blank", "changed"])
+def test_event_stage_row_rejects_source_session_provenance_drift(
+    tamper: str,
+) -> None:
+    module = _sut()
+    event = _generated_event(
+        "event-stage-session",
+        "environment",
+        SimpleNamespace(height=32, width=32),
+        0.0,
+        "base-stage-session",
+        target_type_policy_digest="a" * 32,
+    )
+    metadata = dict(event.world.metadata)
+    provenance = dict(metadata["target_provenance"])
+    if tamper == "missing":
+        provenance.pop("source_session_id")
+    elif tamper == "blank":
+        provenance["source_session_id"] = ""
+    else:
+        provenance["source_session_id"] = "different-session"
+    metadata["target_provenance"] = provenance
+    changed = replace(
+        event,
+        world=replace(event.world, metadata=metadata),
+    )
+
+    with pytest.raises(module.Sop05RunError, match="source_session_id"):
+        module._event_stage_row(
+            SimpleNamespace(
+                state_id="base-stage-session",
+                trajectory_id="trajectory-a",
+            ),
+            changed,
+        )
 
 
 def _prepared_with_reports(

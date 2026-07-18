@@ -23,7 +23,7 @@ from src.geometry import (
 )
 from src.utils.seeding import stable_digest
 
-BLIND_REACHABILITY_ALGORITHM_VERSION = "blind_reachability_first_v1"
+BLIND_REACHABILITY_ALGORITHM_VERSION = "blind_reachability_first_v2"
 REACHABLE_ARC_SCHEDULE_VERSION = "reachable_arc_schedule_v1"
 
 _TRIAGE_OUTCOMES = frozenset(("certified_clear", "unresolved"))
@@ -103,6 +103,7 @@ class ReachabilityIdentity:
     base_state_id: str
     trajectory_id: str
     source_snippet_id: str
+    source_session_id: str
     conflict_index: int
     conflict_time_s: float
     crossing_side: int
@@ -123,6 +124,11 @@ class ReachabilityIdentity:
             self,
             "source_snippet_id",
             _nonempty_string(self.source_snippet_id, name="source_snippet_id"),
+        )
+        object.__setattr__(
+            self,
+            "source_session_id",
+            _nonempty_string(self.source_session_id, name="source_session_id"),
         )
         if isinstance(self.conflict_index, (bool, np.bool_)) or not isinstance(
             self.conflict_index, (Integral, np.integer)
@@ -350,6 +356,7 @@ def _candidate_identifier(
         _text_identity_token("base_state_id", identity.base_state_id),
         _text_identity_token("trajectory_id", identity.trajectory_id),
         _text_identity_token("source_snippet_id", identity.source_snippet_id),
+        _text_identity_token("source_session_id", identity.source_session_id),
         f"conflict_index={identity.conflict_index}",
         f"conflict_time_s_f64={_float64_bytes_hex(identity.conflict_time_s)}",
         f"crossing_side={identity.crossing_side}",

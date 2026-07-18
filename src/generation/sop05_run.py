@@ -1011,6 +1011,19 @@ def _event_stage_row(
     provenance = metadata.get("target_provenance")
     if not isinstance(provenance, Mapping):
         raise Sop05RunError("event target_provenance must be a mapping")
+    for name in ("source_recording_id", "source_session_id"):
+        value = provenance.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise Sop05RunError(f"event {name} must be a nonempty string")
+        if value != event.target.provenance.get(name):
+            raise Sop05RunError(f"event {name} differs from target provenance")
+    if dict(provenance) != event.target.provenance:
+        raise Sop05RunError("event target_provenance differs from target")
+    if (
+        provenance.get("snippet_id") != event.target.snippet_id
+        or provenance.get("source_object_id") != event.target.source_object_id
+    ):
+        raise Sop05RunError("event target source provenance mismatch")
     identifiers: dict[str, str] = {}
     for name in (
         "causal_occluder_proposal_id",

@@ -101,10 +101,10 @@ from .robot_sweep_cache import (
 _EVENT_TYPES = ("environment", "structural", "mixed")
 SOP05_GENERATOR_ALGORITHM_VERSION = BLIND_REACHABILITY_ALGORITHM_VERSION
 SOP05_GENERATOR_SCHEMA_VERSION = "3.0.0"
-_GENERATED_EVENT_ID_DOMAIN = "sop05-generated-event-lineage-id-v1"
-_GENERATED_EVENT_IDENTITY_VERSION = "sop05_generated_event_lineage_v1"
-_WORLD_ID_DOMAIN = "sop05-generated-world-id-v1"
-_WORLD_IDENTITY_VERSION = "sop05_generated_world_identity_v1"
+_GENERATED_EVENT_ID_DOMAIN = "sop05-generated-event-lineage-id-v2"
+_GENERATED_EVENT_IDENTITY_VERSION = "sop05_generated_event_lineage_v2"
+_WORLD_ID_DOMAIN = "sop05-generated-world-id-v2"
+_WORLD_IDENTITY_VERSION = "sop05_generated_world_identity_v2"
 _FLOAT32_LE_DTYPE_TOKEN = "<f4"
 _ARRAY_ORDER_TOKEN = "C"
 
@@ -610,6 +610,8 @@ def compute_generated_event_id(
     conflict_time_s: float,
     target_dynamic_object_id: str,
     source_snippet_id: str,
+    source_recording_id: str,
+    source_session_id: str,
     source_object_id: str,
     object_type: str,
     footprint_spec: Mapping[str, object],
@@ -620,11 +622,20 @@ def compute_generated_event_id(
     """Build a mother-event lineage ID without variant motion summaries."""
 
     for name, value in (
+        ("source_recording_id", source_recording_id),
+        ("source_session_id", source_session_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-blank string")
+
+    for name, value in (
         ("generator_algorithm_version", generator_algorithm_version),
         ("base_state_id", base_state_id),
         ("trajectory_id", trajectory_id),
         ("target_dynamic_object_id", target_dynamic_object_id),
         ("source_snippet_id", source_snippet_id),
+        ("source_recording_id", source_recording_id),
+        ("source_session_id", source_session_id),
         ("source_object_id", source_object_id),
         ("object_type", object_type),
     ):
@@ -671,6 +682,8 @@ def compute_generated_event_id(
         "conflict_time_s_decimal_9": f"{conflict_time:.9f}",
         "target_dynamic_object_id": target_dynamic_object_id,
         "source_snippet_id": source_snippet_id,
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": source_object_id,
         "target_object_type": object_type,
         "target_footprint_spec": canonical_footprint_spec,
@@ -696,6 +709,8 @@ def compute_generated_world_id(
     event_kind: str,
     target_dynamic_object_id: str,
     source_snippet_id: str,
+    source_recording_id: str,
+    source_session_id: str,
     source_object_id: str,
     object_type: str,
     footprint_spec: Mapping[str, object],
@@ -709,11 +724,20 @@ def compute_generated_world_id(
     """Build a world identity that binds lineage and exact target motion."""
 
     for name, value in (
+        ("source_recording_id", source_recording_id),
+        ("source_session_id", source_session_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-blank string")
+
+    for name, value in (
         ("generator_algorithm_version", generator_algorithm_version),
         ("base_state_id", base_state_id),
         ("trajectory_id", trajectory_id),
         ("target_dynamic_object_id", target_dynamic_object_id),
         ("source_snippet_id", source_snippet_id),
+        ("source_recording_id", source_recording_id),
+        ("source_session_id", source_session_id),
         ("source_object_id", source_object_id),
         ("object_type", object_type),
     ):
@@ -756,6 +780,8 @@ def compute_generated_world_id(
         "event_kind": event_kind,
         "target_dynamic_object_id": target_dynamic_object_id,
         "source_snippet_id": source_snippet_id,
+        "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": source_object_id,
         "target_object_type": object_type,
         "target_footprint_spec": canonical_footprint_spec,
@@ -1445,6 +1471,8 @@ def _build_v5_event(
         conflict_time_s=conflict_time_s,
         target_dynamic_object_id=target.target_dynamic_object_id,
         source_snippet_id=target.snippet_id,
+        source_recording_id=target.provenance["source_recording_id"],
+        source_session_id=target.provenance["source_session_id"],
         source_object_id=target.source_object_id,
         object_type=target.object_type,
         footprint_spec=target.footprint_spec,
@@ -1461,6 +1489,8 @@ def _build_v5_event(
         event_kind="environment",
         target_dynamic_object_id=target.target_dynamic_object_id,
         source_snippet_id=target.snippet_id,
+        source_recording_id=target.provenance["source_recording_id"],
+        source_session_id=target.provenance["source_session_id"],
         source_object_id=target.source_object_id,
         object_type=target.object_type,
         footprint_spec=target.footprint_spec,
@@ -1805,6 +1835,7 @@ def _generate_v5_events(
                             base_state_id=base_state.state_id,
                             trajectory_id=trajectory.trajectory_id,
                             source_snippet_id=snippet.snippet_id,
+                            source_session_id=snippet.source_session_id,
                             conflict_index=conflict_index,
                             conflict_time_s=conflict_time_s,
                             crossing_side=crossing_side,

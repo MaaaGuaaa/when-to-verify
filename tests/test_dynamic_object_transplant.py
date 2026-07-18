@@ -180,6 +180,7 @@ def _reachability_candidate(
         base_state_id=base_state_id,
         trajectory_id=trajectory_id,
         source_snippet_id=snippet.snippet_id,
+        source_session_id=snippet.source_session_id,
         conflict_index=conflict_index,
         conflict_time_s=(
             (conflict_index + 1) * 0.2
@@ -304,7 +305,7 @@ def test_reachability_transplant_has_frozen_output_and_json_provenance() -> None
         **_reachability_transplant_kwargs(candidate),
     )
 
-    assert TRANSFORM_ALGORITHM_VERSION == "reachability_candidate_se2_v1"
+    assert TRANSFORM_ALGORITHM_VERSION == "reachability_candidate_se2_v2"
     assert result.history_poses.shape == (8, 3)
     assert result.current_pose.shape == (3,)
     assert result.future_poses.shape == (15, 3)
@@ -346,6 +347,7 @@ def test_reachability_transplant_has_frozen_output_and_json_provenance() -> None
         "history8_current7_future15_v1"
     )
     assert result.provenance["source_recording_id"] == snippet.source_recording_id
+    assert result.provenance["source_session_id"] == snippet.source_session_id
     assert result.provenance["source_object_id"] == snippet.source_object_id
     json.dumps(result.provenance, sort_keys=True, allow_nan=False)
 
@@ -443,6 +445,12 @@ def test_reachability_transplant_rejects_candidate_identity_mismatches() -> None
     with pytest.raises(ValueError, match="snippet_id"):
         transplant_reachability_candidate(
             replace(snippet, snippet_id="different-snippet"),
+            **_reachability_transplant_kwargs(candidate),
+        )
+
+    with pytest.raises(ValueError, match="source_session_id"):
+        transplant_reachability_candidate(
+            replace(snippet, source_session_id="different-session"),
             **_reachability_transplant_kwargs(candidate),
         )
 
@@ -568,7 +576,7 @@ def _generator_config(event_kind: str = "structural") -> dict:
             },
         },
         "blind_reachability": {
-            "algorithm_version": "blind_reachability_first_v1",
+            "algorithm_version": "blind_reachability_first_v2",
             "obstacle_proposals_per_trajectory": 8,
             "interaction_range_m": [1.0, 4.0],
             "bearing_bin_count": 12,
@@ -1136,6 +1144,33 @@ def test_target_id_is_deterministic_and_resolves_context_collision() -> None:
     assert collision_resolved.target_dynamic_object_id != first.target_dynamic_object_id
 
 
+def test_legacy_transplant_identity_and_provenance_bind_source_session() -> None:
+    snippet = _snippet()
+    policy = normalize_target_type_policy(_policy())
+    kwargs = dict(
+        conflict_point=(1.2, 0.0),
+        conflict_time_s=1.6,
+        crossing_direction=(0.0, 1.0),
+        time_scale=1.0,
+        future_dt_s=0.2,
+        future_steps=15,
+        base_state_id="train-base-1",
+        trajectory_id="traj-1",
+        target_type_policy_digest=policy.digest,
+        seed=13,
+        context_object_ids=(),
+    )
+
+    baseline = transplant_snippet(snippet, **kwargs)
+    changed = transplant_snippet(
+        replace(snippet, source_session_id="source-session-other"), **kwargs
+    )
+
+    assert baseline.provenance["source_session_id"] == "source-session"
+    assert changed.provenance["source_session_id"] == "source-session-other"
+    assert changed.target_dynamic_object_id != baseline.target_dynamic_object_id
+
+
 def _canonical_event_identity_inputs() -> dict[str, object]:
     spec = {
         "object_type": "human",
@@ -1154,6 +1189,8 @@ def _canonical_event_identity_inputs() -> dict[str, object]:
         "conflict_time_s": 1.8,
         "target_dynamic_object_id": "generated::human::known",
         "source_snippet_id": "snippet-known",
+        "source_recording_id": "recording-known",
+        "source_session_id": "session-known",
         "source_object_id": "recording::human",
         "object_type": "human",
         "footprint_spec": spec,
@@ -1177,6 +1214,8 @@ def _canonical_world_identity_inputs(
         "event_kind": lineage["event_kind"],
         "target_dynamic_object_id": lineage["target_dynamic_object_id"],
         "source_snippet_id": lineage["source_snippet_id"],
+        "source_recording_id": lineage["source_recording_id"],
+        "source_session_id": lineage["source_session_id"],
         "source_object_id": lineage["source_object_id"],
         "object_type": lineage["object_type"],
         "footprint_spec": lineage["footprint_spec"],
@@ -1198,7 +1237,7 @@ def test_event_and_world_identity_known_vectors_are_mapping_order_stable() -> No
     }
 
     generated_event_id = event_sampler_module.compute_generated_event_id(**lineage)
-    assert generated_event_id == "event-cbd68044b3190d1d2b31155948acdbd3"
+    assert generated_event_id == "event-07386a294e5f2c90649bf166bccdfb3f"
     assert generated_event_id == event_sampler_module._build_generated_event_id(
         **lineage
     )
@@ -1208,11 +1247,33 @@ def test_event_and_world_identity_known_vectors_are_mapping_order_stable() -> No
 
     world_identity = _canonical_world_identity_inputs(lineage, generated_event_id)
     world_id = event_sampler_module.compute_generated_world_id(**world_identity)
-    assert world_id == "world-181da4381b01b5c9479abe775edbb199"
+    assert world_id == "world-4f6ea2b2762a4b7b637bb23791e938f6"
     assert world_id == event_sampler_module._build_world_id(**world_identity)
     assert world_id == event_sampler_module._build_world_id(
         **{**world_identity, "footprint_spec": reordered_spec}
     )
+
+
+def test_event_and_world_identity_bind_source_recording_and_session() -> None:
+    lineage = _canonical_event_identity_inputs()
+    event_id = event_sampler_module.compute_generated_event_id(**lineage)
+    world_id = event_sampler_module.compute_generated_world_id(
+        **_canonical_world_identity_inputs(lineage, event_id)
+    )
+
+    for field_name, changed_value in (
+        ("source_recording_id", "recording-other"),
+        ("source_session_id", "session-other"),
+    ):
+        changed_lineage = {**lineage, field_name: changed_value}
+        changed_event_id = event_sampler_module.compute_generated_event_id(
+            **changed_lineage
+        )
+        changed_world_id = event_sampler_module.compute_generated_world_id(
+            **_canonical_world_identity_inputs(changed_lineage, changed_event_id)
+        )
+        assert changed_event_id != event_id
+        assert changed_world_id != world_id
 
 
 @pytest.mark.parametrize(
@@ -1224,6 +1285,10 @@ def test_event_and_world_identity_known_vectors_are_mapping_order_stable() -> No
         ("attempt_seed", -1),
         ("conflict_time_s", True),
         ("base_state_id", ""),
+        ("source_recording_id", ""),
+        ("source_recording_id", "   "),
+        ("source_session_id", ""),
+        ("source_session_id", "   "),
         ("generator_config_digest", "not-a-digest"),
         ("footprint_spec_digest", "2" * 32),
         ("object_type", "carried_object"),
@@ -1246,6 +1311,10 @@ def test_generated_event_identity_rejects_noncanonical_inputs(
         ("generated_event_id", ""),
         ("base_state_id", ""),
         ("event_kind", ""),
+        ("source_recording_id", ""),
+        ("source_recording_id", "   "),
+        ("source_session_id", ""),
+        ("source_session_id", "   "),
         ("history_array_digest", "not-a-digest"),
         ("future_array_digest", "A" * 32),
         ("target_type_policy_digest", "3" * 31),
@@ -1288,6 +1357,8 @@ def test_mother_event_lineage_is_motion_invariant_while_world_and_record_identit
         "conflict_time_s": 1.6,
         "target_dynamic_object_id": "generated::human::paired",
         "source_snippet_id": "snippet-paired",
+        "source_recording_id": "recording-paired",
+        "source_session_id": "session-paired",
         "source_object_id": "recording::human-paired",
         "object_type": "human",
         "footprint_spec": spec,
@@ -1316,6 +1387,8 @@ def test_mother_event_lineage_is_motion_invariant_while_world_and_record_identit
             event_kind=lineage["event_kind"],
             target_dynamic_object_id=lineage["target_dynamic_object_id"],
             source_snippet_id=lineage["source_snippet_id"],
+            source_recording_id=lineage["source_recording_id"],
+            source_session_id=lineage["source_session_id"],
             source_object_id=lineage["source_object_id"],
             object_type=lineage["object_type"],
             footprint_spec=spec,
@@ -1389,7 +1462,7 @@ def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
         }
         assert config["time_scale_range"] == (1.0, 1.0)
         assert config["blind_reachability"]["algorithm_version"] == (
-            "blind_reachability_first_v1"
+            "blind_reachability_first_v2"
         )
         assert config["blind_reachability"][
             "obstacle_proposals_per_trajectory"
@@ -1429,8 +1502,18 @@ def test_generator_config_freezes_v5_algorithm_token() -> None:
 
     assert (
         event_sampler_module.SOP05_GENERATOR_ALGORITHM_VERSION
-        == "blind_reachability_first_v1"
+        == "blind_reachability_first_v2"
     )
+
+
+def test_generator_config_rejects_v1_reachability_snapshot() -> None:
+    config = _generator_config()
+    config["blind_reachability"]["algorithm_version"] = (
+        "blind_reachability_first_v1"
+    )
+
+    with pytest.raises(GeneratorConfigError, match="algorithm_version"):
+        normalize_generator_config(config)
 
 
 @pytest.mark.parametrize(
@@ -2561,7 +2644,7 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
 
     assert len(report.events) == 1
     assert report.summary["generator_algorithm_version"] == (
-        "blind_reachability_first_v1"
+        "blind_reachability_first_v2"
     )
     assert report.summary["obstacle_proposal_count"] == (
         report.summary["obstacle_proposal_rejected_count"]
@@ -2580,7 +2663,7 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
     assert report.summary["exact_validation_accepted_count"] > 0
     event = report.events[0]
     assert event.world.metadata["generator_algorithm_version"] == (
-        "blind_reachability_first_v1"
+        "blind_reachability_first_v2"
     )
     assert event.world.occluders[0]["placement_strategy"] == (
         "causal_free_space_schedule_v1"

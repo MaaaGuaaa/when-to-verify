@@ -28,7 +28,7 @@ MOTION_SNIPPET_FUTURE_STEPS = 15
 MOTION_SNIPPET_SAMPLE_DT_S = 0.2
 MOTION_SNIPPET_DURATION_S = 4.4
 MOTION_SNIPPET_CURRENT_TIME_S = 1.4
-TRANSFORM_ALGORITHM_VERSION = "reachability_candidate_se2_v1"
+TRANSFORM_ALGORITHM_VERSION = "reachability_candidate_se2_v2"
 
 
 class TargetPolicyError(ValueError):
@@ -178,6 +178,14 @@ def _validate_snippet(snippet: MotionSnippet) -> None:
         validate_dynamic_object_spec(spec)
     except ValueError as exc:
         raise TransplantError("snippet_contract_invalid", str(exc)) from exc
+    for name, value in (
+        ("source_recording_id", snippet.source_recording_id),
+        ("source_session_id", snippet.source_session_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise TransplantError(
+                "snippet_contract_invalid", f"snippet {name} must be non-empty"
+            )
     positions = np.asarray(snippet.positions)
     velocities = np.asarray(snippet.velocities)
     headings = np.asarray(snippet.headings)
@@ -266,6 +274,8 @@ def _stable_target_id(
             base_state_id,
             trajectory_id,
             snippet.snippet_id,
+            snippet.source_recording_id,
+            snippet.source_session_id,
             snippet.source_object_id,
             target_type_policy_digest,
             int(seed),
@@ -426,6 +436,7 @@ def transplant_snippet(
     provenance = {
         "snippet_id": snippet.snippet_id,
         "source_recording_id": snippet.source_recording_id,
+        "source_session_id": snippet.source_session_id,
         "source_object_id": snippet.source_object_id,
         "source_body_name": snippet.provenance.get("source_body_name"),
         "raw_role": snippet.provenance.get("raw_role"),
@@ -497,7 +508,7 @@ def _reachability_transform_id(
 ) -> str:
     canonical_poses = np.ascontiguousarray(transformed_poses, dtype=np.dtype("<f4"))
     payload = {
-        "domain": "reachability-candidate-se2-transform-identity-v1",
+        "domain": "reachability-candidate-se2-transform-identity-v2",
         "transform_algorithm_version": TRANSFORM_ALGORITHM_VERSION,
         "reachability_algorithm_version": BLIND_REACHABILITY_ALGORITHM_VERSION,
         "reachable_arc_schedule_version": REACHABLE_ARC_SCHEDULE_VERSION,
@@ -507,6 +518,7 @@ def _reachability_transform_id(
             "snippet_id": snippet.snippet_id,
             "split": snippet.split,
             "source_recording_id": snippet.source_recording_id,
+            "source_session_id": snippet.source_session_id,
             "source_object_id": snippet.source_object_id,
             "object_type": snippet.object_type,
         },
@@ -540,7 +552,7 @@ def _stable_reachability_target_id(
     salt = 0
     while True:
         digest = stable_digest(
-            "reachability-candidate-target-identity-v1",
+            "reachability-candidate-target-identity-v2",
             transform_id,
             salt,
             size=12,
@@ -573,6 +585,10 @@ def transplant_reachability_candidate(
         raise TypeError("candidate must be a ReachabilityCandidate")
     if snippet.snippet_id != candidate.identity.source_snippet_id:
         raise ValueError("snippet_id must match candidate source_snippet_id")
+    if snippet.source_session_id != candidate.identity.source_session_id:
+        raise ValueError(
+            "source_session_id must match candidate source_session_id"
+        )
 
     dt_s = _finite_real(future_dt_s, name="future_dt_s")
     if dt_s != MOTION_SNIPPET_SAMPLE_DT_S:
@@ -681,6 +697,7 @@ def transplant_reachability_candidate(
         "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": snippet.snippet_id,
         "source_recording_id": snippet.source_recording_id,
+        "source_session_id": snippet.source_session_id,
         "source_object_id": snippet.source_object_id,
         "source_body_name": snippet.provenance.get("source_body_name"),
         "raw_role": snippet.provenance.get("raw_role"),

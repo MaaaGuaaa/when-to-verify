@@ -36,6 +36,7 @@ from src.generation.event_target_motion_shard import (
     validate_event_target_motion_world_join,
     write_event_target_motion_shard,
 )
+from src.generation.robot_sweep_cache import RobotSweepCache
 from src.generation.sop05_input_adapter import (
     ProducerEvidence,
     SOP04_COMPLETION_POLICY,
@@ -58,6 +59,7 @@ from src.generation.sop05_selection import (
     Sop05SelectionCandidate,
     select_sop05_event_ids,
 )
+from src.geometry import RectangleFootprint, inflate_footprint
 from src.utils.config import load_config
 
 
@@ -179,6 +181,7 @@ class _PairReportTransport:
 
 
 _PAIR_WORKER_PREPARED: PreparedSop05Run | None = None
+_PAIR_WORKER_ROBOT_SWEEP_CACHE: RobotSweepCache | None = None
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -711,9 +714,46 @@ def preflight_summary(prepared: PreparedSop05Run) -> dict[str, object]:
     }
 
 
+def _prewarm_robot_sweep_cache(
+    prepared: PreparedSop05Run,
+) -> RobotSweepCache:
+    """Build each scheduled canonical future once in stable ID order."""
+
+    if not isinstance(prepared, PreparedSop05Run):
+        raise TypeError("prepared must be PreparedSop05Run")
+    robot_config = prepared.base_config["robot"]
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            robot_config["length_m"], robot_config["width_m"]
+        ),
+        robot_config["inflation_m"],
+    )
+    cache = RobotSweepCache()
+    for trajectory_id in sorted(
+        {pair.trajectory_id for pair in prepared.schedule}
+    ):
+        try:
+            trajectory = prepared.sop04.by_id[trajectory_id]
+        except KeyError as exc:
+            raise Sop05RunError(
+                f"unknown scheduled trajectory_id: {trajectory_id}"
+            ) from exc
+        cache.get(
+            trajectory,
+            robot_footprint=robot_footprint,
+            grid=prepared.grid,
+            future_dt_s=prepared.base_config["bev"]["future_dt_s"],
+        )
+    return cache
+
+
 def _generate_pair(
-    prepared: PreparedSop05Run, pair: RankedPair
+    prepared: PreparedSop05Run,
+    pair: RankedPair,
+    robot_sweep_cache: RobotSweepCache,
 ) -> PairGenerationReport:
+    if not isinstance(robot_sweep_cache, RobotSweepCache):
+        raise TypeError("robot_sweep_cache must be a RobotSweepCache")
     cpu_started = time.process_time()
     base_state, oracle_context = prepared.sop03.load_pair(
         pair.state_id, prepared.grid
@@ -733,6 +773,7 @@ def _generate_pair(
         generator_config=prepared.generator_config,
         seed=pair.pair_seed,
         event_count=prepared.request.events_per_pair,
+        robot_sweep_cache=robot_sweep_cache,
     )
     return PairGenerationReport(
         rank=pair.rank,
@@ -1216,30 +1257,43 @@ def _validate_pair_report(
         raise Sop05RunError("accepted event candidate order mismatch")
 
 
-def _initialize_pair_worker(prepared: PreparedSop05Run) -> None:
+def _initialize_pair_worker(
+    prepared: PreparedSop05Run,
+    robot_sweep_cache: RobotSweepCache,
+) -> None:
     if not isinstance(prepared, PreparedSop05Run):
         raise TypeError("prepared must be PreparedSop05Run")
-    global _PAIR_WORKER_PREPARED
+    if not isinstance(robot_sweep_cache, RobotSweepCache):
+        raise TypeError("robot_sweep_cache must be a RobotSweepCache")
+    global _PAIR_WORKER_PREPARED, _PAIR_WORKER_ROBOT_SWEEP_CACHE
     _PAIR_WORKER_PREPARED = prepared
+    _PAIR_WORKER_ROBOT_SWEEP_CACHE = robot_sweep_cache
 
 
 def _generate_pair_in_worker(pair: RankedPair) -> _PairReportTransport:
     prepared = _PAIR_WORKER_PREPARED
-    if prepared is None:
+    robot_sweep_cache = _PAIR_WORKER_ROBOT_SWEEP_CACHE
+    if prepared is None or robot_sweep_cache is None:
         raise RuntimeError("pair process worker was not initialized")
-    item = _generate_pair(prepared, pair)
+    item = _generate_pair(prepared, pair, robot_sweep_cache)
     _validate_pair_report(prepared, item)
     return _transport_pair_report(item)
 
 
-def _make_pair_process_pool(prepared: PreparedSop05Run) -> ProcessPoolExecutor:
+def _make_pair_process_pool(
+    prepared: PreparedSop05Run,
+    robot_sweep_cache: RobotSweepCache,
+) -> ProcessPoolExecutor:
     """Build a true CPU process pool with forked read-only audited inputs."""
+
+    if not isinstance(robot_sweep_cache, RobotSweepCache):
+        raise TypeError("robot_sweep_cache must be a RobotSweepCache")
 
     return ProcessPoolExecutor(
         max_workers=prepared.request.workers,
         mp_context=get_context("fork"),
         initializer=_initialize_pair_worker,
-        initargs=(prepared,),
+        initargs=(prepared, robot_sweep_cache),
     )
 
 
@@ -1330,6 +1384,7 @@ def collect_sop05_generation(
 
     if not isinstance(prepared, PreparedSop05Run):
         raise TypeError("prepared must be PreparedSop05Run")
+    robot_sweep_cache = _prewarm_robot_sweep_cache(prepared)
     pair_reports: list[PairGenerationReport] = []
     all_events: list[GeneratedEvent] = []
     seen_event_ids: set[str] = set()
@@ -1337,14 +1392,15 @@ def collect_sop05_generation(
     candidate_by_event_id: dict[str, Sop05SelectionCandidate] = {}
 
     executor_context = (
-        _make_pair_process_pool(prepared)
+        _make_pair_process_pool(prepared, robot_sweep_cache)
         if prepared.request.workers > 1
         else nullcontext(None)
     )
     with executor_context as executor:
         if executor is None:
             completed = (
-                _generate_pair(prepared, pair) for pair in prepared.schedule
+                _generate_pair(prepared, pair, robot_sweep_cache)
+                for pair in prepared.schedule
             )
         else:
             completed = (

@@ -42,6 +42,10 @@ from src.generation.event_sampler import (
     load_generator_config,
     normalize_generator_config,
 )
+from src.generation.robot_sweep_cache import (
+    RobotSweepCache,
+    RobotSweepCacheIdentityError,
+)
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
     CircleFootprint,
@@ -2598,6 +2602,123 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
         event.target.future_poses,
     )
     assert float(np.min(clearances)) <= 0.0
+
+
+def test_generate_events_shared_robot_cache_reports_per_call_deltas() -> None:
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    shared_cache = RobotSweepCache()
+    shared_cache.get(
+        trajectory,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=config["bev"]["future_dt_s"],
+    )
+
+    cold = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+    warm_first = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+        robot_sweep_cache=shared_cache,
+    )
+    warm_second = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+        robot_sweep_cache=shared_cache,
+    )
+
+    assert [event.generated_event_id for event in cold.events] == [
+        event.generated_event_id for event in warm_first.events
+    ] == [event.generated_event_id for event in warm_second.events]
+    assert np.array_equal(
+        cold.events[0].target.history_poses,
+        warm_first.events[0].target.history_poses,
+    )
+    assert np.array_equal(
+        cold.events[0].target.future_poses,
+        warm_second.events[0].target.future_poses,
+    )
+    assert cold.summary["robot_sweep_cache"] == {
+        "size": 1,
+        "hits": 0,
+        "misses": 1,
+        "builds": 1,
+    }
+    expected_warm_delta = {
+        "size": 0,
+        "hits": 1,
+        "misses": 0,
+        "builds": 0,
+    }
+    assert warm_first.summary["robot_sweep_cache"] == expected_warm_delta
+    assert warm_second.summary["robot_sweep_cache"] == expected_warm_delta
+    assert shared_cache.stats.size == 1
+    assert shared_cache.stats.hits == 2
+    assert shared_cache.stats.misses == 1
+    assert shared_cache.stats.builds == 1
+
+
+def test_generate_events_shared_robot_cache_fails_closed_on_identity_change() -> None:
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            config["robot"]["length_m"], config["robot"]["width_m"]
+        ),
+        config["robot"]["inflation_m"],
+    )
+    shared_cache = RobotSweepCache()
+    shared_cache.get(
+        trajectory,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=config["bev"]["future_dt_s"],
+    )
+    changed_poses = trajectory.poses.copy()
+    changed_poses[0, 1] += np.float32(0.01)
+    changed = replace(trajectory, poses=changed_poses)
+
+    with pytest.raises(RobotSweepCacheIdentityError, match="binding changed"):
+        generate_events(
+            base_state=base,
+            oracle_context=oracle,
+            trajectory=changed,
+            snippet_libraries=libraries,
+            base_config=config,
+            generator_config=generator_config,
+            seed=20260716,
+            event_count=1,
+            robot_sweep_cache=shared_cache,
+        )
 
 
 @pytest.mark.parametrize(

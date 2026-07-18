@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.contracts import OracleWorld
+from src.contracts import LocalTrajectory, OracleWorld
 from src.generation.dynamic_object_transplant import (
     MOTION_SNIPPET_CURRENT_INDEX,
     MOTION_SNIPPET_CURRENT_TIME_S,
@@ -42,6 +42,7 @@ from src.generation.event_target_motion_shard import (
     load_event_target_motion_shard,
 )
 from src.generation.sop05_input_adapter import ProducerEvidence, StablePair
+from src.geometry import RectangleFootprint, inflate_footprint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -240,6 +241,39 @@ def _request(module, tmp_path: Path, **overrides):
     return module.Sop05RunRequest(**values)
 
 
+def _fixture_trajectory(
+    trajectory_id: str = "trajectory-a",
+) -> LocalTrajectory:
+    future_steps = 15
+    grid_size = 160
+    poses = np.zeros((future_steps, 3), dtype=np.float32)
+    poses[:, 0] = (
+        np.arange(1, future_steps + 1, dtype=np.float32) * np.float32(0.08)
+    )
+    maps = np.zeros((grid_size, grid_size), dtype=np.float32)
+    return LocalTrajectory(
+        trajectory_id=trajectory_id,
+        poses=poses,
+        controls=np.zeros((future_steps, 2), dtype=np.float32),
+        swept_mask=maps.copy(),
+        tta_map=maps.copy(),
+        braking_map=maps.copy(),
+        centerline_map=maps.copy(),
+        task_cost=0.0,
+        metadata={
+            "pose_time_layout_version": (
+                "future_endpoints_dt_to_horizon_v1"
+            ),
+            "pose_time_offsets_s": tuple(
+                float(value)
+                for value in (
+                    (np.arange(future_steps, dtype=np.float64) + 1.0) * 0.2
+                )
+            ),
+        },
+    )
+
+
 def _install_preflight_inputs(
     monkeypatch,
     module,
@@ -261,9 +295,10 @@ def _install_preflight_inputs(
             SimpleNamespace(base_state_id=state_id),
         ),
     )
+    trajectory = _fixture_trajectory()
     sop04 = SimpleNamespace(
-        trajectories=(object(),),
-        by_id={"trajectory-a": object()},
+        trajectories=(trajectory,),
+        by_id={"trajectory-a": trajectory},
         producer_evidence=_evidence(resolved_sop04_root, "2"),
         trajectory_bank_version="sop04_audited_bank_v2",
         pose_time_layout_version="future_endpoints_dt_to_horizon_v1",
@@ -711,8 +746,8 @@ def _prepared_with_reports(
 
 
 def _install_thread_pair_pool(monkeypatch, module) -> None:
-    def make_pool(prepared):
-        module._initialize_pair_worker(prepared)
+    def make_pool(prepared, robot_sweep_cache):
+        module._initialize_pair_worker(prepared, robot_sweep_cache)
         return ThreadPoolExecutor(max_workers=prepared.request.workers)
 
     monkeypatch.setattr(module, "_make_pair_process_pool", make_pool)
@@ -764,6 +799,50 @@ def test_prepare_is_read_only_and_freezes_ranked_pair_schedule(
     assert "payload_checksums" not in prepared.input_lock["sop04"]
     assert not request.output_dir.exists()
     assert not list(tmp_path.glob(".run.staging-*"))
+
+
+def test_prewarm_robot_sweeps_builds_each_unique_trajectory_once_in_sorted_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _sut()
+    _install_preflight_inputs(monkeypatch, module, tmp_path)
+    prepared = module.prepare_sop05_run(_request(module, tmp_path))
+    trajectory_a = prepared.sop04.by_id["trajectory-a"]
+    trajectory_b = replace(trajectory_a, trajectory_id="trajectory-b")
+    prepared = replace(
+        prepared,
+        sop04=SimpleNamespace(
+            **{
+                **vars(prepared.sop04),
+                "trajectories": (trajectory_b, trajectory_a),
+                "by_id": {
+                    "trajectory-b": trajectory_b,
+                    "trajectory-a": trajectory_a,
+                },
+            }
+        ),
+        schedule=(
+            module.RankedPair(0, "base-a", "trajectory-b", 101),
+            module.RankedPair(1, "base-b", "trajectory-a", 102),
+            module.RankedPair(2, "base-c", "trajectory-b", 103),
+        ),
+    )
+    calls: list[str] = []
+    original_get = module.RobotSweepCache.get
+
+    def recording_get(cache, trajectory, **kwargs):
+        calls.append(trajectory.trajectory_id)
+        return original_get(cache, trajectory, **kwargs)
+
+    monkeypatch.setattr(module.RobotSweepCache, "get", recording_get)
+
+    cache = module._prewarm_robot_sweep_cache(prepared)
+
+    assert calls == ["trajectory-a", "trajectory-b"]
+    assert cache.stats.size == 2
+    assert cache.stats.hits == 0
+    assert cache.stats.misses == 2
+    assert cache.stats.builds == 2
 
 
 @pytest.mark.parametrize(
@@ -1388,6 +1467,82 @@ def test_default_parallel_backend_runs_generation_in_child_processes(
     }
     assert child_pids
     assert parent_pid not in child_pids
+
+
+def test_prewarmed_cache_is_hit_per_pair_and_worker_count_is_byte_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _sut()
+    prepared_two, reports = _prepared_with_reports(module, tmp_path, monkeypatch)
+    prepared_one = replace(
+        prepared_two,
+        request=replace(prepared_two.request, workers=1),
+        runtime_provenance={**prepared_two.runtime_provenance, "workers": 1},
+    )
+
+    def generate(**kwargs):
+        cache = kwargs["robot_sweep_cache"]
+        robot_config = kwargs["base_config"]["robot"]
+        footprint = inflate_footprint(
+            RectangleFootprint(
+                robot_config["length_m"], robot_config["width_m"]
+            ),
+            robot_config["inflation_m"],
+        )
+        before = cache.stats
+        cache.get(
+            kwargs["trajectory"],
+            robot_footprint=footprint,
+            grid=prepared_two.grid,
+            future_dt_s=kwargs["base_config"]["bev"]["future_dt_s"],
+        )
+        after = cache.stats
+        report = reports[kwargs["seed"]]
+        return replace(
+            report,
+            summary={
+                **report.summary,
+                "robot_sweep_cache": {
+                    "size": after.size - before.size,
+                    "hits": after.hits - before.hits,
+                    "misses": after.misses - before.misses,
+                    "builds": after.builds - before.builds,
+                },
+            },
+        )
+
+    monkeypatch.setattr(module, "generate_events", generate)
+
+    single = module.collect_sop05_generation(prepared_one)
+    parallel = module.collect_sop05_generation(prepared_two)
+
+    expected_hit = {"size": 0, "hits": 1, "misses": 0, "builds": 0}
+    assert all(
+        item.report.summary["robot_sweep_cache"] == expected_hit
+        for collection in (single, parallel)
+        for item in collection.pair_reports
+    )
+    assert [event.generated_event_id for event in single.all_events] == [
+        event.generated_event_id for event in parallel.all_events
+    ]
+    assert module._canonical_json_bytes(
+        [item.report.summary for item in single.pair_reports]
+    ) == module._canonical_json_bytes(
+        [item.report.summary for item in parallel.pair_reports]
+    )
+    single_summary = {
+        key: value
+        for key, value in single.generation_summary.items()
+        if key != "allocated_cpu_seconds"
+    }
+    parallel_summary = {
+        key: value
+        for key, value in parallel.generation_summary.items()
+        if key != "allocated_cpu_seconds"
+    }
+    assert module._canonical_json_bytes(single_summary) == (
+        module._canonical_json_bytes(parallel_summary)
+    )
 
 
 def test_worker_count_does_not_change_selected_scientific_results(

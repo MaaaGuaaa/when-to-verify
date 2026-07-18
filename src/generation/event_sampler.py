@@ -1569,6 +1569,7 @@ def _generate_v5_events(
     seed: int,
     event_count: int,
     attempt_index_start: int,
+    robot_sweep_cache: RobotSweepCache | None,
 ) -> EventGenerationReport:
     grid = build_grid_spec(base_config)
     validate_base_state(base_state, grid)
@@ -1621,7 +1622,16 @@ def _generate_v5_events(
         robot_cfg["inflation_m"],
     )
     future_dt_s = float(base_config["bev"]["future_dt_s"])
-    sweep_cache = RobotSweepCache()
+    if robot_sweep_cache is not None and not isinstance(
+        robot_sweep_cache, RobotSweepCache
+    ):
+        raise TypeError("robot_sweep_cache must be a RobotSweepCache or None")
+    sweep_cache = (
+        RobotSweepCache()
+        if robot_sweep_cache is None
+        else robot_sweep_cache
+    )
+    cache_stats_before = sweep_cache.stats
     sweep_bundle = prepare_robot_collision_sweep_bundle(
         base_state,
         trajectory,
@@ -2034,10 +2044,10 @@ def _generate_v5_events(
         "reachability_transform_ids": tuple(transform_ids),
         "exact_validation_ids": tuple(exact_validation_ids),
         "robot_sweep_cache": {
-            "size": cache_stats.size,
-            "hits": cache_stats.hits,
-            "misses": cache_stats.misses,
-            "builds": cache_stats.builds,
+            "size": cache_stats.size - cache_stats_before.size,
+            "hits": cache_stats.hits - cache_stats_before.hits,
+            "misses": cache_stats.misses - cache_stats_before.misses,
+            "builds": cache_stats.builds - cache_stats_before.builds,
         },
         "target_type_policy": policy.as_dict(),
         "target_type_policy_digest": policy.digest,
@@ -2059,6 +2069,7 @@ def generate_events(
     seed: int,
     event_count: int,
     attempt_index_start: int = 0,
+    robot_sweep_cache: RobotSweepCache | None = None,
 ) -> EventGenerationReport:
     """Generate environment mothers with the blind-reachability-first v5 path."""
 
@@ -2069,6 +2080,10 @@ def generate_events(
         attempt_index_start, (int, np.integer)
     ):
         raise TypeError("attempt_index_start must be an integer")
+    if robot_sweep_cache is not None and not isinstance(
+        robot_sweep_cache, RobotSweepCache
+    ):
+        raise TypeError("robot_sweep_cache must be a RobotSweepCache or None")
     return _generate_v5_events(
         base_state=base_state,
         oracle_context=oracle_context,
@@ -2079,4 +2094,5 @@ def generate_events(
         seed=int(seed),
         event_count=event_count,
         attempt_index_start=int(attempt_index_start),
+        robot_sweep_cache=robot_sweep_cache,
     )

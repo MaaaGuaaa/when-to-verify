@@ -495,6 +495,15 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 ## 7.1 任务
 
 - 接收 `BaseState`、`LocalTrajectory`、typed `MotionSnippet`；
+- `LocalTrajectory` 只接受 `sop04_audited_bank_v2` /
+  `future_endpoints_dt_to_horizon_v1`：15 个 future pose 是 `q1…q15`、时间为
+  `0.2…3.0 s`，冲突零基 index `k` 映射为 `(k+1)*0.2 s`；旧 `0.0…2.8 s`
+  布局不得兼容
+- SOP05 preflight 必须由 CLI 显式接收目录外可信 SOP04 handoff digest，并在
+  `sop05_input_lock_v2` / run identity 中绑定 bank/layout/time/offset、bank semantic
+  digest 和 external handoff digest
+- 只接受 `history8_current7_future15_v1`；以 source index `7` 为当前，未来冲突锚点的
+  source time 为 `1.4 + conflict_time_s`；
 - 在候选轨迹上选冲突时刻和冲突点；
 - 放置矩形墙体、货架、柱子或结构性 blind sector；
 - 对目标 snippet 做 SE(2) 变换和有限时间缩放；主分布默认 human target；
@@ -601,6 +610,12 @@ angular_velocities: [-0.8, -0.4, 0.0, 0.4, 0.8]
 horizon_s: 3.0
 dt: 0.2
 ```
+
+正式候选库冻结为 `trajectory_bank_version=sop04_audited_bank_v2`、
+`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，首末 pose 时间分别为
+`0.2 s` 与 `3.0 s`。v2 audit 必须通过 future-endpoint kinematics、query-map、
+shape/dtype/finite 和 serial/parallel exact-match，并以目录外 external handoff digest
+交给 W2/SOP05；v1 或 `poses[0]=q0` 的库立即拒绝。
 
 可加入少量后退 stress test，但不作为主训练分布。
 

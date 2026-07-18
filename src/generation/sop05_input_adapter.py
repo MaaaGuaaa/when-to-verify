@@ -46,6 +46,14 @@ _FUTURE_STEPS = 15
 _SAMPLE_DT_S = 0.2
 _SNIPPET_DURATION_S = 4.4
 _LAYOUT_VERSION = "history8_current7_future15_v1"
+SOP04_TRAJECTORY_BANK_VERSION = "sop04_audited_bank_v2"
+SOP04_POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
+SOP04_COMPLETION_POLICY = SOP04_TRAJECTORY_BANK_VERSION
+_SOP04_EXTERNAL_HANDOFF_LABEL = "sop04_audited_bank_v2_envelope"
+_SOP04_EXTERNAL_HANDOFF_DOMAIN = b"sop04_audited_bank_v2_external_handoff\0"
+_SOP04_CORE_PAYLOADS = frozenset(
+    {"trajectory_bank.npz", "trajectory_manifest.jsonl", "summary.json"}
+)
 
 
 class Sop05InputError(ValueError):
@@ -171,6 +179,12 @@ class Sop04TrajectoryBank:
     trajectories: tuple[LocalTrajectory, ...]
     by_id: dict[str, LocalTrajectory]
     producer_evidence: ProducerEvidence
+    trajectory_bank_version: str
+    pose_time_layout_version: str
+    pose_time_offsets_s: tuple[float, ...]
+    pose_time_offsets_sha256: str
+    bank_semantic_digest_sha256: str
+    external_handoff_digest_sha256: str
 
 
 @dataclass(frozen=True)
@@ -847,39 +861,109 @@ def load_sop03_split_inputs(
     )
 
 
-def _validate_sop04_readiness(root: Path) -> tuple[dict[str, Any], str]:
+def _sop04_pose_time_offsets() -> tuple[float, ...]:
+    return tuple(
+        float(value)
+        for value in (np.arange(_FUTURE_STEPS, dtype=np.float64) + 1.0)
+        * _SAMPLE_DT_S
+    )
+
+
+def _sop04_pose_time_offsets_sha256(offsets: tuple[float, ...]) -> str:
+    payload = json.dumps(
+        list(offsets),
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(b"sop04_pose_time_offsets_v1\0" + payload).hexdigest()
+
+
+def _validate_sop04_time_contract(
+    value: dict[str, Any],
+    label: str,
+    *,
+    require_bank_version: bool,
+) -> tuple[float, ...]:
+    if require_bank_version:
+        _require(
+            value.get("trajectory_bank_version")
+            == SOP04_TRAJECTORY_BANK_VERSION,
+            f"{label} trajectory bank version mismatch",
+        )
+    _require(
+        value.get("pose_time_layout_version")
+        == SOP04_POSE_TIME_LAYOUT_VERSION,
+        f"{label} pose-time layout version mismatch",
+    )
+    _require(
+        type(value.get("trajectory_steps")) is int
+        and value["trajectory_steps"] == _FUTURE_STEPS,
+        f"{label} trajectory_steps mismatch",
+    )
+    expected = {
+        "dt_s": _SAMPLE_DT_S,
+        "first_pose_time_s": _SAMPLE_DT_S,
+        "last_pose_time_s": _FUTURE_STEPS * _SAMPLE_DT_S,
+    }
+    for name, expected_value in expected.items():
+        observed = value.get(name)
+        _require(
+            type(observed) in {int, float}
+            and math.isfinite(float(observed))
+            and math.isclose(
+                float(observed), expected_value, rel_tol=0.0, abs_tol=1e-12
+            ),
+            f"{label} {name} mismatch",
+        )
+    return _sop04_pose_time_offsets()
+
+
+def _validate_sop04_readiness(
+    root: Path,
+) -> tuple[dict[str, Any], str, str]:
     audit = _load_json(root / "audit_report.json", "SOP-04 audit report")
     _require(audit.get("status") == "ok", "SOP-04 audit status is not ok")
     _require(
         audit.get("schema_version") == SCHEMA_VERSION,
         "SOP-04 audit schema_version mismatch",
     )
-    _require(
-        audit.get("shape_dtype_finite_validation") == "passed_all",
-        "SOP-04 shape/dtype/finite audit did not pass",
+    _validate_sop04_time_contract(
+        audit, "SOP-04 audit", require_bank_version=True
     )
+    for name in (
+        "artifact_reload_validation",
+        "shape_dtype_finite_validation",
+        "future_endpoint_kinematics",
+        "query_map_invariants",
+        "manifest_array_alignment",
+        "summary_npz_alignment",
+        "checksum_verification",
+    ):
+        expected = (
+            "passed"
+            if name == "artifact_reload_validation"
+            else "passed_all"
+        )
+        _require(
+            audit.get(name) == expected,
+            f"SOP-04 {name.replace('_', ' ')} audit did not pass",
+        )
     _require(
-        audit.get("query_map_invariants") == "passed_all",
-        "SOP-04 query map audit did not pass",
-    )
-    _require(
-        audit.get("manifest_array_alignment") == "passed_all",
-        "SOP-04 manifest alignment audit did not pass",
+        audit.get("determinism_reference_exact_match") is True,
+        "SOP-04 determinism reference exact-match audit did not pass",
     )
     _require(
         audit.get("serial_parallel_exact_match") is True,
         "SOP-04 serial_parallel exact-match audit did not pass",
     )
     _require(audit.get("trajectory_count") == 21, "SOP-04 trajectory count mismatch")
+    provenance = audit.get("provenance")
+    _require(isinstance(provenance, dict), "SOP-04 audit provenance missing")
     _require(
-        audit.get("forward_trajectory_count") == 20,
-        "SOP-04 forward trajectory count mismatch",
+        provenance.get("canonical_shared_bank") is True,
+        "SOP-04 audit is not the canonical shared bank",
     )
-    _require(
-        audit.get("stop_trajectory_count") == 1,
-        "SOP-04 stop trajectory count mismatch",
-    )
-    code_commit = audit.get("code_commit")
+    code_commit = provenance.get("code_commit")
     _require(
         isinstance(code_commit, str) and _COMMIT.fullmatch(code_commit) is not None,
         "SOP-04 audit commit is invalid",
@@ -888,7 +972,13 @@ def _validate_sop04_readiness(root: Path) -> tuple[dict[str, Any], str]:
         audit.get("checksum_file") == "artifact_checksums.sha256",
         "SOP-04 checksum file evidence mismatch",
     )
-    return audit, code_commit
+    semantic_digest = audit.get("bank_semantic_digest_sha256")
+    _require(
+        isinstance(semantic_digest, str)
+        and _SHA256.fullmatch(semantic_digest) is not None,
+        "SOP-04 bank semantic digest is invalid",
+    )
+    return audit, code_commit, semantic_digest
 
 
 def _validate_sop04_checksum_envelope(
@@ -901,18 +991,68 @@ def _validate_sop04_checksum_envelope(
         "SOP-04 checksum manifest digest mismatch",
     )
     entries = _parse_checksum_manifest(root, manifest_path)
-    excluded = {"artifact_checksums.sha256", "audit_report.json"}
+    excluded = {
+        "artifact_checksums.sha256",
+        "audit_report.json",
+        "external_handoff_digest.sha256",
+    }
     actual = _actual_payload_files(root, excluded)
     _require(
-        set(entries) == set(actual),
-        "SOP-04 checksum payload set does not exactly match files on disk",
+        set(entries) == _SOP04_CORE_PAYLOADS
+        and set(actual) == _SOP04_CORE_PAYLOADS,
+        "SOP-04 checksum payload set must contain exactly the v2 core files",
     )
     _require(
-        type(audit.get("artifact_file_count")) is int
-        and audit["artifact_file_count"] == len(entries),
-        "SOP-04 artifact file count mismatch",
+        type(audit.get("checksummed_payload_file_count")) is int
+        and audit["checksummed_payload_file_count"] == len(entries),
+        "SOP-04 checksummed payload file count mismatch",
     )
     return _verify_checksum_entries(entries, checksum_workers), manifest_sha256
+
+
+def _validate_sop04_external_handoff(
+    root: Path,
+    *,
+    expected_digest: object,
+) -> str:
+    _require(
+        isinstance(expected_digest, str)
+        and _SHA256.fullmatch(expected_digest) is not None,
+        "expected SOP-04 external handoff digest must be 64 lowercase hex",
+    )
+    path = root / "external_handoff_digest.sha256"
+    _require(path.is_file(), "SOP-04 external handoff digest is missing")
+    _require(not path.is_symlink(), "SOP-04 external handoff digest is unsafe")
+    try:
+        line = path.read_text(encoding="utf-8").rstrip("\n")
+    except (OSError, UnicodeError) as exc:
+        raise Sop05InputError("failed to read SOP-04 external handoff digest") from exc
+    match = re.fullmatch(
+        rf"([0-9a-f]{{64}})  {_SOP04_EXTERNAL_HANDOFF_LABEL}", line
+    )
+    _require(match is not None, "SOP-04 external handoff digest is malformed")
+    assert match is not None
+    observed = match.group(1)
+    hasher = hashlib.sha256()
+    try:
+        hasher.update(_SOP04_EXTERNAL_HANDOFF_DOMAIN)
+        hasher.update((root / "artifact_checksums.sha256").read_bytes())
+        hasher.update(b"\0")
+        hasher.update((root / "audit_report.json").read_bytes())
+    except OSError as exc:
+        raise Sop05InputError(
+            "failed to read SOP-04 external handoff envelope"
+        ) from exc
+    computed = hasher.hexdigest()
+    _require(
+        observed == computed,
+        "SOP-04 external handoff digest does not match its envelope",
+    )
+    _require(
+        observed == expected_digest,
+        "SOP-04 external handoff digest does not match the trusted handoff",
+    )
+    return observed
 
 
 def _load_sop04_arrays(
@@ -948,6 +1088,16 @@ def _load_sop04_arrays(
         raise Sop05InputError(f"invalid SOP-04 trajectory bank: {exc}") from exc
     _require(isinstance(metadata, dict), "SOP-04 metadata must be an object")
     _validate_schema(metadata, "SOP-04 embedded metadata")
+    _require(
+        metadata.get("trajectory_bank_version")
+        == SOP04_TRAJECTORY_BANK_VERSION,
+        "SOP-04 embedded metadata trajectory bank version mismatch",
+    )
+    _require(
+        metadata.get("pose_time_layout_version")
+        == SOP04_POSE_TIME_LAYOUT_VERSION,
+        "SOP-04 embedded metadata pose-time layout version mismatch",
+    )
     return arrays, metadata
 
 
@@ -1017,6 +1167,9 @@ def _build_sop04_trajectories(
     metadata: dict[str, Any],
     summary: dict[str, Any],
 ) -> tuple[LocalTrajectory, ...]:
+    pose_time_offsets = _validate_sop04_time_contract(
+        summary, "SOP-04 summary", require_bank_version=True
+    )
     ids_raw = metadata.get("trajectory_ids")
     rows_metadata = metadata.get("trajectory_metadata")
     _require(isinstance(ids_raw, list), "SOP-04 trajectory_ids must be a list")
@@ -1064,12 +1217,22 @@ def _build_sop04_trajectories(
             row.get("trajectory_steps") == _FUTURE_STEPS,
             "SOP-04 manifest trajectory_steps mismatch",
         )
+        _validate_sop04_time_contract(
+            row,
+            f"SOP-04 trajectory manifest row {index}",
+            require_bank_version=True,
+        )
         _require(
             row.get("query_map_shape") == [grid.height, grid.width],
             "SOP-04 manifest query map shape mismatch",
         )
         item_metadata = rows_metadata[index]
         assert isinstance(item_metadata, dict)
+        _validate_sop04_time_contract(
+            item_metadata,
+            f"SOP-04 trajectory metadata {index}",
+            require_bank_version=False,
+        )
         _close(row.get("v_mps"), item_metadata.get("v"), "velocity")
         _close(row.get("omega_radps"), item_metadata.get("omega"), "yaw rate")
         _close(row.get("task_cost"), arrays["task_costs"][index], "task cost")
@@ -1080,6 +1243,34 @@ def _build_sop04_trajectories(
                 and row[flag] == item_metadata[flag],
                 f"SOP-04 manifest {flag} mismatch",
             )
+        controls = arrays["controls"][index]
+        _require(
+            np.array_equal(
+                controls,
+                np.repeat(controls[:1], _FUTURE_STEPS, axis=0),
+            ),
+            "SOP-04 canonical trajectory controls must be constant",
+        )
+        v = float(controls[0, 0])
+        omega = float(controls[0, 1])
+        times = np.asarray(pose_time_offsets, dtype=np.float64)
+        expected_poses = np.zeros((_FUTURE_STEPS, 3), dtype=np.float64)
+        if omega == 0.0:
+            expected_poses[:, 0] = v * times
+        else:
+            yaw = omega * times
+            expected_poses[:, 0] = (v / omega) * np.sin(yaw)
+            expected_poses[:, 1] = (v / omega) * (1.0 - np.cos(yaw))
+            expected_poses[:, 2] = yaw
+        _require(
+            np.allclose(
+                arrays["poses"][index],
+                expected_poses,
+                rtol=0.0,
+                atol=1e-6,
+            ),
+            "SOP-04 poses do not follow future endpoint time semantics",
+        )
         trajectories.append(
             LocalTrajectory(
                 trajectory_id=trajectory_id,
@@ -1090,7 +1281,12 @@ def _build_sop04_trajectories(
                 braking_map=arrays["braking_maps"][index].copy(order="C"),
                 centerline_map=arrays["centerline_maps"][index].copy(order="C"),
                 task_cost=float(arrays["task_costs"][index]),
-                metadata={**item_metadata, "array_index": index},
+                metadata={
+                    **item_metadata,
+                    "array_index": index,
+                    "trajectory_bank_version": SOP04_TRAJECTORY_BANK_VERSION,
+                    "pose_time_offsets_s": pose_time_offsets,
+                },
             )
         )
     _require(
@@ -1112,6 +1308,7 @@ def load_sop04_trajectory_bank(
     root: str | Path,
     grid: GridSpec,
     *,
+    expected_external_handoff_digest_sha256: str,
     checksum_workers: int = 1,
 ) -> Sop04TrajectoryBank:
     """Validate and load the canonical SOP-04 trajectory bank."""
@@ -1121,12 +1318,21 @@ def load_sop04_trajectory_bank(
     _require(isinstance(grid, GridSpec), "grid must be a GridSpec")
     _require(grid.future_steps == _FUTURE_STEPS, "SOP-04 trajectory layout mismatch")
     _require(grid.height > 0 and grid.width > 0, "SOP-04 grid shape is invalid")
-    audit, code_commit = _validate_sop04_readiness(root_path)
+    audit, code_commit, bank_semantic_digest = _validate_sop04_readiness(
+        root_path
+    )
     checksums, checksum_manifest_sha256 = _validate_sop04_checksum_envelope(
         root_path, audit, checksum_workers
     )
+    external_handoff_digest = _validate_sop04_external_handoff(
+        root_path,
+        expected_digest=expected_external_handoff_digest_sha256,
+    )
     summary = _load_json(root_path / "summary.json", "SOP-04 summary")
     _validate_schema(summary, "SOP-04 summary")
+    pose_time_offsets = _validate_sop04_time_contract(
+        summary, "SOP-04 summary", require_bank_version=True
+    )
     provenance = summary.get("provenance")
     _require(isinstance(provenance, dict), "SOP-04 summary provenance missing")
     _require(
@@ -1136,6 +1342,10 @@ def load_sop04_trajectory_bank(
     _require(
         provenance.get("code_commit") == code_commit,
         "SOP-04 producer commit mismatch",
+    )
+    _require(
+        audit.get("provenance") == provenance,
+        "SOP-04 audit/summary provenance mismatch",
     )
     _require(summary.get("accepted_count") == 21, "SOP-04 summary count mismatch")
     _require(summary.get("candidate_count") == 21, "SOP-04 candidate count mismatch")
@@ -1147,6 +1357,16 @@ def load_sop04_trajectory_bank(
     )
     _require(summary.get("grid_height") == grid.height, "SOP-04 grid height mismatch")
     _require(summary.get("grid_width") == grid.width, "SOP-04 grid width mismatch")
+    _require(
+        type(summary.get("grid_resolution_m")) in {int, float}
+        and math.isclose(
+            float(summary["grid_resolution_m"]),
+            float(grid.resolution_m),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ),
+        "SOP-04 grid resolution mismatch",
+    )
     _require(
         summary.get("meets_minimum_acceptance_rate") is True,
         "SOP-04 acceptance threshold was not met",
@@ -1175,7 +1395,7 @@ def load_sop04_trajectory_bank(
         code_commit=code_commit,
         checksum_manifest_sha256=checksum_manifest_sha256,
         audit_sha256=_sha256_file(root_path / "audit_report.json"),
-        completion_policy="sop04_audited_bank_v1",
+        completion_policy=SOP04_COMPLETION_POLICY,
         payload_checksums=checksums,
     )
     return Sop04TrajectoryBank(
@@ -1183,6 +1403,14 @@ def load_sop04_trajectory_bank(
         trajectories=trajectories,
         by_id=by_id,
         producer_evidence=evidence,
+        trajectory_bank_version=SOP04_TRAJECTORY_BANK_VERSION,
+        pose_time_layout_version=SOP04_POSE_TIME_LAYOUT_VERSION,
+        pose_time_offsets_s=pose_time_offsets,
+        pose_time_offsets_sha256=_sop04_pose_time_offsets_sha256(
+            pose_time_offsets
+        ),
+        bank_semantic_digest_sha256=bank_semantic_digest,
+        external_handoff_digest_sha256=external_handoff_digest,
     )
 
 

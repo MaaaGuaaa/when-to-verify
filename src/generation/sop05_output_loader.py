@@ -146,6 +146,19 @@ _UPSTREAM_EVIDENCE_KEYS = frozenset(
         "completion_policy",
     }
 )
+_SOP04_EVIDENCE_KEYS = _UPSTREAM_EVIDENCE_KEYS | frozenset(
+    {
+        "trajectory_bank_version",
+        "pose_time_layout_version",
+        "trajectory_steps",
+        "dt_s",
+        "first_pose_time_s",
+        "last_pose_time_s",
+        "pose_time_offsets_sha256",
+        "bank_semantic_digest_sha256",
+        "external_handoff_digest_sha256",
+    }
+)
 _SELECTION_KEYS = frozenset(
     {
         "seed",
@@ -905,6 +918,72 @@ def _validate_upstream_evidence(
     }
 
 
+def _validate_sop04_evidence(value: object, *, label: str) -> dict[str, object]:
+    evidence = _require_mapping(value, label=label)
+    _require_exact_keys(evidence, _SOP04_EVIDENCE_KEYS, label=label)
+    identity: dict[str, object] = _validate_upstream_evidence(
+        {key: evidence[key] for key in _UPSTREAM_EVIDENCE_KEYS},
+        label=label,
+        completion_policy="sop04_audited_bank_v2",
+    )
+    if evidence.get("trajectory_bank_version") != "sop04_audited_bank_v2":
+        raise ValueError(f"{label} trajectory bank version mismatch")
+    if (
+        evidence.get("pose_time_layout_version")
+        != "future_endpoints_dt_to_horizon_v1"
+    ):
+        raise ValueError(f"{label} pose-time layout version mismatch")
+    if evidence.get("trajectory_steps") != 15:
+        raise ValueError(f"{label} trajectory_steps mismatch")
+    for name, expected in (
+        ("dt_s", 0.2),
+        ("first_pose_time_s", 0.2),
+        ("last_pose_time_s", 3.0),
+    ):
+        observed = _finite_real(evidence.get(name), label=f"{label} {name}")
+        if abs(observed - expected) > 1e-12:
+            raise ValueError(f"{label} {name} mismatch")
+        identity[name] = observed
+    expected_offsets = tuple(
+        float(value)
+        for value in (np.arange(15, dtype=np.float64) + 1.0) * 0.2
+    )
+    offsets_payload = json.dumps(
+        list(expected_offsets),
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    expected_offsets_digest = hashlib.sha256(
+        b"sop04_pose_time_offsets_v1\0" + offsets_payload
+    ).hexdigest()
+    offsets_digest = _require_hex_digest(
+        evidence.get("pose_time_offsets_sha256"),
+        size=64,
+        label=f"{label} pose_time_offsets_sha256",
+    )
+    if offsets_digest != expected_offsets_digest:
+        raise ValueError(f"{label} pose time offsets digest mismatch")
+    identity.update(
+        {
+            "trajectory_bank_version": "sop04_audited_bank_v2",
+            "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+            "trajectory_steps": 15,
+            "pose_time_offsets_sha256": offsets_digest,
+            "bank_semantic_digest_sha256": _require_hex_digest(
+                evidence.get("bank_semantic_digest_sha256"),
+                size=64,
+                label=f"{label} bank semantic digest",
+            ),
+            "external_handoff_digest_sha256": _require_hex_digest(
+                evidence.get("external_handoff_digest_sha256"),
+                size=64,
+                label=f"{label} external handoff digest",
+            ),
+        }
+    )
+    return identity
+
+
 def _validate_pair_schedule(value: object) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list) or not value:
         raise ValueError("SOP05 scientific_request pair_schedule must be non-empty")
@@ -995,7 +1074,7 @@ def _validate_run_contract(
         run_manifest.get("input_lock"), label="SOP05 input_lock"
     )
     _require_exact_keys(input_lock, _INPUT_LOCK_KEYS, label="SOP05 input_lock")
-    if input_lock.get("version") != "sop05_input_lock_v1":
+    if input_lock.get("version") != "sop05_input_lock_v2":
         raise ValueError("unsupported SOP05 input_lock version")
     if input_lock.get("split") != split:
         raise ValueError("SOP05 input_lock split mismatch")
@@ -1004,10 +1083,9 @@ def _validate_run_contract(
         label="SOP05 input_lock sop03",
         completion_policy="sop03_complete_marker_v1",
     )
-    sop04_identity = _validate_upstream_evidence(
+    sop04_identity = _validate_sop04_evidence(
         input_lock.get("sop04"),
         label="SOP05 input_lock sop04",
-        completion_policy="sop04_audited_bank_v1",
     )
     selection = _require_mapping(
         input_lock.get("selection"), label="SOP05 input_lock selection"

@@ -629,9 +629,11 @@ python scripts/03_extract_base_states.py --config configs/data_thor.yaml --all-s
 
 ### SOP
 
-- [ ] 实现 constant `(v, ω)` 差速 rollout；当前局部原点 `q0` 只作积分种子，不写入输出数组
-- [ ] 冻结 `pose_time_layout_version=future_endpoints_dt_to_horizon_v1`：
-      `poses[0:15]=q1...q15`，零基 index `k` 对应 `(k+1)*0.2 s`，覆盖 `0.2...3.0 s`
+- [ ] 实现 constant `(v, ω)` 差速 rollout；局部原点 `q0=(0,0,0)` 只作为积分种子，
+      不写入输出 pose 数组
+- [ ] 冻结 `pose_time_layout_version=future_endpoints_dt_to_horizon_v1`：输出
+      `poses[0:15]=q1…q15`，时间偏移严格为 `0.2,0.4,…,3.0 s`；禁止输出旧
+      `q0…q14 / 0.0…2.8 s` 布局
 - [ ] 使用配置中的 4 个正向速度 × 5 个角速度，stop 单独标记
 - [ ] reverse 仅按概率用于结构性盲区 stress test，不进入默认主分布
 - [ ] 过滤静态碰撞、BEV 越界、动力学超限和无效停滞
@@ -640,12 +642,16 @@ python scripts/03_extract_base_states.py --config configs/data_thor.yaml --all-s
 - [ ] 生成 `braking_margin_map`
 - [ ] 生成 `centerline_map`
 - [ ] 为 straight、left arc、right arc、stop 写解析测试
+- [ ] 发布 `trajectory_bank_version=sop04_audited_bank_v2`，并生成通过 shape/dtype/finite、
+      future-endpoint kinematics、query-map、serial/parallel determinism 检查的 audit；以目录外
+      保存的 `external_handoff_digest.sha256` 作为 SOP05 的可信输入锚点
 
 ### 验收
 
 - 直线和恒角速度圆弧与解析解误差在离散积分容差内
 - `poses.shape == (15,3)`、`controls.shape == (15,2)`
-- `poses[0]` 对应 `0.2 s`、`poses[14]` 对应 `3.0 s`；旧 `0.0...2.8 s` 布局被拒绝
+- `poses[0]` 对应 `+0.2 s`、`poses[14]` 对应 `+3.0 s`，每个零基 future index `k`
+  的物理时刻为 `(k+1) × 0.2 s`
 - swept mask 覆盖所有时刻 footprint
 - TTA 对同一中心线方向非递减，未经过为 `-1`
 - 静态碰撞轨迹 100% 被过滤
@@ -682,6 +688,13 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### SOP
 
+- [ ] 输入侧只接受 `sop04_audited_bank_v2` 与
+      `future_endpoints_dt_to_horizon_v1`；严格核对 15 点 `0.2…3.0 s`、v2 audit、三个
+      core payload checksum 和目录外可信 handoff digest。旧 v1、缺字段或 `0.0…2.8 s`
+      产物立即拒绝，不得兼容解释
+- [ ] `scripts/05_generate_events.py` 必须显式接收目录外
+      `--sop04-handoff-digest`；`sop05_input_lock_v2` 和 run identity 必须绑定 bank/layout、
+      时间参数、offset digest、bank semantic digest 与 external handoff digest
 - [ ] 从轨迹 `τ*=1.0–2.2 s` 选择冲突时刻和位置
 - [ ] 计算轨迹切向与法向，拒绝高曲率或无放置空间的位置
 - [ ] 环境/混合事件采用单层联合候选：先按 wall/shelf/pillar 参数沿法向放置并验证
@@ -1389,7 +1402,8 @@ python scripts/08_generate_verification_dataset.py \
 
 - 所有模块使用机器人当前局部坐标
 - 所有角度为弧度；配置中的 degree 必须在边界显式转换一次
-- 所有 future index 到时间统一使用 `tau=k*future_dt`
+- 所有零基 future index 到时间统一使用 `tau=(k+1)*future_dt`；`k=0` 是首个未来端点，
+  不是当前时刻
 - grid x/y、row/column 映射只定义一次
 - 机器人和所有动态对象轨迹必须在相同时间网格比较
 

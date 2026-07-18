@@ -494,10 +494,18 @@ step_dt: 0.2
 
 基础候选约 20 条，按概率加入 6 条倒车候选。
 
-rollout 的 `controls[k]` 作用于 `[k*step_dt,(k+1)*step_dt]`，输出 `poses[k]` 是该
-区间末端 `q_(k+1)`。正式候选库必须绑定
-`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`；`q0` 不得占用
-`poses[0]`。
+冻结的积分与序列化语义为：`q0=(0,0,0)` 只作为当前时刻的积分种子，不进入
+`LocalTrajectory.poses`；15 个输出依次为 `q1…q15`，时间偏移严格是
+`0.2,0.4,…,3.0 s`。因此零基 future index `k` 对应
+`tau=(k+1)*0.2 s`，不得将 `poses[0]` 解释为当前时刻。
+
+正式共享库必须声明
+`trajectory_bank_version=sop04_audited_bank_v2` 与
+`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，并由 v2 audit 证明
+future-endpoint kinematics、shape/dtype/finite、query-map 以及 serial/parallel
+determinism。SOP05 只接受三个 core payload 的精确 checksum envelope，并要求调用方从
+产物目录外传入可信 `external_handoff_digest`；旧 v1、缺少时间字段或
+`0.0…2.8 s` 布局一律拒绝，不做双版本兼容。
 
 ### 7.2 轨迹过滤
 
@@ -568,6 +576,9 @@ BaseState z
 ```text
 τ* ∈ [1.0s, 2.2s]
 ```
+
+若冲突点由零基 future index `k` 选取，则
+`τ*=(k+1)future_dt`；禁止使用 `k*future_dt` 造成一帧错位。
 
 对应：
 

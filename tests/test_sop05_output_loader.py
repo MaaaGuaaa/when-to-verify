@@ -270,6 +270,15 @@ def _run_id(manifest: dict[str, object]) -> str:
                 "code_commit",
                 "checksum_manifest_sha256",
                 "audit_sha256",
+                "trajectory_bank_version",
+                "pose_time_layout_version",
+                "trajectory_steps",
+                "dt_s",
+                "first_pose_time_s",
+                "last_pose_time_s",
+                "pose_time_offsets_sha256",
+                "bank_semantic_digest_sha256",
+                "external_handoff_digest_sha256",
             )
         },
         "selection": input_lock["selection"],
@@ -615,7 +624,7 @@ def _write_complete_publication(
         ).hexdigest(),
     }
     input_lock = {
-        "version": "sop05_input_lock_v1",
+        "version": "sop05_input_lock_v2",
         "split": "train",
         "sop03": {
             "code_commit": "1" * 40,
@@ -627,7 +636,20 @@ def _write_complete_publication(
             "code_commit": "2" * 40,
             "checksum_manifest_sha256": "c" * 64,
             "audit_sha256": "d" * 64,
-            "completion_policy": "sop04_audited_bank_v1",
+            "completion_policy": "sop04_audited_bank_v2",
+            "trajectory_bank_version": "sop04_audited_bank_v2",
+            "pose_time_layout_version": (
+                "future_endpoints_dt_to_horizon_v1"
+            ),
+            "trajectory_steps": 15,
+            "dt_s": 0.2,
+            "first_pose_time_s": 0.2,
+            "last_pose_time_s": 3.0,
+            "pose_time_offsets_sha256": (
+                "1287220ad6fb1eec96bc41662ab61e2e443b1927f9fed0a4f6d3325aed2027db"
+            ),
+            "bank_semantic_digest_sha256": "f" * 64,
+            "external_handoff_digest_sha256": "e" * 64,
         },
         "selection": selection,
     }
@@ -1552,6 +1574,54 @@ def test_load_complete_sop05_events_rejects_resealed_old_contract_versions(
     _reseal_publication(root)
 
     with pytest.raises(ValueError, match="unsupported|completion mismatch"):
+        load_complete_sop05_events(
+            root,
+            grid=_grid(),
+            expected_publication_semantic_digest=(
+                _fixture_publication_digest(root)
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("completion_policy", "sop04_audited_bank_v1", "completion_policy"),
+        ("trajectory_bank_version", "sop04_audited_bank_v1", "bank version"),
+        (
+            "pose_time_layout_version",
+            "legacy_t0_to_horizon_minus_dt_v0",
+            "layout",
+        ),
+        ("trajectory_steps", 14, "trajectory_steps"),
+        ("dt_s", 0.25, "dt_s"),
+        ("first_pose_time_s", 0.0, "first_pose_time_s"),
+        ("last_pose_time_s", 2.8, "last_pose_time_s"),
+        ("pose_time_offsets_sha256", "0" * 64, "offsets"),
+        ("bank_semantic_digest_sha256", "bad", "semantic"),
+        ("external_handoff_digest_sha256", "bad", "handoff"),
+    ],
+)
+def test_load_complete_sop05_events_rejects_resealed_stale_sop04_contract(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    from src.generation.sop05_output_loader import load_complete_sop05_events
+
+    root = tmp_path / "run"
+    _write_complete_publication(root)
+    manifest_path = root / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["input_lock"]["sop04"][field] = value
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _reseal_publication(root)
+
+    with pytest.raises(ValueError, match=match):
         load_complete_sop05_events(
             root,
             grid=_grid(),

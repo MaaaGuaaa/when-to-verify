@@ -4,7 +4,7 @@
 # DECISIONS.md before other workflows adopt it.
 
 seed: 42
-schema_version: "2.0.0"
+schema_version: "3.0.0"
 
 bev:
   range_m: 16.0          # full BEV width and height in meters ([-8, 8] each axis)
@@ -12,7 +12,7 @@ bev:
   size: 160              # H == W == 160 cells
   history_steps: 8       # K, at history_dt_s spacing (1.6 s window)
   history_dt_s: 0.2
-  future_steps: 15       # T, at future_dt_s spacing (3.0 s horizon)
+  future_steps: 15       # q1...q15 endpoints at 0.2...3.0 s; q0 is not serialized
   future_dt_s: 0.2
 
 robot:

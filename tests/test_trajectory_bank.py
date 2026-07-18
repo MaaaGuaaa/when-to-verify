@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from src.contracts import SCHEMA_VERSION
 from src.utils.config import load_config
 
 
@@ -134,7 +135,7 @@ def test_bank_round_trip_is_numeric_and_refuses_overwrite(
     summary = json.loads(
         (output_dir / "summary.json").read_text(encoding="utf-8")
     )
-    assert summary["schema_version"] == "2.0.0"
+    assert summary["schema_version"] == SCHEMA_VERSION == "3.0.0"
     assert summary["provenance"]["code_commit"] == "test-commit"
     assert summary["trajectory_bank_version"] == "sop04_audited_bank_v2"
     assert (

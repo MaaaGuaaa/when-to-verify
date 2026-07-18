@@ -13,10 +13,14 @@ from pathlib import Path
 
 import numpy as np
 
-from src.contracts import ARRAY_DTYPE, LocalTrajectory, SCHEMA_VERSION
+from src.contracts import (
+    ARRAY_DTYPE,
+    POSE_TIME_LAYOUT_VERSION,
+    LocalTrajectory,
+    SCHEMA_VERSION,
+)
 
 from .differential_drive import (
-    POSE_TIME_LAYOUT_VERSION,
     rollout_constant_control,
 )
 from .query_maps import build_local_trajectory

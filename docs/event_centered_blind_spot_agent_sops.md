@@ -629,7 +629,9 @@ python scripts/03_extract_base_states.py --config configs/data_thor.yaml --all-s
 
 ### SOP
 
-- [ ] 实现 constant `(v, ω)` 差速 rollout，初始 pose 为局部原点
+- [ ] 实现 constant `(v, ω)` 差速 rollout；当前局部原点 `q0` 只作积分种子，不写入输出数组
+- [ ] 冻结 `pose_time_layout_version=future_endpoints_dt_to_horizon_v1`：
+      `poses[0:15]=q1...q15`，零基 index `k` 对应 `(k+1)*0.2 s`，覆盖 `0.2...3.0 s`
 - [ ] 使用配置中的 4 个正向速度 × 5 个角速度，stop 单独标记
 - [ ] reverse 仅按概率用于结构性盲区 stress test，不进入默认主分布
 - [ ] 过滤静态碰撞、BEV 越界、动力学超限和无效停滞
@@ -643,6 +645,7 @@ python scripts/03_extract_base_states.py --config configs/data_thor.yaml --all-s
 
 - 直线和恒角速度圆弧与解析解误差在离散积分容差内
 - `poses.shape == (15,3)`、`controls.shape == (15,2)`
+- `poses[0]` 对应 `0.2 s`、`poses[14]` 对应 `3.0 s`；旧 `0.0...2.8 s` 布局被拒绝
 - swept mask 覆盖所有时刻 footprint
 - TTA 对同一中心线方向非递减，未经过为 `-1`
 - 静态碰撞轨迹 100% 被过滤
@@ -871,7 +874,7 @@ python scripts/04_generate_risk_dataset.py \
 - [ ] 实现 `1 - product(1-p_occ)` probabilistic union
 - [ ] 避免对同一 cell/时刻重复计算导致概率失真，并记录聚合定义
 - [ ] 使用与主模型完全相同的 train/calibration/val/test
-- [ ] 强制读取 schema `2.0.0` 与当前 G1 manifest digest，拒绝 v1 数据和 checkpoint
+- [ ] 强制读取 schema `3.0.0` 与当前 G1 manifest digest，拒绝旧数据和 checkpoint
 - [ ] 保存 occupancy 指标和 trajectory risk 指标
 - [ ] 将聚合后风险送入与主模型同样的校准流程
 
@@ -1129,7 +1132,7 @@ python scripts/10_eval_offline.py \
 - [ ] 不存储 post-verification actor、oracle occupancy 或 world identity 特征
 - [ ] 保留 `br_before`、`post_risk` 供审计，不作为默认模型输入
 - [ ] 按 split 写独立 shards 和 metadata
-- [ ] manifest 绑定 schema `2.0.0`、target object type、footprint kind、
+- [ ] manifest 绑定 schema `3.0.0`、target object type、footprint kind、
       source object ID 和上游 G2 digest
 - [ ] forbidden-token 测试覆盖 dynamic-object future/oracle/post-verify 字段名
 - [ ] 输出每动作、每 blind type、正负价值和 value quantile 分布

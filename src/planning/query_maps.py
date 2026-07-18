@@ -6,7 +6,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.contracts import ARRAY_DTYPE, GridSpec, LocalTrajectory, build_grid_spec
+from src.contracts import (
+    ARRAY_DTYPE,
+    POSE_TIME_LAYOUT_VERSION,
+    GridSpec,
+    LocalTrajectory,
+    build_grid_spec,
+)
 from src.geometry import (
     CircleFootprint,
     Footprint,
@@ -16,7 +22,6 @@ from src.geometry import (
     world_to_grid,
 )
 
-from .differential_drive import POSE_TIME_LAYOUT_VERSION
 from .trajectory_sampler import CandidateRollout
 
 

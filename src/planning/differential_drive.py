@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.contracts import ARRAY_DTYPE
-
-POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
+from src.contracts import ARRAY_DTYPE, POSE_TIME_LAYOUT_VERSION
 
 
 def rollout_constant_control(

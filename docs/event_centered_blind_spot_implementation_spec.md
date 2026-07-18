@@ -273,6 +273,11 @@ future_dt        = 0.2 s
 future_steps T   = 15
 ```
 
+未来数组统一采用 `future_endpoints_dt_to_horizon_v1`：当前位姿 `q0` 只作为积分种子，
+不写入未来数组；`poses[0:15]=q1...q15`，零基索引 `k` 的物理时刻严格为
+`(k+1)*future_dt`，即 `0.2...3.0 s`。旧 `q0...q14 / 0.0...2.8 s` 布局属于
+schema 2，不得由 schema 3 loader 静默解释或改标签。
+
 原始轨迹统一用线性插值/角度 unwrap 后插值到上述时间网格。
 
 ### 4.3 BEV 网格
@@ -489,6 +494,11 @@ step_dt: 0.2
 
 基础候选约 20 条，按概率加入 6 条倒车候选。
 
+rollout 的 `controls[k]` 作用于 `[k*step_dt,(k+1)*step_dt]`，输出 `poses[k]` 是该
+区间末端 `q_(k+1)`。正式候选库必须绑定
+`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`；`q0` 不得占用
+`poses[0]`。
+
 ### 7.2 轨迹过滤
 
 丢弃：
@@ -685,7 +695,7 @@ source_anchor_time = 1.4 + conflict_time_s
 并让该时刻对应：
 
 \[
-t_{k^*}\approx \tau^*
+t^{source}_{k^*}-1.4\approx \tau^*
 \]
 
 ### 9.2 横穿方向
@@ -948,7 +958,7 @@ def compute_risk_gt(robot_traj, hidden_object_trajectories, dynamic_object_specs
     critical_object_id = None
 
     for k, robot_pose in enumerate(robot_traj.poses):
-        tau = k * cfg.future_dt
+        tau = (k + 1) * cfg.future_dt
         robot_shape = inflated_robot_shape(robot_pose, cfg.robot_inflation)
 
         for object_id, object_traj in hidden_object_trajectories.items():

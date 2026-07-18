@@ -14,14 +14,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.contracts import POSE_TIME_LAYOUT_VERSION  # noqa: E402
 from src.planning.trajectory_bank import (  # noqa: E402
     TRAJECTORY_BANK_VERSION,
     build_trajectory_bank,
     trajectory_bank_semantic_digest,
     write_trajectory_bank,
-)
-from src.planning.differential_drive import (  # noqa: E402
-    POSE_TIME_LAYOUT_VERSION,
 )
 from src.utils.config import load_config  # noqa: E402
 

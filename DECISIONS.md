@@ -98,3 +98,28 @@ Serialized schema-v1 artifacts are rejected rather than silently upgraded.
 They must be regenerated after the v2 producer pipeline is integrated. Split
 grouping by human participant remains unchanged and is distinct from the
 dynamic-object IDs stored in base states.
+
+---
+
+## 2026-07-18 · Future endpoint time contract
+
+### D12. Schema 3 freezes future arrays at `dt ... horizon`
+
+Schema `3.0.0` is a breaking semantic migration from schema `2.0.0`:
+
+- The current local pose `q0` at `t=0` is only the rollout integration seed and
+  is never serialized in a future pose array.
+- `controls[k]` acts on `[k*future_dt, (k+1)*future_dt]`; `poses[k]` stores the
+  resulting endpoint `q_(k+1)` at `(k+1)*future_dt`.
+- Every aligned future dynamic-object pose and every risk-label lookup uses the
+  same zero-based-index mapping `(k+1)*future_dt`.
+- With `T=15` and `future_dt=0.2 s`, serialized endpoints cover exactly
+  `0.2, 0.4, ..., 3.0 s`. The old `q0...q14 / 0.0...2.8 s` layout is invalid.
+- `POSE_TIME_LAYOUT_VERSION="future_endpoints_dt_to_horizon_v1"` is the single
+  central layout token. SOP-specific artifact versions may retain their own
+  version numbers but must bind this token and global schema `3.0.0`.
+
+Shape alone cannot distinguish the old and new layouts. Therefore schema-v2
+artifacts and old trajectory-bank handoff digests are rejected, not relabeled
+or interpreted compatibly; affected producers must regenerate and republish
+their checksums and external handoff digests.

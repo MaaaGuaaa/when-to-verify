@@ -24,7 +24,11 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = "2.0.0"
+SCHEMA_VERSION = "3.0.0"
+
+# Every serialized future pose uses endpoint semantics.  The current pose q0 is
+# an integration seed only; array index k stores q_(k+1) at (k+1) * future_dt.
+POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
 # --- Channel layout (order is a frozen contract; see spec §11.3 and §2.5) ------
 # Two per-timestep history channels, stacked over K history steps.
@@ -166,8 +170,8 @@ class LocalTrajectory:
     """Candidate local plan and its precomputed query maps."""
 
     trajectory_id: str
-    poses: np.ndarray  # [T, 3] -> x, y, yaw
-    controls: np.ndarray  # [T, 2] -> v, omega
+    poses: np.ndarray  # [T, 3]; poses[k] == q_(k+1) at (k+1) * future_dt
+    controls: np.ndarray  # [T, 2]; controls[k] acts on [k*dt, (k+1)*dt]
     swept_mask: np.ndarray  # [H, W]
     tta_map: np.ndarray  # [H, W], not-traversed cells == -1
     braking_map: np.ndarray  # [H, W]

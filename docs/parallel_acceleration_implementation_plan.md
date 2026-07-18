@@ -578,6 +578,9 @@ empty_blind_spot: 0.10
 ## 8.1 任务
 
 - 差速模型 rollout；
+- 当前局部原点 `q0` 只作为积分种子；正式数组 `poses[0:15]=q1...q15`，零基 index
+  `k` 对应 `(k+1)*dt`，覆盖 `0.2...3.0 s`；
+- 候选库绑定 `future_endpoints_dt_to_horizon_v1`，拒绝旧 `q0...q14 / 0.0...2.8 s`；
 - 过滤静态碰撞和动力学不合理轨迹；
 - 生成 swept mask、TTA、braking map；
 - 计算 collision、near miss、min clearance、TTC、连续风险严重度；

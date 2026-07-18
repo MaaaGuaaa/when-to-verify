@@ -57,6 +57,12 @@ def test_scene_geometry_is_seed_independent():
     assert np.array_equal(a, c)
 
 
+def test_toy_trajectory_uses_future_endpoints_not_current_seed():
+    poses = toy_world.rollout(1.0, 0.0)
+    assert poses[0, 0] == pytest.approx(0.2)
+    assert poses[-1, 0] == pytest.approx(3.0)
+
+
 # --- Risk answers match hand derivation ---------------------------------------
 def test_collision_case_matches_hand_answer():
     world = toy_world.build_toy_world()

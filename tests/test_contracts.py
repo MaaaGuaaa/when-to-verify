@@ -20,6 +20,7 @@ from src.contracts import (  # noqa: E402
     HISTORY_CHANNELS,
     INPUT_CHANNELS,
     MODEL_INPUT_CLASSES,
+    POSE_TIME_LAYOUT_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
     ContractError,
@@ -67,6 +68,11 @@ def test_grid_spec_from_default_config():
     assert grid.n_history_channels == 2
     assert grid.n_state_channels == 9
     assert grid.n_trajectory_channels == 4
+
+
+def test_future_endpoint_time_contract_is_central_and_breaking():
+    assert contracts.SCHEMA_VERSION == "3.0.0"
+    assert POSE_TIME_LAYOUT_VERSION == "future_endpoints_dt_to_horizon_v1"
 
 
 # --- Oracle-leakage guard ------------------------------------------------------
@@ -396,13 +402,16 @@ def test_serialization_uses_no_object_arrays(tmp_path):
         assert "meta_json" in data.files
 
 
-def test_load_dataclass_rejects_v1_schema_artifacts(tmp_path):
+@pytest.mark.parametrize("old_schema_version", ["1.0.0", "2.0.0"])
+def test_load_dataclass_rejects_pre_v3_schema_artifacts(
+    tmp_path, old_schema_version
+):
     grid = build_grid_spec(load_config())
     path = save_dataclass(_make_dynamic_base_state(grid), tmp_path / "base.npz")
     with np.load(path, allow_pickle=False) as payload:
         arrays = {key: payload[key].copy() for key in payload.files}
     metadata = json.loads(str(arrays["meta_json"]))
-    metadata["schema_version"] = "1.0.0"
+    metadata["schema_version"] = old_schema_version
     arrays["meta_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
     with path.open("wb") as handle:
         np.savez(handle, **arrays)
@@ -454,7 +463,7 @@ def test_sample_id_stable_regardless_of_call_order():
 def test_base_config_loads_and_validates():
     cfg = load_config(_ROOT / "configs" / "base.yaml")
     assert cfg["schema_version"] == contracts.SCHEMA_VERSION
-    assert contracts.SCHEMA_VERSION == "2.0.0"
+    assert contracts.SCHEMA_VERSION == "3.0.0"
     assert cfg["bev"]["size"] == 160
     assert cfg["scenario_bank"]["reject_cost"] == 0.20
     assert "pedestrian" not in cfg
@@ -495,9 +504,14 @@ def test_unknown_config_key_rejected():
         validate_config({"totally_unknown": True})
 
 
-def test_load_config_rejects_schema_version_drift(tmp_path):
+@pytest.mark.parametrize("old_schema_version", ["1.0.0", "2.0.0"])
+def test_load_config_rejects_schema_version_drift(
+    tmp_path, old_schema_version
+):
     config_path = tmp_path / "old-schema.yaml"
-    config_path.write_text('schema_version: "1.0.0"\n', encoding="utf-8")
+    config_path.write_text(
+        f'schema_version: "{old_schema_version}"\n', encoding="utf-8"
+    )
 
     with pytest.raises(ConfigError, match="schema_version"):
         load_config(config_path)

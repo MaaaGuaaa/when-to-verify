@@ -75,14 +75,14 @@ TOY_VERIFICATION_ACTIONS: tuple[tuple[str, float, float, float, bool], ...] = (
 
 # --- Independent reference math (test oracle) ---------------------------------
 def rollout(v: float, omega: float, dt: float = FUTURE_DT, steps: int = FUTURE_STEPS) -> np.ndarray:
-    """Constant-control differential-drive rollout; poses[k] at time k*dt."""
+    """Constant-control rollout; ``poses[k]`` is at ``(k + 1) * dt``."""
     poses = np.zeros((steps, 3), dtype=np.float32)
     x = y = th = 0.0
     for k in range(steps):
-        poses[k] = (x, y, th)
         x += v * math.cos(th) * dt
         y += v * math.sin(th) * dt
         th += omega * dt
+        poses[k] = (x, y, th)
     return poses
 
 
@@ -114,7 +114,7 @@ def risk_gt_reference(
     max_severity = 0.0
     steps = robot_xy.shape[0]
     for k in range(steps):
-        tau = k * dt
+        tau = (k + 1) * dt
         clearance = _clearance(robot_xy[k], ped_xy_seq[k])
         min_clearance = min(min_clearance, clearance)
         if clearance <= 0.0:

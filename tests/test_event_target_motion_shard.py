@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from src.contracts import (
+    SCHEMA_VERSION,
     GridSpec,
     OracleContext,
     OracleWorld,
@@ -179,7 +180,7 @@ def test_factory_freezes_contract_and_owns_c_contiguous_float32_copies() -> None
     current[:] = -99.0
     future[:] = -99.0
 
-    assert record.schema_version == "2.0.0"
+    assert record.schema_version == SCHEMA_VERSION
     assert record.layout_version == "event_target_motion_history8_future15_v1"
     assert record.history_poses.shape == (8, 3)
     assert record.current_pose.shape == (3,)

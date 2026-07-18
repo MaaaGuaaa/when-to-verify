@@ -11,7 +11,14 @@ import pytest
 
 import src.generation.occluder_sampler as occluder_sampler_module
 import src.generation.paired_variants as paired_variants_module
-from src.contracts import BaseState, OracleContext, build_grid_spec, validate_oracle_world
+from src.contracts import (
+    SCHEMA_VERSION,
+    BaseState,
+    OracleContext,
+    OracleWorld,
+    build_grid_spec,
+    validate_oracle_world,
+)
 from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
 from src.generation.dynamic_object_transplant import (
     TransplantError,
@@ -32,6 +39,7 @@ from src.generation.event_sampler import (
 from src.generation.paired_variants import (
     PairGenerationError,
     PairedVariantConfigError,
+    VARIANT_ORDER,
     assemble_paired_event_group,
     generate_paired_variants,
     load_paired_variant_config,
@@ -90,16 +98,66 @@ def _snippet() -> MotionSnippet:
     )
 
 
+def _exact_safe_curve_snippet() -> MotionSnippet:
+    """23-sample real curve used by the v5 reachability mother fixture."""
+
+    snippet = _snippet()
+    relative_times = (np.arange(23, dtype=np.float64) - 7.0) * 0.2
+    conflict_time_s = 2.2
+    lateral_acceleration = 0.8
+    initial_lateral_velocity = lateral_acceleration * conflict_time_s
+    lateral = np.where(
+        relative_times <= 0.0,
+        initial_lateral_velocity * relative_times,
+        np.where(
+            relative_times <= conflict_time_s,
+            lateral_acceleration
+            * relative_times
+            * (conflict_time_s - relative_times),
+            -initial_lateral_velocity
+            * (relative_times - conflict_time_s)
+            + 1.1 * (relative_times - conflict_time_s) ** 2,
+        ),
+    )
+    lateral_velocity = np.where(
+        relative_times <= 0.0,
+        initial_lateral_velocity,
+        np.where(
+            relative_times <= conflict_time_s,
+            lateral_acceleration
+            * (conflict_time_s - 2.0 * relative_times),
+            -initial_lateral_velocity
+            + 2.2 * (relative_times - conflict_time_s),
+        ),
+    )
+    positions = np.column_stack((0.8 * relative_times, lateral))
+    positions -= positions[0]
+    velocities = np.column_stack(
+        (np.full(23, 0.8, dtype=np.float64), lateral_velocity)
+    )
+    headings = np.arctan2(velocities[:, 1], velocities[:, 0])
+    return replace(
+        snippet,
+        snippet_id="train-human-snippet-exact-safe-curve",
+        positions=positions.astype(np.float32),
+        velocities=velocities.astype(np.float32),
+        headings=headings.astype(np.float32),
+        mean_speed_mps=1.5,
+        max_acceleration_mps2=2.2,
+        mean_abs_curvature_per_m=0.5,
+    )
+
+
 def _paired_source_inputs():
     config = load_config()
     grid = build_grid_spec(config)
     context_id = "context-recording::LO1"
     context_history = np.tile(
-        np.asarray([-5.0, 5.0, np.pi / 4.0], dtype=np.float32),
+        np.asarray([-2.0, 2.0, np.pi / 4.0], dtype=np.float32),
         (grid.history_steps, 1),
     )
     context_future = np.tile(
-        np.asarray([-5.0, 5.0, np.pi / 4.0], dtype=np.float32),
+        np.asarray([-2.0, 2.0, np.pi / 4.0], dtype=np.float32),
         (grid.future_steps, 1),
     )
     context_spec = {
@@ -107,17 +165,17 @@ def _paired_source_inputs():
         "footprint": {"kind": "rectangle", "length_m": 0.8, "width_m": 0.2},
     }
     base_state = BaseState(
-        state_id="train-base-paired-fixture",
+        state_id="train-base-event-fixture",
         split="train",
         recording_id="context-recording",
         dynamic_object_ids=(context_id,),
         timestamp=10.0,
         robot_history=np.zeros((grid.history_steps, 3), dtype=np.float32),
-        robot_state=np.asarray([0.8, 0.0], dtype=np.float32),
+        robot_state=np.asarray([0.4, 0.0], dtype=np.float32),
         visible_dynamic_object_history={context_id: context_history.copy()},
         visible_dynamic_object_specs={context_id: context_spec},
         static_map_local=np.zeros((grid.height, grid.width), dtype=np.float32),
-        metadata={"fixture": "sop06"},
+        metadata={"fixture": "sop05"},
     )
     oracle_context = OracleContext(
         base_state_id=base_state.state_id,
@@ -127,11 +185,22 @@ def _paired_source_inputs():
         metadata={"future_dt_s": 0.2},
     )
     trajectory = build_local_trajectory(
-        sample_candidate_rollouts(config)[17],
+        sample_candidate_rollouts(config)[7],
         config,
         braking_deceleration_mps2=1.0,
     )
-    snippet = _snippet()
+    trajectory = replace(
+        trajectory,
+        metadata={
+            **trajectory.metadata,
+            "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+            "pose_time_offsets_s": (
+                (np.arange(grid.future_steps, dtype=np.float64) + 1.0)
+                * float(config["bev"]["future_dt_s"])
+            ).tolist(),
+        },
+    )
+    snippet = _exact_safe_curve_snippet()
     libraries = {
         "human": SnippetLibrary(
             object_type="human",
@@ -153,54 +222,29 @@ def _mother_inputs():
         snippet,
         libraries,
     ) = _paired_source_inputs()
-    generator_config = normalize_generator_config(
-        {
-            "schema_version": "2.0.0",
-            "target_type_policy": {
-                "whitelist": ["human"],
-                "weights": {
-                    "human": 1.0,
-                    "carried_object": 0.0,
-                    "unknown_dynamic": 0.0,
-                },
-            },
-            "event_type_weights": {
-                "environment": 0.0,
-                "structural": 1.0,
-                "mixed": 0.0,
-            },
-            "conflict_time_range_s": [1.0, 1.0],
-            "max_local_curvature_per_m": 1.0,
-            "crossing_angle_max_deg": 35.0,
-            "time_scale_range": [1.0, 1.0],
-            "max_resample_attempts": 32,
-            "min_contiguous_visible_frames": 2,
-            "occluders": {
-                "types": ["pillar"],
-                "normal_offset_range_m": [0.8, 1.2],
-                "wall": {
-                    "length_range_m": [1.0, 1.4],
-                    "width_range_m": [0.2, 0.3],
-                },
-                "shelf": {
-                    "length_range_m": [1.0, 1.4],
-                    "width_range_m": [0.4, 0.5],
-                },
-                "pillar": {
-                    "length_range_m": [0.4, 0.5],
-                    "width_range_m": [0.4, 0.5],
-                },
-            },
-            "structural_fov": {
-                "forward_fov_deg": [160.0],
-                "range_m": [6.0],
-                "optional_blind_sectors": [
-                    {"center_deg": -90.0, "width_deg": 110.0},
-                    {"center_deg": 90.0, "width_deg": 110.0},
-                ],
-            },
-        }
+    generator_config = load_generator_config(
+        ROOT / "configs" / "generator_test.yaml"
     )
+    generator_config["conflict_time_range_s"] = (2.2, 2.2)
+    generator_config["occluders"] = {
+        "types": ("pillar",),
+        "wall": {
+            "length_range_m": (1.0, 1.4),
+            "width_range_m": (0.2, 0.3),
+        },
+        "shelf": {
+            "length_range_m": (1.0, 1.4),
+            "width_range_m": (0.4, 0.5),
+        },
+        "pillar": {
+            "length_range_m": (0.4, 0.5),
+            "width_range_m": (0.4, 0.5),
+        },
+    }
+    generator_config["blind_reachability"] = {
+        **generator_config["blind_reachability"],
+        "obstacle_proposals_per_trajectory": 8,
+    }
     report = generate_events(
         base_state=base_state,
         oracle_context=oracle_context,
@@ -208,7 +252,7 @@ def _mother_inputs():
         snippet_libraries=libraries,
         base_config=config,
         generator_config=generator_config,
-        seed=23,
+        seed=20260716,
         event_count=1,
     )
     assert len(report.events) == 1
@@ -302,36 +346,34 @@ def test_paired_config_freezes_thresholds_coverage_and_digest() -> None:
     assert first.irrelevant_min_clearance_m == 1.5
     assert first.lateral_offset_step_m == 0.025
     assert first.lateral_offset_max_m == 3.0
-    assert first.minimum_required_variants == (
-        "collision",
-        "empty_blind_spot",
+    assert first.paired_generator_algorithm_version == (
+        "independent_partial_pairs_v1"
     )
-    assert first.minimum_contrast_variants == (
-        "near_miss",
-        "temporal_safe",
-        "spatial_safe",
-    )
-    assert first.minimum_contrast_count == 1
-    assert first.complete_evaluation_requires_all_variants is True
+    assert first.group_contract_version == "sop06_partial_pair_group_v1"
+    assert first.mother_required_variants == ("collision",)
+    assert first.training_minimum_contrast_count == 0
+    assert first.audit_requires_all_variants is True
     assert len(first.digest) == 32
 
 
-def test_joint_environment_versions_are_public_frozen_constants() -> None:
+def test_partial_pair_versions_are_public_frozen_constants() -> None:
     assert getattr(
         paired_variants_module,
-        "JOINT_ENVIRONMENT_PAIR_VERSION",
+        "PAIRED_GENERATOR_ALGORITHM_VERSION",
         None,
-    ) == "joint_environment_pair_v2"
-    assert getattr(
-        occluder_sampler_module,
-        "JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION",
-        None,
-    ) == "joint_multi_los_envelope_v2"
+    ) == "independent_partial_pairs_v1"
+    assert paired_variants_module.PAIRED_GROUP_CONTRACT_VERSION == (
+        "sop06_partial_pair_group_v1"
+    )
 
 
 def test_paired_config_rejects_unknown_keys_and_weak_irrelevant_threshold() -> None:
     valid = {
-        "schema_version": "2.0.0",
+        "schema_version": SCHEMA_VERSION,
+        "paired_generator_algorithm_version": (
+            "independent_partial_pairs_v1"
+        ),
+        "group_contract_version": "sop06_partial_pair_group_v1",
         "near_miss_clearance_range_m": [0.05, 0.35],
         "temporal_offset_candidates_s": [
             0.8,
@@ -347,14 +389,9 @@ def test_paired_config_rejects_unknown_keys_and_weak_irrelevant_threshold() -> N
         "irrelevant_min_clearance_m": 1.5,
         "lateral_offset_step_m": 0.025,
         "lateral_offset_max_m": 3.0,
-        "minimum_required_variants": ["collision", "empty_blind_spot"],
-        "minimum_contrast_variants": [
-            "near_miss",
-            "temporal_safe",
-            "spatial_safe",
-        ],
-        "minimum_contrast_count": 1,
-        "complete_evaluation_requires_all_variants": True,
+        "mother_required_variants": ["collision"],
+        "training_minimum_contrast_count": 0,
+        "audit_requires_all_variants": True,
     }
     with pytest.raises(PairedVariantConfigError, match="unknown"):
         normalize_paired_variant_config({**valid, "unknown": 1})
@@ -364,12 +401,65 @@ def test_paired_config_rejects_unknown_keys_and_weak_irrelevant_threshold() -> N
         )
 
 
-def test_joint_environment_pair_exhausts_feasible_prefix_for_complete_six_pack(
-) -> None:
-    assert hasattr(paired_variants_module, "generate_joint_environment_pair")
+def test_singleton_collision_group_is_training_eligible_partial() -> None:
+    paired_config = load_paired_variant_config(
+        ROOT / "configs" / "paired_variants.yaml"
+    )
+    pair_group_id = "pair-singleton-collision"
+    world = OracleWorld(
+        world_id="world-singleton-collision",
+        base_state_id="base-singleton-collision",
+        static_occupancy=np.zeros((1, 1), dtype=np.float32),
+        dynamic_object_trajectories={},
+        dynamic_object_specs={},
+        occluders=(),
+        blind_spot_config={
+            "kind": "environment",
+            "structural": None,
+            "occluder_ids": [],
+        },
+        random_seed=7,
+        metadata={"pair_group_id": pair_group_id},
+    )
+    collision = paired_variants_module.PairedVariant(
+        variant_kind="collision",
+        world=world,
+        target=None,
+        target_visibility_history=None,
+        visibility_sequence=None,
+        clearance_sequence_m=np.asarray([-0.1], dtype=np.float32),
+        min_clearance_m=-0.1,
+        time_to_min_clearance_s=0.2,
+    )
+    missing = {
+        kind: "not_generated"
+        for kind in paired_variants_module.VARIANT_ORDER
+        if kind != "collision"
+    }
+
+    group = assemble_paired_event_group(
+        pair_group_id=pair_group_id,
+        variants={"collision": collision},
+        missing_variant_reasons=missing,
+        paired_config=paired_config,
+    )
+
+    assert group.coverage_mask == (True, False, False, False, False, False)
+    assert group.is_complete is False
+    assert group.eligible_for_strict_evaluation is False
+    assert group.by_kind == {"collision": group.variants[0]}
+    assert group.variants[0].world.metadata[
+        "paired_generator_algorithm_version"
+    ] == "independent_partial_pairs_v1"
+    assert group.variants[0].world.metadata["pair_group_contract_version"] == (
+        "sop06_partial_pair_group_v1"
+    )
+
+
+def test_formal_v5_config_rejects_retired_joint_sixpack_producer() -> None:
     (
         config,
-        grid,
+        _,
         base_state,
         oracle,
         trajectory,
@@ -382,148 +472,187 @@ def test_joint_environment_pair_exhausts_feasible_prefix_for_complete_six_pack(
     generator_config = load_generator_config(
         ROOT / "configs" / "generator_train.yaml"
     )
-    generator_config["max_resample_attempts"] = 64
 
-    report = paired_variants_module.generate_joint_environment_pair(
+    with pytest.raises(
+        PairGenerationError, match="joint_environment_pair_v2 is retired"
+    ) as exc_info:
+        paired_variants_module.generate_joint_environment_pair(
+            base_state=base_state,
+            oracle_context=oracle,
+            trajectory=trajectory,
+            snippet_libraries=libraries,
+            base_config=config,
+            generator_config=generator_config,
+            paired_config=paired_config,
+            seed=20260716,
+        )
+
+    assert exc_info.value.reason == "joint_environment_pair_v2_retired"
+
+
+def test_partial_generator_rejects_retired_joint_mother(complete_pair) -> None:
+    (
+        config,
+        _,
+        base_state,
+        oracle,
+        trajectory,
+        mother,
+        paired_config,
+        _,
+    ) = complete_pair
+    retired_world = replace(
+        mother.world,
+        metadata={
+            **mother.world.metadata,
+            "joint_pair_generator_algorithm_version": (
+                "joint_environment_pair_v2"
+            ),
+        },
+    )
+
+    with pytest.raises(
+        PairGenerationError, match="retired joint_environment_pair_v2"
+    ) as exc_info:
+        generate_paired_variants(
+            mother_event=replace(mother, world=retired_world),
+            source_snippet=_exact_safe_curve_snippet(),
+            base_state=base_state,
+            trajectory=trajectory,
+            oracle_context=oracle,
+            base_config=config,
+            paired_config=paired_config,
+            seed=20260716,
+        )
+
+    assert exc_info.value.reason == "retired_joint_mother"
+
+
+def test_optional_variant_failures_preserve_collision_and_empty(
+    complete_pair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        config,
+        _,
+        base_state,
+        oracle,
+        trajectory,
+        mother,
+        paired_config,
+        _,
+    ) = complete_pair
+
+    def reject_geometric(*, variant_kind: str, **_: object):
+        return None, f"{variant_kind}_unavailable"
+
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_geometric_variant",
+        reject_geometric,
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_temporal_variant",
+        lambda **_: (
+            None,
+            "temporal_transplant:snippet_stationary_at_conflict",
+        ),
+    )
+
+    group = generate_paired_variants(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
         base_state=base_state,
-        oracle_context=oracle,
         trajectory=trajectory,
-        snippet_libraries=libraries,
+        oracle_context=oracle,
         base_config=config,
-        generator_config=generator_config,
         paired_config=paired_config,
         seed=20260716,
     )
 
-    assert report.mother_event is not None, report.summary
-    assert report.group is not None, report.summary
-    assert report.group.is_complete is True
-    assert report.group.eligible_for_strict_evaluation is True
-    assert report.group.coverage_mask == (True, True, True, True, True, True)
-    assert report.group.missing_variant_reasons == {}
-    expected_rebound_history = np.zeros(grid.history_steps, dtype=bool)
-    np.testing.assert_array_equal(
-        report.mother_event.target_visibility_history,
-        expected_rebound_history,
+    assert tuple(variant.variant_kind for variant in group.variants) == (
+        "collision",
+        "empty_blind_spot",
     )
-    np.testing.assert_array_equal(
-        report.group.by_kind["collision"].target_visibility_history,
-        expected_rebound_history,
+    assert group.coverage_mask == (
+        True,
+        False,
+        False,
+        False,
+        False,
+        True,
     )
-    assert report.mother_event.world.metadata[
-        "target_visibility_history"
-    ] == [False] * grid.history_steps
-    assert report.mother_event.world.metadata["visibility_sequence"] == [
-        bool(value) for value in report.mother_event.visibility_sequence
-    ]
-    assert report.mother_event.event_kind == "environment"
-    assert generator_config["conflict_time_range_s"][0] <= (
-        report.mother_event.conflict_time_s
-    ) <= generator_config["conflict_time_range_s"][1]
-    assert report.mother_event.world.occluders[0]["placement_strategy"] == (
-        "joint_multi_los_envelope_v2"
-    )
-    occluder_type = report.mother_event.world.occluders[0]["type"]
-    dimensions = generator_config["occluders"][occluder_type]
-    assert dimensions["length_range_m"][0] <= (
-        report.mother_event.world.occluders[0]["length_m"]
-    ) <= dimensions["length_range_m"][1]
-    assert dimensions["width_range_m"][0] <= (
-        report.mother_event.world.occluders[0]["width_m"]
-    ) <= dimensions["width_range_m"][1]
-    temporal = report.group.by_kind["temporal_safe"]
-    assert temporal.temporal_offset_s in paired_config.temporal_offset_candidates_s
-    assert temporal.min_clearance_m > 0.0
-    assert temporal.visibility_sequence is not None
-    assert not bool(temporal.visibility_sequence[0])
-    assert bool(temporal.visibility_sequence[-1])
-    assert report.summary["generator_algorithm_version"] == (
-        "joint_environment_pair_v2"
-    )
-    assert report.summary["accepted_count"] == 1
-    assert report.summary["complete_group_count"] == 1
-    assert 1 <= report.summary["attempted_count"] <= 64
-    assert report.summary["mother_accepted_count"] >= 1
-    assert report.summary["pair_candidate_count"] >= 1
-    assert report.summary["occluder_candidate_count"] >= 1
-    assert report.summary["request_acceptance_rate"] == pytest.approx(1.0)
-    assert report.summary["attempt_acceptance_rate"] == pytest.approx(
-        1.0 / report.summary["attempted_count"]
-    )
-    rejection_reasons = report.summary["rejection_reasons"]
-    occluder_rejections = report.mother_event.world.metadata[
-        "joint_pair_occluder_rejection_reasons"
-    ]
-    assert occluder_rejections
-    for reason, count in occluder_rejections.items():
-        assert rejection_reasons[f"occluder:{reason}"] == count
-    assert report.summary["selected_conflict_time_s"] == pytest.approx(
-        report.mother_event.conflict_time_s
-    )
-    occluder = report.mother_event.world.occluders[0]
-    occluder_footprint = RectangleFootprint(
-        occluder["length_m"], occluder["width_m"]
-    )
-    target_footprint = footprint_from_spec(
-        report.mother_event.target.footprint_spec
-    )
-    for target in (report.mother_event.target, temporal.target):
-        assert target is not None
-        assert target.history_poses.shape == (8, 3)
-        assert target.future_poses.shape == (15, 3)
-        np.testing.assert_array_equal(target.history_poses[7], target.current_pose)
-        assert not occluder_sampler_module._intersects_robot_sweep(
-            occluder_footprint,
-            np.asarray(occluder["pose"], dtype=np.float64),
-            target_footprint,
-            np.vstack((target.history_poses, target.future_poses)),
-            grid=grid,
-        )
-    assert not occluder_sampler_module._intersects_robot_sweep(
-        occluder_footprint,
-        np.asarray(occluder["pose"], dtype=np.float64),
-        inflate_footprint(
-            RectangleFootprint(
-                config["robot"]["length_m"], config["robot"]["width_m"]
-            ),
-            config["robot"]["inflation_m"],
+    assert group.is_complete is False
+    assert group.eligible_for_strict_evaluation is False
+    assert group.missing_variant_reasons == {
+        "near_miss": "near_miss_unavailable",
+        "temporal_safe": (
+            "temporal_transplant:snippet_stationary_at_conflict"
         ),
-        np.vstack((base_state.robot_history, trajectory.poses)),
-        grid=grid,
-    )
-    for object_id, spec in oracle.dynamic_object_specs.items():
-        context_footprint = footprint_from_spec(spec)
-        context_motion = np.vstack(
-            (
-                oracle.dynamic_object_history[object_id],
-                oracle.dynamic_object_future[object_id],
-            )
+        "spatial_safe": "spatial_safe_unavailable",
+        "irrelevant_hidden": "irrelevant_hidden_unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "failed_kind",
+    ("near_miss", "spatial_safe", "irrelevant_hidden"),
+)
+def test_each_geometric_failure_preserves_other_successful_variants(
+    complete_pair,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_kind: str,
+) -> None:
+    (
+        config,
+        _,
+        base_state,
+        oracle,
+        trajectory,
+        mother,
+        paired_config,
+        baseline,
+    ) = complete_pair
+    real_geometric_variant = paired_variants_module._geometric_variant
+
+    def reject_one(*, variant_kind: str, **kwargs):
+        if variant_kind == failed_kind:
+            return None, f"{failed_kind}_forced_unavailable"
+        return real_geometric_variant(
+            variant_kind=variant_kind,
+            **kwargs,
         )
-        clearances = trajectory_signed_clearances(
-            occluder_footprint,
-            np.tile(
-                np.asarray(occluder["pose"], dtype=np.float32),
-                (context_motion.shape[0], 1),
-            ),
-            context_footprint,
-            context_motion,
-        )
-        assert np.all(clearances > 0.0)
-    validate_event_target_motion_world_join(
-        report.mother_event.target_motion_record,
-        report.mother_event.world,
-        grid,
+
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_geometric_variant",
+        reject_one,
     )
-    assert (
-        report.mother_event.target_motion_record.world_id
-        == report.mother_event.world.world_id
+    group = generate_paired_variants(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle,
+        base_config=config,
+        paired_config=paired_config,
+        seed=20260716,
     )
-    for variant in report.group.variants:
-        validate_oracle_world(variant.world, grid)
-        assert variant.world.occluders == report.mother_event.world.occluders
-        assert variant.world.metadata["joint_pair_generator_algorithm_version"] == (
-            "joint_environment_pair_v2"
-        )
+
+    assert group.pair_group_id == baseline.pair_group_id
+    assert "collision" in group.by_kind
+    assert "empty_blind_spot" in group.by_kind
+    assert failed_kind not in group.by_kind
+    assert group.missing_variant_reasons[failed_kind] == (
+        f"{failed_kind}_forced_unavailable"
+    )
+    for retained_kind in {
+        "near_miss",
+        "spatial_safe",
+        "irrelevant_hidden",
+    } - {failed_kind}:
+        assert retained_kind in group.by_kind
 
 
 def test_temporal_variant_audits_transplant_errors_and_exhausts_schedule(
@@ -590,7 +719,8 @@ def test_temporal_variant_audits_transplant_errors_and_exhausts_schedule(
     assert attempted_conflict_times == pytest.approx(expected_conflict_times)
 
 
-def test_joint_pair_audits_retiming_transplant_errors_without_crashing(
+def test_temporal_transplant_failure_becomes_group_missing_reason(
+    complete_pair,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (
@@ -599,16 +729,10 @@ def test_joint_pair_audits_retiming_transplant_errors_without_crashing(
         base_state,
         oracle,
         trajectory,
-        _,
-        libraries,
-    ) = _paired_source_inputs()
-    paired_config = load_paired_variant_config(
-        ROOT / "configs" / "paired_variants.yaml"
-    )
-    generator_config = load_generator_config(
-        ROOT / "configs" / "generator_train.yaml"
-    )
-    generator_config["max_resample_attempts"] = 16
+        mother,
+        paired_config,
+        baseline,
+    ) = complete_pair
     attempted_conflict_times: list[float] = []
 
     def reject_retiming(*args, **kwargs):
@@ -621,28 +745,31 @@ def test_joint_pair_audits_retiming_transplant_errors_without_crashing(
         reject_retiming,
     )
 
-    report = paired_variants_module.generate_joint_environment_pair(
+    group = generate_paired_variants(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
         base_state=base_state,
-        oracle_context=oracle,
         trajectory=trajectory,
-        snippet_libraries=libraries,
+        oracle_context=oracle,
         base_config=config,
-        generator_config=generator_config,
         paired_config=paired_config,
         seed=20260716,
     )
 
-    rejection_key = "temporal_transplant:snippet_stationary_at_conflict"
-    assert report.mother_event is None
-    assert report.group is None
-    assert report.summary["accepted_count"] == 0
-    assert len(attempted_conflict_times) > 1
-    assert report.summary["rejection_reasons"][rejection_key] == len(
-        attempted_conflict_times
+    assert group.pair_group_id == baseline.pair_group_id
+    assert group.by_kind["collision"].world.world_id == (
+        baseline.by_kind["collision"].world.world_id
     )
+    assert "temporal_safe" not in group.by_kind
+    assert group.missing_variant_reasons["temporal_safe"] == (
+        "temporal_transplant:snippet_stationary_at_conflict"
+    )
+    assert len(attempted_conflict_times) > 1
+    assert group.is_complete is False
 
 
-def test_joint_search_resumes_same_anchor_after_first_mother_pair_failure(
+def test_optional_failure_does_not_resample_or_change_mother_identity(
+    complete_pair,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (
@@ -651,94 +778,60 @@ def test_joint_search_resumes_same_anchor_after_first_mother_pair_failure(
         base_state,
         oracle,
         trajectory,
-        _,
-        libraries,
-    ) = _paired_source_inputs()
-    paired_config = load_paired_variant_config(
-        ROOT / "configs" / "paired_variants.yaml"
-    )
-    generator_config = load_generator_config(
-        ROOT / "configs" / "generator_train.yaml"
-    )
-    generator_config["max_resample_attempts"] = 64
-    real_generate_events = paired_variants_module.generate_events
-    real_generate_pairs = paired_variants_module.generate_paired_variants
-    calls = []
-    pair_call_count = 0
+        mother,
+        paired_config,
+        baseline,
+    ) = complete_pair
+    real_geometric_variant = paired_variants_module._geometric_variant
 
-    def recording_generate_events(**kwargs):
-        report = real_generate_events(**kwargs)
-        calls.append(
-            {
-                "anchor": tuple(kwargs["generator_config"][
-                    "conflict_time_range_s"
-                ]),
-                "seed": kwargs["seed"],
-                "start": kwargs.get("attempt_index_start", 0),
-                "stop": report.summary["attempt_index_stop_exclusive"],
-                "attempted": report.summary["attempted_count"],
-            }
+    def forbid_mother_resample(**_: object):
+        raise AssertionError("SOP06 must not resample an accepted SOP05 mother")
+
+    def reject_near_miss(*, variant_kind: str, **kwargs):
+        if variant_kind == "near_miss":
+            return None, "near_miss_unavailable"
+        return real_geometric_variant(
+            variant_kind=variant_kind,
+            **kwargs,
         )
-        return report
-
-    def reject_first_mother_pair(**kwargs):
-        nonlocal pair_call_count
-        pair_call_count += 1
-        if pair_call_count == 1:
-            raise PairGenerationError("forced_first_mother_pair_failure")
-        return real_generate_pairs(**kwargs)
 
     monkeypatch.setattr(
         paired_variants_module,
         "generate_events",
-        recording_generate_events,
+        forbid_mother_resample,
     )
     monkeypatch.setattr(
         paired_variants_module,
-        "generate_paired_variants",
-        reject_first_mother_pair,
+        "_geometric_variant",
+        reject_near_miss,
     )
 
-    report = paired_variants_module.generate_joint_environment_pair(
+    group = generate_paired_variants(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
         base_state=base_state,
-        oracle_context=oracle,
         trajectory=trajectory,
-        snippet_libraries=libraries,
+        oracle_context=oracle,
         base_config=config,
-        generator_config=generator_config,
         paired_config=paired_config,
         seed=20260716,
     )
 
-    assert report.mother_event is not None, report.summary
-    assert report.group is not None, report.summary
-    assert report.group.is_complete
-    assert pair_call_count >= 2
-    assert len(calls) >= 2
-    assert calls[0]["anchor"] == calls[1]["anchor"]
-    assert calls[0]["seed"] == calls[1]["seed"]
-    assert calls[0]["start"] == 0
-    assert calls[1]["start"] == calls[0]["stop"]
-    assert calls[1]["start"] > 0
-    assert report.mother_event.world.metadata[
-        "joint_pair_anchor_round_index"
-    ] == 0
-    selected_attempt = report.mother_event.world.metadata[
-        "joint_pair_anchor_attempt_index"
-    ]
-    assert calls[1]["start"] <= selected_attempt < calls[1]["stop"]
-    assert report.mother_event.world.metadata[
-        "joint_pair_anchor_candidate_limit"
-    ] == 16
-    assert report.summary["attempted_count"] == sum(
-        call["attempted"] for call in calls
+    assert group.pair_group_id == baseline.pair_group_id
+    assert group.by_kind["collision"].world.world_id == (
+        baseline.by_kind["collision"].world.world_id
     )
-    assert report.summary["rejection_reasons"][
-        "pair:forced_first_mother_pair_failure"
-    ] == 1
+    assert group.by_kind["collision"].target is mother.target
+    assert "near_miss" not in group.by_kind
+    assert group.missing_variant_reasons["near_miss"] == (
+        "near_miss_unavailable"
+    )
+    assert "spatial_safe" in group.by_kind
+    assert "irrelevant_hidden" in group.by_kind
+    assert "empty_blind_spot" in group.by_kind
 
 
-def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
+def test_partial_pair_preserves_skeleton_and_meets_exact_risk_geometry(
     complete_pair,
 ) -> None:
     (
@@ -751,14 +844,15 @@ def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
         paired_config,
         group,
     ) = complete_pair
-    assert group.is_complete is True
-    assert group.eligible_for_strict_evaluation is True
-    assert group.coverage_mask == (True, True, True, True, True, True)
-    assert group.missing_variant_reasons == {}
+    assert group.is_complete is False
+    assert group.eligible_for_strict_evaluation is False
+    assert group.coverage_mask == (True, True, False, True, True, True)
+    assert group.missing_variant_reasons == {
+        "temporal_safe": "temporal_variant_still_collides"
+    }
     assert tuple(variant.variant_kind for variant in group.variants) == (
         "collision",
         "near_miss",
-        "temporal_safe",
         "spatial_safe",
         "irrelevant_hidden",
         "empty_blind_spot",
@@ -782,10 +876,6 @@ def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
     assert variants["irrelevant_hidden"].min_clearance_m >= (
         paired_config.irrelevant_min_clearance_m
     )
-    assert variants["temporal_safe"].min_clearance_m > 0.0
-    assert variants["temporal_safe"].temporal_offset_s in (
-        paired_config.temporal_offset_candidates_s
-    )
     spatial_minimum_index = int(
         round(
             variants["spatial_safe"].time_to_min_clearance_s
@@ -794,24 +884,6 @@ def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
         - 1
     )
     assert abs(spatial_minimum_index - mother.conflict_index) <= 1
-
-    temporal_target = variants["temporal_safe"].target
-    assert temporal_target is not None
-    asynchronous_clearances = [
-        signed_clearance(robot_footprint, robot_pose, target_footprint, target_pose)
-        for robot_pose in trajectory.poses
-        for target_pose in temporal_target.future_poses
-    ]
-    assert min(asynchronous_clearances) <= 0.0
-    np.testing.assert_array_equal(
-        trajectory_signed_clearances(
-            robot_footprint,
-            trajectory.poses,
-            target_footprint,
-            temporal_target.future_poses,
-        ),
-        variants["temporal_safe"].clearance_sequence_m,
-    )
 
     non_target_ids = set(oracle.dynamic_object_future)
     for variant in group.variants:
@@ -838,7 +910,6 @@ def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
     for kind in (
         "collision",
         "near_miss",
-        "temporal_safe",
         "spatial_safe",
         "irrelevant_hidden",
     ):
@@ -860,29 +931,39 @@ def test_six_pack_preserves_skeleton_and_meets_exact_risk_geometry(
     assert set(empty.world.dynamic_object_trajectories) == non_target_ids
 
 
-def test_structural_producer_pair_renders_without_joint_environment_version(
+def test_v5_environment_partial_group_renders_without_joint_pair_version(
     complete_pair,
 ) -> None:
-    from src.generation.sop06_pipeline import render_sop06_paired_variant
+    from src.generation.sop06_pipeline import render_sop06_partial_pair_group
 
     config, _, base, oracle, _, mother, paired_config, group = complete_pair
-    assert mother.event_kind == "structural"
+    assert mother.event_kind == "environment"
+    assert mother.world.metadata["generator_algorithm_version"] == (
+        "blind_reachability_first_v1"
+    )
     assert "joint_pair_generator_algorithm_version" not in (
         mother.world.metadata
     )
-    assert group.is_complete is True
+    assert group.is_complete is False
 
-    rendered = render_sop06_paired_variant(
+    rendered = render_sop06_partial_pair_group(
+        group=group,
         mother_record=mother.target_motion_record,
         mother_world=mother.world,
-        variant=group.by_kind["collision"],
         base_state=base,
         oracle_context=oracle,
         config=config,
         expected_paired_config_digest=paired_config.digest,
     )
 
-    assert rendered.bev_history.shape[0] == config["bev"]["history_steps"]
+    assert rendered.variant_kinds == tuple(
+        variant.variant_kind for variant in group.variants
+    )
+    assert rendered.audit_certified is False
+    assert all(
+        observation.bev_history.shape[0] == config["bev"]["history_steps"]
+        for observation in rendered.observations
+    )
 
 
 def test_spatial_variants_apply_one_se2_to_complete_23_point_motion(
@@ -1143,7 +1224,7 @@ def test_base_state_only_actor_participates_in_history_collision_without_future(
     with pytest.raises(PairGenerationError) as exc_info:
         generate_paired_variants(
             mother_event=mother,
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=base_with_actor,
             trajectory=trajectory,
             oracle_context=oracle,
@@ -1228,7 +1309,7 @@ def test_joint_replacement_occluder_checks_history_only_sweeps(
         oracle_context=oracle,
         environment=environment,
         collision_target=mother.target,
-        temporal_target=group.by_kind["temporal_safe"].target,
+        temporal_target=group.by_kind["spatial_safe"].target,
     )
     assert reason == expected_reason
 
@@ -1267,7 +1348,7 @@ def test_joint_collision_sweeps_cover_exact_available_motion(complete_pair) -> N
             paired_config.near_miss_clearance_range_m[1]
         ),
     )
-    temporal_target = group.by_kind["temporal_safe"].target
+    temporal_target = group.by_kind["spatial_safe"].target
     assert temporal_target is not None
 
     sweeps = paired_variants_module._joint_occluder_collision_sweeps(
@@ -1439,7 +1520,7 @@ def test_overlapping_base_and_oracle_actor_history_and_spec_must_match(
     with pytest.raises(PairGenerationError) as exc_info:
         generate_paired_variants(
             mother_event=mother,
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=inconsistent_base,
             trajectory=trajectory,
             oracle_context=oracle,
@@ -1517,7 +1598,7 @@ def test_pair_rejects_tampered_mother_target_motion_record_join(
     with pytest.raises(PairGenerationError) as exc_info:
         generate_paired_variants(
             mother_event=tampered,
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=base,
             trajectory=trajectory,
             oracle_context=oracle,
@@ -1585,7 +1666,7 @@ def test_pair_rejects_valid_record_whose_target_identity_differs_from_mother(
     with pytest.raises(PairGenerationError) as exc_info:
         generate_paired_variants(
             mother_event=changed_mother,
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=base,
             trajectory=trajectory,
             oracle_context=oracle,
@@ -1620,7 +1701,7 @@ def test_pair_rejects_oracle_world_object_not_declared_by_context_or_target(
     with pytest.raises(PairGenerationError) as exc_info:
         generate_paired_variants(
             mother_event=replace(mother, world=changed_world),
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=base,
             trajectory=trajectory,
             oracle_context=oracle,
@@ -1644,7 +1725,7 @@ def test_pair_generation_is_elementwise_deterministic(complete_pair) -> None:
     ) = complete_pair
     second = generate_paired_variants(
         mother_event=mother,
-        source_snippet=_snippet(),
+        source_snippet=_exact_safe_curve_snippet(),
         base_state=base,
         trajectory=trajectory,
         oracle_context=oracle,
@@ -1681,38 +1762,57 @@ def test_partial_group_policy_records_fixed_coverage_and_excludes_strict_eval(
     partial = assemble_paired_event_group(
         pair_group_id=complete.pair_group_id,
         variants=variants,
-        missing_variant_reasons={"irrelevant_hidden": "clearance_unavailable"},
+        missing_variant_reasons={
+            "temporal_safe": "temporal_variant_still_collides",
+            "irrelevant_hidden": "clearance_unavailable",
+        },
         paired_config=paired_config,
     )
 
-    assert partial.coverage_mask == (True, True, True, True, False, True)
+    assert partial.coverage_mask == (True, True, False, True, False, True)
     assert partial.is_complete is False
     assert partial.eligible_for_strict_evaluation is False
     assert partial.missing_variant_reasons == {
+        "temporal_safe": "temporal_variant_still_collides",
         "irrelevant_hidden": "clearance_unavailable"
     }
     summary = summarize_paired_groups((complete, partial))
     assert summary["group_count"] == 2
-    assert summary["complete_group_count"] == 1
-    assert summary["partial_group_count"] == 1
+    assert summary["complete_group_count"] == 0
+    assert summary["partial_group_count"] == 2
     assert summary["coverage_counts"]["irrelevant_hidden"] == 1
 
-    minimum_only = {
-        kind: complete.by_kind[kind]
-        for kind in ("collision", "empty_blind_spot")
-    }
-    with pytest.raises(PairGenerationError, match="minimum contrast"):
+    collision_only = {"collision": complete.by_kind["collision"]}
+    singleton = assemble_paired_event_group(
+        pair_group_id=complete.pair_group_id,
+        variants=collision_only,
+        missing_variant_reasons={
+            kind: "not_generated"
+            for kind in VARIANT_ORDER
+            if kind != "collision"
+        },
+        paired_config=paired_config,
+    )
+    assert singleton.coverage_mask == (
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+    assert singleton.is_complete is False
+
+    with pytest.raises(PairGenerationError, match="mother required"):
         assemble_paired_event_group(
             pair_group_id=complete.pair_group_id,
-            variants=minimum_only,
+            variants={
+                "empty_blind_spot": complete.by_kind["empty_blind_spot"]
+            },
             missing_variant_reasons={
                 kind: "not_generated"
-                for kind in (
-                    "near_miss",
-                    "temporal_safe",
-                    "spatial_safe",
-                    "irrelevant_hidden",
-                )
+                for kind in VARIANT_ORDER
+                if kind != "empty_blind_spot"
             },
             paired_config=paired_config,
         )
@@ -1757,7 +1857,7 @@ def test_pair_rejects_context_actor_that_is_itself_critical(complete_pair) -> No
     with pytest.raises(PairGenerationError, match="multi_object_context"):
         generate_paired_variants(
             mother_event=colliding_mother,
-            source_snippet=_snippet(),
+            source_snippet=_exact_safe_curve_snippet(),
             base_state=colliding_base,
             trajectory=trajectory,
             oracle_context=colliding_context,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,9 @@ from .observation_renderer import RenderedObservation, render_observation
 from .occluder_sampler import JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION
 from .paired_variants import (
     JOINT_ENVIRONMENT_PAIR_VERSION,
+    PAIRED_GENERATOR_ALGORITHM_VERSION,
+    PAIRED_GROUP_CONTRACT_VERSION,
+    PairedEventGroup,
     PairedVariant,
     VARIANT_ORDER,
     compute_pair_group_id,
@@ -42,16 +46,58 @@ from src.utils.seeding import stable_digest
 
 
 _BLIND_SPOT_KEYS = frozenset({"kind", "structural", "occluder_ids"})
+_V5_ENVIRONMENT_BLIND_SPOT_KEYS = frozenset(
+    {"kind", "occluder_ids", "blind_region_digest"}
+)
 _STRUCTURAL_KEYS = frozenset(
     {"forward_fov_deg", "range_m", "blind_sectors"}
 )
 _EVENT_KINDS = frozenset({"environment", "structural", "mixed"})
+_FORMAL_SOP05_GENERATOR_VERSION = "blind_reachability_first_v1"
+
+
+@dataclass(frozen=True)
+class RenderedSop06Group:
+    """Rendered group with an explicit audit-certification boundary."""
+
+    pair_group_id: str
+    variant_kinds: tuple[str, ...]
+    observations: tuple[RenderedObservation, ...]
+    coverage_mask: tuple[bool, ...]
+    is_complete: bool
+    audit_certified: bool
 
 
 def _validate_joint_six_pack_versions(
     mother_world: OracleWorld,
     paired_world: OracleWorld,
 ) -> None:
+    paired_algorithm = paired_world.metadata.get(
+        "paired_generator_algorithm_version"
+    )
+    if paired_algorithm == PAIRED_GENERATOR_ALGORITHM_VERSION:
+        for label, world in (("mother", mother_world), ("paired", paired_world)):
+            if world.metadata.get("joint_pair_generator_algorithm_version") == (
+                JOINT_ENVIRONMENT_PAIR_VERSION
+            ):
+                raise ValueError(
+                    f"{label} uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}"
+                )
+        if paired_world.metadata.get("pair_group_contract_version") != (
+            PAIRED_GROUP_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "paired pair_group_contract_version must equal "
+                f"{PAIRED_GROUP_CONTRACT_VERSION}"
+            )
+        if mother_world.metadata.get("generator_algorithm_version") != (
+            _FORMAL_SOP05_GENERATOR_VERSION
+        ):
+            raise ValueError(
+                "formal SOP06 mother generator_algorithm_version must equal "
+                f"{_FORMAL_SOP05_GENERATOR_VERSION}"
+            )
+        return
     if mother_world.metadata.get("event_kind") != "environment":
         return
     for label, world in (
@@ -80,9 +126,12 @@ def _validate_joint_six_pack_versions(
 
 def _sensor_from_world(world: OracleWorld) -> StructuralBlindSpot | None:
     config = world.blind_spot_config
-    if not isinstance(config, Mapping) or set(config) != _BLIND_SPOT_KEYS:
+    if not isinstance(config, Mapping):
+        raise ValueError("world blind_spot_config must be a mapping")
+    is_v5_environment = set(config) == _V5_ENVIRONMENT_BLIND_SPOT_KEYS
+    if not is_v5_environment and set(config) != _BLIND_SPOT_KEYS:
         raise ValueError(
-            "world blind_spot_config keys must be kind/structural/occluder_ids"
+            "world blind_spot_config keys do not match a frozen layout"
         )
     kind = config["kind"]
     if kind not in _EVENT_KINDS:
@@ -113,6 +162,18 @@ def _sensor_from_world(world: OracleWorld) -> StructuralBlindSpot | None:
         raise ValueError(
             "world blind_spot_config occluder_ids mismatch world.occluders"
         )
+
+    if is_v5_environment:
+        digest = config["blind_region_digest"]
+        if kind != "environment":
+            raise ValueError(
+                "v5 blind-region layout is valid only for environment worlds"
+            )
+        if not isinstance(digest, str) or not digest:
+            raise ValueError("v5 blind_region_digest must be a non-empty string")
+        if not world_occluder_ids:
+            raise ValueError("environment world requires an occluder")
+        return None
 
     raw = config["structural"]
     if kind == "environment":
@@ -609,4 +670,235 @@ def render_sop06_variant(
         static_occupancy=world.static_occupancy,
         sensor_config=sensor_config,
         config=config,
+    )
+
+
+def _validate_formal_mother_world(world: OracleWorld) -> None:
+    if not isinstance(world, OracleWorld):
+        raise TypeError("mother_world must be an OracleWorld")
+    joint_version = world.metadata.get(
+        "joint_pair_generator_algorithm_version"
+    )
+    if joint_version is not None:
+        if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
+            raise ValueError(
+                f"mother uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}"
+            )
+        raise ValueError("mother contains unsupported joint-pair identity")
+    if world.metadata.get("generator_algorithm_version") != (
+        _FORMAL_SOP05_GENERATOR_VERSION
+    ):
+        raise ValueError(
+            "formal SOP06 mother generator_algorithm_version must equal "
+            f"{_FORMAL_SOP05_GENERATOR_VERSION}"
+        )
+
+
+def render_sop06_mother_event(
+    *,
+    record: EventTargetMotionRecord,
+    world: OracleWorld,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    config: Mapping[str, Any],
+) -> RenderedObservation:
+    """Render one formal v5 collision mother through the history-only path."""
+
+    _validate_formal_mother_world(world)
+    return render_sop06_variant(
+        record=record,
+        world=world,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        config=config,
+    )
+
+
+def _validate_formal_pair_group(
+    group: PairedEventGroup,
+    *,
+    mother_world: OracleWorld,
+    expected_paired_config_digest: str,
+) -> None:
+    if not isinstance(group, PairedEventGroup):
+        raise TypeError("group must be a PairedEventGroup")
+    _validate_formal_mother_world(mother_world)
+    if group.paired_config_digest != expected_paired_config_digest:
+        raise ValueError(
+            "group paired_config_digest does not match expected trusted digest"
+        )
+    if not isinstance(group.pair_group_id, str) or not group.pair_group_id:
+        raise ValueError("formal SOP06 pair_group_id must be non-empty")
+    by_kind = group.by_kind
+    if len(by_kind) != len(group.variants):
+        raise ValueError("formal SOP06 group contains duplicate variant kinds")
+    expected_coverage = tuple(kind in by_kind for kind in VARIANT_ORDER)
+    if group.coverage_mask != expected_coverage:
+        raise ValueError("formal SOP06 group coverage mask mismatch")
+    if "collision" not in by_kind:
+        raise ValueError("formal SOP06 group requires collision mother position")
+    absent = set(VARIANT_ORDER) - set(by_kind)
+    if set(group.missing_variant_reasons) != absent:
+        raise ValueError("formal SOP06 group missing reasons mismatch coverage")
+    if any(
+        not isinstance(reason, str) or not reason
+        for reason in group.missing_variant_reasons.values()
+    ):
+        raise ValueError(
+            "formal SOP06 missing reasons must be non-empty strings"
+        )
+    if group.is_complete != all(expected_coverage):
+        raise ValueError("formal SOP06 group completeness mismatch coverage")
+    if group.eligible_for_strict_evaluation != group.is_complete:
+        raise ValueError(
+            "formal SOP06 strict eligibility must equal completeness"
+        )
+    expected_kinds = tuple(kind for kind in VARIANT_ORDER if kind in by_kind)
+    observed_kinds = tuple(variant.variant_kind for variant in group.variants)
+    if observed_kinds != expected_kinds:
+        raise ValueError("formal SOP06 variants must follow frozen coverage order")
+    expected_coverage_by_kind = {
+        kind: expected_coverage[index]
+        for index, kind in enumerate(VARIANT_ORDER)
+    }
+    for variant in group.variants:
+        metadata = variant.world.metadata
+        if metadata.get("pair_group_id") != group.pair_group_id:
+            raise ValueError("formal SOP06 variant pair_group_id mismatch")
+        if metadata.get("paired_config_digest") != group.paired_config_digest:
+            raise ValueError("formal SOP06 variant paired_config_digest mismatch")
+        if metadata.get("paired_generator_algorithm_version") != (
+            PAIRED_GENERATOR_ALGORITHM_VERSION
+        ):
+            raise ValueError(
+                "formal SOP06 paired_generator_algorithm_version must equal "
+                f"{PAIRED_GENERATOR_ALGORITHM_VERSION}"
+            )
+        if metadata.get("pair_group_contract_version") != (
+            PAIRED_GROUP_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "formal SOP06 pair_group_contract_version must equal "
+                f"{PAIRED_GROUP_CONTRACT_VERSION}"
+            )
+        if metadata.get("paired_coverage_mask") != list(expected_coverage):
+            raise ValueError("formal SOP06 paired_coverage_mask mismatch")
+        if metadata.get("paired_coverage") != expected_coverage_by_kind:
+            raise ValueError("formal SOP06 paired_coverage mismatch")
+        if metadata.get("paired_missing_variant_reasons") != dict(
+            group.missing_variant_reasons
+        ):
+            raise ValueError(
+                "formal SOP06 paired_missing_variant_reasons mismatch"
+            )
+        if metadata.get("paired_group_complete") is not group.is_complete:
+            raise ValueError("formal SOP06 paired_group_complete mismatch")
+        if metadata.get("eligible_for_strict_paired_evaluation") is not (
+            group.eligible_for_strict_evaluation
+        ):
+            raise ValueError(
+                "formal SOP06 strict-evaluation metadata mismatch"
+            )
+        joint_version = metadata.get("joint_pair_generator_algorithm_version")
+        if joint_version is not None:
+            if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
+                raise ValueError(
+                    f"paired variant uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}"
+                )
+            raise ValueError("paired variant contains unsupported joint-pair identity")
+
+
+def _render_formal_pair_group(
+    *,
+    group: PairedEventGroup,
+    mother_record: EventTargetMotionRecord,
+    mother_world: OracleWorld,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    config: Mapping[str, Any],
+    expected_paired_config_digest: str,
+    audit_certified: bool,
+) -> RenderedSop06Group:
+    _validate_formal_pair_group(
+        group,
+        mother_world=mother_world,
+        expected_paired_config_digest=expected_paired_config_digest,
+    )
+    observations = tuple(
+        render_sop06_paired_variant(
+            mother_record=mother_record,
+            mother_world=mother_world,
+            variant=variant,
+            base_state=base_state,
+            oracle_context=oracle_context,
+            config=config,
+            expected_paired_config_digest=expected_paired_config_digest,
+        )
+        for variant in group.variants
+    )
+    return RenderedSop06Group(
+        pair_group_id=group.pair_group_id,
+        variant_kinds=tuple(variant.variant_kind for variant in group.variants),
+        observations=observations,
+        coverage_mask=group.coverage_mask,
+        is_complete=group.is_complete,
+        audit_certified=audit_certified,
+    )
+
+
+def render_sop06_partial_pair_group(
+    *,
+    group: PairedEventGroup,
+    mother_record: EventTargetMotionRecord,
+    mother_world: OracleWorld,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    config: Mapping[str, Any],
+    expected_paired_config_digest: str,
+) -> RenderedSop06Group:
+    """Render training variants without ever certifying sixpack completeness."""
+
+    return _render_formal_pair_group(
+        group=group,
+        mother_record=mother_record,
+        mother_world=mother_world,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        config=config,
+        expected_paired_config_digest=expected_paired_config_digest,
+        audit_certified=False,
+    )
+
+
+def render_sop06_complete_audit_group(
+    *,
+    group: PairedEventGroup,
+    mother_record: EventTargetMotionRecord,
+    mother_world: OracleWorld,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    config: Mapping[str, Any],
+    expected_paired_config_digest: str,
+) -> RenderedSop06Group:
+    """Render a conditional complete sixpack for audit/ablation only."""
+
+    if not isinstance(group, PairedEventGroup):
+        raise TypeError("group must be a PairedEventGroup")
+    if (
+        not group.is_complete
+        or group.coverage_mask != (True,) * len(VARIANT_ORDER)
+        or not group.eligible_for_strict_evaluation
+    ):
+        raise ValueError(
+            "complete audit requires a complete six-position paired group"
+        )
+    return _render_formal_pair_group(
+        group=group,
+        mother_record=mother_record,
+        mother_world=mother_world,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        config=config,
+        expected_paired_config_digest=expected_paired_config_digest,
+        audit_certified=True,
     )

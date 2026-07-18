@@ -9,6 +9,7 @@ import pytest
 
 import src.generation.paired_variants as paired_variants_module
 from src.contracts import (
+    SCHEMA_VERSION,
     HISTORY_CHANNELS,
     BaseState,
     OracleContext,
@@ -25,7 +26,7 @@ from src.generation.dynamic_object_transplant import (
     TransplantedDynamicObject,
     footprint_from_spec,
 )
-from src.generation.paired_variants import PairedVariant
+from src.generation.paired_variants import PairedEventGroup, PairedVariant
 from src.generation.sop06_pipeline import render_sop06_variant
 from src.generation.structural_blindspot import (
     StructuralBlindSpot,
@@ -51,7 +52,7 @@ PAIRED_CONFIG_DIGEST = "b" * 32
 
 def _config() -> dict[str, object]:
     return {
-        "schema_version": "2.0.0",
+        "schema_version": SCHEMA_VERSION,
         "bev": {
             "range_m": 9.0,
             "resolution_m": 1.0,
@@ -179,7 +180,7 @@ def _inputs(
     )
     world_metadata = {
         **build_event_target_motion_world_metadata(record),
-        "schema_version": "2.0.0",
+        "schema_version": SCHEMA_VERSION,
         "event_kind": event_kind,
         "joint_pair_generator_algorithm_version": (
             "joint_environment_pair_v2"
@@ -525,7 +526,7 @@ def _paired_variant(
         random_seed=paired_seed,
         metadata={
             **mother_metadata,
-            "schema_version": "2.0.0",
+            "schema_version": SCHEMA_VERSION,
             "world_id": world_id,
             "mother_generated_event_id": record.generated_event_id,
             "mother_world_id": mother_world.world_id,
@@ -614,6 +615,408 @@ def test_pipeline_accepts_real_paired_variant_and_empty_without_boolean_switch(
     assert present.bev_history.flags.owndata
     assert empty.bev_history.flags.owndata
     assert not np.shares_memory(present.bev_history, empty.bev_history)
+
+
+def _formal_partial_group_fixture() -> tuple[dict[str, object], PairedEventGroup]:
+    inputs = _inputs()
+    mother_metadata = dict(inputs["world"].metadata)
+    mother_metadata.pop("joint_pair_generator_algorithm_version", None)
+    mother_metadata["generator_algorithm_version"] = (
+        "blind_reachability_first_v1"
+    )
+    inputs["world"] = replace(inputs["world"], metadata=mother_metadata)
+    variant = _paired_variant(inputs, empty=False)
+    coverage_mask = (True, False, False, False, False, False)
+    missing_reasons = {
+        kind: "not_generated"
+        for kind in paired_variants_module.VARIANT_ORDER
+        if kind != "collision"
+    }
+    coverage = {
+        kind: coverage_mask[index]
+        for index, kind in enumerate(paired_variants_module.VARIANT_ORDER)
+    }
+    variant_metadata = {
+        **variant.world.metadata,
+        "paired_generator_algorithm_version": (
+            "independent_partial_pairs_v1"
+        ),
+        "pair_group_contract_version": "sop06_partial_pair_group_v1",
+        "paired_coverage_mask": list(coverage_mask),
+        "paired_coverage": coverage,
+        "paired_missing_variant_reasons": missing_reasons,
+        "paired_group_complete": False,
+        "eligible_for_strict_paired_evaluation": False,
+    }
+    variant_metadata.pop("joint_pair_generator_algorithm_version", None)
+    variant = replace(
+        variant,
+        world=replace(variant.world, metadata=variant_metadata),
+    )
+    group = PairedEventGroup(
+        pair_group_id=variant.world.metadata["pair_group_id"],
+        variants=(variant,),
+        coverage_mask=coverage_mask,
+        missing_variant_reasons=missing_reasons,
+        is_complete=False,
+        eligible_for_strict_evaluation=False,
+        paired_config_digest=PAIRED_CONFIG_DIGEST,
+    )
+    return inputs, group
+
+
+def test_formal_partial_consumer_accepts_singleton_without_claiming_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+    sentinel = object()
+    monkeypatch.setattr(
+        pipeline,
+        "render_sop06_paired_variant",
+        lambda **_: sentinel,
+    )
+
+    rendered = pipeline.render_sop06_partial_pair_group(
+        group=group,
+        mother_record=inputs["record"],
+        mother_world=inputs["world"],
+        base_state=inputs["base_state"],
+        oracle_context=inputs["oracle_context"],
+        config=inputs["config"],
+        expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+    )
+
+    assert rendered.pair_group_id == group.pair_group_id
+    assert rendered.variant_kinds == ("collision",)
+    assert rendered.observations == (sentinel,)
+    assert rendered.is_complete is False
+    assert rendered.audit_certified is False
+
+
+def test_formal_partial_consumer_preserves_sparse_coverage_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, singleton = _formal_partial_group_fixture()
+    kinds = ("collision", "spatial_safe", "empty_blind_spot")
+    coverage_mask = tuple(
+        kind in kinds for kind in paired_variants_module.VARIANT_ORDER
+    )
+    missing_reasons = {
+        kind: "not_generated"
+        for kind in paired_variants_module.VARIANT_ORDER
+        if kind not in kinds
+    }
+    coverage = {
+        kind: coverage_mask[index]
+        for index, kind in enumerate(paired_variants_module.VARIANT_ORDER)
+    }
+    collision = singleton.variants[0]
+    variants = tuple(
+        replace(
+            collision,
+            variant_kind=kind,
+            world=replace(
+                collision.world,
+                metadata={
+                    **collision.world.metadata,
+                    "paired_variant_kind": kind,
+                    "paired_coverage_mask": list(coverage_mask),
+                    "paired_coverage": coverage,
+                    "paired_missing_variant_reasons": missing_reasons,
+                },
+            ),
+        )
+        for kind in kinds
+    )
+    group = replace(
+        singleton,
+        variants=variants,
+        coverage_mask=coverage_mask,
+        missing_variant_reasons=missing_reasons,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "render_sop06_paired_variant",
+        lambda **kwargs: kwargs["variant"].variant_kind,
+    )
+
+    rendered = pipeline.render_sop06_partial_pair_group(
+        group=group,
+        mother_record=inputs["record"],
+        mother_world=inputs["world"],
+        base_state=inputs["base_state"],
+        oracle_context=inputs["oracle_context"],
+        config=inputs["config"],
+        expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+    )
+
+    assert rendered.variant_kinds == kinds
+    assert rendered.observations == kinds
+    assert rendered.coverage_mask == coverage_mask
+    assert rendered.is_complete is False
+    assert rendered.audit_certified is False
+
+
+def test_formal_mother_consumer_has_separate_v5_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, _ = _formal_partial_group_fixture()
+    sentinel = object()
+    monkeypatch.setattr(pipeline, "render_sop06_variant", lambda **_: sentinel)
+
+    assert pipeline.render_sop06_mother_event(
+        record=inputs["record"],
+        world=inputs["world"],
+        base_state=inputs["base_state"],
+        oracle_context=inputs["oracle_context"],
+        config=inputs["config"],
+    ) is sentinel
+
+    old_world = replace(
+        inputs["world"],
+        metadata={
+            **inputs["world"].metadata,
+            "joint_pair_generator_algorithm_version": (
+                "joint_environment_pair_v2"
+            ),
+        },
+    )
+    with pytest.raises(ValueError, match="retired joint_environment_pair_v2"):
+        pipeline.render_sop06_mother_event(
+            record=inputs["record"],
+            world=old_world,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+        )
+
+
+def test_formal_mother_consumer_executes_real_history_only_renderer() -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, _ = _formal_partial_group_fixture()
+    rendered = pipeline.render_sop06_mother_event(
+        record=inputs["record"],
+        world=inputs["world"],
+        base_state=inputs["base_state"],
+        oracle_context=inputs["oracle_context"],
+        config=inputs["config"],
+    )
+
+    assert rendered.bev_history.shape[0] == inputs["config"]["bev"][
+        "history_steps"
+    ]
+    assert rendered.bev_history.dtype == np.float32
+    assert rendered.state_channels.dtype == np.float32
+    assert np.isfinite(rendered.bev_history).all()
+    assert np.isfinite(rendered.state_channels).all()
+
+
+def test_complete_audit_consumer_rejects_partial_before_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+
+    def forbidden(**_: object) -> object:
+        raise AssertionError("renderer must not run for partial audit input")
+
+    monkeypatch.setattr(pipeline, "render_sop06_paired_variant", forbidden)
+    with pytest.raises(ValueError, match="complete six-position"):
+        pipeline.render_sop06_complete_audit_group(
+            group=group,
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
+def test_complete_audit_rejects_forged_complete_flags_on_sparse_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, partial = _formal_partial_group_fixture()
+    forged = replace(
+        partial,
+        is_complete=True,
+        eligible_for_strict_evaluation=True,
+    )
+
+    def forbidden(**_: object) -> object:
+        raise AssertionError("renderer must not run for forged audit input")
+
+    monkeypatch.setattr(pipeline, "render_sop06_paired_variant", forbidden)
+    with pytest.raises(ValueError, match="complete six-position"):
+        pipeline.render_sop06_complete_audit_group(
+            group=forged,
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
+def test_formal_partial_consumer_rejects_empty_missing_reason_before_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+    bad_reasons = dict(group.missing_variant_reasons)
+    bad_reasons["near_miss"] = ""
+    tampered = replace(group, missing_variant_reasons=bad_reasons)
+    monkeypatch.setattr(
+        pipeline,
+        "render_sop06_paired_variant",
+        lambda **_: object(),
+    )
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        pipeline.render_sop06_partial_pair_group(
+            group=tampered,
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
+def test_formal_partial_consumer_rejects_tampered_group_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+    collision = group.variants[0]
+    metadata = {
+        **collision.world.metadata,
+        "paired_coverage_mask": [True] * 6,
+    }
+    tampered = replace(
+        group,
+        variants=(
+            replace(
+                collision,
+                world=replace(collision.world, metadata=metadata),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "render_sop06_paired_variant",
+        lambda **_: object(),
+    )
+
+    with pytest.raises(ValueError, match="paired_coverage_mask mismatch"):
+        pipeline.render_sop06_partial_pair_group(
+            group=tampered,
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
+def test_complete_audit_consumer_certifies_only_all_six_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, partial = _formal_partial_group_fixture()
+    collision = partial.variants[0]
+    variants = tuple(
+        replace(
+            collision,
+            variant_kind=kind,
+            world=replace(
+                collision.world,
+                metadata={
+                    **collision.world.metadata,
+                    "paired_variant_kind": kind,
+                    "paired_coverage_mask": [True] * 6,
+                    "paired_coverage": {
+                        variant_kind: True
+                        for variant_kind in paired_variants_module.VARIANT_ORDER
+                    },
+                    "paired_missing_variant_reasons": {},
+                    "paired_group_complete": True,
+                    "eligible_for_strict_paired_evaluation": True,
+                },
+            ),
+        )
+        for kind in paired_variants_module.VARIANT_ORDER
+    )
+    complete = replace(
+        partial,
+        variants=variants,
+        coverage_mask=(True, True, True, True, True, True),
+        missing_variant_reasons={},
+        is_complete=True,
+        eligible_for_strict_evaluation=True,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "render_sop06_paired_variant",
+        lambda **kwargs: kwargs["variant"].variant_kind,
+    )
+
+    rendered = pipeline.render_sop06_complete_audit_group(
+        group=complete,
+        mother_record=inputs["record"],
+        mother_world=inputs["world"],
+        base_state=inputs["base_state"],
+        oracle_context=inputs["oracle_context"],
+        config=inputs["config"],
+        expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+    )
+
+    assert rendered.variant_kinds == paired_variants_module.VARIANT_ORDER
+    assert rendered.observations == paired_variants_module.VARIANT_ORDER
+    assert rendered.is_complete is True
+    assert rendered.audit_certified is True
+
+
+def test_formal_partial_consumer_rejects_retired_joint_pair_version() -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+    old_metadata = {
+        **group.variants[0].world.metadata,
+        "joint_pair_generator_algorithm_version": "joint_environment_pair_v2",
+    }
+    old_variant = replace(
+        group.variants[0],
+        world=replace(group.variants[0].world, metadata=old_metadata),
+    )
+    old_group = replace(group, variants=(old_variant,))
+
+    with pytest.raises(ValueError, match="retired joint_environment_pair_v2"):
+        pipeline.render_sop06_partial_pair_group(
+            group=old_group,
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
 
 
 def _retag_joint_pair_versions(

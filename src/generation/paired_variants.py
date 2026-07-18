@@ -79,8 +79,11 @@ VARIANT_ORDER = (
     "empty_blind_spot",
 )
 _TEMPORAL_OFFSETS = (0.8, -0.8, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5)
-_REQUIRED_VARIANTS = ("collision", "empty_blind_spot")
-_CONTRAST_VARIANTS = ("near_miss", "temporal_safe", "spatial_safe")
+_MOTHER_REQUIRED_VARIANTS = ("collision",)
+PAIRED_GENERATOR_ALGORITHM_VERSION = "independent_partial_pairs_v1"
+PAIRED_GROUP_CONTRACT_VERSION = "sop06_partial_pair_group_v1"
+# Historical identity retained only by the explicitly named legacy joint
+# search function.  Formal v5 producers/consumers use the two constants above.
 JOINT_ENVIRONMENT_PAIR_VERSION = "joint_environment_pair_v2"
 _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE = 16
 _SOP05_JOIN_METADATA_KEYS = frozenset(
@@ -122,21 +125,26 @@ class _CandidateRejected(Exception):
 @dataclass(frozen=True)
 class PairedVariantConfig:
     schema_version: str
+    paired_generator_algorithm_version: str
+    group_contract_version: str
     near_miss_clearance_range_m: tuple[float, float]
     temporal_offset_candidates_s: tuple[float, ...]
     spatial_safe_clearance_range_m: tuple[float, float]
     irrelevant_min_clearance_m: float
     lateral_offset_step_m: float
     lateral_offset_max_m: float
-    minimum_required_variants: tuple[str, ...]
-    minimum_contrast_variants: tuple[str, ...]
-    minimum_contrast_count: int
-    complete_evaluation_requires_all_variants: bool
+    mother_required_variants: tuple[str, ...]
+    training_minimum_contrast_count: int
+    audit_requires_all_variants: bool
     digest: str
 
     def as_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
+            "paired_generator_algorithm_version": (
+                self.paired_generator_algorithm_version
+            ),
+            "group_contract_version": self.group_contract_version,
             "near_miss_clearance_range_m": list(
                 self.near_miss_clearance_range_m
             ),
@@ -149,12 +157,11 @@ class PairedVariantConfig:
             "irrelevant_min_clearance_m": self.irrelevant_min_clearance_m,
             "lateral_offset_step_m": self.lateral_offset_step_m,
             "lateral_offset_max_m": self.lateral_offset_max_m,
-            "minimum_required_variants": list(self.minimum_required_variants),
-            "minimum_contrast_variants": list(self.minimum_contrast_variants),
-            "minimum_contrast_count": self.minimum_contrast_count,
-            "complete_evaluation_requires_all_variants": (
-                self.complete_evaluation_requires_all_variants
+            "mother_required_variants": list(self.mother_required_variants),
+            "training_minimum_contrast_count": (
+                self.training_minimum_contrast_count
             ),
+            "audit_requires_all_variants": self.audit_requires_all_variants,
         }
 
 
@@ -254,16 +261,17 @@ def normalize_paired_variant_config(
         raise PairedVariantConfigError("paired config must be a mapping")
     expected = {
         "schema_version",
+        "paired_generator_algorithm_version",
+        "group_contract_version",
         "near_miss_clearance_range_m",
         "temporal_offset_candidates_s",
         "spatial_safe_clearance_range_m",
         "irrelevant_min_clearance_m",
         "lateral_offset_step_m",
         "lateral_offset_max_m",
-        "minimum_required_variants",
-        "minimum_contrast_variants",
-        "minimum_contrast_count",
-        "complete_evaluation_requires_all_variants",
+        "mother_required_variants",
+        "training_minimum_contrast_count",
+        "audit_requires_all_variants",
     }
     if set(config) != expected:
         unknown = sorted(set(config) - expected)
@@ -274,6 +282,19 @@ def normalize_paired_variant_config(
     if config["schema_version"] != SCHEMA_VERSION:
         raise PairedVariantConfigError(
             f"schema_version must be {SCHEMA_VERSION}"
+        )
+    if (
+        config["paired_generator_algorithm_version"]
+        != PAIRED_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise PairedVariantConfigError(
+            "paired_generator_algorithm_version must equal "
+            f"{PAIRED_GENERATOR_ALGORITHM_VERSION}"
+        )
+    if config["group_contract_version"] != PAIRED_GROUP_CONTRACT_VERSION:
+        raise PairedVariantConfigError(
+            "group_contract_version must equal "
+            f"{PAIRED_GROUP_CONTRACT_VERSION}"
         )
     near_miss = _range_pair(
         config["near_miss_clearance_range_m"],
@@ -313,43 +334,43 @@ def normalize_paired_variant_config(
         raise PairedVariantConfigError(
             "lateral offset step/maximum do not cover the irrelevant threshold"
         )
-    required = tuple(config["minimum_required_variants"])
-    contrasts = tuple(config["minimum_contrast_variants"])
-    if required != _REQUIRED_VARIANTS:
+    required = tuple(config["mother_required_variants"])
+    if required != _MOTHER_REQUIRED_VARIANTS:
         raise PairedVariantConfigError(
-            "minimum_required_variants must match the frozen SOP-06 policy"
+            "mother_required_variants must equal [collision]"
         )
-    if contrasts != _CONTRAST_VARIANTS:
-        raise PairedVariantConfigError(
-            "minimum_contrast_variants must match the frozen SOP-06 policy"
-        )
-    count = config["minimum_contrast_count"]
+    count = config["training_minimum_contrast_count"]
     if isinstance(count, (bool, np.bool_)) or not isinstance(
         count, (int, np.integer)
     ):
-        raise PairedVariantConfigError("minimum_contrast_count must be an integer")
-    count = int(count)
-    if not 1 <= count <= len(contrasts):
         raise PairedVariantConfigError(
-            "minimum_contrast_count must lie within the contrast variant count"
+            "training_minimum_contrast_count must be an integer"
         )
-    complete = config["complete_evaluation_requires_all_variants"]
+    count = int(count)
+    if count != 0:
+        raise PairedVariantConfigError(
+            "training_minimum_contrast_count must equal zero"
+        )
+    complete = config["audit_requires_all_variants"]
     if not isinstance(complete, (bool, np.bool_)) or not bool(complete):
         raise PairedVariantConfigError(
-            "complete_evaluation_requires_all_variants must be true"
+            "audit_requires_all_variants must be true"
         )
     normalized_payload = {
         "schema_version": SCHEMA_VERSION,
+        "paired_generator_algorithm_version": (
+            PAIRED_GENERATOR_ALGORITHM_VERSION
+        ),
+        "group_contract_version": PAIRED_GROUP_CONTRACT_VERSION,
         "near_miss_clearance_range_m": list(near_miss),
         "temporal_offset_candidates_s": list(temporal),
         "spatial_safe_clearance_range_m": list(spatial_safe),
         "irrelevant_min_clearance_m": irrelevant,
         "lateral_offset_step_m": step,
         "lateral_offset_max_m": maximum,
-        "minimum_required_variants": list(required),
-        "minimum_contrast_variants": list(contrasts),
-        "minimum_contrast_count": count,
-        "complete_evaluation_requires_all_variants": True,
+        "mother_required_variants": list(required),
+        "training_minimum_contrast_count": count,
+        "audit_requires_all_variants": True,
     }
     payload = json.dumps(
         normalized_payload,
@@ -359,16 +380,19 @@ def normalize_paired_variant_config(
     )
     return PairedVariantConfig(
         schema_version=SCHEMA_VERSION,
+        paired_generator_algorithm_version=(
+            PAIRED_GENERATOR_ALGORITHM_VERSION
+        ),
+        group_contract_version=PAIRED_GROUP_CONTRACT_VERSION,
         near_miss_clearance_range_m=near_miss,
         temporal_offset_candidates_s=temporal,
         spatial_safe_clearance_range_m=spatial_safe,
         irrelevant_min_clearance_m=irrelevant,
         lateral_offset_step_m=step,
         lateral_offset_max_m=maximum,
-        minimum_required_variants=required,
-        minimum_contrast_variants=contrasts,
-        minimum_contrast_count=count,
-        complete_evaluation_requires_all_variants=True,
+        mother_required_variants=required,
+        training_minimum_contrast_count=count,
+        audit_requires_all_variants=True,
         digest=stable_digest(payload, size=16),
     )
 
@@ -930,6 +954,10 @@ def _variant_world(
     metadata = {
         **mother_metadata,
         "schema_version": SCHEMA_VERSION,
+        "paired_generator_algorithm_version": (
+            paired_config.paired_generator_algorithm_version
+        ),
+        "pair_group_contract_version": paired_config.group_contract_version,
         "world_id": world_id,
         "mother_generated_event_id": mother_event.generated_event_id,
         "mother_world_id": mother_event.world.world_id,
@@ -1328,12 +1356,14 @@ def _temporal_variant(
     provenance = mother_event.target.provenance
     required = {
         "conflict_point",
-        "crossing_direction",
         "time_scale",
         "target_type_policy_digest",
         "seed",
     }
-    if not required <= set(provenance):
+    crossing_direction = provenance.get(
+        "desired_crossing_direction", provenance.get("crossing_direction")
+    )
+    if not required <= set(provenance) or crossing_direction is None:
         return None, "mother_target_provenance_incomplete"
     horizon_s = environment.grid.future_steps * environment.future_dt_s
     last_reason = "temporal_offset_unavailable"
@@ -1349,7 +1379,7 @@ def _temporal_variant(
                 source_snippet,
                 conflict_point=provenance["conflict_point"],
                 conflict_time_s=conflict_time,
-                crossing_direction=provenance["crossing_direction"],
+                crossing_direction=crossing_direction,
                 time_scale=provenance["time_scale"],
                 future_dt_s=environment.future_dt_s,
                 future_steps=environment.grid.future_steps,
@@ -1442,6 +1472,10 @@ def _stamp_group_metadata(
     for variant in group.variants:
         metadata = {
             **variant.world.metadata,
+            "paired_generator_algorithm_version": (
+                PAIRED_GENERATOR_ALGORITHM_VERSION
+            ),
+            "pair_group_contract_version": PAIRED_GROUP_CONTRACT_VERSION,
             "paired_coverage_mask": list(group.coverage_mask),
             "paired_coverage": coverage,
             "paired_missing_variant_reasons": dict(
@@ -1486,19 +1520,11 @@ def assemble_paired_event_group(
         not isinstance(reason, str) or not reason for reason in reasons.values()
     ):
         raise PairGenerationError("missing_variant_reasons_incomplete")
-    missing_required = set(normalized.minimum_required_variants) - set(variants)
+    missing_required = set(normalized.mother_required_variants) - set(variants)
     if missing_required:
         raise PairGenerationError(
-            "minimum_required_variants_missing",
-            f"minimum required variants missing: {sorted(missing_required)}",
-        )
-    contrast_count = sum(
-        kind in variants for kind in normalized.minimum_contrast_variants
-    )
-    if contrast_count < normalized.minimum_contrast_count:
-        raise PairGenerationError(
-            "minimum_contrast_missing",
-            "minimum contrast coverage is not satisfied",
+            "mother_required_variants_missing",
+            f"mother required variants missing: {sorted(missing_required)}",
         )
     coverage = tuple(kind in variants for kind in VARIANT_ORDER)
     complete = all(coverage)
@@ -1511,7 +1537,7 @@ def assemble_paired_event_group(
         },
         is_complete=complete,
         eligible_for_strict_evaluation=(
-            complete and normalized.complete_evaluation_requires_all_variants
+            complete and normalized.audit_requires_all_variants
         ),
         paired_config_digest=normalized.digest,
     )
@@ -1543,6 +1569,19 @@ def generate_paired_variants(
         seed, (int, np.integer)
     ):
         raise TypeError("seed must be an integer")
+    joint_version = mother_event.world.metadata.get(
+        "joint_pair_generator_algorithm_version"
+    )
+    if joint_version is not None:
+        if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
+            raise PairGenerationError(
+                "retired_joint_mother",
+                f"retired {JOINT_ENVIRONMENT_PAIR_VERSION} mother is invalid",
+            )
+        raise PairGenerationError(
+            "unsupported_joint_mother",
+            "mother contains unsupported joint-pair identity",
+        )
     normalized = _as_paired_config(paired_config)
     _validate_source_snippet(mother_event, source_snippet)
     environment = _pair_environment(
@@ -1762,12 +1801,14 @@ def _retimed_target_candidate(
     provenance = mother_event.target.provenance
     required = {
         "conflict_point",
-        "crossing_direction",
         "time_scale",
         "target_type_policy_digest",
         "seed",
     }
-    if not required <= set(provenance):
+    crossing_direction = provenance.get(
+        "desired_crossing_direction", provenance.get("crossing_direction")
+    )
+    if not required <= set(provenance) or crossing_direction is None:
         raise PairGenerationError("mother_target_provenance_incomplete")
     conflict_time = mother_event.conflict_time_s + offset_s
     horizon_s = environment.grid.future_steps * environment.future_dt_s
@@ -1778,7 +1819,7 @@ def _retimed_target_candidate(
             source_snippet,
             conflict_point=provenance["conflict_point"],
             conflict_time_s=conflict_time,
-            crossing_direction=provenance["crossing_direction"],
+            crossing_direction=crossing_direction,
             time_scale=provenance["time_scale"],
             future_dt_s=environment.future_dt_s,
             future_steps=environment.grid.future_steps,
@@ -2051,6 +2092,17 @@ def generate_joint_environment_pair(
     counted with explicit reasons and the bounded search continues.
     """
 
+    if (
+        isinstance(generator_config, Mapping)
+        and generator_config.get("production_event_kind") == "environment"
+        and isinstance(generator_config.get("blind_reachability"), Mapping)
+        and generator_config["blind_reachability"].get("algorithm_version")
+        == "blind_reachability_first_v1"
+    ):
+        raise PairGenerationError(
+            "joint_environment_pair_v2_retired",
+            "joint_environment_pair_v2 is retired for formal v5 input",
+        )
     if not isinstance(base_state, BaseState):
         raise TypeError("base_state must be a BaseState")
     if not isinstance(oracle_context, OracleContext):

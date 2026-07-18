@@ -205,7 +205,10 @@ def _decision(base: BaseState, grid: GridSpec):
 
 
 def test_public_builder_exposes_only_current_causal_inputs() -> None:
-    assert blind_region.BLIND_REGION_VERSION == "blind_region_v1"
+    assert (
+        blind_region.BLIND_REGION_VERSION
+        == "blind_region_causal_delta_v2"
+    )
     assert (
         blind_region.VISIBILITY_ALGORITHM_VERSION
         == "raycast_visibility_environment_v1"
@@ -245,7 +248,7 @@ def test_region_derives_causal_identity_from_the_verified_decision() -> None:
         replace(region, causal_context_digest="0" * 64)
 
 
-def test_builder_uses_one_formal_environment_raycast(
+def test_builder_uses_total_and_baseline_environment_raycasts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     grid = _grid()
@@ -281,12 +284,16 @@ def test_builder_uses_one_formal_environment_raycast(
     monkeypatch.setattr(blind_region, "raycast_visibility", capture)
     region = blind_region.build_blind_region(base, decision, grid=grid)
 
-    assert len(calls) == 1
-    occupancy, sensor_pose, fov_rad, max_range_m = calls[0]
-    assert np.array_equal(occupancy, region.total_current_occupancy)
-    assert np.array_equal(sensor_pose, base.robot_history[-1])
-    assert fov_rad == pytest.approx(2.0 * np.pi, rel=0.0, abs=0.0)
-    assert max_range_m is None
+    assert len(calls) == 2
+    baseline_occupancy = (
+        region.static_occupancy | region.current_context_occupancy
+    )
+    assert np.array_equal(calls[0][0], region.total_current_occupancy)
+    assert np.array_equal(calls[1][0], baseline_occupancy)
+    for _occupancy, sensor_pose, fov_rad, max_range_m in calls:
+        assert np.array_equal(sensor_pose, base.robot_history[-1])
+        assert fov_rad == pytest.approx(2.0 * np.pi, rel=0.0, abs=0.0)
+        assert max_range_m is None
 
 
 def test_builder_matches_renderer_kernel_and_mask_equations() -> None:
@@ -322,9 +329,94 @@ def test_builder_matches_renderer_kernel_and_mask_equations() -> None:
     assert np.array_equal(region.raw_unobservable_mask, ~region.visibility_mask)
     assert np.array_equal(
         region.blind_free_mask,
-        region.raw_unobservable_mask & ~region.total_current_occupancy,
+        decision.useful_shadow_mask,
     )
     assert not np.any(region.blind_free_mask & region.total_current_occupancy)
+
+
+def test_builder_excludes_blind_cells_that_preexist_the_causal_occluder() -> None:
+    grid = _grid()
+    static = np.zeros((grid.height, grid.width), dtype=np.float32)
+    static[:, 16] = 1.0
+    base = _base_state(grid, static=static)
+    decision = _decision(base, grid)
+
+    region = blind_region.build_blind_region(base, decision, grid=grid)
+    baseline_occupancy = (
+        region.static_occupancy | region.current_context_occupancy
+    )
+    baseline_visibility = raycast_visibility(
+        baseline_occupancy,
+        grid,
+        sensor_pose=base.robot_history[-1],
+        fov_rad=2.0 * np.pi,
+        max_range_m=None,
+    )
+    preexisting_blind_free = (
+        ~baseline_visibility
+        & ~baseline_occupancy
+        & ~decision.useful_shadow_mask
+    )
+
+    assert np.any(preexisting_blind_free)
+    assert np.any(preexisting_blind_free & region.raw_unobservable_mask)
+    assert np.array_equal(
+        region.blind_free_mask,
+        decision.useful_shadow_mask,
+    )
+    assert not np.any(region.blind_free_mask & preexisting_blind_free)
+    spec = _circle_spec(radius_m=0.1)
+    center_mask = blind_region.build_footprint_center_mask(
+        region,
+        footprint_spec=spec,
+        footprint_spec_digest=compute_footprint_spec_digest(spec),
+        yaw_bin_rad=0.0,
+    )
+    assert center_mask.valid_cell_count > 0
+    assert not np.any(center_mask.center_mask & preexisting_blind_free)
+
+
+def test_builder_rejects_shadow_tamper_that_claims_preexisting_blind_cell() -> None:
+    grid = _grid()
+    static = np.zeros((grid.height, grid.width), dtype=np.float32)
+    static[:, 16] = 1.0
+    base = _base_state(grid, static=static)
+    decision = _decision(base, grid)
+    candidate = decision.accepted
+    assert candidate is not None
+
+    baseline_occupancy = static.astype(np.bool_)
+    for object_id in base.dynamic_object_ids:
+        baseline_occupancy |= rasterize_footprint(
+            footprint_from_spec(base.visible_dynamic_object_specs[object_id]),
+            base.visible_dynamic_object_history[object_id][-1],
+            grid,
+        )
+    baseline_visibility = raycast_visibility(
+        baseline_occupancy,
+        grid,
+        sensor_pose=base.robot_history[-1],
+        fov_rad=2.0 * np.pi,
+        max_range_m=None,
+    )
+    preexisting_blind_free = (
+        ~baseline_visibility
+        & ~baseline_occupancy
+        & ~candidate.mask
+        & ~decision.useful_shadow_mask
+    )
+    assert np.any(preexisting_blind_free)
+    forged_shadow = np.array(decision.useful_shadow_mask, copy=True)
+    forged_row, forged_column = np.argwhere(preexisting_blind_free)[0]
+    forged_shadow[forged_row, forged_column] = True
+    forged_decision = replace(
+        decision,
+        useful_shadow_mask=forged_shadow,
+        useful_shadow_count=int(np.count_nonzero(forged_shadow)),
+    )
+
+    with pytest.raises(ValueError, match="causal useful shadow.*renderer delta"):
+        blind_region.build_blind_region(base, forged_decision, grid=grid)
 
 
 def test_builder_uses_only_last_visible_context_pose() -> None:
@@ -487,6 +579,48 @@ def test_region_arrays_are_bytes_backed_read_only_and_deterministic() -> None:
             values.flat[0] = values.flat[0]
 
 
+def test_causal_shadow_change_updates_region_and_center_mask_identities() -> None:
+    grid = _grid(size=25)
+    base = _base_state(grid, with_context=False)
+    decision = _decision(base, grid)
+    shadow = np.array(decision.useful_shadow_mask, copy=True)
+    removed_row, removed_column = np.argwhere(shadow)[0]
+    shadow[removed_row, removed_column] = False
+    narrowed_decision = replace(
+        decision,
+        useful_shadow_mask=shadow,
+        useful_shadow_count=int(np.count_nonzero(shadow)),
+    )
+
+    full = blind_region.build_blind_region(base, decision, grid=grid)
+    narrowed = blind_region.build_blind_region(
+        base,
+        narrowed_decision,
+        grid=grid,
+    )
+    spec = _circle_spec(radius_m=0.1)
+    digest = compute_footprint_spec_digest(spec)
+    full_centers = blind_region.build_footprint_center_mask(
+        full,
+        footprint_spec=spec,
+        footprint_spec_digest=digest,
+        yaw_bin_rad=0.0,
+    )
+    narrowed_centers = blind_region.build_footprint_center_mask(
+        narrowed,
+        footprint_spec=spec,
+        footprint_spec_digest=digest,
+        yaw_bin_rad=0.0,
+    )
+
+    assert full.visibility_digest == narrowed.visibility_digest
+    assert full.raw_unobservable_digest == narrowed.raw_unobservable_digest
+    assert full.blind_free_digest != narrowed.blind_free_digest
+    assert full.region_digest != narrowed.region_digest
+    assert full_centers.center_mask_digest != narrowed_centers.center_mask_digest
+    assert full_centers.identity_digest != narrowed_centers.identity_digest
+
+
 def test_none_static_map_is_treated_as_empty_renderer_occupancy() -> None:
     grid = _grid()
     base = replace(_base_state(grid, with_context=False), static_map_local=None)
@@ -554,13 +688,18 @@ def _brute_center_mask(
             footprint_mask = rasterize_footprint(footprint, pose, region.grid)
             result[row, column] = bool(
                 _inside(footprint, pose, region.grid)
-                and np.all(region.blind_free_mask[footprint_mask])
+                and np.all(
+                    region.causal_decision.useful_shadow_mask[footprint_mask]
+                )
             )
     return result
 
 
 def test_center_and_exact_versions_and_public_apis_are_frozen() -> None:
-    assert blind_region.CENTER_MASK_VERSION == "footprint_center_mask_v1"
+    assert (
+        blind_region.CENTER_MASK_VERSION
+        == "footprint_center_mask_causal_delta_v2"
+    )
     assert blind_region.EXACT_HIDDEN_POSE_VERSION == "exact_hidden_pose_v1"
     assert tuple(
         inspect.signature(blind_region.build_footprint_center_mask).parameters
@@ -599,11 +738,12 @@ def test_circle_center_mask_is_yaw_invariant_and_matches_brute_force() -> None:
     assert np.array_equal(zero.center_mask, rotated.center_mask)
     assert np.array_equal(zero.center_mask, brute)
     assert zero.valid_cell_count == int(np.count_nonzero(brute))
+    assert zero.valid_cell_count > 0
 
 
 def test_rectangle_center_masks_are_yaw_specific_and_match_brute_force() -> None:
-    _, region = _region(size=21)
-    spec = _rectangle_spec(length_m=1.5, width_m=0.5)
+    _, region = _region(size=25)
+    spec = _rectangle_spec(length_m=0.9, width_m=0.3)
     digest = compute_footprint_spec_digest(spec)
     zero = blind_region.build_footprint_center_mask(
         region,
@@ -626,6 +766,8 @@ def test_rectangle_center_masks_are_yaw_specific_and_match_brute_force() -> None
         quarter.center_mask,
         _brute_center_mask(region, footprint_spec=spec, yaw_rad=np.pi / 2.0),
     )
+    assert zero.valid_cell_count > 0
+    assert quarter.valid_cell_count > 0
     assert not np.array_equal(zero.center_mask, quarter.center_mask)
 
 
@@ -761,7 +903,7 @@ def test_exact_hidden_pose_reports_stable_rejection_reasons(
 
 def test_continuous_yaw_exact_check_overrides_yaw_bin_broad_phase() -> None:
     grid, region = _region(size=25)
-    spec = _rectangle_spec(length_m=1.8, width_m=0.3)
+    spec = _rectangle_spec(length_m=0.9, width_m=0.3)
     digest = compute_footprint_spec_digest(spec)
     broad = blind_region.build_footprint_center_mask(
         region,

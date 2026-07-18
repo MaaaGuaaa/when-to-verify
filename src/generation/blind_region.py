@@ -36,8 +36,8 @@ from src.generation.occluder_sampler import OccluderGeometryCandidate
 from src.generation.structural_blindspot import footprint_visibility_sequence
 
 
-BLIND_REGION_VERSION = "blind_region_v1"
-CENTER_MASK_VERSION = "footprint_center_mask_v1"
+BLIND_REGION_VERSION = "blind_region_causal_delta_v2"
+CENTER_MASK_VERSION = "footprint_center_mask_causal_delta_v2"
 EXACT_HIDDEN_POSE_VERSION = "exact_hidden_pose_v1"
 VISIBILITY_ALGORITHM_VERSION = "raycast_visibility_environment_v1"
 
@@ -362,11 +362,43 @@ class BlindRegion:
         if visibility.shape != total.shape:
             raise ValueError("raycast_visibility returned an invalid shape")
         raw_unobservable = np.asarray(~visibility, dtype=np.bool_, order="C")
-        blind_free = np.asarray(
-            raw_unobservable & ~total,
+        baseline_occupancy = np.asarray(
+            static | context,
             dtype=np.bool_,
             order="C",
         )
+        baseline_visibility = np.asarray(
+            raycast_visibility(
+                baseline_occupancy,
+                self.grid,
+                sensor_pose=sensor_pose,
+                fov_rad=_ENVIRONMENT_FOV_RAD,
+                max_range_m=_ENVIRONMENT_MAX_RANGE_M,
+            ),
+            dtype=np.bool_,
+            order="C",
+        )
+        if baseline_visibility.shape != total.shape:
+            raise ValueError("raycast_visibility returned an invalid shape")
+        renderer_delta = np.asarray(
+            baseline_visibility & raw_unobservable & ~total,
+            dtype=np.bool_,
+            order="C",
+        )
+        causal_shadow = _canonical_bool_grid(
+            self.causal_decision.useful_shadow_mask,
+            name="causal_occluder.useful_shadow_mask",
+            grid=self.grid,
+        )
+        if np.any(causal_shadow & total):
+            raise ValueError("causal useful shadow must contain only free cells")
+        if np.any(causal_shadow & visibility):
+            raise ValueError("causal useful shadow must be currently unobservable")
+        if np.any(causal_shadow & ~renderer_delta):
+            raise ValueError(
+                "causal useful shadow must be a subset of the renderer delta"
+            )
+        blind_free = causal_shadow
 
         arrays = {
             "sensor_pose": sensor_pose,

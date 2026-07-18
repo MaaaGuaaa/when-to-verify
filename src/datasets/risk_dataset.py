@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import math
@@ -19,6 +20,7 @@ from src.contracts import (
     BaseState,
     GridSpec,
     LocalTrajectory,
+    OracleContext,
     OracleWorld,
     RiskSample,
     assert_no_oracle_leakage,
@@ -26,21 +28,31 @@ from src.contracts import (
     validate_risk_sample,
 )
 from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_sampler import SOP05_GENERATOR_ALGORITHM_VERSION
+from src.generation.event_target_motion_shard import EventTargetMotionRecord
 from src.generation.observation_renderer import (
     RENDERER_LAYOUT_VERSION,
     render_observation,
+)
+from src.generation.paired_variants import (
+    JOINT_ENVIRONMENT_PAIR_VERSION,
+    PAIRED_GENERATOR_ALGORITHM_VERSION,
+    PAIRED_GROUP_CONTRACT_VERSION,
+    PairedVariant,
 )
 from src.generation.risk_gt import (
     RISK_GT_VERSION,
     compute_hidden_risk_gt,
     resolve_no_object_clearance_sentinel,
 )
+from src.generation.sop06_pipeline import render_sop06_paired_variant
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
     RectangleFootprint,
     inflate_footprint,
     rasterize_footprint,
 )
+from src.utils.seeding import stable_digest
 
 
 _RISK_CONFIG_KEYS = frozenset(
@@ -74,6 +86,7 @@ _FORBIDDEN_METADATA_KEY_TOKENS = (
     "dynamic_object_trajectories",
     "hidden_object_ids",
 )
+_RISK_INPUT_ADAPTER_VERSION = "sop06_variant_to_risk_input_v1"
 
 
 @dataclass(frozen=True)
@@ -92,6 +105,259 @@ class RiskBuildInput:
     hidden_object_ids: tuple[str, ...]
     sensor_config: StructuralBlindSpot | None
     provenance: Mapping[str, object]
+
+
+def _canonical_config_digest(config: Mapping[str, object]) -> str:
+    try:
+        payload = json.dumps(
+            dict(config),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("base_config must be finite canonical JSON") from exc
+    return stable_digest(payload, size=16)
+
+
+def _validate_formal_sop06_variant_identity(
+    mother_world: OracleWorld,
+    variant: PairedVariant,
+) -> None:
+    if not isinstance(mother_world.metadata, Mapping):
+        raise ValueError("mother_world metadata must be a mapping")
+    if not isinstance(variant.world.metadata, Mapping):
+        raise ValueError("paired world metadata must be a mapping")
+    for label, metadata in (
+        ("mother", mother_world.metadata),
+        ("paired variant", variant.world.metadata),
+    ):
+        joint_version = metadata.get("joint_pair_generator_algorithm_version")
+        if joint_version is not None:
+            if joint_version == JOINT_ENVIRONMENT_PAIR_VERSION:
+                raise ValueError(
+                    f"{label} uses retired {JOINT_ENVIRONMENT_PAIR_VERSION}"
+                )
+            raise ValueError(f"{label} contains unsupported joint identity")
+    if mother_world.metadata.get("generator_algorithm_version") != (
+        SOP05_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError(
+            "mother generator_algorithm_version must equal "
+            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
+        )
+    metadata = variant.world.metadata
+    if metadata.get("paired_generator_algorithm_version") != (
+        PAIRED_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError(
+            "paired_generator_algorithm_version must equal "
+            f"{PAIRED_GENERATOR_ALGORITHM_VERSION}"
+        )
+    if metadata.get("pair_group_contract_version") != (
+        PAIRED_GROUP_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "pair_group_contract_version must equal "
+            f"{PAIRED_GROUP_CONTRACT_VERSION}"
+        )
+
+
+def _copy_sop06_scene_history(
+    *,
+    base_state: BaseState,
+    oracle_context: OracleContext,
+    variant: PairedVariant,
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, object]]]:
+    histories: dict[str, np.ndarray] = {}
+    specs: dict[str, dict[str, object]] = {}
+    for object_id in sorted(base_state.dynamic_object_ids):
+        histories[object_id] = np.array(
+            base_state.visible_dynamic_object_history[object_id],
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        specs[object_id] = deepcopy(
+            base_state.visible_dynamic_object_specs[object_id]
+        )
+    for object_id in sorted(oracle_context.dynamic_object_history):
+        history = oracle_context.dynamic_object_history[object_id]
+        spec = oracle_context.dynamic_object_specs[object_id]
+        if object_id in histories:
+            if not np.array_equal(histories[object_id], history):
+                raise ValueError(
+                    "overlapping BaseState/OracleContext history mismatch"
+                )
+            if specs[object_id] != spec:
+                raise ValueError(
+                    "overlapping BaseState/OracleContext spec mismatch"
+                )
+            continue
+        histories[object_id] = np.array(
+            history, dtype=np.float32, order="C", copy=True
+        )
+        specs[object_id] = deepcopy(spec)
+    if variant.target is not None:
+        target_id = variant.target.target_dynamic_object_id
+        if target_id in histories:
+            raise ValueError("paired target id collides with scene history")
+        histories[target_id] = np.array(
+            variant.target.history_poses,
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        specs[target_id] = deepcopy(variant.target.footprint_spec)
+    return histories, specs
+
+
+def build_risk_input_from_sop06_variant(
+    *,
+    mother_record: EventTargetMotionRecord,
+    mother_world: OracleWorld,
+    variant: PairedVariant,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    expected_paired_config_digest: str,
+    source_session_id: str,
+    seed_namespace: str,
+) -> RiskBuildInput:
+    """Adapt one formally validated SOP06 variant without leaking label future."""
+
+    if not isinstance(mother_record, EventTargetMotionRecord):
+        raise TypeError("mother_record must be an EventTargetMotionRecord")
+    if not isinstance(mother_world, OracleWorld):
+        raise TypeError("mother_world must be an OracleWorld")
+    if not isinstance(variant, PairedVariant):
+        raise TypeError("variant must be a PairedVariant")
+    if not isinstance(base_state, BaseState):
+        raise TypeError("base_state must be a BaseState")
+    if not isinstance(trajectory, LocalTrajectory):
+        raise TypeError("trajectory must be a LocalTrajectory")
+    if not isinstance(oracle_context, OracleContext):
+        raise TypeError("oracle_context must be an OracleContext")
+    if not isinstance(base_config, Mapping):
+        raise TypeError("base_config must be a mapping")
+    config = dict(base_config)
+    if config.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
+    source_session_id = _require_nonempty_string(
+        source_session_id, name="source_session_id"
+    )
+    seed_namespace = _require_nonempty_string(
+        seed_namespace, name="seed_namespace"
+    )
+    if trajectory.trajectory_id != mother_record.trajectory_id:
+        raise ValueError("trajectory_id does not match mother record")
+    _validate_formal_sop06_variant_identity(mother_world, variant)
+
+    # This is the authoritative SOP06 validation/render boundary.  It checks
+    # record/world/context joins, trusted config identity, retired versions,
+    # paired lineage, target history/future digests, and skeleton equality.
+    render_sop06_paired_variant(
+        mother_record=mother_record,
+        mother_world=mother_world,
+        variant=variant,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        config=config,
+        expected_paired_config_digest=expected_paired_config_digest,
+    )
+    blind_spot_config = variant.world.blind_spot_config
+    if not isinstance(blind_spot_config, Mapping) or (
+        blind_spot_config.get("kind") != "environment"
+    ):
+        raise ValueError("formal v5 risk adapter requires an environment variant")
+
+    histories, specs = _copy_sop06_scene_history(
+        base_state=base_state,
+        oracle_context=oracle_context,
+        variant=variant,
+    )
+    pair_group_id = _require_nonempty_string(
+        variant.world.metadata.get("pair_group_id"), name="pair_group_id"
+    )
+    target_footprint = mother_record.footprint_spec.get("footprint")
+    if not isinstance(target_footprint, Mapping):
+        raise ValueError("mother target footprint must be a mapping")
+    target_footprint_kind = _require_nonempty_string(
+        target_footprint.get("kind"), name="target_footprint_kind"
+    )
+    base_config_digest = _canonical_config_digest(config)
+    sample_id = f"{base_state.split}-" + stable_digest(
+        _RISK_INPUT_ADAPTER_VERSION,
+        pair_group_id,
+        base_state.state_id,
+        trajectory.trajectory_id,
+        variant.variant_kind,
+        variant.world.world_id,
+        expected_paired_config_digest,
+        base_config_digest,
+        seed_namespace,
+        size=12,
+    )
+    provenance = _canonical_metadata_copy(
+        {
+            "risk_input_adapter_version": _RISK_INPUT_ADAPTER_VERSION,
+            "source_recording_id": base_state.recording_id,
+            "session_id": source_session_id,
+            "source_snippet_id": mother_record.source_snippet_id,
+            "source_object_id": mother_record.source_object_id,
+            "seed_namespace": seed_namespace,
+            "target_object_type": mother_record.object_type,
+            "target_footprint_kind": target_footprint_kind,
+            "target_type_policy_digest": (
+                mother_record.target_type_policy_digest
+            ),
+            "blind_spot_type": blind_spot_config["kind"],
+            "generator_algorithm_version": (
+                mother_world.metadata["generator_algorithm_version"]
+            ),
+            "paired_generator_algorithm_version": (
+                variant.world.metadata[
+                    "paired_generator_algorithm_version"
+                ]
+            ),
+            "pair_group_contract_version": (
+                variant.world.metadata["pair_group_contract_version"]
+            ),
+            "paired_config_digest": expected_paired_config_digest,
+            "base_config_digest": base_config_digest,
+            "variant_kind": variant.variant_kind,
+            "variant_random_seed": variant.world.random_seed,
+        },
+        name="provenance",
+    )
+    hidden_object_ids = (
+        ()
+        if variant.target is None
+        else (variant.target.target_dynamic_object_id,)
+    )
+    source = RiskBuildInput(
+        sample_id=sample_id,
+        pair_group_id=pair_group_id,
+        event_type=variant.variant_kind,
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_world=variant.world,
+        observed_static_occupancy=np.array(
+            variant.world.static_occupancy,
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        ),
+        scene_dynamic_history=histories,
+        scene_dynamic_specs=specs,
+        hidden_object_ids=hidden_object_ids,
+        sensor_config=None,
+        provenance=provenance,
+    )
+    _validate_source_join(source)
+    return source
 
 
 def _require_nonempty_string(value: Any, *, name: str) -> str:

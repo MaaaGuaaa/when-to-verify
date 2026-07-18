@@ -8,7 +8,7 @@ and callers must prepare them separately rather than aliasing them here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from numbers import Real
 import struct
@@ -61,6 +61,19 @@ class RobotSweepCacheEntry:
     key: RobotSweepCacheKey
     swept_mask: np.ndarray
     prepared_future_sweep: PreparedOccluderCollisionSweep
+    _swept_mask_storage: bytes = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        incoming_bytes = np.asarray(self.swept_mask).tobytes(order="C")
+        if incoming_bytes != self.key.swept_mask_bytes:
+            raise ValueError("swept_mask bytes must match the cache key")
+        storage = self.key.swept_mask_bytes
+        immutable_mask = np.frombuffer(
+            storage,
+            dtype=np.dtype("<f4"),
+        ).reshape((self.key.grid.height, self.key.grid.width))
+        object.__setattr__(self, "_swept_mask_storage", storage)
+        object.__setattr__(self, "swept_mask", immutable_mask)
 
 
 @dataclass(frozen=True)

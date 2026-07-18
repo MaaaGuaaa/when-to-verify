@@ -69,11 +69,9 @@ def test_prepare_collision_sweep_owns_canonical_read_only_interval_geometry() ->
     )
     assert prepared.dense_poses.dtype == np.float64
     assert prepared.dense_poses.flags.c_contiguous
-    assert prepared.dense_poses.flags.owndata
     assert not prepared.dense_poses.flags.writeable
     assert prepared.interval_motion_bounds_m.dtype == np.float64
     assert prepared.interval_motion_bounds_m.flags.c_contiguous
-    assert prepared.interval_motion_bounds_m.flags.owndata
     assert not prepared.interval_motion_bounds_m.flags.writeable
     assert prepared.interval_motion_bounds_m.shape == (
         prepared.dense_poses.shape[0] - 1,
@@ -84,6 +82,13 @@ def test_prepare_collision_sweep_owns_canonical_read_only_interval_geometry() ->
     np.testing.assert_array_equal(prepared.dense_poses[-1], original[-1])
     with pytest.raises(ValueError, match="read-only"):
         prepared.dense_poses[0, 0] = 1.0
+    for values in (
+        prepared.dense_poses,
+        prepared.interval_motion_bounds_m,
+    ):
+        with pytest.raises(ValueError, match="WRITEABLE"):
+            values.setflags(write=True)
+        assert not values.flags.owndata
     with pytest.raises(FrozenInstanceError):
         prepared.rejection_reason = "changed"  # type: ignore[misc]
 
@@ -183,6 +188,29 @@ def test_prepared_sweep_rejects_stale_grid_and_preparation_version() -> None:
             (1.0, 1.0, 0.0),
             (stale,),
             grid=grid,
+        )
+
+
+def test_prepared_sweep_rejects_forged_zero_interval_motion_bounds() -> None:
+    grid = _grid()
+    raw = _raw_sweep(
+        np.asarray([[0.0, 0.0, 0.0], [0.04, 0.0, 0.0]]),
+    )
+    prepared = prepare_occluder_collision_sweep(raw, grid=grid)
+    occluder = RectangleFootprint(0.002, 0.002)
+    assert occluder_collision_sweep_rejection_reason(
+        occluder,
+        (0.02, 0.0, 0.0),
+        (raw,),
+        grid=grid,
+    ) == "occluder_robot_swept_overlap"
+
+    with pytest.raises(ValueError, match="canonical interval motion bounds"):
+        replace(
+            prepared,
+            interval_motion_bounds_m=np.zeros_like(
+                prepared.interval_motion_bounds_m
+            ),
         )
 
 

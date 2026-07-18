@@ -106,6 +106,31 @@ def test_candidate_uses_exact_se2_start_and_maps_anchor_to_conflict(
     )
 
 
+def test_candidate_preserves_unwrapped_heading_difference_across_branch_cut() -> None:
+    source_delta = np.array([-1.0, 0.1], dtype=np.float64)
+    desired_direction = np.array([-1.0, -0.1], dtype=np.float64)
+    expected_rotation = float(
+        np.arctan2(desired_direction[1], desired_direction[0])
+        - np.arctan2(source_delta[1], source_delta[0])
+    )
+
+    candidate = build_reachability_candidate(
+        conflict_point=[0.0, 0.0],
+        source_current_xy=[0.0, 0.0],
+        source_anchor_xy=source_delta,
+        desired_crossing_direction=desired_direction,
+        identity=_identity(crossing_side=-1, angle_offset_deg=-10.0),
+    )
+
+    assert expected_rotation < -np.pi
+    assert candidate.rotation_rad == expected_rotation
+    np.testing.assert_allclose(
+        candidate.current_xy + candidate.rotation_matrix @ source_delta,
+        [0.0, 0.0],
+        atol=1e-14,
+    )
+
+
 def test_crossing_schedule_has_frozen_order_count_and_unit_directions() -> None:
     directions = scheduled_crossing_directions(
         np.array([2.0, 0.0], dtype=np.float32),

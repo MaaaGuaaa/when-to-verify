@@ -20,7 +20,6 @@ from src.geometry import (
     points_in_grid,
     segments_intersect,
     world_to_grid,
-    wrap_angle,
 )
 from src.utils.seeding import stable_digest
 
@@ -389,7 +388,7 @@ def build_reachability_candidate(
         name="desired_crossing_direction",
     )
 
-    rotation_rad = wrap_angle(
+    rotation_rad = float(
         np.arctan2(desired[1], desired[0])
         - np.arctan2(source_delta[1], source_delta[0])
     )

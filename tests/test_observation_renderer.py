@@ -16,6 +16,7 @@ if str(_ROOT) not in sys.path:
 
 from src.contracts import (  # noqa: E402
     HISTORY_CHANNELS,
+    SCHEMA_VERSION,
     STATE_CHANNELS,
     BaseState,
     build_grid_spec,
@@ -39,7 +40,7 @@ from src.geometry import (  # noqa: E402
 
 def _toy_config() -> dict:
     return {
-        "schema_version": "2.0.0",
+        "schema_version": SCHEMA_VERSION,
         "bev": {
             "range_m": 9.0,
             "resolution_m": 1.0,

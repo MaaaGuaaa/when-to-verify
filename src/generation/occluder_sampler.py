@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from typing import Any, Mapping
 
@@ -105,6 +105,12 @@ class PreparedOccluderCollisionSweep:
     rejection_reason: str
     grid: GridSpec
     preparation_version: str = OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION
+    _dense_pose_storage: bytes = field(init=False, repr=False, compare=False)
+    _interval_motion_bound_storage: bytes = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.footprint, (CircleFootprint, RectangleFootprint)):
@@ -112,25 +118,51 @@ class PreparedOccluderCollisionSweep:
         dense_poses = _poses(self.dense_poses, name="dense_poses")
         if dense_poses.shape[0] == 0:
             raise ValueError("dense_poses must not be empty")
-        dense_poses = np.array(
+        canonical_dense_poses = np.array(
             dense_poses,
-            dtype=np.float64,
+            dtype=np.dtype("<f8"),
             order="C",
             copy=True,
         )
-        dense_poses.setflags(write=False)
 
         bounds = np.asarray(self.interval_motion_bounds_m)
-        if bounds.shape != (dense_poses.shape[0] - 1,) or bounds.dtype.kind not in "iuf":
+        if (
+            bounds.shape != (canonical_dense_poses.shape[0] - 1,)
+            or bounds.dtype.kind not in "iuf"
+        ):
             raise ValueError(
                 "interval_motion_bounds_m must have shape (len(dense_poses) - 1,)"
             )
-        bounds = np.array(bounds, dtype=np.float64, order="C", copy=True)
-        if not np.isfinite(bounds).all() or np.any(bounds < 0.0):
+        canonical_bounds = np.array(
+            bounds,
+            dtype=np.dtype("<f8"),
+            order="C",
+            copy=True,
+        )
+        if not np.isfinite(canonical_bounds).all() or np.any(canonical_bounds < 0.0):
             raise ValueError(
                 "interval_motion_bounds_m must contain finite non-negative values"
             )
-        bounds.setflags(write=False)
+        motion_radius_m = _sweep_motion_radius(self.footprint)
+        expected_bounds = np.asarray(
+            [
+                _pose_interval_motion_bound(
+                    start_pose,
+                    end_pose,
+                    motion_radius_m=motion_radius_m,
+                )
+                for start_pose, end_pose in zip(
+                    canonical_dense_poses[:-1],
+                    canonical_dense_poses[1:],
+                    strict=True,
+                )
+            ],
+            dtype=np.dtype("<f8"),
+        )
+        if not np.array_equal(canonical_bounds, expected_bounds):
+            raise ValueError(
+                "interval_motion_bounds_m must match canonical interval motion bounds"
+            )
 
         if not isinstance(self.rejection_reason, str) or not self.rejection_reason:
             raise ValueError("rejection_reason must be non-empty")
@@ -139,8 +171,24 @@ class PreparedOccluderCollisionSweep:
         if not isinstance(self.preparation_version, str) or not self.preparation_version:
             raise ValueError("preparation_version must be non-empty")
 
-        object.__setattr__(self, "dense_poses", dense_poses)
-        object.__setattr__(self, "interval_motion_bounds_m", bounds)
+        dense_pose_storage = canonical_dense_poses.tobytes(order="C")
+        interval_motion_bound_storage = expected_bounds.tobytes(order="C")
+        immutable_dense_poses = np.frombuffer(
+            dense_pose_storage,
+            dtype=np.dtype("<f8"),
+        ).reshape(canonical_dense_poses.shape)
+        immutable_bounds = np.frombuffer(
+            interval_motion_bound_storage,
+            dtype=np.dtype("<f8"),
+        )
+        object.__setattr__(self, "_dense_pose_storage", dense_pose_storage)
+        object.__setattr__(
+            self,
+            "_interval_motion_bound_storage",
+            interval_motion_bound_storage,
+        )
+        object.__setattr__(self, "dense_poses", immutable_dense_poses)
+        object.__setattr__(self, "interval_motion_bounds_m", immutable_bounds)
 
 
 def _finite_real(value: Any, *, name: str) -> float:

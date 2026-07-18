@@ -117,16 +117,61 @@ def test_repeated_get_builds_once_and_returns_same_immutable_entry() -> None:
     assert cold.key.footprint == RectangleFootprint(0.4, 0.2)
     assert cold.swept_mask.dtype == np.float32
     assert cold.swept_mask.flags.c_contiguous
-    assert cold.swept_mask.flags.owndata
     assert not cold.swept_mask.flags.writeable
     assert cold.prepared_future_sweep.dense_poses.dtype == np.float64
     assert cold.prepared_future_sweep.dense_poses.flags.c_contiguous
-    assert cold.prepared_future_sweep.dense_poses.flags.owndata
     assert not cold.prepared_future_sweep.dense_poses.flags.writeable
     with pytest.raises(ValueError, match="read-only"):
         cold.swept_mask[0, 0] = 1.0
     with pytest.raises(FrozenInstanceError):
         cold.trajectory_id = "changed"  # type: ignore[misc]
+
+
+def test_cached_arrays_cannot_be_reenabled_or_pollute_warm_cold_results() -> None:
+    trajectory = _trajectory()
+    cache = RobotSweepCache()
+    cold = _get(cache, trajectory, footprint=CircleFootprint(0.02))
+    arrays = (
+        cold.swept_mask,
+        cold.prepared_future_sweep.dense_poses,
+        cold.prepared_future_sweep.interval_motion_bounds_m,
+    )
+    snapshots = tuple(values.tobytes() for values in arrays)
+    occluder = CircleFootprint(0.02)
+
+    for values in arrays:
+        with pytest.raises(ValueError, match="WRITEABLE"):
+            values.setflags(write=True)
+        assert not values.flags.owndata
+
+    warm = _get(cache, trajectory, footprint=CircleFootprint(0.02))
+    cold_again = _get(
+        RobotSweepCache(),
+        trajectory,
+        footprint=CircleFootprint(0.02),
+    )
+    assert tuple(values.tobytes() for values in arrays) == snapshots
+    assert warm is cold
+    assert warm.swept_mask.tobytes() == cold_again.swept_mask.tobytes()
+    assert (
+        warm.prepared_future_sweep.dense_poses.tobytes()
+        == cold_again.prepared_future_sweep.dense_poses.tobytes()
+    )
+    assert (
+        occluder_collision_sweep_rejection_reason(
+            occluder,
+            (0.4, 0.0, 0.0),
+            (warm.prepared_future_sweep,),
+            grid=_grid(),
+        )
+        == occluder_collision_sweep_rejection_reason(
+            occluder,
+            (0.4, 0.0, 0.0),
+            (cold_again.prepared_future_sweep,),
+            grid=_grid(),
+        )
+        == _REJECTION_REASON
+    )
 
 
 def test_key_binds_exact_canonical_bytes_and_cold_warm_builds_are_identical() -> None:

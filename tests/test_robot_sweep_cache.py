@@ -15,6 +15,7 @@ from src.generation.occluder_sampler import (
 from src.generation.robot_sweep_cache import (
     ROBOT_SWEEP_CACHE_VERSION,
     RobotSweepCache,
+    RobotSweepCacheEntry,
     RobotSweepCacheIdentityError,
 )
 from src.geometry import CircleFootprint, RectangleFootprint
@@ -300,6 +301,68 @@ def test_distinct_trajectory_ids_never_alias_even_with_identical_arrays() -> Non
     assert cache.stats.hits == 0
     assert cache.stats.misses == 2
     assert cache.stats.builds == 2
+
+
+def test_entry_rejects_spliced_prepared_future_with_different_interior_pose() -> None:
+    grid = _grid()
+    first_poses = np.asarray(
+        [[0.2, 0.0, 0.0], [0.4, 0.0, 0.0], [0.6, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    second_poses = first_poses.copy()
+    second_poses[1, 1] = 0.05
+    cache = RobotSweepCache()
+    first = _get(
+        cache,
+        _trajectory(trajectory_id="splice-a", poses=first_poses, grid=grid),
+        grid=grid,
+    )
+    second = _get(
+        cache,
+        _trajectory(trajectory_id="splice-b", poses=second_poses, grid=grid),
+        grid=grid,
+    )
+    np.testing.assert_array_equal(
+        first.prepared_future_sweep.dense_poses[[0, -1]],
+        second.prepared_future_sweep.dense_poses[[0, -1]],
+    )
+
+    for key_entry, prepared_entry in ((first, second), (second, first)):
+        with pytest.raises(ValueError, match="prepared future sweep.*cache key"):
+            RobotSweepCacheEntry(
+                trajectory_id=key_entry.trajectory_id,
+                key=key_entry.key,
+                swept_mask=key_entry.swept_mask,
+                prepared_future_sweep=prepared_entry.prepared_future_sweep,
+            )
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"canonical_digest": "0" * 64}, "canonical_digest"),
+        ({"cache_version": "robot_sweep_cache_v0"}, "cache_version"),
+        (
+            {"preparation_version": "occluder_collision_sweep_preparation_v0"},
+            "preparation_version",
+        ),
+    ],
+)
+def test_cache_key_rejects_forged_digest_or_versions(
+    changes: dict[str, str],
+    message: str,
+) -> None:
+    entry = _get(RobotSweepCache(), _trajectory())
+
+    with pytest.raises(ValueError, match=message):
+        replace(entry.key, **changes)
+
+
+def test_entry_rejects_trajectory_id_that_disagrees_with_key() -> None:
+    entry = _get(RobotSweepCache(), _trajectory())
+
+    with pytest.raises(ValueError, match="trajectory_id.*cache key"):
+        replace(entry, trajectory_id="forged-trajectory-id")
 
 
 @pytest.mark.parametrize(

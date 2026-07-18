@@ -52,6 +52,89 @@ class RobotSweepCacheKey:
     rejection_reason: str
     canonical_digest: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.trajectory_id, str) or not self.trajectory_id:
+            raise ValueError("trajectory_id must be non-empty")
+        grid = _validate_grid(self.grid)
+        if not isinstance(self.footprint, (CircleFootprint, RectangleFootprint)):
+            raise TypeError("footprint must be a Footprint")
+        future_dt_s = _finite_float(
+            self.future_dt_s,
+            name="future_dt_s",
+            positive=True,
+        )
+        if self.pose_time_layout_version != SOP04_POSE_TIME_LAYOUT_VERSION:
+            raise ValueError("pose_time_layout_version is not the frozen v1 layout")
+        if self.cache_version != ROBOT_SWEEP_CACHE_VERSION:
+            raise ValueError("cache_version mismatch")
+        if (
+            self.preparation_version
+            != OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION
+        ):
+            raise ValueError("preparation_version mismatch")
+        if not isinstance(self.rejection_reason, str) or not self.rejection_reason:
+            raise ValueError("rejection_reason must be non-empty")
+
+        if not isinstance(self.pose_bytes, bytes):
+            raise TypeError("pose_bytes must be canonical bytes")
+        expected_pose_nbytes = grid.future_steps * 3 * np.dtype("<f8").itemsize
+        if len(self.pose_bytes) != expected_pose_nbytes:
+            raise ValueError("pose_bytes length does not match grid.future_steps")
+        poses = np.frombuffer(self.pose_bytes, dtype=np.dtype("<f8")).reshape(
+            (grid.future_steps, 3)
+        )
+        if not np.isfinite(poses).all():
+            raise ValueError("pose_bytes must encode only finite float64 poses")
+
+        if not isinstance(self.swept_mask_bytes, bytes):
+            raise TypeError("swept_mask_bytes must be canonical bytes")
+        expected_mask_nbytes = (
+            grid.height * grid.width * np.dtype("<f4").itemsize
+        )
+        if len(self.swept_mask_bytes) != expected_mask_nbytes:
+            raise ValueError("swept_mask_bytes length does not match grid shape")
+        swept_mask = np.frombuffer(
+            self.swept_mask_bytes,
+            dtype=np.dtype("<f4"),
+        ).reshape((grid.height, grid.width))
+        if not np.isfinite(swept_mask).all():
+            raise ValueError("swept_mask_bytes must encode finite float32 values")
+        if not np.all((swept_mask == 0.0) | (swept_mask == 1.0)):
+            raise ValueError("swept_mask_bytes must encode a binary mask")
+
+        if not isinstance(self.pose_time_offsets_bytes, bytes):
+            raise TypeError("pose_time_offsets_bytes must be canonical bytes")
+        expected_offsets_nbytes = grid.future_steps * np.dtype("<f8").itemsize
+        if len(self.pose_time_offsets_bytes) != expected_offsets_nbytes:
+            raise ValueError(
+                "pose_time_offsets_bytes length does not match grid.future_steps"
+            )
+        offsets = np.frombuffer(
+            self.pose_time_offsets_bytes,
+            dtype=np.dtype("<f8"),
+        )
+        if not np.isfinite(offsets).all():
+            raise ValueError("pose_time_offsets_bytes must encode finite values")
+        expected_offsets = (
+            np.arange(grid.future_steps, dtype=np.float64) + np.float64(1.0)
+        ) * np.float64(future_dt_s)
+        if not np.array_equal(offsets, expected_offsets):
+            raise ValueError("pose_time_offsets_bytes mismatch future_dt_s")
+
+        expected_digest = _canonical_key_digest(
+            trajectory_id=self.trajectory_id,
+            pose_bytes=self.pose_bytes,
+            swept_mask_bytes=self.swept_mask_bytes,
+            footprint=self.footprint,
+            grid=grid,
+            future_dt_s=future_dt_s,
+            layout_version=self.pose_time_layout_version,
+            offsets_bytes=self.pose_time_offsets_bytes,
+            rejection_reason=self.rejection_reason,
+        )
+        if self.canonical_digest != expected_digest:
+            raise ValueError("canonical_digest does not match bound key fields")
+
 
 @dataclass(frozen=True)
 class RobotSweepCacheEntry:
@@ -64,9 +147,49 @@ class RobotSweepCacheEntry:
     _swept_mask_storage: bytes = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.key, RobotSweepCacheKey):
+            raise TypeError("key must be a RobotSweepCacheKey")
+        if self.trajectory_id != self.key.trajectory_id:
+            raise ValueError("entry trajectory_id must match cache key trajectory_id")
         incoming_bytes = np.asarray(self.swept_mask).tobytes(order="C")
         if incoming_bytes != self.key.swept_mask_bytes:
             raise ValueError("swept_mask bytes must match the cache key")
+        prepared = self.prepared_future_sweep
+        if not isinstance(prepared, PreparedOccluderCollisionSweep):
+            raise TypeError(
+                "prepared_future_sweep must be a PreparedOccluderCollisionSweep"
+            )
+        prepared_binding_matches = (
+            prepared.footprint == self.key.footprint
+            and prepared.grid == self.key.grid
+            and prepared.rejection_reason == self.key.rejection_reason
+            and prepared.preparation_version == self.key.preparation_version
+        )
+        raw_poses = np.frombuffer(
+            self.key.pose_bytes,
+            dtype=np.dtype("<f8"),
+        ).reshape((self.key.grid.future_steps, 3))
+        expected_prepared = prepare_occluder_collision_sweep(
+            OccluderCollisionSweep(
+                footprint=self.key.footprint,
+                poses=raw_poses,
+                rejection_reason=self.key.rejection_reason,
+            ),
+            grid=self.key.grid,
+        )
+        prepared_geometry_matches = (
+            prepared.dense_poses.shape == expected_prepared.dense_poses.shape
+            and prepared.dense_poses.tobytes(order="C")
+            == expected_prepared.dense_poses.tobytes(order="C")
+            and prepared.interval_motion_bounds_m.shape
+            == expected_prepared.interval_motion_bounds_m.shape
+            and prepared.interval_motion_bounds_m.tobytes(order="C")
+            == expected_prepared.interval_motion_bounds_m.tobytes(order="C")
+        )
+        if not prepared_binding_matches or not prepared_geometry_matches:
+            raise ValueError(
+                "prepared future sweep does not match cache key canonical preparation"
+            )
         storage = self.key.swept_mask_bytes
         immutable_mask = np.frombuffer(
             storage,

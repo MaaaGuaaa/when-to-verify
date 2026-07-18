@@ -48,6 +48,7 @@ from src.generation.paired_variants import (
 )
 from src.geometry import (
     RectangleFootprint,
+    grid_to_world,
     inflate_footprint,
     rasterize_footprint,
     signed_clearance,
@@ -1197,6 +1198,128 @@ def test_candidate_validation_covers_history_before_current(
             environment=environment,
         )
     assert exc_info.value.reason == expected_reason
+
+
+def test_candidate_validation_rejects_context_collision_between_safe_frames(
+    complete_pair,
+) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    environment = paired_variants_module._pair_environment(
+        mother_event=mother,
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        critical_clearance_threshold_m=(
+            paired_config.near_miss_clearance_range_m[1]
+        ),
+    )
+    target_poses = np.vstack(
+        (mother.target.history_poses, mother.target.future_poses)
+    )
+    context_id = next(iter(oracle.dynamic_object_history))
+    offsets = np.ones((target_poses.shape[0], 1), dtype=np.float32)
+    offsets[target_poses.shape[0] // 2 :] = np.float32(-1.0)
+    context_poses = target_poses.copy()
+    context_poses[:, 0:1] += offsets
+    context_poses[:, 2] = np.float32(0.0)
+    endpoint_clearances = trajectory_signed_clearances(
+        environment.target_footprint,
+        target_poses,
+        environment.context_footprints[context_id],
+        context_poses,
+    )
+    assert np.all(endpoint_clearances > 0.0)
+    crossing_context = replace(
+        oracle,
+        dynamic_object_history={context_id: context_poses[:8].copy()},
+        dynamic_object_future={context_id: context_poses[8:].copy()},
+    )
+
+    with pytest.raises(paired_variants_module._CandidateRejected) as exc_info:
+        paired_variants_module._validate_target_candidate(
+            mother.target,
+            trajectory=trajectory,
+            base_state=base,
+            oracle_context=crossing_context,
+            base_config=config,
+            environment=environment,
+        )
+
+    assert exc_info.value.reason == "target_context_collision"
+
+
+def test_candidate_validation_rejects_static_contact_between_rotation_samples(
+    complete_pair,
+) -> None:
+    config, grid, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    environment = paired_variants_module._pair_environment(
+        mother_event=mother,
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        critical_clearance_threshold_m=(
+            paired_config.near_miss_clearance_range_m[1]
+        ),
+    )
+    target_center = grid_to_world(np.asarray([110, 80], dtype=np.int64), grid)
+    occupied_index = np.asarray([111, 110], dtype=np.int64)
+    occupied_center = grid_to_world(occupied_index, grid)
+    relative_center = occupied_center - target_center
+    contact_yaw = float(np.arctan2(relative_center[1], relative_center[0]))
+    target_footprint = RectangleFootprint(
+        2.0 * float(np.linalg.norm(relative_center)),
+        0.002,
+    )
+    start_pose = np.asarray(
+        [*target_center, contact_yaw - np.deg2rad(2.25)], dtype=np.float32
+    )
+    end_pose = np.asarray(
+        [*target_center, contact_yaw + np.deg2rad(6.75)], dtype=np.float32
+    )
+    poses = np.tile(end_pose, (23, 1)).astype(np.float32)
+    poses[0] = start_pose
+    target = replace(
+        mother.target,
+        object_type="carried_object",
+        history_poses=poses[:8].copy(),
+        current_pose=poses[7].copy(),
+        future_poses=poses[8:].copy(),
+    )
+    occupancy = np.zeros((grid.height, grid.width), dtype=bool)
+    occupancy[tuple(occupied_index)] = True
+    cell_footprint = RectangleFootprint(grid.resolution_m, grid.resolution_m)
+    cell_pose = np.asarray([*occupied_center, 0.0])
+    fixed_samples = np.asarray(
+        [
+            start_pose,
+            [*target_center, contact_yaw + np.deg2rad(2.25)],
+            end_pose,
+        ],
+        dtype=np.float64,
+    )
+    assert all(
+        signed_clearance(target_footprint, pose, cell_footprint, cell_pose) > 0.0
+        for pose in fixed_samples
+    )
+    environment = replace(
+        environment,
+        target_footprint=target_footprint,
+        base_static_occupancy=occupancy,
+    )
+
+    with pytest.raises(paired_variants_module._CandidateRejected) as exc_info:
+        paired_variants_module._validate_target_candidate(
+            target,
+            trajectory=trajectory,
+            base_state=base,
+            oracle_context=oracle,
+            base_config=config,
+            environment=environment,
+        )
+
+    assert exc_info.value.reason == "target_static_collision"
 
 
 def test_base_state_only_actor_participates_in_history_collision_without_future(

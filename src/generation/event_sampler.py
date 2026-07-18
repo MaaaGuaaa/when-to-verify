@@ -30,7 +30,6 @@ from src.geometry import (
     intersects,
     points_in_grid,
     rasterize_footprint,
-    rasterize_footprint_sweep,
     raycast_visibility,
     trajectory_signed_clearances,
 )
@@ -79,11 +78,12 @@ from .occluder_sampler import (
     OccluderCollisionSweep,
     OccluderPlacement,
     OccluderSamplingError,
-    _densify_pose_sequence,
     align_environment_occluder_to_target_los,
     build_joint_occluder_schedule,
     normalize_occluder_config,
     propose_environment_occluder_geometry,
+    synchronized_sweeps_intersect,
+    swept_footprint_intersects_occupancy,
     validate_environment_occluder_target,
 )
 from .structural_blindspot import (
@@ -1008,15 +1008,12 @@ def _validate_target_physics(
         if base_state.static_map_local is None
         else np.asarray(base_state.static_map_local)
     )
-    dense_target_poses = _densify_pose_sequence(
-        all_poses.astype(np.float64),
-        max_translation_step_m=0.5 * grid.resolution_m,
-        max_yaw_step_rad=np.deg2rad(5.0),
-    )
-    target_sweep = rasterize_footprint_sweep(
-        footprint, dense_target_poses, grid
-    )
-    if np.any(target_sweep & (static != 0)):
+    if swept_footprint_intersects_occupancy(
+        footprint,
+        all_poses,
+        static,
+        grid=grid,
+    ):
         raise _EventRejection("target_static_collision")
     if not bool(np.any(points_in_grid(target.future_poses[:, :2], grid))):
         raise _EventRejection("target_future_out_of_bounds")
@@ -1057,13 +1054,13 @@ def _validate_target_physics(
                 oracle_context.dynamic_object_future[object_id],
             )
         )
-        clearances = trajectory_signed_clearances(
+        if synchronized_sweeps_intersect(
             footprint,
             all_poses,
             context_footprints[object_id],
             context_poses,
-        )
-        if np.any(clearances <= 0.0):
+            grid=grid,
+        ):
             raise _EventRejection("target_context_collision")
     return footprint
 
@@ -1813,6 +1810,15 @@ def _generate_v5_events(
                             identity=identity,
                         )
                         candidate_ids.append(candidate.candidate_id)
+                        if not bool(points_in_grid(candidate.current_xy, grid)):
+                            counters["transform_rejected_count"] += 1
+                            rejection_reasons["transform_out_of_bounds"] = (
+                                rejection_reasons.get(
+                                    "transform_out_of_bounds", 0
+                                )
+                                + 1
+                            )
+                            continue
                         yaw = float(snippet.headings[7]) + candidate.rotation_rad
                         mask_key = (
                             region.region_digest,

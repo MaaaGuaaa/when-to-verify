@@ -46,9 +46,11 @@ from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
     CircleFootprint,
     RectangleFootprint,
+    grid_to_world,
     inflate_footprint,
     rasterize_footprint,
     rasterize_footprint_sweep,
+    signed_clearance,
     trajectory_signed_clearances,
     wrap_angle,
 )
@@ -655,6 +657,107 @@ def _v5_mother_inputs():
         trajectory,
         libraries,
         normalize_generator_config(generator_config),
+    )
+
+
+def _mirror_pose_array_y(poses: np.ndarray) -> np.ndarray:
+    mirrored = np.asarray(poses).copy()
+    mirrored[:, 1] *= np.float32(-1.0)
+    mirrored[:, 2] *= np.float32(-1.0)
+    return mirrored
+
+
+def _mirrored_v5_mother_inputs():
+    config, grid, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    mirrored_base = replace(
+        base,
+        robot_history=_mirror_pose_array_y(base.robot_history),
+        visible_dynamic_object_history={
+            object_id: _mirror_pose_array_y(poses)
+            for object_id, poses in base.visible_dynamic_object_history.items()
+        },
+        static_map_local=np.flip(base.static_map_local, axis=0).copy(),
+    )
+    mirrored_oracle = replace(
+        oracle,
+        dynamic_object_history={
+            object_id: _mirror_pose_array_y(poses)
+            for object_id, poses in oracle.dynamic_object_history.items()
+        },
+        dynamic_object_future={
+            object_id: _mirror_pose_array_y(poses)
+            for object_id, poses in oracle.dynamic_object_future.items()
+        },
+    )
+    mirrored_trajectory = replace(
+        trajectory,
+        poses=_mirror_pose_array_y(trajectory.poses),
+        swept_mask=np.flip(trajectory.swept_mask, axis=0).copy(),
+        tta_map=np.flip(trajectory.tta_map, axis=0).copy(),
+        braking_map=np.flip(trajectory.braking_map, axis=0).copy(),
+        centerline_map=np.flip(trajectory.centerline_map, axis=0).copy(),
+    )
+    mirrored_libraries = {
+        object_type: replace(
+            library,
+            snippets=tuple(
+                replace(
+                    snippet,
+                    positions=np.column_stack(
+                        (snippet.positions[:, 0], -snippet.positions[:, 1])
+                    ).astype(np.float32),
+                    velocities=np.column_stack(
+                        (snippet.velocities[:, 0], -snippet.velocities[:, 1])
+                    ).astype(np.float32),
+                    headings=(-snippet.headings).astype(np.float32),
+                )
+                for snippet in library.snippets
+            ),
+        )
+        for object_type, library in libraries.items()
+    }
+    return (
+        config,
+        grid,
+        mirrored_base,
+        mirrored_oracle,
+        mirrored_trajectory,
+        mirrored_libraries,
+        generator_config,
+    )
+
+
+def _oblique_v5_mother_inputs():
+    config, grid, base, oracle, _, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    candidate = sample_candidate_rollouts(config)[13]
+    trajectory = build_local_trajectory(
+        candidate,
+        config,
+        braking_deceleration_mps2=1.0,
+    )
+    trajectory = replace(
+        trajectory,
+        metadata={
+            **trajectory.metadata,
+            "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
+            "pose_time_offsets_s": (
+                (np.arange(grid.future_steps, dtype=np.float64) + 1.0)
+                * float(config["bev"]["future_dt_s"])
+            ).tolist(),
+        },
+    )
+    return (
+        config,
+        grid,
+        base,
+        oracle,
+        trajectory,
+        libraries,
+        generator_config,
     )
 
 
@@ -2061,6 +2164,42 @@ def test_target_physics_rejects_collision_only_in_context_history() -> None:
     assert exc_info.value.reason == "target_context_collision"
 
 
+def test_target_physics_rejects_context_collision_between_safe_frames() -> None:
+    config, _, base, oracle, _, _ = _base_inputs()
+    target = _valid_physics_target()
+    target_poses = np.vstack((target.history_poses, target.future_poses))
+    context_id = next(iter(oracle.dynamic_object_history))
+    offsets = np.ones((target_poses.shape[0], 1), dtype=np.float32)
+    offsets[target_poses.shape[0] // 2 :] = np.float32(-1.0)
+    context_poses = target_poses.copy()
+    context_poses[:, 0:1] += offsets
+    context_poses[:, 2] = np.float32(0.0)
+    context_footprint = RectangleFootprint(0.8, 0.2)
+    target_footprint = footprint_from_spec(target.footprint_spec)
+    endpoint_clearances = trajectory_signed_clearances(
+        target_footprint,
+        target_poses,
+        context_footprint,
+        context_poses,
+    )
+    assert np.all(endpoint_clearances > 0.0)
+    between_frame_collision = replace(
+        oracle,
+        dynamic_object_history={context_id: context_poses[:8].copy()},
+        dynamic_object_future={context_id: context_poses[8:].copy()},
+    )
+
+    with pytest.raises(event_sampler_module._EventRejection) as exc_info:
+        event_sampler_module._validate_target_physics(
+            target,
+            base_state=base,
+            oracle_context=between_frame_collision,
+            base_config=config,
+        )
+
+    assert exc_info.value.reason == "target_context_collision"
+
+
 def test_target_physics_rejects_speed_jump_only_in_history() -> None:
     config, _, base, oracle, _, _ = _base_inputs()
     target = _valid_physics_target()
@@ -2185,6 +2324,89 @@ def test_v5_summary_reconciles_each_candidate_layer() -> None:
     )
 
 
+def test_out_of_grid_mask_query_is_bounded_transform_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    real_builder = event_sampler_module.build_reachability_candidate
+
+    def build_out_of_grid_candidate(**kwargs):
+        source_current = np.asarray(kwargs["source_current_xy"], dtype=np.float64)
+        return real_builder(
+            **{
+                **kwargs,
+                "source_anchor_xy": source_current
+                + np.asarray([100.0, 0.0], dtype=np.float64),
+            }
+        )
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "build_reachability_candidate",
+        build_out_of_grid_candidate,
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert report.events == ()
+    summary = report.summary
+    assert summary["transform_candidate_count"] > 0
+    assert summary["transform_candidate_count"] == summary[
+        "transform_rejected_count"
+    ]
+    assert summary["chord_certified_count"] == 0
+    assert summary["chord_unresolved_count"] == 0
+    assert summary["exact_validation_count"] == 0
+    assert summary["rejection_reasons"]["transform_out_of_bounds"] == summary[
+        "transform_candidate_count"
+    ]
+    assert summary["obstacle_proposal_count"] == (
+        summary["obstacle_proposal_rejected_count"]
+        + summary["obstacle_proposal_passed_count"]
+    )
+
+
+def test_unexpected_mask_query_exception_still_aborts_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+
+    def fail_unexpectedly(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        raise RuntimeError("unexpected mask query failure")
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "candidate_queries_mask",
+        fail_unexpectedly,
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected mask query failure"):
+        generate_events(
+            base_state=base,
+            oracle_context=oracle,
+            trajectory=trajectory,
+            snippet_libraries=libraries,
+            base_config=config,
+            generator_config=generator_config,
+            seed=20260716,
+            event_count=1,
+        )
+
+
 def test_generate_events_resumes_absolute_candidate_index_without_reseeding(
 ) -> None:
     config, _, base, oracle, trajectory, libraries = _base_inputs()
@@ -2231,24 +2453,87 @@ def test_generate_events_resumes_absolute_candidate_index_without_reseeding(
 
 
 def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
-    config, grid, _, _, _, _ = _base_inputs()
-    rectangle = replace(
-        _exact_safe_curve_snippet(),
+    config, grid, base, oracle, _, _ = _base_inputs()
+    target_center = grid_to_world(np.asarray([110, 80], dtype=np.int64), grid)
+    occupied_index = np.asarray([111, 110], dtype=np.int64)
+    occupied_center = grid_to_world(occupied_index, grid)
+    relative_center = occupied_center - target_center
+    contact_yaw = float(np.arctan2(relative_center[1], relative_center[0]))
+    footprint_spec = {
+        "object_type": "carried_object",
+        "footprint": {
+            "kind": "rectangle",
+            "length_m": 2.0 * float(np.linalg.norm(relative_center)),
+            "width_m": 0.002,
+        },
+    }
+    start_pose = np.asarray(
+        [*target_center, contact_yaw - np.deg2rad(2.25)], dtype=np.float32
+    )
+    end_pose = np.asarray(
+        [*target_center, contact_yaw + np.deg2rad(6.75)], dtype=np.float32
+    )
+    poses = np.tile(end_pose, (23, 1)).astype(np.float32)
+    poses[0] = start_pose
+    target = replace(
+        _valid_physics_target(),
         object_type="carried_object",
-        footprint={"kind": "rectangle", "length_m": 1.2, "width_m": 0.2},
+        footprint_spec=footprint_spec,
+        history_poses=poses[:8].copy(),
+        current_pose=poses[7].copy(),
+        future_poses=poses[8:].copy(),
     )
-    candidate = _reachability_candidate(rectangle, conflict_index=10)
-    target = transplant_reachability_candidate(
-        rectangle,
-        **_reachability_transplant_kwargs(candidate),
+    static = np.zeros((grid.height, grid.width), dtype=np.float32)
+    static[tuple(occupied_index)] = np.float32(1.0)
+    fixed_samples = np.asarray(
+        [
+            start_pose,
+            [
+                *target_center,
+                contact_yaw + np.deg2rad(2.25),
+            ],
+            end_pose,
+        ],
+        dtype=np.float64,
     )
-    target_mask = rasterize_footprint_sweep(
-        RectangleFootprint(1.2, 0.2),
-        np.vstack((target.current_pose, target.future_poses)),
-        grid,
+    cell_footprint = RectangleFootprint(grid.resolution_m, grid.resolution_m)
+    cell_pose = np.asarray([*occupied_center, 0.0])
+    assert all(
+        signed_clearance(
+            footprint_from_spec(footprint_spec),
+            pose,
+            cell_footprint,
+            cell_pose,
+        )
+        > 0.0
+        for pose in fixed_samples
     )
-    assert target_mask.any()
-    assert np.unique(np.round(target.future_poses[:, 2], decimals=5)).size > 1
+
+    with pytest.raises(event_sampler_module._EventRejection) as exc_info:
+        event_sampler_module._validate_target_physics(
+            target,
+            base_state=replace(base, static_map_local=static),
+            oracle_context=replace(
+                oracle,
+                dynamic_object_history={
+                    key: np.tile(
+                        np.asarray([-3.0, -3.0, 0.0], dtype=np.float32),
+                        (grid.history_steps, 1),
+                    )
+                    for key in oracle.dynamic_object_history
+                },
+                dynamic_object_future={
+                    key: np.tile(
+                        np.asarray([-3.0, -3.0, 0.0], dtype=np.float32),
+                        (grid.future_steps, 1),
+                    )
+                    for key in oracle.dynamic_object_future
+                },
+            ),
+            base_config=config,
+        )
+
+    assert exc_info.value.reason == "target_static_collision"
 
 
 def test_environment_generation_uses_blind_reachability_first_mother() -> None:
@@ -2313,6 +2598,47 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
         event.target.future_poses,
     )
     assert float(np.min(clearances)) <= 0.0
+
+
+@pytest.mark.parametrize(
+    ("case", "inputs_factory", "seed", "expected_side"),
+    (
+        ("left", _v5_mother_inputs, 1, 1),
+        ("right", _mirrored_v5_mother_inputs, 2, -1),
+        ("oblique", _oblique_v5_mother_inputs, 1, 0),
+    ),
+    ids=("left", "right", "oblique"),
+)
+def test_v5_real_entry_accepts_lateral_and_oblique_mothers(
+    case: str,
+    inputs_factory,
+    seed: int,
+    expected_side: int,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        inputs_factory()
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=seed,
+        event_count=1,
+    )
+
+    assert len(report.events) == 1
+    event = report.events[0]
+    if expected_side:
+        assert expected_side * float(event.target.current_pose[1]) > 0.5
+        assert expected_side * float(event.world.occluders[0]["pose"][1]) > 0.5
+    else:
+        assert case == "oblique"
+        assert abs(float(trajectory.poses[-1, 2])) > 1.0
+        assert float(np.ptp(trajectory.poses[:, 1])) > 0.5
 
 
 def test_environment_mother_collects_then_stably_selects_fixture_batch() -> None:

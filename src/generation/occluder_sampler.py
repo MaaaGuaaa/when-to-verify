@@ -15,6 +15,7 @@ from src.geometry import (
     RectangleFootprint,
     footprint_aabb,
     grid_bounds,
+    grid_to_world,
     rasterize_footprint,
     raycast_visibility,
     signed_clearance,
@@ -339,6 +340,12 @@ def _sweep_motion_radius(footprint: Footprint) -> float:
     return 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
 
 
+def _rotation_motion_radius(footprint: Footprint) -> float:
+    if isinstance(footprint, CircleFootprint):
+        return 0.0
+    return _sweep_motion_radius(footprint)
+
+
 def _pose_interval_motion_bound(
     start_pose: np.ndarray,
     end_pose: np.ndarray,
@@ -348,6 +355,276 @@ def _pose_interval_motion_bound(
     yaw_delta = float(wrap_angle(end_pose[2] - start_pose[2]))
     result = float(np.linalg.norm(end_pose[:2] - start_pose[:2]))
     return result + motion_radius_m * abs(yaw_delta)
+
+
+def _densify_synchronized_pose_sequences(
+    poses_a: np.ndarray,
+    poses_b: np.ndarray,
+    *,
+    max_translation_step_m: float,
+    max_yaw_step_rad: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if poses_a.shape != poses_b.shape:
+        raise ValueError("synchronized pose sequences must have the same shape")
+    if poses_a.shape[0] == 0:
+        raise ValueError("synchronized pose sequences must not be empty")
+
+    dense_a = [poses_a[0].copy()]
+    dense_b = [poses_b[0].copy()]
+    for start_a, end_a, start_b, end_b in zip(
+        poses_a[:-1],
+        poses_a[1:],
+        poses_b[:-1],
+        poses_b[1:],
+        strict=True,
+    ):
+        yaw_delta_a = float(wrap_angle(end_a[2] - start_a[2]))
+        yaw_delta_b = float(wrap_angle(end_b[2] - start_b[2]))
+        steps = max(
+            1,
+            int(
+                np.ceil(
+                    float(np.linalg.norm(end_a[:2] - start_a[:2]))
+                    / max_translation_step_m
+                )
+            ),
+            int(
+                np.ceil(
+                    float(np.linalg.norm(end_b[:2] - start_b[:2]))
+                    / max_translation_step_m
+                )
+            ),
+            int(np.ceil(abs(yaw_delta_a) / max_yaw_step_rad)),
+            int(np.ceil(abs(yaw_delta_b) / max_yaw_step_rad)),
+        )
+        fractions = np.arange(1, steps + 1, dtype=np.float64) / steps
+        positions_a = start_a[:2] + fractions[:, None] * (
+            end_a[:2] - start_a[:2]
+        )
+        positions_b = start_b[:2] + fractions[:, None] * (
+            end_b[:2] - start_b[:2]
+        )
+        yaws_a = wrap_angle(start_a[2] + fractions * yaw_delta_a)
+        yaws_b = wrap_angle(start_b[2] + fractions * yaw_delta_b)
+        dense_a.extend(np.column_stack((positions_a, yaws_a)))
+        dense_b.extend(np.column_stack((positions_b, yaws_b)))
+    return (
+        np.asarray(dense_a, dtype=np.float64),
+        np.asarray(dense_b, dtype=np.float64),
+    )
+
+
+def _dense_synchronized_sweeps_intersect(
+    footprint_a: Footprint,
+    dense_poses_a: np.ndarray,
+    footprint_b: Footprint,
+    dense_poses_b: np.ndarray,
+) -> bool:
+    clearances = trajectory_signed_clearances(
+        footprint_a,
+        dense_poses_a,
+        footprint_b,
+        dense_poses_b,
+    )
+    if np.any(clearances <= 0.0):
+        return True
+
+    rotation_radius_a = _rotation_motion_radius(footprint_a)
+    rotation_radius_b = _rotation_motion_radius(footprint_b)
+
+    def interval_intersects(
+        start_a: np.ndarray,
+        end_a: np.ndarray,
+        start_b: np.ndarray,
+        end_b: np.ndarray,
+        start_clearance: float,
+        end_clearance: float,
+        depth: int,
+    ) -> bool:
+        relative_translation = (end_b[:2] - start_b[:2]) - (
+            end_a[:2] - start_a[:2]
+        )
+        motion_bound = float(np.linalg.norm(relative_translation)) + (
+            rotation_radius_a
+            * abs(float(wrap_angle(end_a[2] - start_a[2])))
+        ) + (
+            rotation_radius_b
+            * abs(float(wrap_angle(end_b[2] - start_b[2])))
+        )
+        if max(start_clearance, end_clearance) > motion_bound:
+            return False
+        if depth >= 20:
+            return True
+
+        midpoint_a = np.empty(3, dtype=np.float64)
+        midpoint_b = np.empty(3, dtype=np.float64)
+        midpoint_a[:2] = 0.5 * (start_a[:2] + end_a[:2])
+        midpoint_b[:2] = 0.5 * (start_b[:2] + end_b[:2])
+        midpoint_a[2] = wrap_angle(
+            start_a[2] + 0.5 * float(wrap_angle(end_a[2] - start_a[2]))
+        )
+        midpoint_b[2] = wrap_angle(
+            start_b[2] + 0.5 * float(wrap_angle(end_b[2] - start_b[2]))
+        )
+        midpoint_clearance = signed_clearance(
+            footprint_a,
+            midpoint_a,
+            footprint_b,
+            midpoint_b,
+        )
+        if midpoint_clearance <= 0.0:
+            return True
+        return interval_intersects(
+            start_a,
+            midpoint_a,
+            start_b,
+            midpoint_b,
+            start_clearance,
+            midpoint_clearance,
+            depth + 1,
+        ) or interval_intersects(
+            midpoint_a,
+            end_a,
+            midpoint_b,
+            end_b,
+            midpoint_clearance,
+            end_clearance,
+            depth + 1,
+        )
+
+    return any(
+        interval_intersects(
+            dense_poses_a[index],
+            dense_poses_a[index + 1],
+            dense_poses_b[index],
+            dense_poses_b[index + 1],
+            float(clearances[index]),
+            float(clearances[index + 1]),
+            0,
+        )
+        for index in range(dense_poses_a.shape[0] - 1)
+    )
+
+
+def synchronized_sweeps_intersect(
+    footprint_a: Footprint,
+    poses_a: Any,
+    footprint_b: Footprint,
+    poses_b: Any,
+    *,
+    grid: GridSpec,
+) -> bool:
+    """Conservatively reject contact anywhere between synchronized SE(2) frames."""
+
+    if not isinstance(
+        footprint_a, (CircleFootprint, RectangleFootprint)
+    ) or not isinstance(footprint_b, (CircleFootprint, RectangleFootprint)):
+        raise TypeError("footprints must be CircleFootprint or RectangleFootprint")
+    if not isinstance(grid, GridSpec):
+        raise TypeError("grid must be a GridSpec")
+    resolution_m = _finite_real(grid.resolution_m, name="grid.resolution_m")
+    if resolution_m <= 0.0:
+        raise ValueError("grid.resolution_m must be positive")
+    pose_array_a = _poses(poses_a, name="poses_a")
+    pose_array_b = _poses(poses_b, name="poses_b")
+    dense_a, dense_b = _densify_synchronized_pose_sequences(
+        pose_array_a,
+        pose_array_b,
+        max_translation_step_m=0.5 * resolution_m,
+        max_yaw_step_rad=np.deg2rad(5.0),
+    )
+    return _dense_synchronized_sweeps_intersect(
+        footprint_a,
+        dense_a,
+        footprint_b,
+        dense_b,
+    )
+
+
+def swept_footprint_intersects_occupancy(
+    footprint: Footprint,
+    poses: Any,
+    occupancy: Any,
+    *,
+    grid: GridSpec,
+) -> bool:
+    """Certify a continuous sweep against closed occupied grid-cell rectangles."""
+
+    if not isinstance(footprint, (CircleFootprint, RectangleFootprint)):
+        raise TypeError("footprint must be CircleFootprint or RectangleFootprint")
+    if not isinstance(grid, GridSpec):
+        raise TypeError("grid must be a GridSpec")
+    resolution_m = _finite_real(grid.resolution_m, name="grid.resolution_m")
+    if resolution_m <= 0.0:
+        raise ValueError("grid.resolution_m must be positive")
+    pose_array = _poses(poses, name="poses")
+    if pose_array.shape[0] == 0:
+        raise ValueError("poses must not be empty")
+    occupancy_array = np.asarray(occupancy)
+    if (
+        occupancy_array.shape != (grid.height, grid.width)
+        or occupancy_array.dtype.kind not in "biuf"
+    ):
+        raise ValueError("occupancy must be a numeric grid-shaped array")
+    if occupancy_array.dtype.kind in "iuf" and not np.isfinite(
+        occupancy_array
+    ).all():
+        raise ValueError("occupancy must contain only finite values")
+    occupied_indices = np.argwhere(occupancy_array != 0)
+    if occupied_indices.size == 0:
+        return False
+
+    dense_poses = _densify_pose_sequence(
+        pose_array,
+        max_translation_step_m=0.5 * resolution_m,
+        max_yaw_step_rad=np.deg2rad(5.0),
+    )
+    occupied_centers = grid_to_world(occupied_indices, grid)
+    broadphase_margin = _sweep_motion_radius(footprint) + (
+        resolution_m / np.sqrt(2.0)
+    )
+    cell_footprint = RectangleFootprint(
+        resolution_m,
+        resolution_m,
+    )
+    pose_segments = (
+        (dense_poses,)
+        if dense_poses.shape[0] == 1
+        else tuple(
+            dense_poses[index : index + 2]
+            for index in range(dense_poses.shape[0] - 1)
+        )
+    )
+    for segment_poses in pose_segments:
+        candidate_mask = (
+            (
+                occupied_centers[:, 0]
+                >= np.min(segment_poses[:, 0]) - broadphase_margin
+            )
+            & (
+                occupied_centers[:, 0]
+                <= np.max(segment_poses[:, 0]) + broadphase_margin
+            )
+            & (
+                occupied_centers[:, 1]
+                >= np.min(segment_poses[:, 1]) - broadphase_margin
+            )
+            & (
+                occupied_centers[:, 1]
+                <= np.max(segment_poses[:, 1]) + broadphase_margin
+            )
+        )
+        for center in occupied_centers[candidate_mask]:
+            cell_poses = np.zeros_like(segment_poses)
+            cell_poses[:, :2] = center
+            if _dense_synchronized_sweeps_intersect(
+                footprint,
+                segment_poses,
+                cell_footprint,
+                cell_poses,
+            ):
+                return True
+    return False
 
 
 def prepare_occluder_collision_sweep(

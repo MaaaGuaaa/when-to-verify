@@ -29,7 +29,6 @@ from src.geometry import (
     intersects,
     points_in_grid,
     rasterize_footprint,
-    rasterize_footprint_sweep,
     raycast_visibility,
     signed_clearance,
     trajectory_signed_clearances,
@@ -58,9 +57,10 @@ from .occluder_sampler import (
     JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION,
     OccluderCollisionSweep,
     OccluderSamplingError,
-    _densify_pose_sequence,
     align_environment_occluder_to_target_los_envelope,
     occluder_collision_sweep_rejection_reason,
+    synchronized_sweeps_intersect,
+    swept_footprint_intersects_occupancy,
 )
 from .structural_blindspot import (
     StructuralBlindSpot,
@@ -713,25 +713,24 @@ def _validate_target_candidate(
     ):
         raise _CandidateRejected("target_current_robot_overlap")
 
-    dense_all_poses = _densify_pose_sequence(
-        all_poses.astype(np.float64),
-        max_translation_step_m=0.5 * environment.grid.resolution_m,
-        max_yaw_step_rad=np.deg2rad(5.0),
-    )
-    if environment.base_static_occupancy.any():
-        sweep = rasterize_footprint_sweep(
-            environment.target_footprint, dense_all_poses, environment.grid
-        )
-        if np.any(sweep & environment.base_static_occupancy):
-            raise _CandidateRejected("target_static_collision")
-    for occluder_footprint, occluder_pose in environment.occluder_geometry:
-        clearances = trajectory_signed_clearances(
-            occluder_footprint,
-            np.tile(occluder_pose, (dense_all_poses.shape[0], 1)),
+    if (
+        environment.base_static_occupancy.any()
+        and swept_footprint_intersects_occupancy(
             environment.target_footprint,
-            dense_all_poses,
+            all_poses,
+            environment.base_static_occupancy,
+            grid=environment.grid,
         )
-        if np.any(clearances <= 0.0):
+    ):
+        raise _CandidateRejected("target_static_collision")
+    for occluder_footprint, occluder_pose in environment.occluder_geometry:
+        if synchronized_sweeps_intersect(
+            environment.target_footprint,
+            all_poses,
+            occluder_footprint,
+            np.tile(occluder_pose, (all_poses.shape[0], 1)),
+            grid=environment.grid,
+        ):
             raise _CandidateRejected("target_occluder_collision")
 
     for object_id in sorted(environment.context_footprints):
@@ -742,35 +741,35 @@ def _validate_target_candidate(
                 oracle_context.dynamic_object_future[object_id],
             )
         )
-        clearances = trajectory_signed_clearances(
+        if synchronized_sweeps_intersect(
             environment.target_footprint,
             all_poses,
             context_footprint,
             context_poses,
-        )
-        if np.any(clearances <= 0.0):
+            grid=environment.grid,
+        ):
             raise _CandidateRejected("target_context_collision")
 
     base_only_ids = set(environment.scene_history_footprints) - set(
         environment.context_footprints
     )
     for object_id in sorted(base_only_ids):
-        clearances = trajectory_signed_clearances(
+        if synchronized_sweeps_intersect(
             environment.target_footprint,
             history,
             environment.scene_history_footprints[object_id],
             environment.scene_dynamic_history[object_id],
-        )
-        if np.any(clearances <= 0.0):
+            grid=environment.grid,
+        ):
             raise _CandidateRejected("target_base_history_collision")
 
-    robot_history_clearances = trajectory_signed_clearances(
+    if synchronized_sweeps_intersect(
         environment.robot_footprint,
         base_state.robot_history,
         environment.target_footprint,
         history,
-    )
-    if np.any(robot_history_clearances <= 0.0):
+        grid=environment.grid,
+    ):
         raise _CandidateRejected("target_robot_history_collision")
 
     velocities = np.diff(all_poses[:, :2].astype(np.float64), axis=0) / (

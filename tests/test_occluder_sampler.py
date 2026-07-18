@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError, replace
 import numpy as np
 import pytest
 
+import src.generation.occluder_sampler as occluder_sampler_module
 from src.contracts import GridSpec
 from src.generation.occluder_sampler import (
     OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION,
@@ -14,8 +15,16 @@ from src.generation.occluder_sampler import (
     PreparedOccluderCollisionSweep,
     occluder_collision_sweep_rejection_reason,
     prepare_occluder_collision_sweep,
+    synchronized_sweeps_intersect,
+    swept_footprint_intersects_occupancy,
 )
-from src.geometry import CircleFootprint, RectangleFootprint
+from src.geometry import (
+    CircleFootprint,
+    RectangleFootprint,
+    grid_to_world,
+    signed_clearance,
+    trajectory_signed_clearances,
+)
 
 
 def _grid(*, resolution_m: float = 0.1) -> GridSpec:
@@ -39,6 +48,167 @@ def _raw_sweep(
         poses=poses,
         rejection_reason=reason,
     )
+
+
+@pytest.mark.parametrize(
+    ("footprint_a", "footprint_b"),
+    (
+        (CircleFootprint(0.1), CircleFootprint(0.1)),
+        (CircleFootprint(0.1), RectangleFootprint(0.2, 0.1)),
+        (RectangleFootprint(0.2, 0.1), RectangleFootprint(0.2, 0.1)),
+    ),
+    ids=("circle-circle", "circle-rectangle", "rectangle-rectangle"),
+)
+def test_synchronized_sweeps_reject_between_frame_position_exchange(
+    footprint_a,
+    footprint_b,
+) -> None:
+    poses_a = np.asarray([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    poses_b = np.asarray([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
+    assert signed_clearance(footprint_a, poses_a[0], footprint_b, poses_b[0]) > 0.0
+    assert signed_clearance(footprint_a, poses_a[1], footprint_b, poses_b[1]) > 0.0
+
+    assert synchronized_sweeps_intersect(
+        footprint_a,
+        poses_a,
+        footprint_b,
+        poses_b,
+        grid=_grid(),
+    )
+
+
+def test_synchronized_common_translation_preserves_tiny_positive_gap() -> None:
+    footprint = CircleFootprint(0.1)
+    poses_a = np.asarray([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]])
+    poses_b = poses_a.copy()
+    poses_b[:, 1] += 0.20000005
+    assert np.all(
+        trajectory_signed_clearances(
+            footprint,
+            poses_a,
+            footprint,
+            poses_b,
+        )
+        > 0.0
+    )
+    assert not synchronized_sweeps_intersect(
+        footprint,
+        poses_a,
+        footprint,
+        poses_b,
+        grid=_grid(),
+    )
+
+
+def test_circle_yaw_does_not_consume_clearance_margin() -> None:
+    footprint = CircleFootprint(0.1)
+    poses_a = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, np.deg2rad(5.0)]]
+    )
+    poses_b = np.asarray(
+        [[0.0, 0.200000001, 0.0], [0.0, 0.200000001, 0.0]]
+    )
+    assert np.all(
+        trajectory_signed_clearances(
+            footprint,
+            poses_a,
+            footprint,
+            poses_b,
+        )
+        > 0.0
+    )
+
+    assert not synchronized_sweeps_intersect(
+        footprint,
+        poses_a,
+        footprint,
+        poses_b,
+        grid=_grid(),
+    )
+
+
+def test_static_occupancy_rejects_contact_between_rotation_samples() -> None:
+    grid = GridSpec(
+        height=200,
+        width=200,
+        history_steps=2,
+        future_steps=2,
+        resolution_m=0.02,
+    )
+    cell_index = np.asarray([102, 149], dtype=np.int64)
+    cell_center = grid_to_world(cell_index, grid)
+    contact_yaw = float(np.arctan2(cell_center[1], cell_center[0]))
+    footprint = RectangleFootprint(
+        2.0 * float(np.linalg.norm(cell_center)),
+        0.002,
+    )
+    poses = np.asarray(
+        [
+            [0.0, 0.0, contact_yaw - np.deg2rad(2.25)],
+            [0.0, 0.0, contact_yaw + np.deg2rad(6.75)],
+        ]
+    )
+    fixed_samples = np.asarray(
+        [
+            poses[0],
+            [0.0, 0.0, contact_yaw + np.deg2rad(2.25)],
+            poses[1],
+        ]
+    )
+    cell = RectangleFootprint(grid.resolution_m, grid.resolution_m)
+    cell_pose = np.asarray([*cell_center, 0.0])
+    assert all(
+        signed_clearance(footprint, pose, cell, cell_pose) > 0.0
+        for pose in fixed_samples
+    )
+    occupancy = np.zeros((grid.height, grid.width), dtype=bool)
+    occupancy[tuple(cell_index)] = True
+
+    assert swept_footprint_intersects_occupancy(
+        footprint,
+        poses,
+        occupancy,
+        grid=grid,
+    )
+
+
+def test_static_occupancy_broadphase_is_local_to_each_dense_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = GridSpec(
+        height=100,
+        width=100,
+        history_steps=2,
+        future_steps=2,
+        resolution_m=0.1,
+    )
+    poses = np.asarray([[-4.0, -4.0, 0.0], [4.0, 4.0, 0.0]])
+    occupancy = np.zeros((grid.height, grid.width), dtype=bool)
+    occupancy[10:30, 70:90] = True
+    occupancy[70:90, 10:30] = True
+    real_intersection = (
+        occluder_sampler_module._dense_synchronized_sweeps_intersect
+    )
+    checked_cells = 0
+
+    def count_checked_cells(*args, **kwargs) -> bool:
+        nonlocal checked_cells
+        checked_cells += 1
+        return real_intersection(*args, **kwargs)
+
+    monkeypatch.setattr(
+        occluder_sampler_module,
+        "_dense_synchronized_sweeps_intersect",
+        count_checked_cells,
+    )
+
+    assert not swept_footprint_intersects_occupancy(
+        CircleFootprint(0.05),
+        poses,
+        occupancy,
+        grid=grid,
+    )
+    assert checked_cells <= 2
 
 
 def test_prepare_collision_sweep_owns_canonical_read_only_interval_geometry() -> None:

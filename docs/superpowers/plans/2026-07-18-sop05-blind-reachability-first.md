@@ -15,6 +15,8 @@
 - Create `src/generation/blind_reachability.py`: pure snippet displacement, finite angle schedule, exact SE(2) start-pose construction, mask queries, chord triage, stable candidate identities.
 - Create `src/generation/causal_occluder.py`: deterministic free-space environment-occluder proposals independent of one conflict-point normal.
 - Create `src/generation/blind_region.py`: formal-renderer input assembly and footprint/yaw-safe center-mask broad phase.
+- Create `src/generation/robot_sweep_cache.py`: strict-key immutable preparation cache for the small SOP04 trajectory bank and per-base sweeps.
+- Modify `src/generation/occluder_sampler.py`: allow the existing continuous validator to consume prepared sweeps without changing its signed-clearance semantics.
 - Modify `src/generation/event_sampler.py`: environment-only v5 orchestration and exact continuous acceptance.
 - Modify `src/generation/sop05_input_adapter.py`: require corrected SOP04 future-endpoint layout.
 - Modify `src/generation/sop05_selection.py`: v5 producer/report tokens and deterministic diversity-aware total selection.
@@ -162,8 +164,12 @@ Run the Step 2 test twice, then commit the exact two files.
 **Files:**
 - Create: `src/generation/causal_occluder.py`
 - Create: `src/generation/blind_region.py`
+- Create: `src/generation/robot_sweep_cache.py`
 - Create: `tests/test_causal_occluder.py`
 - Create: `tests/test_blind_region.py`
+- Create: `tests/test_robot_sweep_cache.py`
+- Modify: `src/generation/occluder_sampler.py`
+- Modify: `tests/test_occluder_sampler.py`
 - Modify: `configs/generator_train.yaml`
 - Modify: `configs/generator_test.yaml`
 
@@ -193,7 +199,24 @@ bearing quadrants, never overlaps the continuous robot/context sweeps, is not
 derived from a conflict-point normal, emits one stable proposal identity, and
 records explicit free-space/shadow rejection reasons.
 
-- [ ] **Step 3: Write RED blind-mask tests**
+- [ ] **Step 3: Write RED robot-sweep cache tests**
+
+Build a toy bank with repeated use of the same trajectory. Require exactly one
+future-sweep preparation for one strict key, read-only cached arrays, stable
+cache identity, and byte-identical cold/warm entries. The key must bind
+trajectory ID, exact pose and persisted swept-mask digests, robot footprint,
+grid, corrected pose-time layout, and preparation algorithm version. Changing
+any bound input must miss or fail; the same trajectory ID with different poses
+must never alias.
+
+Require prepared and legacy unprepared paths through
+`occluder_collision_sweep_rejection_reason` to return identical results for
+clearance, frame contact, and between-frame contact. Cache only canonical
+future geometry globally per worker; prepare robot history per base and context
+motion per base/object. A stored SOP04 `swept_mask` is broad-phase evidence
+only and cannot decide collision by itself.
+
+- [ ] **Step 4: Write RED blind-mask tests**
 
 Require `build_blind_region` to call the same ray-casting kernel used by the
 formal renderer and to combine base static, causal obstacle, current context,
@@ -201,16 +224,17 @@ FOV, and range while rejecting any oracle-future input. Assert byte equality
 with a direct renderer-kernel call. Test circle masks and yaw-binned rectangle
 masks, followed by exact polygon visibility.
 
-- [ ] **Step 4: Run RED**
+- [ ] **Step 5: Run RED**
 
 ```bash
 srun -p gpu -c 8 --mem=12G -t 00:15:00 \
   /home/home/ccnt_zq/zq_zhouyiqun/hyz_ws/AAAI/.conda-envs/sop4-risk/bin/python \
   -m pytest -q tests/test_causal_occluder.py tests/test_blind_region.py \
+  tests/test_robot_sweep_cache.py tests/test_occluder_sampler.py \
   tests/test_occluder_visibility.py tests/test_observation_renderer.py
 ```
 
-- [ ] **Step 5: Implement minimal modules using existing geometry**
+- [ ] **Step 6: Implement minimal modules using existing geometry**
 
 Reuse `OccluderCollisionSweep`, continuous signed-clearance certification,
 `rasterize_footprint`, `raycast_visibility`, and
@@ -218,10 +242,18 @@ Reuse `OccluderCollisionSweep`, continuous signed-clearance certification,
 semantics. Proposal IDs bind type, exact pose/dimensions, schedule index, seed,
 base ID, and trajectory ID.
 
-- [ ] **Step 6: Run GREEN and commit**
+Prepare the current bank once per worker through
+`ROBOT_SWEEP_CACHE_VERSION = "robot_sweep_cache_v1"`. Reuse canonical
+dense future poses and interval motion geometry; do not cache
+occluder-specific clearances, target motion, visibility, static occupancy, or
+context from another base. Keep the old unprepared validator entry point for
+v4 callers and require numerical/verdict equivalence in tests.
 
-Run Step 4. Require no change to legacy v4 tests except version-specific
-fixtures. Commit the two modules, two tests, and two generator configs.
+- [ ] **Step 7: Run GREEN and commit**
+
+Run Step 5. Require no change to legacy v4 tests except version-specific
+fixtures. Commit the three new modules, three new tests, the directly modified
+occluder sampler/test, and two generator configs.
 
 ### Task 4: Orchestrate environment collision mothers
 

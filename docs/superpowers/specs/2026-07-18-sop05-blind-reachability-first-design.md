@@ -94,6 +94,31 @@ Construct continuous collision sweeps for robot history plus future and all
 context-object history plus future. Inflate them by the configured footprints.
 These sweeps define where a new static obstacle may not be placed.
 
+The SOP04 candidate bank is intentionally small (the current bank contains 21
+entries: 20 moving candidates and stop), so the candidate-future part of this
+work must be prepared once and reused rather than rebuilt for every obstacle
+proposal. The count 21 is descriptive, not a hard-coded contract: cache
+construction enumerates the formal bank manifest and supports any future bank
+size.
+
+Each worker keeps an immutable robot-future sweep cache whose key binds the
+trajectory ID, exact float64 pose digest, persisted swept-mask digest, robot
+footprint digest, grid digest, `future_endpoints_dt_to_horizon_v1` layout, and
+continuous-collision preparation version. An entry retains the validated SOP04
+query mask for coarse lookup, the canonical SE(2)-densified future poses, and
+the reusable interval geometry/motion bounds needed by the exact clearance
+validator. Reusing an entry may skip normalization, rasterization, and
+densification, but never an occluder-specific signed-clearance decision.
+
+The base-specific robot-history sweep is prepared once per base state, and
+context-object sweeps once per base/object. They are not aliased to the
+canonical trajectory cache. Static occupancy, target motion, visibility, and
+the proposed occluder also remain per-candidate inputs. A coarse mask hit is
+`unresolved`, not proof of collision; only the unchanged continuous validator
+may accept or reject physical clearance. Cache-key mismatch, stale layout, or
+digest mismatch is a hard error rather than a silent recomputation under the
+same identity.
+
 ### 2. Propose one causal environment occluder
 
 Sample one wall, shelf, or pillar from free space in a configured interaction
@@ -280,6 +305,7 @@ The implementation should keep the existing public contracts and introduce
 small generation units with explicit responsibilities:
 
 - obstacle free-space proposal and causal-occluder validation;
+- immutable canonical robot-sweep preparation and per-worker cache lookup;
 - visibility and footprint-safe blind-center-mask construction;
 - snippet reachability indexing and arc/annular-sector queries;
 - chord broad-phase scoring;
@@ -324,6 +350,12 @@ are forbidden. Base/trajectory work items are independent and may run through
 Slurm CPU arrays or process workers. The final reducer canonicalizes accepted
 entries before total-quota selection and atomic publication.
 
+Sweep caches are process-local performance state, never scientific state. A
+cache hit and a cold build must return byte-identical prepared arrays and the
+same physical verdicts. Worker count, task ordering, eviction, and warm/cold
+state must not affect candidate IDs, report denominators, acceptance, or output
+digests.
+
 Repeated runs with the same inputs, configuration, code identity, and seed
 must publish the same selected event IDs and semantic digest regardless of
 worker count or completion order.
@@ -338,6 +370,8 @@ Structured summaries report, at minimum:
 - chord broad-phase passes and rejections;
 - exact 23-frame validations and rejection reasons;
 - accepted mother events and accepted events per CPU-hour;
+- canonical/base/context sweep-cache builds, hits, misses, preparation time,
+  and exact-clearance calls;
 - unique base, trajectory, snippet, obstacle-type, bearing-bin,
   approach-side, and conflict-time counts; and
 - per-variant attempts/accepts plus complete-sixpack count for the audit subset.
@@ -372,13 +406,16 @@ Implementation follows test-driven development and must include:
 5. Shape, dtype, NaN/Inf, current/history seam, time-scale, no-extrapolation,
    collision, and visibility invariants.
 6. Determinism across repeated serial and parallel runs.
-7. A Slurm real-data smoke benchmark over 10-100 outputs using the same trusted
+7. Sweep-cache tests proving one preparation per strict key, immutable cached
+   arrays, hard failure on pose/layout/footprint/grid mismatch, and identical
+   cold-cache/warm-cache physical verdicts.
+8. A Slurm real-data smoke benchmark over 10-100 outputs using the same trusted
    SOP03/SOP04 inputs as v4.
-8. A same-budget v4/v5 comparison reporting accepted mothers per CPU-hour and
+9. A same-budget v4/v5 comparison reporting accepted mothers per CPU-hour and
    every stage conversion rate. Full-scale generation does not start unless v5
    improves accepted-event throughput by at least 2x without violating any
    scientific invariant; 5x or greater is the performance target.
-9. Five deterministic-random mother events sampled before pair-success
+10. Five deterministic-random mother events sampled before pair-success
    conditioning, showing robot state, candidate trajectory, causal obstacle,
    blind/visible regions, source-derived target history/future, and collision
    timing. A separate complete-sixpack audit must be labeled as a conditional

@@ -8,7 +8,7 @@ import re
 
 
 SOP05_PUBLICATION_IDENTITY_VERSION = (
-    "sop05_publication_semantic_digest_v1"
+    "sop05_publication_semantic_digest_v2"
 )
 _DOMAIN_PREFIX = SOP05_PUBLICATION_IDENTITY_VERSION.encode("ascii") + b"\0"
 _RUN_ID_PATTERN = re.compile(r"sop05-run-[0-9a-f]{32}\Z")

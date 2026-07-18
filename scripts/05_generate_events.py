@@ -20,11 +20,15 @@ from src.contracts import ContractError  # noqa: E402
 from src.generation.event_sampler import GeneratorConfigError  # noqa: E402
 from src.generation.sop05_input_adapter import Sop05InputError  # noqa: E402
 from src.generation.sop05_run import (  # noqa: E402
+    SOP05_RUN_VERSION,
     Sop05RunError,
     Sop05RunRequest,
     execute_sop05_run,
     preflight_summary,
     prepare_sop05_run,
+)
+from src.generation.sop05_selection import (  # noqa: E402
+    SOP05_TOTAL_QUOTA_SELECTION_VERSION,
 )
 from src.utils.config import ConfigError  # noqa: E402
 
@@ -152,10 +156,15 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     payload = {
+        "producer_version": SOP05_RUN_VERSION,
+        "selection_version": SOP05_TOTAL_QUOTA_SELECTION_VERSION,
         "run_state": result.run_state,
         "run_id": result.run_id,
         "output_dir": str(result.output_dir),
         "selected_count": result.generation_summary["selected_count"],
+        "allocated_cpu_seconds": result.generation_summary[
+            "allocated_cpu_seconds"
+        ],
         "publication_semantic_digest": result.publication_semantic_digest,
     }
     print(json.dumps(payload, sort_keys=True, allow_nan=False))

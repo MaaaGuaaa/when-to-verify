@@ -23,9 +23,16 @@ from src.contracts import SCHEMA_VERSION, GridSpec, OracleWorld, build_grid_spec
 from src.generation.dynamic_object_transplant import (
     MOTION_SNIPPET_CURRENT_INDEX,
     MOTION_SNIPPET_CURRENT_TIME_S,
+    MOTION_SNIPPET_FUTURE_STEPS,
     MOTION_SNIPPET_LAYOUT_VERSION,
+    MOTION_SNIPPET_SAMPLE_DT_S,
+    TRANSFORM_ALGORITHM_VERSION,
     TransplantedDynamicObject,
     normalize_target_type_policy,
+)
+from src.generation.blind_reachability import (
+    BLIND_REACHABILITY_ALGORITHM_VERSION,
+    REACHABLE_ARC_SCHEDULE_VERSION,
 )
 from src.generation.event_sampler import (
     GeneratedEvent,
@@ -46,22 +53,20 @@ from src.generation.sop05_selection import (
     SOP05_PAIR_REPORT_VERSION,
     SOP05_RUN_PRODUCER_VERSION,
     SOP05_TOTAL_QUOTA_SELECTION_VERSION,
+    Sop05SelectionCandidate,
     select_sop05_event_ids,
 )
 from src.generation.sop05_publication_identity import (
     SOP05_PUBLICATION_IDENTITY_VERSION,
     compute_sop05_publication_semantic_digest,
 )
-from src.generation.structural_blindspot import (
-    StructuralBlindSpot,
-    has_continuous_emergence,
-)
+from src.generation.structural_blindspot import has_continuous_emergence
 from src.utils.config import load_config
 
 
-SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v2"
-SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v2"
-SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v2"
+SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v3"
+SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v3"
+SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v3"
 
 _EVENT_KINDS = SOP05_EVENT_KIND_ORDER
 _VISIBILITY_HISTORY_LAYOUT = "target_visibility_history8_current7_v1"
@@ -113,6 +118,12 @@ _COMPLETION_MARKER_KEYS = frozenset(
 )
 _PROVENANCE_KEYS = frozenset(
     {
+        "transform_algorithm_version",
+        "transform_id",
+        "reachability_candidate_id",
+        "reachability_algorithm_version",
+        "reachable_arc_schedule_version",
+        "motion_snippet_layout_version",
         "snippet_id",
         "source_recording_id",
         "source_object_id",
@@ -120,18 +131,29 @@ _PROVENANCE_KEYS = frozenset(
         "raw_role",
         "geometry_source",
         "orientation_source",
-        "target_type_policy_digest",
-        "footprint_spec_digest",
-        "conflict_time_s",
-        "conflict_point",
-        "crossing_direction",
-        "rotation_rad",
-        "time_scale",
-        "motion_snippet_layout_version",
+        "source_start_timestamp",
         "source_current_index",
         "source_current_time_s",
-        "source_conflict_anchor_time_s",
+        "source_anchor_index",
+        "source_anchor_time_s",
+        "source_delta_xy",
+        "candidate_current_xy",
+        "conflict_point",
+        "rotation_rad",
+        "desired_crossing_direction",
+        "crossing_side",
+        "angle_offset_deg",
+        "conflict_index",
+        "conflict_time_s",
+        "time_scale",
+        "future_dt_s",
+        "future_steps",
+        "base_state_id",
+        "trajectory_id",
+        "target_type_policy_digest",
+        "footprint_spec_digest",
         "seed",
+        "context_object_ids",
     }
 )
 _SOURCE_IDENTITY_KEYS = frozenset(
@@ -201,40 +223,57 @@ _PAIR_REPORT_KEYS = frozenset(
         "state_id",
         "trajectory_id",
         "seed",
+        "allocated_cpu_seconds",
         "summary",
         "accepted_events",
     }
 )
-_ACCEPTED_EVENT_KEYS = frozenset({"generated_event_id", "event_kind"})
+_ACCEPTED_EVENT_KEYS = frozenset(
+    {
+        "generated_event_id",
+        "event_kind",
+        "object_type",
+        "occluder_type",
+        "crossing_side",
+        "conflict_index",
+        "causal_occluder_proposal_id",
+        "blind_region_id",
+        "reachability_candidate_id",
+        "reachability_transform_id",
+        "exact_validation_id",
+    }
+)
 _PAIR_SUMMARY_KEYS = frozenset(
     {
         "schema_version",
         "seed",
         "requested_event_count",
-        "complete_joint_candidates_attempted",
-        "attempted_count",
-        "joint_candidate_attempted_count",
-        "attempt_index_start",
-        "attempt_index_stop_exclusive",
         "accepted_count",
         "rejected_count",
-        "acceptance_rate",
-        "attempt_acceptance_rate",
-        "request_acceptance_rate",
         "unaccepted_event_count",
+        "attempt_index_start",
+        "attempt_index_stop_exclusive",
         "rejection_reasons",
-        "rejection_stage_counts",
-        "occluder_candidate_rejection_reasons",
-        "requested_event_kind_counts",
-        "event_kind_counts",
-        "by_event_kind",
-        "by_object_type",
-        "by_footprint_kind",
-        "by_geometry_source",
+        "obstacle_proposal_count",
+        "obstacle_proposal_rejected_count",
+        "obstacle_proposal_passed_count",
+        "transform_candidate_count",
+        "transform_rejected_count",
+        "chord_certified_count",
+        "chord_unresolved_count",
+        "exact_validation_count",
+        "exact_validation_accepted_count",
+        "exact_validation_rejected_count",
+        "proposal_ids",
+        "reachability_candidate_ids",
+        "reachability_transform_ids",
+        "exact_validation_ids",
+        "robot_sweep_cache",
         "target_type_policy",
         "target_type_policy_digest",
         "generator_config_digest",
         "generator_algorithm_version",
+        "production_event_kind",
     }
 )
 _GLOBAL_SUMMARY_KEYS = frozenset(
@@ -244,15 +283,20 @@ _GLOBAL_SUMMARY_KEYS = frozenset(
         "run_state",
         "processed_pair_count",
         "requested_event_count",
-        "attempted_count",
         "generator_accepted_count",
+        "candidate_count",
         "selected_count",
         "quota_trimmed_count",
         "generated_event_kind_counts",
         "selected_event_kind_counts",
         "quota_met",
+        "production_event_kind",
+        "canonical_candidate_order",
+        "selected_event_ids",
         "rejection_reasons",
-        "rejection_stage_counts",
+        "stage_counts",
+        "stage_ids",
+        "allocated_cpu_seconds",
         "generator_invariants",
     }
 )
@@ -262,35 +306,31 @@ _GENERATOR_INVARIANT_KEYS = frozenset(
         "target_type_policy_digest",
         "generator_config_digest",
         "generator_algorithm_version",
+        "production_event_kind",
     }
 )
-_REJECTION_STAGE_KEYS = frozenset(
-    {"occluder_geometry", "target_conditioning", "visibility"}
+_BLIND_SPOT_KEYS = frozenset(
+    {"kind", "occluder_ids", "blind_region_digest"}
 )
-_EVENT_KIND_BUCKET_KEYS = frozenset(
-    {
-        "requested",
-        "attempted",
-        "accepted",
-        "rejected",
-        "request_acceptance_rate",
-        "attempt_acceptance_rate",
-        "rejection_reasons",
-        "rejection_stage_counts",
-    }
-)
-_BUCKET_KEYS = frozenset(
-    {
-        "attempted",
-        "accepted",
-        "rejected",
-        "attempt_acceptance_rate",
-        "rejection_reasons",
-    }
-)
-_BLIND_SPOT_KEYS = frozenset({"kind", "structural", "occluder_ids"})
-_STRUCTURAL_KEYS = frozenset({"forward_fov_deg", "range_m", "blind_sectors"})
 _ALLOWED_SPLITS = frozenset({"train", "calibration", "val", "test"})
+_STAGE_COUNT_NAMES = (
+    "obstacle_proposal_count",
+    "obstacle_proposal_rejected_count",
+    "obstacle_proposal_passed_count",
+    "transform_candidate_count",
+    "transform_rejected_count",
+    "chord_certified_count",
+    "chord_unresolved_count",
+    "exact_validation_count",
+    "exact_validation_accepted_count",
+    "exact_validation_rejected_count",
+)
+_STAGE_ID_NAMES = (
+    "proposal_ids",
+    "reachability_candidate_ids",
+    "reachability_transform_ids",
+    "exact_validation_ids",
+)
 
 
 @dataclass(frozen=True)
@@ -311,12 +351,15 @@ class _ValidatedPairReports:
     generated_event_ids: frozenset[str]
     event_pair_identity: Mapping[str, tuple[str, str]]
     event_kind_by_id: Mapping[str, str]
+    stage_row_by_id: Mapping[str, Mapping[str, object]]
     selected_event_ids: tuple[str, ...]
     requested_event_count: int
-    attempted_count: int
     generated_event_kind_counts: dict[str, int]
     rejection_reasons: dict[str, int]
-    rejection_stage_counts: dict[str, int]
+    stage_counts: dict[str, int]
+    stage_ids: dict[str, list[str]]
+    canonical_candidate_order: list[dict[str, str]]
+    allocated_cpu_seconds: float
     generator_invariants: dict[str, object]
 
 
@@ -457,13 +500,6 @@ def _require_hex_digest(value: object, *, size: int, label: str) -> str:
     return value
 
 
-def _require_rate(value: object, *, label: str) -> float:
-    result = _finite_real(value, label=label)
-    if not 0.0 <= result <= 1.0:
-        raise ValueError(f"{label} must lie in [0, 1]")
-    return result
-
-
 def _require_count_map(
     value: object,
     *,
@@ -479,11 +515,6 @@ def _require_count_map(
             raise ValueError(f"{label} keys must be non-empty strings")
         result[key] = _nonnegative_int(count, label=f"{label}[{key!r}]")
     return result
-
-
-def _require_rate_equal(actual: float, expected: float, *, label: str) -> None:
-    if abs(actual - expected) > 1e-12:
-        raise ValueError(f"{label} mismatch")
 
 
 def _bool_vector(value: object, *, size: int, label: str) -> np.ndarray:
@@ -512,63 +543,32 @@ def _validate_event_skeleton(world: OracleWorld, event_kind: str) -> None:
     _require_exact_keys(
         blind_spot, _BLIND_SPOT_KEYS, label="world blind_spot_config"
     )
-    if blind_spot.get("kind") != event_kind:
+    if event_kind != "environment" or blind_spot.get("kind") != "environment":
         raise ValueError("world event skeleton kind mismatch")
     raw_occluder_ids = blind_spot.get("occluder_ids")
     if not isinstance(raw_occluder_ids, list) or any(
         not isinstance(value, str) or not value for value in raw_occluder_ids
     ):
         raise ValueError("world event skeleton occluder_ids are invalid")
-    if len(raw_occluder_ids) != len(set(raw_occluder_ids)):
-        raise ValueError("world event skeleton occluder_ids are not unique")
-
-    world_occluder_ids: list[str] = []
-    for index, raw_occluder in enumerate(world.occluders):
-        occluder = _require_mapping(
-            raw_occluder, label=f"world occluders[{index}]"
-        )
-        occluder_id = _require_nonempty_string(
-            occluder.get("occluder_id"),
-            label=f"world occluders[{index}] occluder_id",
-        )
-        world_occluder_ids.append(occluder_id)
-    if len(world_occluder_ids) != len(set(world_occluder_ids)):
-        raise ValueError("world event skeleton occluder IDs are not unique")
-    if raw_occluder_ids != world_occluder_ids:
+    if len(raw_occluder_ids) != 1 or len(world.occluders) != 1:
+        raise ValueError("formal v5 event skeleton requires one causal occluder")
+    occluder = _require_mapping(
+        world.occluders[0], label="world causal occluder"
+    )
+    occluder_id = _require_nonempty_string(
+        occluder.get("occluder_id"), label="world causal occluder occluder_id"
+    )
+    proposal_id = _require_nonempty_string(
+        occluder.get("proposal_id"), label="world causal occluder proposal_id"
+    )
+    if raw_occluder_ids != [occluder_id]:
         raise ValueError("world event skeleton occluder ID join mismatch")
-
-    structural = blind_spot.get("structural")
-    if event_kind == "environment":
-        if not world_occluder_ids:
-            raise ValueError("environment event skeleton requires an occluder")
-        if structural is not None:
-            raise ValueError(
-                "environment event skeleton cannot contain a structural sensor"
-            )
-        return
-    if event_kind == "structural" and world_occluder_ids:
-        raise ValueError("structural event skeleton cannot contain an occluder")
-    if event_kind == "mixed" and not world_occluder_ids:
-        raise ValueError("mixed event skeleton requires an occluder")
-    structural_mapping = _require_mapping(
-        structural, label=f"{event_kind} event skeleton structural sensor"
+    if proposal_id != occluder_id:
+        raise ValueError("world causal occluder proposal identity mismatch")
+    _require_nonempty_string(
+        blind_spot.get("blind_region_digest"),
+        label="world blind_region_digest",
     )
-    _require_exact_keys(
-        structural_mapping,
-        _STRUCTURAL_KEYS,
-        label=f"{event_kind} event skeleton structural sensor",
-    )
-    sectors = structural_mapping.get("blind_sectors")
-    if not isinstance(sectors, list):
-        raise ValueError("event skeleton blind_sectors must be a list")
-    try:
-        StructuralBlindSpot(
-            forward_fov_deg=structural_mapping.get("forward_fov_deg"),
-            range_m=structural_mapping.get("range_m"),
-            blind_sectors=tuple(dict(sector) for sector in sectors),
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("event skeleton structural sensor is invalid") from exc
 
 
 def _validate_target_provenance(
@@ -584,14 +584,39 @@ def _validate_target_provenance(
     copied = _canonical_json_copy(mapping, label="target_provenance")
     if not isinstance(copied, dict):
         raise ValueError("target_provenance must be an object")
-    identity = {
+    identity: dict[str, object] = {
+        "transform_algorithm_version": TRANSFORM_ALGORITHM_VERSION,
+        "reachability_algorithm_version": (
+            BLIND_REACHABILITY_ALGORITHM_VERSION
+        ),
+        "reachable_arc_schedule_version": REACHABLE_ARC_SCHEDULE_VERSION,
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
         "source_object_id": record.source_object_id,
         "target_type_policy_digest": record.target_type_policy_digest,
         "footprint_spec_digest": record.footprint_spec_digest,
+        "source_current_index": MOTION_SNIPPET_CURRENT_INDEX,
+        "source_current_time_s": MOTION_SNIPPET_CURRENT_TIME_S,
+        "source_anchor_index": MOTION_SNIPPET_CURRENT_INDEX + 1 + conflict_index,
+        "source_anchor_time_s": (
+            (MOTION_SNIPPET_CURRENT_INDEX + 1 + conflict_index)
+            * MOTION_SNIPPET_SAMPLE_DT_S
+        ),
+        "conflict_index": conflict_index,
+        "conflict_time_s": conflict_time_s,
+        "time_scale": 1.0,
+        "future_dt_s": MOTION_SNIPPET_SAMPLE_DT_S,
+        "future_steps": MOTION_SNIPPET_FUTURE_STEPS,
+        "base_state_id": record.base_state_id,
+        "trajectory_id": record.trajectory_id,
+        "seed": attempt_seed,
     }
     for key, expected in identity.items():
-        if copied.get(key) != expected:
+        observed = copied.get(key)
+        if isinstance(expected, float):
+            if abs(_finite_real(observed, label=f"target_provenance {key}") - expected) > 1e-9:
+                raise ValueError(f"target_provenance {key} mismatch")
+        elif observed != expected:
             raise ValueError(f"target_provenance {key} mismatch")
     for key in ("source_recording_id", "geometry_source", "orientation_source"):
         _require_nonempty_string(copied.get(key), label=f"target_provenance {key}")
@@ -601,52 +626,61 @@ def _validate_target_provenance(
             raise ValueError(
                 f"target_provenance {key} must be None or a non-empty string"
             )
-    stored_conflict_time = _finite_real(
-        copied.get("conflict_time_s"),
-        label="target_provenance conflict_time_s",
-    )
-    if abs(stored_conflict_time - conflict_time_s) > 1e-9:
-        raise ValueError("target_provenance conflict_time_s mismatch")
-    time_scale = _finite_real(
-        copied.get("time_scale"), label="target_provenance time_scale"
-    )
-    if time_scale != 1.0:
-        raise ValueError("target_provenance time_scale must equal 1.0")
-    if copied.get("motion_snippet_layout_version") != (
-        MOTION_SNIPPET_LAYOUT_VERSION
-    ):
-        raise ValueError("target_provenance motion snippet layout mismatch")
-    if copied.get("source_current_index") != MOTION_SNIPPET_CURRENT_INDEX:
-        raise ValueError("target_provenance source current index mismatch")
-    source_current_time = _finite_real(
-        copied.get("source_current_time_s"),
-        label="target_provenance source_current_time_s",
-    )
-    if abs(source_current_time - MOTION_SNIPPET_CURRENT_TIME_S) > 1e-9:
-        raise ValueError("target_provenance source current time mismatch")
-    source_anchor_time = _finite_real(
-        copied.get("source_conflict_anchor_time_s"),
-        label="target_provenance source_conflict_anchor_time_s",
-    )
-    expected_anchor_time = MOTION_SNIPPET_CURRENT_TIME_S + conflict_time_s
-    if abs(source_anchor_time - expected_anchor_time) > 1e-9:
-        raise ValueError("target_provenance source conflict anchor mismatch")
     conflict_point = _validate_numeric_vector(
         copied.get("conflict_point"), size=2, label="target_provenance conflict_point"
     )
-    _validate_numeric_vector(
-        copied.get("crossing_direction"),
+    desired_direction = _validate_numeric_vector(
+        copied.get("desired_crossing_direction"),
         size=2,
-        label="target_provenance crossing_direction",
+        label="target_provenance desired_crossing_direction",
     )
+    if abs(float(np.linalg.norm(desired_direction)) - 1.0) > 1e-9:
+        raise ValueError("target_provenance desired crossing direction is not unit")
+    source_delta = _validate_numeric_vector(
+        copied.get("source_delta_xy"),
+        size=2,
+        label="target_provenance source_delta_xy",
+    )
+    if float(np.linalg.norm(source_delta)) <= 1e-9:
+        raise ValueError("target_provenance source_delta_xy is degenerate")
+    candidate_current = _validate_numeric_vector(
+        copied.get("candidate_current_xy"),
+        size=2,
+        label="target_provenance candidate_current_xy",
+    )
+    if not np.allclose(
+        candidate_current,
+        np.asarray(record.current_pose[:2], dtype=np.float64),
+        rtol=0.0,
+        atol=1e-5,
+    ):
+        raise ValueError("target_provenance candidate current pose mismatch")
     _finite_real(copied.get("rotation_rad"), label="target_provenance rotation_rad")
-    provenance_seed = _nonnegative_int(
-        copied.get("seed"), label="target_provenance seed"
+    _finite_real(
+        copied.get("angle_offset_deg"),
+        label="target_provenance angle_offset_deg",
     )
-    if provenance_seed != attempt_seed:
-        raise ValueError(
-            "target_provenance seed does not match world random_seed"
-        )
+    crossing_side = copied.get("crossing_side")
+    if type(crossing_side) is not int or crossing_side not in {-1, 1}:
+        raise ValueError("target_provenance crossing_side must be -1 or 1")
+    _finite_real(
+        copied.get("source_start_timestamp"),
+        label="target_provenance source_start_timestamp",
+    )
+    transform_id = _require_nonempty_string(
+        copied.get("transform_id"), label="target_provenance transform_id"
+    )
+    candidate_id = _require_nonempty_string(
+        copied.get("reachability_candidate_id"),
+        label="target_provenance reachability_candidate_id",
+    )
+    if transform_id == candidate_id:
+        raise ValueError("target transform and reachability candidate IDs collide")
+    context_ids = copied.get("context_object_ids")
+    if not isinstance(context_ids, list) or context_ids != sorted(set(context_ids)) or any(
+        not isinstance(value, str) or not value for value in context_ids
+    ):
+        raise ValueError("target_provenance context_object_ids are invalid")
     expected_conflict_point = np.asarray(
         record.future_poses[conflict_index, :2], dtype=np.float64
     )
@@ -769,6 +803,30 @@ def restore_generated_event(
     if blind_spot_config.get("kind") != event_kind:
         raise ValueError("world metadata event_kind/blind spot mismatch")
     _validate_event_skeleton(world, event_kind)
+    stage_ids = {
+        name: _require_nonempty_string(
+            metadata.get(name), label=f"world metadata {name}"
+        )
+        for name in (
+            "causal_occluder_proposal_id",
+            "blind_region_id",
+            "reachability_candidate_id",
+            "reachability_transform_id",
+            "exact_validation_id",
+        )
+    }
+    causal_occluder = _require_mapping(
+        world.occluders[0], label="world causal occluder"
+    )
+    if (
+        causal_occluder.get("occluder_id")
+        != stage_ids["causal_occluder_proposal_id"]
+        or causal_occluder.get("proposal_id")
+        != stage_ids["causal_occluder_proposal_id"]
+        or blind_spot_config.get("blind_region_digest")
+        != stage_ids["blind_region_id"]
+    ):
+        raise ValueError("world causal occluder/blind-region identity mismatch")
     if metadata.get("dynamic_object_snippet_id") != record.source_snippet_id:
         raise ValueError("world metadata dynamic_object_snippet_id mismatch")
 
@@ -847,6 +905,15 @@ def restore_generated_event(
         conflict_index=conflict_index,
         attempt_seed=attempt_seed,
     )
+    if (
+        provenance.get("reachability_candidate_id")
+        != stage_ids["reachability_candidate_id"]
+        or provenance.get("transform_id")
+        != stage_ids["reachability_transform_id"]
+    ):
+        raise ValueError("world reachability stage identity mismatch")
+    if provenance.get("context_object_ids") != context_ids:
+        raise ValueError("target provenance context object identity mismatch")
     footprint_spec = _canonical_json_copy(
         record.footprint_spec, label="target footprint spec"
     )
@@ -1154,8 +1221,6 @@ def _validate_run_contract(
             label="SOP05 scientific_request max_pairs",
         ),
     }
-    if scientific_ints["events_per_pair"] % 10:
-        raise ValueError("SOP05 scientific_request events_per_pair must be a multiple of 10")
     for name in ("seed", "max_base_states", "trajectory_count", "max_pairs"):
         if scientific_ints[name] != selection_values[name]:
             raise ValueError(f"SOP05 scientific_request {name} differs from input_lock")
@@ -1224,12 +1289,15 @@ def _validate_run_contract(
         raise ValueError(
             "SOP05 scientific_request generator_config_semantic_digest mismatch"
         )
-    if generator_config.get("event_type_weights") != {
-        "environment": 0.6,
-        "structural": 0.3,
-        "mixed": 0.1,
-    }:
-        raise ValueError("SOP05 generator event_type_weights differ from 60/30/10")
+    blind_reachability = generator_config.get("blind_reachability")
+    if (
+        generator_config.get("schema_version") != "3.0.0"
+        or generator_config.get("production_event_kind") != "environment"
+        or not isinstance(blind_reachability, Mapping)
+        or blind_reachability.get("algorithm_version")
+        != SOP05_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError("SOP05 generator snapshot is not formal v5")
     raw_policy = _require_mapping(
         scientific.get("target_type_policy"),
         label="SOP05 scientific_request target_type_policy",
@@ -1367,64 +1435,14 @@ def _validate_checksum_manifest(root: Path) -> None:
             raise ValueError(f"SOP05 checksum mismatch for {relative}")
 
 
-def _validate_bucket_map(
-    value: object,
-    *,
-    label: str,
-    expected_attempted: int,
-    expected_accepted: int,
-    expected_rejected: int,
-    expected_rejection_reasons: Mapping[str, int],
-) -> None:
-    buckets = _require_mapping(value, label=label)
-    if not buckets:
-        raise ValueError(f"{label} must not be empty")
-    attempted_total = 0
-    accepted_total = 0
-    rejected_total = 0
-    rejection_totals: Counter[str] = Counter()
-    for key, raw_bucket in buckets.items():
-        if not key:
-            raise ValueError(f"{label} keys must be non-empty strings")
-        bucket = _require_mapping(raw_bucket, label=f"{label}[{key!r}]")
-        _require_exact_keys(bucket, _BUCKET_KEYS, label=f"{label}[{key!r}]")
-        attempted = _nonnegative_int(
-            bucket.get("attempted"), label=f"{label}[{key!r}] attempted"
-        )
-        accepted = _nonnegative_int(
-            bucket.get("accepted"), label=f"{label}[{key!r}] accepted"
-        )
-        rejected = _nonnegative_int(
-            bucket.get("rejected"), label=f"{label}[{key!r}] rejected"
-        )
-        if accepted + rejected != attempted:
-            raise ValueError(f"{label}[{key!r}] count mismatch")
-        rate = _require_rate(
-            bucket.get("attempt_acceptance_rate"),
-            label=f"{label}[{key!r}] attempt_acceptance_rate",
-        )
-        _require_rate_equal(
-            rate,
-            accepted / attempted if attempted else 0.0,
-            label=f"{label}[{key!r}] attempt_acceptance_rate",
-        )
-        reasons = _require_count_map(
-            bucket.get("rejection_reasons"),
-            label=f"{label}[{key!r}] rejection_reasons",
-        )
-        if sum(reasons.values()) != rejected:
-            raise ValueError(f"{label}[{key!r}] rejection reason total mismatch")
-        attempted_total += attempted
-        accepted_total += accepted
-        rejected_total += rejected
-        rejection_totals.update(reasons)
-    if (
-        attempted_total != expected_attempted
-        or accepted_total != expected_accepted
-        or rejected_total != expected_rejected
-        or dict(rejection_totals) != dict(expected_rejection_reasons)
+
+
+def _require_stage_id_list(value: object, *, label: str) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item for item in value
     ):
-        raise ValueError(f"{label} aggregate mismatch")
+        raise ValueError(f"{label} must be a string list")
+    return list(value)
 
 
 def _validate_pair_summary(
@@ -1438,7 +1456,7 @@ def _validate_pair_summary(
     _require_exact_keys(
         summary, _PAIR_SUMMARY_KEYS, label="pair generation report summary"
     )
-    if summary.get("schema_version") != SCHEMA_VERSION:
+    if summary.get("schema_version") != "3.0.0":
         raise ValueError("pair generation report summary schema_version mismatch")
     if summary.get("seed") != pair_seed:
         raise ValueError("pair generation report summary seed mismatch")
@@ -1448,26 +1466,6 @@ def _validate_pair_summary(
     )
     if requested != contract.events_per_pair:
         raise ValueError("pair generation report requested_event_count mismatch")
-    attempted = _nonnegative_int(
-        summary.get("attempted_count"),
-        label="pair generation report attempted_count",
-    )
-    for alias in (
-        "complete_joint_candidates_attempted",
-        "joint_candidate_attempted_count",
-    ):
-        if _nonnegative_int(
-            summary.get(alias), label=f"pair generation report {alias}"
-        ) != attempted:
-            raise ValueError("pair generation report attempted_count aliases mismatch")
-    _nonnegative_int(
-        summary.get("attempt_index_start"),
-        label="pair generation report attempt_index_start",
-    )
-    if summary.get("attempt_index_stop_exclusive") is not None:
-        raise ValueError(
-            "pair generation report attempt_index_stop_exclusive must be None"
-        )
     accepted = _nonnegative_int(
         summary.get("accepted_count"),
         label="pair generation report accepted_count",
@@ -1478,155 +1476,85 @@ def _validate_pair_summary(
         summary.get("rejected_count"),
         label="pair generation report rejected_count",
     )
-    if attempted < accepted or rejected != attempted - accepted:
-        raise ValueError("pair generation report rejected_count mismatch")
     unaccepted = _nonnegative_int(
         summary.get("unaccepted_event_count"),
         label="pair generation report unaccepted_event_count",
     )
     if unaccepted != requested - accepted:
         raise ValueError("pair generation report unaccepted_event_count mismatch")
-    expected_attempt_rate = accepted / attempted if attempted else 0.0
-    expected_request_rate = accepted / requested
-    for name, expected in (
-        ("attempt_acceptance_rate", expected_attempt_rate),
-        ("acceptance_rate", expected_request_rate),
-        ("request_acceptance_rate", expected_request_rate),
-    ):
-        _require_rate_equal(
-            _require_rate(summary.get(name), label=f"pair generation report {name}"),
-            expected,
-            label=f"pair generation report {name}",
-        )
     rejection_reasons = _require_count_map(
         summary.get("rejection_reasons"),
         label="pair generation report rejection_reasons",
     )
-    if sum(rejection_reasons.values()) != rejected:
-        raise ValueError("pair generation report rejection reason total mismatch")
-    rejection_stages = _require_count_map(
-        summary.get("rejection_stage_counts"),
-        label="pair generation report rejection_stage_counts",
-        exact_keys=_REJECTION_STAGE_KEYS,
-    )
-    if sum(rejection_stages.values()) != rejected:
-        raise ValueError("pair generation report rejection stage total mismatch")
-    _require_count_map(
-        summary.get("occluder_candidate_rejection_reasons"),
-        label="pair generation report occluder_candidate_rejection_reasons",
-    )
-    expected_requested_counts = {
-        "environment": requested * 6 // 10,
-        "structural": requested * 3 // 10,
-        "mixed": requested // 10,
+    stage_counts = {
+        name: _nonnegative_int(
+            summary.get(name), label=f"pair generation report {name}"
+        )
+        for name in _STAGE_COUNT_NAMES
     }
-    requested_counts = _require_count_map(
-        summary.get("requested_event_kind_counts"),
-        label="pair generation report requested_event_kind_counts",
-        exact_keys=frozenset(_EVENT_KINDS),
+    if stage_counts["obstacle_proposal_count"] != (
+        stage_counts["obstacle_proposal_rejected_count"]
+        + stage_counts["obstacle_proposal_passed_count"]
+    ):
+        raise ValueError("pair generation report obstacle conservation mismatch")
+    if stage_counts["transform_candidate_count"] != (
+        stage_counts["transform_rejected_count"]
+        + stage_counts["chord_certified_count"]
+        + stage_counts["chord_unresolved_count"]
+    ):
+        raise ValueError("pair generation report transform conservation mismatch")
+    if stage_counts["exact_validation_count"] != (
+        stage_counts["exact_validation_accepted_count"]
+        + stage_counts["exact_validation_rejected_count"]
+    ):
+        raise ValueError("pair generation report exact conservation mismatch")
+    if rejected != stage_counts["exact_validation_rejected_count"]:
+        raise ValueError("pair generation report exact rejection mismatch")
+    if accepted > stage_counts["exact_validation_accepted_count"]:
+        raise ValueError("pair accepted events exceed exact acceptances")
+    attempt_start = _nonnegative_int(
+        summary.get("attempt_index_start"),
+        label="pair generation report attempt_index_start",
     )
-    if requested_counts != expected_requested_counts:
-        raise ValueError("pair generation report requested event kind counts mismatch")
-    event_kind_counts = _require_count_map(
-        summary.get("event_kind_counts"),
-        label="pair generation report event_kind_counts",
-        exact_keys=frozenset(_EVENT_KINDS),
+    attempt_stop = _nonnegative_int(
+        summary.get("attempt_index_stop_exclusive"),
+        label="pair generation report attempt_index_stop_exclusive",
     )
-    if sum(event_kind_counts.values()) != accepted:
-        raise ValueError("pair generation report event kind count total mismatch")
-
-    by_event_kind = _require_mapping(
-        summary.get("by_event_kind"), label="pair generation report by_event_kind"
+    if attempt_stop < attempt_start or stage_counts[
+        "obstacle_proposal_count"
+    ] != attempt_stop - attempt_start:
+        raise ValueError("pair generation report proposal schedule mismatch")
+    stage_ids = {
+        name: _require_stage_id_list(
+            summary.get(name), label=f"pair generation report {name}"
+        )
+        for name in _STAGE_ID_NAMES
+    }
+    if len(stage_ids["proposal_ids"]) != stage_counts[
+        "obstacle_proposal_count"
+    ]:
+        raise ValueError("pair generation report proposal ID count mismatch")
+    cache = _require_mapping(
+        summary.get("robot_sweep_cache"),
+        label="pair generation report robot_sweep_cache",
     )
     _require_exact_keys(
-        by_event_kind,
-        frozenset(_EVENT_KINDS),
-        label="pair generation report by_event_kind",
+        cache,
+        frozenset({"size", "hits", "misses", "builds"}),
+        label="pair generation report robot_sweep_cache",
     )
-    kind_attempted_total = 0
-    kind_reasons: Counter[str] = Counter()
-    kind_stages: Counter[str] = Counter()
-    for kind in _EVENT_KINDS:
-        bucket = _require_mapping(
-            by_event_kind.get(kind),
-            label=f"pair generation report by_event_kind[{kind!r}]",
+    cache_counts = {
+        name: _nonnegative_int(
+            cache.get(name),
+            label=f"pair generation report robot_sweep_cache {name}",
         )
-        _require_exact_keys(
-            bucket,
-            _EVENT_KIND_BUCKET_KEYS,
-            label=f"pair generation report by_event_kind[{kind!r}]",
-        )
-        kind_requested = _nonnegative_int(
-            bucket.get("requested"),
-            label=f"pair generation report {kind} requested",
-        )
-        kind_attempted = _nonnegative_int(
-            bucket.get("attempted"),
-            label=f"pair generation report {kind} attempted",
-        )
-        kind_accepted = _nonnegative_int(
-            bucket.get("accepted"),
-            label=f"pair generation report {kind} accepted",
-        )
-        kind_rejected = _nonnegative_int(
-            bucket.get("rejected"),
-            label=f"pair generation report {kind} rejected",
-        )
-        if (
-            kind_requested != requested_counts[kind]
-            or kind_accepted != event_kind_counts[kind]
-            or kind_accepted + kind_rejected != kind_attempted
-        ):
-            raise ValueError(f"pair generation report {kind} bucket count mismatch")
-        for name, expected in (
-            (
-                "request_acceptance_rate",
-                kind_accepted / kind_requested if kind_requested else 0.0,
-            ),
-            (
-                "attempt_acceptance_rate",
-                kind_accepted / kind_attempted if kind_attempted else 0.0,
-            ),
-        ):
-            _require_rate_equal(
-                _require_rate(
-                    bucket.get(name),
-                    label=f"pair generation report {kind} {name}",
-                ),
-                expected,
-                label=f"pair generation report {kind} {name}",
-            )
-        reasons = _require_count_map(
-            bucket.get("rejection_reasons"),
-            label=f"pair generation report {kind} rejection_reasons",
-        )
-        stages = _require_count_map(
-            bucket.get("rejection_stage_counts"),
-            label=f"pair generation report {kind} rejection_stage_counts",
-            exact_keys=_REJECTION_STAGE_KEYS,
-        )
-        if sum(reasons.values()) != kind_rejected or sum(stages.values()) != kind_rejected:
-            raise ValueError(f"pair generation report {kind} rejection total mismatch")
-        kind_attempted_total += kind_attempted
-        kind_reasons.update(reasons)
-        kind_stages.update(stages)
+        for name in cache
+    }
     if (
-        kind_attempted_total != attempted
-        or dict(kind_reasons) != rejection_reasons
-        or {key: kind_stages[key] for key in _REJECTION_STAGE_KEYS}
-        != rejection_stages
+        cache_counts["builds"] > cache_counts["misses"]
+        or cache_counts["size"] > cache_counts["builds"]
     ):
-        raise ValueError("pair generation report event-kind aggregates mismatch")
-
-    for name in ("by_object_type", "by_footprint_kind", "by_geometry_source"):
-        _validate_bucket_map(
-            summary.get(name),
-            label=f"pair generation report {name}",
-            expected_attempted=attempted,
-            expected_accepted=accepted,
-            expected_rejected=rejected,
-            expected_rejection_reasons=rejection_reasons,
-        )
+        raise ValueError("pair generation report robot cache conservation mismatch")
     if summary.get("target_type_policy") != contract.target_type_policy:
         raise ValueError("pair generation report target_type_policy mismatch")
     if summary.get("target_type_policy_digest") != contract.target_type_policy_digest:
@@ -1635,28 +1563,28 @@ def _validate_pair_summary(
         contract.generator_config_semantic_digest
     ):
         raise ValueError("pair generation report generator_config_digest mismatch")
-    algorithm_version = _require_nonempty_string(
-        summary.get("generator_algorithm_version"),
-        label="pair generation report generator_algorithm_version",
-    )
-    if algorithm_version != SOP05_GENERATOR_ALGORITHM_VERSION:
-        raise ValueError(
-            "pair generation report generator_algorithm_version does not "
-            f"match the frozen {SOP05_GENERATOR_ALGORITHM_VERSION!r} contract"
-        )
+    if summary.get("generator_algorithm_version") != (
+        SOP05_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise ValueError("pair generation report generator algorithm mismatch")
+    if summary.get("production_event_kind") != "environment":
+        raise ValueError("pair generation report production kind mismatch")
     return {
         "requested": requested,
-        "attempted": attempted,
-        "event_kind_counts": event_kind_counts,
+        "event_kind_counts": {"environment": accepted},
         "rejection_reasons": rejection_reasons,
-        "rejection_stage_counts": rejection_stages,
+        "stage_counts": stage_counts,
+        "stage_ids": stage_ids,
         "invariants": {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": "3.0.0",
             "target_type_policy_digest": contract.target_type_policy_digest,
             "generator_config_digest": contract.generator_config_semantic_digest,
-            "generator_algorithm_version": algorithm_version,
+            "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+            "production_event_kind": "environment",
         },
     }
+
+
 
 
 def _load_pair_reports(
@@ -1667,17 +1595,19 @@ def _load_pair_reports(
     except (OSError, UnicodeError) as exc:
         raise ValueError("invalid pair generation reports") from exc
     if not lines or len(lines) != len(contract.schedule):
-        raise ValueError("pair generation reports must not be empty")
-    event_ids: list[str] = []
-    accepted_events: list[tuple[str, str]] = []
+        raise ValueError("pair generation reports must cover the pair schedule")
+
     event_pair_identity: dict[str, tuple[str, str]] = {}
     event_kind_by_id: dict[str, str] = {}
+    stage_row_by_id: dict[str, Mapping[str, object]] = {}
+    candidates: list[Sop05SelectionCandidate] = []
     requested_total = 0
-    attempted_total = 0
-    kind_totals: Counter[str] = Counter()
     rejection_totals: Counter[str] = Counter()
-    rejection_stage_totals: Counter[str] = Counter()
-    generator_invariants: dict[str, object] | None = None
+    stage_counts = {name: 0 for name in _STAGE_COUNT_NAMES}
+    stage_ids = {name: [] for name in _STAGE_ID_NAMES}
+    allocated_cpu_seconds = 0.0
+    invariants: dict[str, object] | None = None
+
     for line_number, line in enumerate(lines, start=1):
         try:
             row = json.loads(
@@ -1698,16 +1628,14 @@ def _load_pair_reports(
             _PAIR_REPORT_KEYS,
             label=f"pair generation report row {line_number}",
         )
-        canonical_line = _canonical_json_bytes(
+        if line != _canonical_json_bytes(
             mapping, label=f"pair generation report row {line_number}"
-        ).decode("utf-8")
-        if line != canonical_line:
+        ).decode("utf-8"):
             raise ValueError("pair generation report rows must be canonical JSON")
         if mapping.get("report_version") != SOP05_PAIR_REPORT_VERSION:
             raise ValueError("unsupported pair generation report version")
-        if (
-            mapping.get("selection_version")
-            != SOP05_TOTAL_QUOTA_SELECTION_VERSION
+        if mapping.get("selection_version") != (
+            SOP05_TOTAL_QUOTA_SELECTION_VERSION
         ):
             raise ValueError("unsupported SOP05 selection version")
         scheduled = contract.schedule[line_number - 1]
@@ -1718,94 +1646,176 @@ def _load_pair_reports(
             or mapping.get("seed") != scheduled["pair_seed"]
         ):
             raise ValueError("pair generation report order/schedule mismatch")
-        raw_accepted_events = mapping.get("accepted_events")
-        if not isinstance(raw_accepted_events, list):
+        cpu_seconds = _finite_real(
+            mapping.get("allocated_cpu_seconds"),
+            label="pair generation report allocated_cpu_seconds",
+        )
+        if cpu_seconds < 0.0:
+            raise ValueError("pair allocated_cpu_seconds must be nonnegative")
+        allocated_cpu_seconds += cpu_seconds
+
+        raw_events = mapping.get("accepted_events")
+        if not isinstance(raw_events, list):
             raise ValueError("pair report accepted_events must be a list")
-        ids: list[str] = []
-        event_kinds: list[str] = []
-        for event_index, raw_event in enumerate(raw_accepted_events):
+        pair_rows: list[dict[str, object]] = []
+        pair_candidates: list[Sop05SelectionCandidate] = []
+        for event_index, raw_event in enumerate(raw_events):
             accepted_event = _require_mapping(
                 raw_event,
-                label=(
-                    "pair generation report accepted event "
-                    f"{line_number}:{event_index}"
-                ),
+                label=f"pair accepted event {line_number}:{event_index}",
             )
             _require_exact_keys(
                 accepted_event,
                 _ACCEPTED_EVENT_KEYS,
                 label="pair generation report accepted event",
             )
+            copied = _canonical_json_copy(
+                accepted_event, label="pair generation report accepted event"
+            )
+            if not isinstance(copied, dict):
+                raise RuntimeError("accepted event evidence changed type")
             event_id = _require_nonempty_string(
-                accepted_event.get("generated_event_id"),
-                label="pair generation report accepted event ID",
+                copied.get("generated_event_id"), label="accepted event ID"
             )
-            event_kind = _require_nonempty_string(
-                accepted_event.get("event_kind"),
-                label="pair generation report accepted event kind",
+            if copied.get("event_kind") != "environment":
+                raise ValueError("formal v5 accepted event must be environment")
+            object_type = _require_nonempty_string(
+                copied.get("object_type"), label="accepted event object_type"
             )
-            if event_kind not in _EVENT_KINDS:
-                raise ValueError(
-                    "pair generation report accepted event kind is unsupported"
+            occluder_type = _require_nonempty_string(
+                copied.get("occluder_type"), label="accepted event occluder_type"
+            )
+            crossing_side = copied.get("crossing_side")
+            if type(crossing_side) is not int or crossing_side not in {-1, 1}:
+                raise ValueError("accepted event crossing_side is invalid")
+            conflict_index = _nonnegative_int(
+                copied.get("conflict_index"),
+                label="accepted event conflict_index",
+            )
+            for name in (
+                "causal_occluder_proposal_id",
+                "blind_region_id",
+                "reachability_candidate_id",
+                "reachability_transform_id",
+                "exact_validation_id",
+            ):
+                _require_nonempty_string(
+                    copied.get(name), label=f"accepted event {name}"
                 )
-            ids.append(event_id)
-            event_kinds.append(event_kind)
-        if len(ids) != len(set(ids)):
-            raise ValueError("pair generation report contains duplicate event IDs")
-        validated_summary = _validate_pair_summary(
+            pair_rows.append(copied)
+            pair_candidates.append(
+                Sop05SelectionCandidate(
+                    base_state_id=str(scheduled["state_id"]),
+                    trajectory_id=str(scheduled["trajectory_id"]),
+                    generated_event_id=event_id,
+                    object_type=object_type,
+                    occluder_type=occluder_type,
+                    crossing_side=crossing_side,
+                    conflict_index=conflict_index,
+                )
+            )
+        pair_event_ids = [item.generated_event_id for item in pair_candidates]
+        if len(pair_event_ids) != len(set(pair_event_ids)):
+            raise ValueError("pair report contains duplicate event IDs")
+        observed_order = [
+            (
+                str(row["causal_occluder_proposal_id"]),
+                str(row["reachability_candidate_id"]),
+                str(row["reachability_transform_id"]),
+            )
+            for row in pair_rows
+        ]
+        if observed_order != sorted(observed_order):
+            raise ValueError("pair accepted candidate order mismatch")
+
+        checked = _validate_pair_summary(
             mapping.get("summary"),
-            pair_seed=scheduled["pair_seed"],
-            accepted_id_count=len(ids),
+            pair_seed=int(scheduled["pair_seed"]),
+            accepted_id_count=len(pair_rows),
             contract=contract,
         )
-        if Counter(event_kinds) != Counter(
-            validated_summary["event_kind_counts"]
-        ):
-            raise ValueError(
-                "pair report accepted event kinds differ from summary"
-            )
-        requested_total += validated_summary["requested"]
-        attempted_total += validated_summary["attempted"]
-        kind_totals.update(validated_summary["event_kind_counts"])
-        rejection_totals.update(validated_summary["rejection_reasons"])
-        rejection_stage_totals.update(validated_summary["rejection_stage_counts"])
-        invariants = validated_summary["invariants"]
-        if generator_invariants is None:
-            generator_invariants = dict(invariants)
-        elif generator_invariants != invariants:
+        checked_ids = checked["stage_ids"]
+        if not isinstance(checked_ids, Mapping):
+            raise RuntimeError("validated stage IDs changed type")
+        for accepted_row in pair_rows:
+            joins = {
+                "causal_occluder_proposal_id": "proposal_ids",
+                "reachability_candidate_id": "reachability_candidate_ids",
+                "reachability_transform_id": "reachability_transform_ids",
+                "exact_validation_id": "exact_validation_ids",
+            }
+            for event_key, summary_key in joins.items():
+                if accepted_row[event_key] not in checked_ids[summary_key]:
+                    raise ValueError(
+                        f"accepted event {event_key} is absent from stage IDs"
+                    )
+        requested_total += int(checked["requested"])
+        rejection_totals.update(checked["rejection_reasons"])
+        checked_counts = checked["stage_counts"]
+        if not isinstance(checked_counts, Mapping):
+            raise RuntimeError("validated stage counts changed type")
+        for name in _STAGE_COUNT_NAMES:
+            stage_counts[name] += int(checked_counts[name])
+        for name in _STAGE_ID_NAMES:
+            stage_ids[name].extend(checked_ids[name])
+        checked_invariants = checked["invariants"]
+        if invariants is None:
+            invariants = dict(checked_invariants)
+        elif invariants != checked_invariants:
             raise ValueError("pair generation report generator invariants differ")
-        for event_id, event_kind in zip(ids, event_kinds, strict=True):
+        for candidate, accepted_row in zip(
+            pair_candidates, pair_rows, strict=True
+        ):
+            event_id = candidate.generated_event_id
+            if event_id in event_pair_identity:
+                raise ValueError("pair reports contain duplicate event IDs")
             event_pair_identity[event_id] = (
-                scheduled["state_id"],
-                scheduled["trajectory_id"],
+                candidate.base_state_id,
+                candidate.trajectory_id,
             )
-            event_kind_by_id[event_id] = event_kind
-            accepted_events.append((event_id, event_kind))
-        event_ids.extend(ids)
-    if len(event_ids) != len(set(event_ids)):
-        raise ValueError("pair generation reports contain duplicate event IDs")
-    if generator_invariants is None:
+            event_kind_by_id[event_id] = "environment"
+            stage_row_by_id[event_id] = MappingProxyType(accepted_row)
+            candidates.append(candidate)
+
+    if invariants is None:
         raise RuntimeError("validated non-empty pair reports lost invariants")
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.base_state_id,
+            candidate.trajectory_id,
+            candidate.generated_event_id,
+        )
+    )
     selected_event_ids = select_sop05_event_ids(
-        accepted_events,
+        candidates,
         seed=contract.selection_seed,
         accepted_quota=contract.accepted_quota,
     )
+    canonical_candidate_order = [
+        {
+            "base_state_id": candidate.base_state_id,
+            "trajectory_id": candidate.trajectory_id,
+            "generated_event_id": candidate.generated_event_id,
+        }
+        for candidate in candidates
+    ]
     return _ValidatedPairReports(
-        generated_event_ids=frozenset(event_ids),
+        generated_event_ids=frozenset(event_pair_identity),
         event_pair_identity=MappingProxyType(event_pair_identity),
         event_kind_by_id=MappingProxyType(event_kind_by_id),
+        stage_row_by_id=MappingProxyType(stage_row_by_id),
         selected_event_ids=selected_event_ids,
         requested_event_count=requested_total,
-        attempted_count=attempted_total,
-        generated_event_kind_counts={kind: kind_totals[kind] for kind in _EVENT_KINDS},
+        generated_event_kind_counts={"environment": len(candidates)},
         rejection_reasons=dict(sorted(rejection_totals.items())),
-        rejection_stage_counts={
-            kind: rejection_stage_totals[kind]
-            for kind in sorted(_REJECTION_STAGE_KEYS)
-        },
-        generator_invariants=generator_invariants,
+        stage_counts=stage_counts,
+        stage_ids=stage_ids,
+        canonical_candidate_order=canonical_candidate_order,
+        allocated_cpu_seconds=allocated_cpu_seconds,
+        generator_invariants=invariants,
     )
+
+
 
 
 def _validate_generation_summary(
@@ -1824,6 +1834,7 @@ def _validate_generation_summary(
         or summary.get("run_id") != contract.run_id
         or summary.get("run_state") != "complete"
         or summary.get("quota_met") is not True
+        or summary.get("production_event_kind") != "environment"
         or len(events) != contract.accepted_quota
         or len(reports.generated_event_ids) < contract.accepted_quota
     ):
@@ -1831,51 +1842,74 @@ def _validate_generation_summary(
     scalar_expectations = {
         "processed_pair_count": len(contract.schedule),
         "requested_event_count": reports.requested_event_count,
-        "attempted_count": reports.attempted_count,
         "generator_accepted_count": len(reports.generated_event_ids),
+        "candidate_count": len(reports.generated_event_ids),
         "selected_count": len(events),
         "quota_trimmed_count": len(reports.generated_event_ids) - len(events),
     }
     for name, expected in scalar_expectations.items():
-        observed = _nonnegative_int(
+        if _nonnegative_int(
             summary.get(name), label=f"SOP05 generation summary {name}"
-        )
-        if observed != expected:
+        ) != expected:
             raise ValueError(f"SOP05 generation summary {name} mismatch")
     generated_counts = _require_count_map(
         summary.get("generated_event_kind_counts"),
-        label="SOP05 generation summary generated_event_kind_counts",
-        exact_keys=frozenset(_EVENT_KINDS),
+        label="SOP05 generation summary generated event kinds",
+        exact_keys=frozenset({"environment"}),
     )
     selected_counts = _require_count_map(
         summary.get("selected_event_kind_counts"),
-        label="SOP05 generation summary selected_event_kind_counts",
-        exact_keys=frozenset(_EVENT_KINDS),
+        label="SOP05 generation summary selected event kinds",
+        exact_keys=frozenset({"environment"}),
     )
-    observed_selected = Counter(event.event_kind for event in events)
-    expected_selected = {
-        kind: observed_selected[kind]
-        for kind in _EVENT_KINDS
-    }
-    if (
-        generated_counts != reports.generated_event_kind_counts
-        or selected_counts != expected_selected
-    ):
+    if generated_counts != reports.generated_event_kind_counts or selected_counts != {
+        "environment": len(events)
+    }:
         raise ValueError("SOP05 generation summary event-kind counts mismatch")
-    rejection_reasons = _require_count_map(
+    if summary.get("canonical_candidate_order") != (
+        reports.canonical_candidate_order
+    ):
+        raise ValueError("SOP05 generation summary candidate order mismatch")
+    if summary.get("selected_event_ids") != list(reports.selected_event_ids):
+        raise ValueError("SOP05 generation summary selected event order mismatch")
+    reasons = _require_count_map(
         summary.get("rejection_reasons"),
         label="SOP05 generation summary rejection_reasons",
     )
-    rejection_stages = _require_count_map(
-        summary.get("rejection_stage_counts"),
-        label="SOP05 generation summary rejection_stage_counts",
-        exact_keys=_REJECTION_STAGE_KEYS,
+    if reasons != reports.rejection_reasons:
+        raise ValueError("SOP05 generation summary rejection reasons mismatch")
+    counts = _require_count_map(
+        summary.get("stage_counts"),
+        label="SOP05 generation summary stage_counts",
+        exact_keys=frozenset(_STAGE_COUNT_NAMES),
     )
-    if (
-        rejection_reasons != reports.rejection_reasons
-        or rejection_stages != reports.rejection_stage_counts
-    ):
-        raise ValueError("SOP05 generation summary rejection aggregates mismatch")
+    if counts != reports.stage_counts:
+        raise ValueError("SOP05 generation summary stage counts mismatch")
+    raw_stage_ids = _require_mapping(
+        summary.get("stage_ids"), label="SOP05 generation summary stage_ids"
+    )
+    _require_exact_keys(
+        raw_stage_ids,
+        frozenset(_STAGE_ID_NAMES),
+        label="SOP05 generation summary stage_ids",
+    )
+    observed_stage_ids = {
+        name: _require_stage_id_list(
+            raw_stage_ids.get(name),
+            label=f"SOP05 generation summary stage_ids {name}",
+        )
+        for name in _STAGE_ID_NAMES
+    }
+    if observed_stage_ids != reports.stage_ids:
+        raise ValueError("SOP05 generation summary stage IDs mismatch")
+    cpu_seconds = _finite_real(
+        summary.get("allocated_cpu_seconds"),
+        label="SOP05 generation summary allocated_cpu_seconds",
+    )
+    if cpu_seconds < 0.0 or abs(
+        cpu_seconds - reports.allocated_cpu_seconds
+    ) > 1e-12:
+        raise ValueError("SOP05 generation summary CPU accounting mismatch")
     invariants = _require_mapping(
         summary.get("generator_invariants"),
         label="SOP05 generation summary generator_invariants",
@@ -1887,10 +1921,10 @@ def _validate_generation_summary(
     )
     if dict(invariants) != reports.generator_invariants:
         raise ValueError("SOP05 generation summary generator invariants mismatch")
-    copy = _canonical_json_copy(summary, label="SOP05 generation summary")
-    if not isinstance(copy, dict):
+    copied = _canonical_json_copy(summary, label="SOP05 generation summary")
+    if not isinstance(copied, dict):
         raise RuntimeError("validated SOP05 generation summary changed type")
-    return copy
+    return copied
 
 
 def load_complete_sop05_events(
@@ -2050,6 +2084,42 @@ def load_complete_sop05_events(
             raise ValueError(
                 "selected SOP05 event kind differs from pair reports"
             )
+        stage_row = reports.stage_row_by_id.get(event.generated_event_id)
+        if stage_row is None:
+            raise ValueError("selected SOP05 event lacks stage evidence")
+        metadata = _require_mapping(
+            event.world.metadata, label="selected SOP05 event metadata"
+        )
+        provenance = _require_mapping(
+            metadata.get("target_provenance"),
+            label="selected SOP05 target provenance",
+        )
+        occluder = _require_mapping(
+            event.world.occluders[0], label="selected SOP05 causal occluder"
+        )
+        expected_row_values = {
+            "event_kind": event.event_kind,
+            "object_type": event.target.object_type,
+            "occluder_type": occluder.get("type"),
+            "crossing_side": provenance.get("crossing_side"),
+            "conflict_index": event.conflict_index,
+            "causal_occluder_proposal_id": metadata.get(
+                "causal_occluder_proposal_id"
+            ),
+            "blind_region_id": metadata.get("blind_region_id"),
+            "reachability_candidate_id": metadata.get(
+                "reachability_candidate_id"
+            ),
+            "reachability_transform_id": metadata.get(
+                "reachability_transform_id"
+            ),
+            "exact_validation_id": metadata.get("exact_validation_id"),
+        }
+        for name, expected_value in expected_row_values.items():
+            if stage_row.get(name) != expected_value:
+                raise ValueError(
+                    f"selected SOP05 event {name} differs from pair reports"
+                )
         if event.world.metadata.get("generator_algorithm_version") != (
             reports.generator_invariants["generator_algorithm_version"]
         ):

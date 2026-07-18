@@ -139,12 +139,12 @@ def test_publication_semantic_digest_uses_frozen_domain_and_canonical_payload(
         allow_nan=False,
     ).encode("utf-8")
     expected = hashlib.blake2b(
-        b"sop05_publication_semantic_digest_v1\0" + canonical_payload,
+        b"sop05_publication_semantic_digest_v2\0" + canonical_payload,
         digest_size=32,
     ).hexdigest()
 
     assert identity.SOP05_PUBLICATION_IDENTITY_VERSION == (
-        "sop05_publication_semantic_digest_v1"
+        "sop05_publication_semantic_digest_v2"
     )
     assert observed == expected
     assert len(observed) == 64
@@ -159,6 +159,31 @@ def test_publication_semantic_digest_uses_frozen_domain_and_canonical_payload(
             identity.compute_sop05_publication_semantic_digest(**changed)
             != observed
         )
+
+
+def test_sop05_generation_contract_versions_are_exact() -> None:
+    module = _sut()
+    selection = importlib.import_module("src.generation.sop05_selection")
+    identity = _publication_identity_sut()
+
+    assert module.SOP05_RUN_VERSION == "sop05_generation_run_v5"
+    assert module.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v3"
+    assert module.SOP05_GENERATION_SUMMARY_VERSION == (
+        "sop05_generation_summary_v3"
+    )
+    assert module.SOP05_INPUT_LOCK_VERSION == "sop05_input_lock_v2"
+    assert selection.SOP05_PAIR_REPORT_VERSION == (
+        "sop05_pair_generation_report_v3"
+    )
+    assert selection.SOP05_DIVERSITY_TOTAL_SELECTION_VERSION == (
+        "sop05_diversity_total_selection_v1"
+    )
+    assert module.SOP05_GENERATOR_ALGORITHM_VERSION == (
+        "blind_reachability_first_v1"
+    )
+    assert identity.SOP05_PUBLICATION_IDENTITY_VERSION == (
+        "sop05_publication_semantic_digest_v2"
+    )
 
 
 @pytest.mark.parametrize(
@@ -444,36 +469,72 @@ def _generated_event(
         "seed": attempt_seed,
     }
     target = replace(target, provenance=provenance)
-    structural = (
-        {
-            "forward_fov_deg": 180.0,
-            "range_m": 6.0,
-            "blind_sectors": [],
-        }
-        if event_kind in {"structural", "mixed"}
-        else None
-    )
+    assert event_kind == "environment"
+    proposal_id = f"proposal-{event_id}"
+    blind_region_id = f"blind-{event_id}"
+    candidate_id = f"candidate-{event_id}"
+    transform_id = f"transform-{event_id}"
+    exact_validation_id = f"exact-{event_id}"
+    provenance = {
+        "transform_algorithm_version": "reachability_candidate_se2_v1",
+        "transform_id": transform_id,
+        "reachability_candidate_id": candidate_id,
+        "reachability_algorithm_version": "blind_reachability_first_v1",
+        "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
+        "snippet_id": record.source_snippet_id,
+        "source_recording_id": "recording",
+        "source_object_id": record.source_object_id,
+        "source_body_name": "human",
+        "raw_role": "human",
+        "geometry_source": "thor_marker_extent",
+        "orientation_source": "velocity",
+        "source_start_timestamp": 0.0,
+        "source_current_index": MOTION_SNIPPET_CURRENT_INDEX,
+        "source_current_time_s": MOTION_SNIPPET_CURRENT_TIME_S,
+        "source_anchor_index": 12,
+        "source_anchor_time_s": 2.4,
+        "source_delta_xy": [0.25, 0.0],
+        "candidate_current_xy": [float(current[0]), float(current[1])],
+        "conflict_point": [
+            float(record.future_poses[4, 0]),
+            float(record.future_poses[4, 1]),
+        ],
+        "rotation_rad": 0.0,
+        "desired_crossing_direction": [1.0, 0.0],
+        "crossing_side": -1,
+        "angle_offset_deg": 0.0,
+        "conflict_index": 4,
+        "conflict_time_s": 1.0,
+        "time_scale": 1.0,
+        "future_dt_s": 0.2,
+        "future_steps": 15,
+        "base_state_id": base_state_id,
+        "trajectory_id": "trajectory-a",
+        "target_type_policy_digest": record.target_type_policy_digest,
+        "footprint_spec_digest": record.footprint_spec_digest,
+        "seed": attempt_seed,
+        "context_object_ids": [],
+    }
+    target = replace(target, provenance=provenance)
     occluders = (
-        (
-            {
-                "occluder_id": f"occluder-{target_id}",
-                "kind": "pillar",
-                "polygon_xy": [
-                    [0.1, -0.2],
-                    [0.3, -0.2],
-                    [0.3, 0.2],
-                    [0.1, 0.2],
-                ],
-                "height_m": 2.0,
-            },
-        )
-        if event_kind in {"environment", "mixed"}
-        else ()
+        {
+            "occluder_id": proposal_id,
+            "proposal_id": proposal_id,
+            "type": "pillar",
+            "polygon_xy": [
+                [0.1, -0.2],
+                [0.3, -0.2],
+                [0.3, 0.2],
+                [0.1, 0.2],
+            ],
+            "height_m": 2.0,
+        },
     )
     visibility = [False] * 4 + [True] * 12
     metadata = {
         **build_event_target_motion_world_metadata(record),
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
         "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
         "generator_config_digest": config_digest,
         "event_kind": event_kind,
@@ -490,7 +551,11 @@ def _generated_event(
             "target_visibility_history8_current7_v1"
         ),
         "context_dynamic_object_ids": [],
-        "occluder_candidate_rejection_reasons": {},
+        "causal_occluder_proposal_id": proposal_id,
+        "blind_region_id": blind_region_id,
+        "reachability_candidate_id": candidate_id,
+        "reachability_transform_id": transform_id,
+        "exact_validation_id": exact_validation_id,
     }
     world = OracleWorld(
         world_id=record.world_id,
@@ -500,11 +565,9 @@ def _generated_event(
         dynamic_object_specs={target_id: spec},
         occluders=occluders,
         blind_spot_config={
-            "kind": event_kind,
-            "structural": structural,
-            "occluder_ids": [
-                occluder["occluder_id"] for occluder in occluders
-            ],
+            "kind": "environment",
+            "occluder_ids": [proposal_id],
+            "blind_region_digest": blind_region_id,
         },
         random_seed=attempt_seed,
         metadata=metadata,
@@ -527,92 +590,75 @@ def _report(
     seed: int,
     events: tuple[GeneratedEvent, ...],
 ) -> EventGenerationReport:
-    counts = Counter(event.event_kind for event in events)
+    events = tuple(
+        sorted(
+            events,
+            key=lambda event: (
+                event.world.metadata["causal_occluder_proposal_id"],
+                event.world.metadata["reachability_candidate_id"],
+                event.world.metadata["reachability_transform_id"],
+            ),
+        )
+    )
     accepted = len(events)
     rejected = 10 - accepted
     reasons = {} if not rejected else {"fixture_rejection": rejected}
-    stages = {
-        "occluder_geometry": 0,
-        "target_conditioning": rejected,
-        "visibility": 0,
-    }
-    requested_counts = {
-        "environment": 6,
-        "structural": 3,
-        "mixed": 1,
-    }
-
-    def event_kind_bucket(kind: str) -> dict[str, object]:
-        requested = requested_counts[kind]
-        kind_accepted = counts[kind]
-        kind_rejected = requested - kind_accepted
-        return {
-            "requested": requested,
-            "attempted": requested,
-            "accepted": kind_accepted,
-            "rejected": kind_rejected,
-            "request_acceptance_rate": kind_accepted / requested,
-            "attempt_acceptance_rate": kind_accepted / requested,
-            "rejection_reasons": (
-                {"fixture_rejection": kind_rejected}
-                if kind_rejected
-                else {}
-            ),
-            "rejection_stage_counts": {
-                "occluder_geometry": 0,
-                "target_conditioning": kind_rejected,
-                "visibility": 0,
-            },
-        }
-
-    aggregate_bucket = {
-        "attempted": 10,
-        "accepted": accepted,
-        "rejected": rejected,
-        "attempt_acceptance_rate": accepted / 10,
-        "rejection_reasons": reasons,
-    }
+    proposal_ids = [
+        str(event.world.metadata["causal_occluder_proposal_id"])
+        for event in events
+    ]
+    proposal_ids.extend(
+        f"proposal-rejected-{seed}-{index}"
+        for index in range(10 - len(proposal_ids))
+    )
     policy = prepared.generator_config["target_type_policy"]
     return EventGenerationReport(
         events=events,
         summary={
-            "schema_version": "2.0.0",
+            "schema_version": "3.0.0",
             "seed": seed,
             "requested_event_count": 10,
-            "complete_joint_candidates_attempted": 10,
-            "attempted_count": 10,
-            "joint_candidate_attempted_count": 10,
-            "attempt_index_start": 0,
-            "attempt_index_stop_exclusive": None,
             "accepted_count": accepted,
             "rejected_count": rejected,
-            "acceptance_rate": accepted / 10,
-            "attempt_acceptance_rate": accepted / 10,
-            "request_acceptance_rate": accepted / 10,
             "unaccepted_event_count": rejected,
+            "attempt_index_start": 0,
+            "attempt_index_stop_exclusive": 10,
             "rejection_reasons": reasons,
-            "rejection_stage_counts": stages,
-            "occluder_candidate_rejection_reasons": {},
-            "requested_event_kind_counts": requested_counts,
-            "event_kind_counts": {
-                "environment": counts["environment"],
-                "structural": counts["structural"],
-                "mixed": counts["mixed"],
-            },
-            "by_event_kind": {
-                kind: event_kind_bucket(kind) for kind in requested_counts
-            },
-            "by_object_type": {"human": dict(aggregate_bucket)},
-            "by_footprint_kind": {"circle": dict(aggregate_bucket)},
-            "by_geometry_source": {
-                "thor_marker_extent": dict(aggregate_bucket)
+            "obstacle_proposal_count": 10,
+            "obstacle_proposal_rejected_count": 0,
+            "obstacle_proposal_passed_count": 10,
+            "transform_candidate_count": 10,
+            "transform_rejected_count": 0,
+            "chord_certified_count": 10,
+            "chord_unresolved_count": 0,
+            "exact_validation_count": 10,
+            "exact_validation_accepted_count": accepted,
+            "exact_validation_rejected_count": rejected,
+            "proposal_ids": proposal_ids,
+            "reachability_candidate_ids": [
+                event.world.metadata["reachability_candidate_id"]
+                for event in events
+            ],
+            "reachability_transform_ids": [
+                event.world.metadata["reachability_transform_id"]
+                for event in events
+            ],
+            "exact_validation_ids": [
+                event.world.metadata["exact_validation_id"] for event in events
+            ],
+            "robot_sweep_cache": {
+                "size": 1,
+                "hits": 0,
+                "misses": 1,
+                "builds": 1,
             },
             "target_type_policy": policy.as_dict(),
             "target_type_policy_digest": policy.digest,
             "generator_config_digest": _generator_digest(
                 prepared.generator_config
             ),
-            "generator_algorithm_version": "joint_occluder_first_v4",
+            "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+            "production_event_kind": "environment",
         },
     )
 
@@ -639,14 +685,12 @@ def _prepared_with_reports(
             attempt_seed=10200 + index,
             canonical_identity=True,
         )
-        for index, kind in enumerate(
-            ("environment",) * 6 + ("structural",) * 3
-        )
+        for index, kind in enumerate(("environment",) * 9)
     )
     pair_one = (
         _generated_event(
-            "fixture-mixed-9",
-            "mixed",
+            "fixture-environment-9",
+            "environment",
             prepared.grid,
             20,
             "base-a",
@@ -783,8 +827,8 @@ def test_run_identity_binds_only_the_total_selection_contract(
     prepared = module.prepare_sop05_run(_request(module, tmp_path))
 
     identity_payload = {
-        "version": "sop05_generation_run_v4",
-        "selection_version": "sop05_total_quota_selection_v1",
+        "version": "sop05_generation_run_v5",
+        "selection_version": "sop05_diversity_total_selection_v1",
         "producer_source_identity": prepared.producer_source_identity,
         "split": prepared.request.split,
         "sop03": {
@@ -1007,7 +1051,6 @@ def test_source_identity_loader_uses_explicit_git_and_reports_dirty_digest() -> 
     ("field_name", "bad_value", "message"),
     [
         ("accepted_quota", 0, "accepted_quota"),
-        ("events_per_pair", 5, "multiple of 10"),
         ("max_base_states", 0, "max_base_states"),
         ("trajectory_count", 0, "trajectory_count"),
         ("max_pairs", 0, "max_pairs"),
@@ -1031,7 +1074,7 @@ def test_prepare_rejects_invalid_finite_run_limits(
     assert not request.output_dir.exists()
 
 
-def test_prepare_accepts_nondecadal_total_quota_but_not_partial_pair_requests(
+def test_prepare_accepts_nondecadal_total_quota_and_pair_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _sut()
@@ -1043,16 +1086,16 @@ def test_prepare_accepts_nondecadal_total_quota_but_not_partial_pair_requests(
 
     assert prepared.request.accepted_quota == 7
     assert not hasattr(prepared, "required_event_kind_counts")
-    with pytest.raises(module.Sop05RunError, match="events_per_pair.*multiple of 10"):
-        module.prepare_sop05_run(
-            _request(
-                module,
-                tmp_path,
-                accepted_quota=7,
-                events_per_pair=7,
-                output_dir=tmp_path / "partial-pair-run",
-            )
+    partial_pair = module.prepare_sop05_run(
+        _request(
+            module,
+            tmp_path,
+            accepted_quota=7,
+            events_per_pair=7,
+            output_dir=tmp_path / "partial-pair-run",
         )
+    )
+    assert partial_pair.request.events_per_pair == 7
 
 
 def test_prepare_rejects_existing_output_and_impossible_capacity_before_generation(
@@ -1101,18 +1144,14 @@ def test_parallel_pair_collection_completes_with_full_mixed_kind_quota(
     assert finish_order == [101, 102]
     assert [item.rank for item in collection.pair_reports] == [0, 1]
     assert Counter(event.event_kind for event in collection.selected_events) == {
-        "environment": 6,
-        "structural": 3,
-        "mixed": 1,
+        "environment": 10,
     }
     assert collection.generation_summary["processed_pair_count"] == 2
     assert collection.generation_summary["generator_accepted_count"] == 10
     assert collection.generation_summary["selected_count"] == 10
     assert collection.generation_summary["quota_met"] is True
     assert collection.generation_summary["selected_event_kind_counts"] == {
-        "environment": 6,
-        "structural": 3,
-        "mixed": 1,
+        "environment": 10,
     }
     assert "required_event_kind_counts" not in collection.generation_summary
     assert "quota_deficits" not in collection.generation_summary
@@ -1146,12 +1185,7 @@ def test_collection_rejects_report_count_mismatch_and_global_identity_replay(
             prepared.generator_config["target_type_policy"].digest
         ),
     )
-    replay = replace(reports[101], events=(duplicate,))
-    replay.summary["event_kind_counts"] = {
-        "environment": 1,
-        "structural": 0,
-        "mixed": 0,
-    }
+    replay = _report(prepared, 101, (duplicate,))
     monkeypatch.setattr(
         module,
         "generate_events",
@@ -1164,18 +1198,12 @@ def test_collection_rejects_report_count_mismatch_and_global_identity_replay(
 @pytest.mark.parametrize(
     ("summary_update", "message"),
     [
-        ({"rejection_reasons": {}}, "rejection_reasons total"),
         (
-            {
-                "rejection_stage_counts": {
-                    "occluder_geometry": 0,
-                    "target_conditioning": 0,
-                    "visibility": 0,
-                }
-            },
-            "rejection_stage_counts total",
+            {"obstacle_proposal_passed_count": 9},
+            "obstacle proposal conservation",
         ),
-        ({"attempt_acceptance_rate": 0.0}, "attempt_acceptance_rate"),
+        ({"chord_certified_count": 9}, "transform candidate conservation"),
+        ({"exact_validation_count": 9}, "exact validation conservation"),
         ({"generator_config_digest": None}, "generator_config_digest"),
     ],
 )
@@ -1257,7 +1285,7 @@ def test_collection_rejects_old_generator_algorithm_version(
             report,
             summary={
                 **report.summary,
-                "generator_algorithm_version": "joint_occluder_first_v3",
+                "generator_algorithm_version": "joint_occluder_first_v4",
             },
         )
         for seed, report in reports.items()
@@ -1339,7 +1367,13 @@ def test_default_parallel_backend_runs_generation_in_child_processes(
         report = reports[kwargs["seed"]]
         return replace(
             report,
-            summary={**report.summary, "fixture_worker_pid": os.getpid()},
+            summary={
+                **report.summary,
+                "rejection_reasons": {
+                    **report.summary["rejection_reasons"],
+                    f"fixture_worker_pid_{os.getpid()}": 0,
+                },
+            },
         )
 
     monkeypatch.setattr(module, "generate_events", generate)
@@ -1347,8 +1381,10 @@ def test_default_parallel_backend_runs_generation_in_child_processes(
     collection = module.collect_sop05_generation(prepared)
 
     child_pids = {
-        item.report.summary["fixture_worker_pid"]
+        int(key.rsplit("_", 1)[1])
         for item in collection.pair_reports
+        for key in item.report.summary["rejection_reasons"]
+        if key.startswith("fixture_worker_pid_")
     }
     assert child_pids
     assert parent_pid not in child_pids
@@ -1429,7 +1465,7 @@ def test_workers_only_bound_execution_and_never_change_processed_schedule(
                     prepared_two.generator_config["target_type_policy"].digest
                 ),
             )
-            for kind, count in (("environment", 6), ("structural", 3), ("mixed", 1))
+            for kind, count in (("environment", 10),)
             for index in range(count)
         )
         return _report(prepared_two, pair_seed, events)
@@ -1485,8 +1521,8 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     )
     assert manifest["run_state"] == "complete"
     assert manifest["run_id"] == prepared.run_id
-    assert manifest["manifest_version"] == "sop05_run_manifest_v2"
-    assert manifest["producer_version"] == "sop05_generation_run_v4"
+    assert manifest["manifest_version"] == "sop05_run_manifest_v3"
+    assert manifest["producer_version"] == "sop05_generation_run_v5"
     assert manifest["runtime"] == {
         "checksum_workers": 2,
         "git_executable": str(prepared.request.git_executable),
@@ -1510,7 +1546,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         result.output_dir / "configs/generator.yaml"
     )
     assert manifest["scientific_request"]["selection_version"] == (
-        "sop05_total_quota_selection_v1"
+        "sop05_diversity_total_selection_v1"
     )
     assert "required_event_kind_counts" not in manifest["scientific_request"]
     generation_summary = json.loads(
@@ -1519,13 +1555,11 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         )
     )
     assert generation_summary["summary_version"] == (
-        "sop05_generation_summary_v2"
+        "sop05_generation_summary_v3"
     )
     assert generation_summary["quota_met"] is True
     assert generation_summary["selected_event_kind_counts"] == {
-        "environment": 6,
-        "mixed": 1,
-        "structural": 3,
+        "environment": 10,
     }
     assert "required_event_kind_counts" not in generation_summary
     assert "quota_deficits" not in generation_summary
@@ -1537,18 +1571,30 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     ]
     assert [row["rank"] for row in report_rows] == [0, 1]
     assert report_rows[0]["report_version"] == (
-        "sop05_pair_generation_report_v2"
+        "sop05_pair_generation_report_v3"
     )
     assert report_rows[0]["selection_version"] == (
-        "sop05_total_quota_selection_v1"
+        "sop05_diversity_total_selection_v1"
     )
-    assert report_rows[0]["accepted_events"] == [
-        {
-            "generated_event_id": event.generated_event_id,
-            "event_kind": event.event_kind,
-        }
-        for event in reports[102].events
-    ]
+    assert [
+        row["generated_event_id"]
+        for row in report_rows[0]["accepted_events"]
+    ] == [event.generated_event_id for event in reports[102].events]
+    assert all(
+        set(row) == module._event_stage_row(
+            module.PairGenerationReport(
+                rank=0,
+                state_id="base-b",
+                trajectory_id="trajectory-a",
+                pair_seed=102,
+                report=reports[102],
+            ),
+            event,
+        ).keys()
+        for row, event in zip(
+            report_rows[0]["accepted_events"], reports[102].events, strict=True
+        )
+    )
     assert report_rows[0]["summary"] == reports[102].summary
     _assert_outer_checksums(result.output_dir)
     loaded = load_event_target_motion_shard(
@@ -1574,9 +1620,9 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         result.publication_semantic_digest
     )
     marker_payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert marker_payload["marker_version"] == "sop05_producer_complete_v2"
+    assert marker_payload["marker_version"] == "sop05_producer_complete_v3"
     assert marker_payload["publication_identity_version"] == (
-        "sop05_publication_semantic_digest_v1"
+        "sop05_publication_semantic_digest_v2"
     )
     assert marker_payload["run_manifest_sha256"] == _sha256(
         result.output_dir / "run_manifest.json"
@@ -1629,9 +1675,10 @@ def test_complete_publication_requires_formal_consumer_round_trip_before_exposur
     )
     tampered_reports = {
         **reports,
-        102: replace(
-            reports[102],
-            events=(fake_identity_event, *reports[102].events[1:]),
+        102: _report(
+            prepared,
+            102,
+            (fake_identity_event, *reports[102].events[1:]),
         ),
     }
     monkeypatch.setattr(
@@ -1726,12 +1773,10 @@ def test_quota_shortfall_publishes_explicit_partial_failure_without_marker(
     )
     assert manifest["run_state"] == "quota_unmet"
     assert summary["run_state"] == "quota_unmet"
-    assert summary["summary_version"] == "sop05_generation_summary_v2"
+    assert summary["summary_version"] == "sop05_generation_summary_v3"
     assert summary["selected_count"] == 6
     assert summary["selected_event_kind_counts"] == {
         "environment": 6,
-        "mixed": 0,
-        "structural": 0,
     }
     assert "required_event_kind_counts" not in summary
     assert "quota_deficits" not in summary
@@ -1796,7 +1841,7 @@ def test_publication_rejects_selection_order_drift(
     )
 
     with pytest.raises(
-        module.Sop05RunError, match="frozen total-quota selection"
+        module.Sop05RunError, match="frozen diversity-total selection"
     ):
         module.publish_sop05_generation(prepared, tampered)
 
@@ -1844,21 +1889,21 @@ def test_publication_rejects_selected_payload_replaced_behind_same_id_and_kind(
     [
         ({"processed_pair_count": 999}, "processed_pair_count"),
         ({"requested_event_count": 999}, "requested_event_count"),
-        ({"attempted_count": 999}, "attempted_count"),
+        ({"candidate_count": 999}, "candidate_count"),
         ({"generator_accepted_count": 999}, "generator_accepted_count"),
         ({"quota_trimmed_count": 999}, "quota_trimmed_count"),
         (
             {
                 "generated_event_kind_counts": {
-                    "environment": 10,
-                    "structural": 0,
-                    "mixed": 0,
+                    "environment": 999,
                 }
             },
             "generated_event_kind_counts",
         ),
         ({"rejection_reasons": {}}, "rejection_reasons"),
-        ({"rejection_stage_counts": {}}, "rejection_stage_counts"),
+        ({"stage_counts": {}}, "stage_counts"),
+        ({"stage_ids": {}}, "stage_ids"),
+        ({"allocated_cpu_seconds": 999.0}, "allocated_cpu_seconds"),
         ({"generator_invariants": {}}, "generator_invariants"),
         ({"obsolete_kind_quota_field": {}}, "schema"),
     ],

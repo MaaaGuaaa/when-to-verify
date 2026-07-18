@@ -83,7 +83,10 @@ def test_cli_executes_once_and_forwards_positive_worker_count(
             run_state="complete",
             run_id="sop05-run-fixture",
             output_dir=request.output_dir,
-            generation_summary={"selected_count": 20},
+            generation_summary={
+                "selected_count": 20,
+                "allocated_cpu_seconds": 12.5,
+            },
             publication_semantic_digest="a" * 64,
             exit_code=0,
         )
@@ -107,10 +110,13 @@ def test_cli_executes_once_and_forwards_positive_worker_count(
     assert request.git_executable == tmp_path / "git"
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
+        "allocated_cpu_seconds": 12.5,
         "output_dir": str(tmp_path / "run"),
+        "producer_version": "sop05_generation_run_v5",
         "publication_semantic_digest": "a" * 64,
         "run_id": "sop05-run-fixture",
         "run_state": "complete",
+        "selection_version": "sop05_diversity_total_selection_v1",
         "selected_count": 20,
     }
 
@@ -171,7 +177,10 @@ def test_cli_returns_four_for_atomically_published_quota_shortfall(
             run_state="quota_unmet",
             run_id="sop05-run-fixture",
             output_dir=request.output_dir,
-            generation_summary={"selected_count": 6},
+            generation_summary={
+                "selected_count": 6,
+                "allocated_cpu_seconds": 3.25,
+            },
             publication_semantic_digest=None,
             exit_code=4,
         )
@@ -181,10 +190,13 @@ def test_cli_returns_four_for_atomically_published_quota_shortfall(
 
     assert cli.main() == 4
     assert json.loads(capsys.readouterr().out) == {
+        "allocated_cpu_seconds": 3.25,
         "output_dir": str(tmp_path / "run"),
+        "producer_version": "sop05_generation_run_v5",
         "publication_semantic_digest": None,
         "run_id": "sop05-run-fixture",
         "run_state": "quota_unmet",
+        "selection_version": "sop05_diversity_total_selection_v1",
         "selected_count": 6,
     }
 

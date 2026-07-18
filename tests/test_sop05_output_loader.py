@@ -45,9 +45,9 @@ def _generator_contract() -> tuple[dict[str, object], str, str]:
 
 def _record_and_world(
     event_index: int = 0,
-    event_kind: str = "structural",
+    event_kind: str = "environment",
     *,
-    generator_algorithm_version: str = "joint_occluder_first_v4",
+    generator_algorithm_version: str = "blind_reachability_first_v1",
 ):
     from src.generation.dynamic_object_transplant import (
         MOTION_SNIPPET_LAYOUT_VERSION,
@@ -143,6 +143,12 @@ def _record_and_world(
         future_poses=future,
     )
     provenance = {
+        "transform_algorithm_version": "reachability_candidate_se2_v1",
+        "transform_id": f"transform-loader-fixture-{suffix}",
+        "reachability_candidate_id": f"candidate-loader-fixture-{suffix}",
+        "reachability_algorithm_version": "blind_reachability_first_v1",
+        "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
         "source_recording_id": "recording",
         "source_object_id": record.source_object_id,
@@ -150,49 +156,50 @@ def _record_and_world(
         "raw_role": "person",
         "geometry_source": "thor_marker_extent",
         "orientation_source": "velocity",
-        "target_type_policy_digest": record.target_type_policy_digest,
-        "footprint_spec_digest": record.footprint_spec_digest,
-        "conflict_time_s": 1.0,
-        "conflict_point": [0.5, 0.0],
-        "crossing_direction": [1.0, 0.0],
-        "rotation_rad": 0.0,
-        "time_scale": 1.0,
-        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
+        "source_start_timestamp": 0.0,
         "source_current_index": 7,
         "source_current_time_s": 1.4,
-        "source_conflict_anchor_time_s": 2.4,
+        "source_anchor_index": 12,
+        "source_anchor_time_s": 2.4,
+        "source_delta_xy": [0.5, 0.0],
+        "candidate_current_xy": [0.0, 0.0],
+        "conflict_point": [0.5, 0.0],
+        "rotation_rad": 0.0,
+        "desired_crossing_direction": [1.0, 0.0],
+        "crossing_side": -1,
+        "angle_offset_deg": 0.0,
+        "conflict_index": 4,
+        "conflict_time_s": 1.0,
+        "time_scale": 1.0,
+        "future_dt_s": 0.2,
+        "future_steps": 15,
+        "base_state_id": record.base_state_id,
+        "trajectory_id": record.trajectory_id,
+        "target_type_policy_digest": record.target_type_policy_digest,
+        "footprint_spec_digest": record.footprint_spec_digest,
         "seed": 17 + event_index,
+        "context_object_ids": [],
     }
     visibility = [False, False, False, True, True] + [True] * 11
-    structural = (
-        {
-            "forward_fov_deg": 180.0,
-            "range_m": 6.0,
-            "blind_sectors": [],
-        }
-        if event_kind in {"structural", "mixed"}
-        else None
-    )
+    proposal_id = f"proposal-{event_index:08d}"
+    blind_region_id = f"blind-loader-fixture-{suffix}"
     occluders = (
-        (
-            {
-                "occluder_id": f"occluder-loader-fixture-{suffix}",
-                "kind": "pillar",
-                "polygon_xy": [
-                    [0.1, -0.2],
-                    [0.3, -0.2],
-                    [0.3, 0.2],
-                    [0.1, 0.2],
-                ],
-                "height_m": 2.0,
-            },
-        )
-        if event_kind in {"environment", "mixed"}
-        else ()
+        {
+            "occluder_id": proposal_id,
+            "proposal_id": proposal_id,
+            "type": "pillar",
+            "polygon_xy": [
+                [0.1, -0.2],
+                [0.3, -0.2],
+                [0.3, 0.2],
+                [0.1, 0.2],
+            ],
+            "height_m": 2.0,
+        },
     )
     metadata = {
         **build_event_target_motion_world_metadata(record),
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
         "generator_algorithm_version": generator_algorithm_version,
         "event_kind": event_kind,
         "dynamic_object_snippet_id": record.source_snippet_id,
@@ -209,7 +216,13 @@ def _record_and_world(
             "target_visibility_history8_current7_v1"
         ),
         "context_dynamic_object_ids": [],
-        "occluder_candidate_rejection_reasons": {},
+        "causal_occluder_proposal_id": proposal_id,
+        "blind_region_id": blind_region_id,
+        "reachability_candidate_id": provenance[
+            "reachability_candidate_id"
+        ],
+        "reachability_transform_id": provenance["transform_id"],
+        "exact_validation_id": f"exact-loader-fixture-{suffix}",
     }
     world = OracleWorld(
         world_id=record.world_id,
@@ -221,11 +234,9 @@ def _record_and_world(
         dynamic_object_specs={record.target_dynamic_object_id: spec},
         occluders=occluders,
         blind_spot_config={
-            "kind": event_kind,
-            "structural": structural,
-            "occluder_ids": [
-                occluder["occluder_id"] for occluder in occluders
-            ],
+            "kind": "environment",
+            "occluder_ids": [proposal_id],
+            "blind_region_digest": blind_region_id,
         },
         random_seed=17 + event_index,
         metadata=metadata,
@@ -325,7 +336,7 @@ def _reseal_publication(root: Path) -> None:
     marker_path = root / ".producer-complete"
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     manifest = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
-    marker["marker_version"] = "sop05_producer_complete_v2"
+    marker["marker_version"] = "sop05_producer_complete_v3"
     marker["publication_identity_version"] = (
         SOP05_PUBLICATION_IDENTITY_VERSION
     )
@@ -396,24 +407,54 @@ def _event_kind_bucket(
     }
 
 
-def _selection_key_for_id(seed: int, event_id: str) -> tuple[str, str]:
+def _selection_key_for_id(seed: int, event_id: str) -> tuple[str, ...]:
     payload = _canonical_json_bytes(
-        ["sop05_total_quota_selection_v1", seed, event_id]
+        [
+            "sop05_diversity_total_selection_v1",
+            seed,
+            "base-loader-fixture",
+            "trajectory-loader-fixture",
+            event_id,
+        ]
     )
-    return hashlib.blake2b(payload, digest_size=16).hexdigest(), event_id
+    return (
+        hashlib.blake2b(payload, digest_size=16).hexdigest(),
+        "base-loader-fixture",
+        "trajectory-loader-fixture",
+        event_id,
+    )
+
+
+def _accepted_event_row(record: object, world: OracleWorld) -> dict[str, object]:
+    metadata = world.metadata
+    provenance = metadata["target_provenance"]
+    return {
+        "generated_event_id": record.generated_event_id,
+        "event_kind": "environment",
+        "object_type": record.object_type,
+        "occluder_type": world.occluders[0]["type"],
+        "crossing_side": provenance["crossing_side"],
+        "conflict_index": metadata["conflict_index"],
+        "causal_occluder_proposal_id": metadata[
+            "causal_occluder_proposal_id"
+        ],
+        "blind_region_id": metadata["blind_region_id"],
+        "reachability_candidate_id": metadata["reachability_candidate_id"],
+        "reachability_transform_id": metadata["reachability_transform_id"],
+        "exact_validation_id": metadata["exact_validation_id"],
+    }
 
 
 def _write_complete_publication(
     root: Path,
     *,
     accepted_quota: int = 10,
-    selected_kind: str = "structural",
+    selected_kind: str = "environment",
 ) -> tuple[object, OracleWorld, str]:
-    if selected_kind not in {"environment", "structural", "mixed"}:
-        raise ValueError("unsupported selected_kind fixture")
+    if selected_kind != "environment":
+        raise ValueError("formal v5 fixture is environment-only")
     requested_count = 40
-    requested_counts = {"environment": 24, "structural": 12, "mixed": 4}
-    if accepted_quota + 1 > requested_counts[selected_kind]:
+    if accepted_quota + 1 > requested_count:
         raise ValueError("fixture quota exceeds selected-kind request capacity")
 
     primary_pairs = [
@@ -426,39 +467,10 @@ def _write_complete_publication(
             23, pair[0].generated_event_id
         ),
     )[:accepted_quota]
-    worst_selected_key = max(
-        _selection_key_for_id(23, pair[0].generated_event_id)
-        for pair in selected_pairs
-    )
-
-    # Keep accepted events of the other kinds in the signed pair report, but
-    # deliberately choose IDs ranked below the primary-kind top-N boundary.
-    # This proves that event kind neither grants a quota nor changes ranking.
-    other_pairs = []
-    candidate_index = 100
-    for event_kind in (
-        kind
-        for kind in ("environment", "structural", "mixed")
-        if kind != selected_kind
-    ):
-        while True:
-            candidate = _record_and_world(candidate_index, event_kind)
-            candidate_index += 1
-            if (
-                _selection_key_for_id(
-                    23, candidate[0].generated_event_id
-                )
-                > worst_selected_key
-            ):
-                other_pairs.append(candidate)
-                break
-    pairs = primary_pairs + other_pairs
+    pairs = primary_pairs
     records = [record for record, _ in pairs]
     event_kinds = [world.metadata["event_kind"] for _, world in pairs]
-    generated_counts = {
-        kind: event_kinds.count(kind)
-        for kind in ("environment", "structural", "mixed")
-    }
+    generated_counts = {"environment": len(event_kinds)}
     selected_records = [record for record, _ in selected_pairs]
     selected_worlds = [world for _, world in selected_pairs]
     record, world = selected_pairs[0]
@@ -471,7 +483,7 @@ def _write_complete_publication(
     configs = root / "configs"
     configs.mkdir()
     (configs / "base.yaml").write_text(
-        "schema_version: '2.0.0'\n"
+        "schema_version: '3.0.0'\n"
         "bev:\n"
         "  range_m: 3.2\n"
         "  resolution_m: 0.1\n"
@@ -492,117 +504,148 @@ def _write_complete_publication(
     rejected_count = requested_count - generated_count
     rejection_reason = "fixture_visibility_rejection"
     rejection_reasons = {rejection_reason: rejected_count}
-    rejection_stages = {
-        "occluder_geometry": 0,
-        "target_conditioning": 0,
-        "visibility": rejected_count,
-    }
+    accepted_rows = sorted(
+        (
+            _accepted_event_row(item, item_world)
+            for item, item_world in pairs
+        ),
+        key=lambda row: (
+            row["causal_occluder_proposal_id"],
+            row["reachability_candidate_id"],
+            row["reachability_transform_id"],
+        ),
+    )
+    proposal_ids = [
+        str(row["causal_occluder_proposal_id"]) for row in accepted_rows
+    ] + [
+        f"proposal-rejected-{index:08d}"
+        for index in range(requested_count - generated_count)
+    ]
     pair_summary = {
-        "schema_version": "2.0.0",
+        "schema_version": "3.0.0",
         "seed": 17,
         "requested_event_count": requested_count,
-        "complete_joint_candidates_attempted": requested_count,
-        "attempted_count": requested_count,
-        "joint_candidate_attempted_count": requested_count,
-        "attempt_index_start": 0,
-        "attempt_index_stop_exclusive": None,
         "accepted_count": generated_count,
         "rejected_count": rejected_count,
-        "acceptance_rate": generated_count / requested_count,
-        "attempt_acceptance_rate": generated_count / requested_count,
-        "request_acceptance_rate": generated_count / requested_count,
         "unaccepted_event_count": rejected_count,
+        "attempt_index_start": 0,
+        "attempt_index_stop_exclusive": requested_count,
         "rejection_reasons": rejection_reasons,
-        "rejection_stage_counts": rejection_stages,
-        "occluder_candidate_rejection_reasons": {},
-        "requested_event_kind_counts": requested_counts,
-        "event_kind_counts": generated_counts,
-        "by_event_kind": {
-            kind: _event_kind_bucket(
-                requested=requested_counts[kind],
-                accepted=generated_counts[kind],
-                rejection_reason=rejection_reason,
-            )
-            for kind in requested_counts
-        },
-        "by_object_type": {
-            "human": _bucket_summary(
-                attempted=requested_count,
-                accepted=generated_count,
-                rejection_reason=rejection_reason,
-            )
-        },
-        "by_footprint_kind": {
-            "circle": _bucket_summary(
-                attempted=requested_count,
-                accepted=generated_count,
-                rejection_reason=rejection_reason,
-            )
-        },
-        "by_geometry_source": {
-            "thor_marker_extent": _bucket_summary(
-                attempted=requested_count,
-                accepted=generated_count,
-                rejection_reason=rejection_reason,
-            )
+        "obstacle_proposal_count": requested_count,
+        "obstacle_proposal_rejected_count": 0,
+        "obstacle_proposal_passed_count": requested_count,
+        "transform_candidate_count": requested_count,
+        "transform_rejected_count": 0,
+        "chord_certified_count": requested_count,
+        "chord_unresolved_count": 0,
+        "exact_validation_count": requested_count,
+        "exact_validation_accepted_count": generated_count,
+        "exact_validation_rejected_count": rejected_count,
+        "proposal_ids": proposal_ids,
+        "reachability_candidate_ids": [
+            row["reachability_candidate_id"] for row in accepted_rows
+        ],
+        "reachability_transform_ids": [
+            row["reachability_transform_id"] for row in accepted_rows
+        ],
+        "exact_validation_ids": [
+            row["exact_validation_id"] for row in accepted_rows
+        ],
+        "robot_sweep_cache": {
+            "size": 1,
+            "hits": 0,
+            "misses": 1,
+            "builds": 1,
         },
         "target_type_policy": target_type_policy,
         "target_type_policy_digest": target_type_policy_digest,
         "generator_config_digest": generator_config_digest,
-        "generator_algorithm_version": "joint_occluder_first_v4",
+        "generator_algorithm_version": "blind_reachability_first_v1",
+        "production_event_kind": "environment",
     }
     (root / "pair_generation_reports.jsonl").write_text(
         json.dumps(
             {
-                "report_version": "sop05_pair_generation_report_v2",
-                "selection_version": "sop05_total_quota_selection_v1",
+                "report_version": "sop05_pair_generation_report_v3",
+                "selection_version": "sop05_diversity_total_selection_v1",
                 "rank": 0,
                 "state_id": record.base_state_id,
                 "trajectory_id": record.trajectory_id,
                 "seed": 17,
+                "allocated_cpu_seconds": 12.5,
                 "summary": pair_summary,
-                "accepted_events": [
-                    {
-                        "generated_event_id": item.generated_event_id,
-                        "event_kind": event_kind,
-                    }
-                    for item, event_kind in zip(
-                        records, event_kinds, strict=True
-                    )
-                ],
+                "accepted_events": accepted_rows,
             },
             sort_keys=True,
             separators=(",", ":"),
         )
         + "\n"
     )
-    selected_counts = {
-        kind: sum(
-            world.metadata["event_kind"] == kind
-            for _, world in selected_pairs
+    selected_counts = {"environment": len(selected_pairs)}
+    canonical_candidate_order = [
+        {
+            "base_state_id": item.base_state_id,
+            "trajectory_id": item.trajectory_id,
+            "generated_event_id": item.generated_event_id,
+        }
+        for item in sorted(
+            records,
+            key=lambda value: (
+                value.base_state_id,
+                value.trajectory_id,
+                value.generated_event_id,
+            ),
         )
-        for kind in ("environment", "structural", "mixed")
-    }
+    ]
+    selected_event_ids = [item.generated_event_id for item in selected_records]
     summary = {
-        "summary_version": "sop05_generation_summary_v2",
+        "summary_version": "sop05_generation_summary_v3",
         "run_id": None,
         "run_state": "complete",
         "processed_pair_count": 1,
         "requested_event_count": requested_count,
-        "attempted_count": requested_count,
         "generator_accepted_count": generated_count,
+        "candidate_count": generated_count,
         "selected_count": accepted_quota,
         "quota_trimmed_count": generated_count - accepted_quota,
         "generated_event_kind_counts": generated_counts,
         "selected_event_kind_counts": selected_counts,
         "quota_met": True,
+        "production_event_kind": "environment",
+        "canonical_candidate_order": canonical_candidate_order,
+        "selected_event_ids": selected_event_ids,
         "rejection_reasons": rejection_reasons,
-        "rejection_stage_counts": rejection_stages,
+        "stage_counts": {
+            name: pair_summary[name]
+            for name in (
+                "obstacle_proposal_count",
+                "obstacle_proposal_rejected_count",
+                "obstacle_proposal_passed_count",
+                "transform_candidate_count",
+                "transform_rejected_count",
+                "chord_certified_count",
+                "chord_unresolved_count",
+                "exact_validation_count",
+                "exact_validation_accepted_count",
+                "exact_validation_rejected_count",
+            )
+        },
+        "stage_ids": {
+            name: pair_summary[name]
+            for name in (
+                "proposal_ids",
+                "reachability_candidate_ids",
+                "reachability_transform_ids",
+                "exact_validation_ids",
+            )
+        },
+        "allocated_cpu_seconds": 12.5,
         "generator_invariants": {
-            "schema_version": "2.0.0",
+            "schema_version": "3.0.0",
             "target_type_policy_digest": target_type_policy_digest,
             "generator_config_digest": generator_config_digest,
-            "generator_algorithm_version": "joint_occluder_first_v4",
+            "generator_algorithm_version": "blind_reachability_first_v1",
+            "production_event_kind": "environment",
         },
     }
     schedule = [
@@ -660,7 +703,7 @@ def _write_complete_publication(
         "max_base_states": 1,
         "trajectory_count": 1,
         "max_pairs": 1,
-        "selection_version": "sop05_total_quota_selection_v1",
+        "selection_version": "sop05_diversity_total_selection_v1",
         "base_config_sha256": _sha256(configs / "base.yaml"),
         "generator_config_sha256": _sha256(configs / "generator.yaml"),
         "generator_config_semantic_digest": generator_config_digest,
@@ -669,8 +712,8 @@ def _write_complete_publication(
         "pair_schedule": schedule,
     }
     manifest = {
-        "manifest_version": "sop05_run_manifest_v2",
-        "producer_version": "sop05_generation_run_v4",
+        "manifest_version": "sop05_run_manifest_v3",
+        "producer_version": "sop05_generation_run_v5",
         "producer_source_identity": {
             "version": "sop05_producer_source_identity_v1",
             "git_commit": "3" * 40,
@@ -719,7 +762,7 @@ def _write_complete_publication(
 
     loaded_shard = load_event_target_motion_shard(shard, grid=_grid())
     marker = {
-        "marker_version": "sop05_producer_complete_v2",
+        "marker_version": "sop05_producer_complete_v3",
         "run_id": manifest["run_id"],
         "run_manifest_sha256": _sha256(root / "run_manifest.json"),
         "checksums_sha256": _sha256(root / "checksums.sha256"),
@@ -797,7 +840,7 @@ def test_restore_generated_event_recovers_full_audited_event() -> None:
     event = restore_generated_event(record, world, grid=_grid())
 
     assert event.generated_event_id == record.generated_event_id
-    assert event.event_kind == "structural"
+    assert event.event_kind == "environment"
     assert event.world is world
     assert event.target.target_dynamic_object_id == (
         record.target_dynamic_object_id
@@ -833,7 +876,7 @@ def test_restore_generated_event_rejects_old_generator_algorithm() -> None:
     from src.generation.sop05_output_loader import restore_generated_event
 
     record, world = _record_and_world(
-        generator_algorithm_version="joint_occluder_first_v3"
+        generator_algorithm_version="joint_occluder_first_v4"
     )
 
     with pytest.raises(ValueError, match="generator_algorithm_version"):
@@ -897,9 +940,13 @@ def test_restore_generated_event_rejects_recomputed_event_identity_drift(
             metadata["conflict_index"] = int(round(float(value) / 0.2)) - 1
         provenance = dict(metadata["target_provenance"])
         provenance["conflict_time_s"] = float(metadata["conflict_time_s"])
-        provenance["source_conflict_anchor_time_s"] = (
-            1.4 + float(metadata["conflict_time_s"])
+        provenance["conflict_index"] = int(metadata["conflict_index"])
+        provenance["source_anchor_index"] = 8 + int(
+            metadata["conflict_index"]
         )
+        provenance["source_anchor_time_s"] = 0.2 * provenance[
+            "source_anchor_index"
+        ]
         provenance["conflict_point"] = [
             float(record.future_poses[int(metadata["conflict_index"]), 0]),
             float(record.future_poses[int(metadata["conflict_index"]), 1]),
@@ -991,7 +1038,7 @@ def test_restore_generated_event_rejects_resealed_fake_generated_identity() -> N
 @pytest.mark.parametrize(
     ("key", "value", "match"),
     [
-        ("event_kind", "environment", "event_kind"),
+        ("event_kind", "structural", "event_kind"),
         ("conflict_index", 5, "conflict index/time"),
         ("visibility_sequence", [0] * 16, "boolean"),
         (
@@ -1039,7 +1086,7 @@ def test_restore_generated_event_rejects_target_provenance_seed_drift() -> None:
     provenance["seed"] = world.random_seed + 1
     metadata["target_provenance"] = provenance
 
-    with pytest.raises(ValueError, match="random_seed"):
+    with pytest.raises(ValueError, match="seed"):
         restore_generated_event(
             record, replace(world, metadata=metadata), grid=_grid()
         )
@@ -1049,8 +1096,8 @@ def test_restore_generated_event_rejects_target_provenance_seed_drift() -> None:
     "case",
     [
         "environment_without_occluder",
-        "structural_with_occluder",
-        "mixed_without_structural_sensor",
+        "multiple_occluders",
+        "proposal_id_mismatch",
         "occluder_id_mismatch",
     ],
 )
@@ -1064,30 +1111,29 @@ def test_restore_generated_event_rejects_invalid_event_skeleton(case: str) -> No
             occluders=(),
             blind_spot_config={
                 "kind": "environment",
-                "structural": None,
                 "occluder_ids": [],
+                "blind_region_digest": world.blind_spot_config[
+                    "blind_region_digest"
+                ],
             },
         )
-    elif case == "structural_with_occluder":
-        record, world = _record_and_world(0, "structural")
-        _, environment = _record_and_world(1, "environment")
-        occluders = environment.occluders
+    elif case == "multiple_occluders":
+        record, world = _record_and_world(0, "environment")
+        extra = {**world.occluders[0], "occluder_id": "extra", "proposal_id": "extra"}
         world = replace(
             world,
-            occluders=occluders,
+            occluders=(*world.occluders, extra),
             blind_spot_config={
                 **world.blind_spot_config,
-                "occluder_ids": [occluders[0]["occluder_id"]],
+                "occluder_ids": [world.occluders[0]["occluder_id"], "extra"],
             },
         )
-    elif case == "mixed_without_structural_sensor":
-        record, world = _record_and_world(0, "mixed")
+    elif case == "proposal_id_mismatch":
+        record, world = _record_and_world(0, "environment")
+        changed = {**world.occluders[0], "proposal_id": "different-proposal"}
         world = replace(
             world,
-            blind_spot_config={
-                **world.blind_spot_config,
-                "structural": None,
-            },
+            occluders=(changed,),
         )
     else:
         record, world = _record_and_world(0, "environment")
@@ -1099,7 +1145,7 @@ def test_restore_generated_event_rejects_invalid_event_skeleton(case: str) -> No
             },
         )
 
-    with pytest.raises(ValueError, match="occluder|structural|event skeleton"):
+    with pytest.raises(ValueError, match="occluder|event skeleton"):
         restore_generated_event(record, world, grid=_grid())
 
 
@@ -1140,7 +1186,7 @@ def test_load_complete_sop05_events_validates_evidence_and_restores(
         record.generated_event_id
     )
     assert loaded.shard.summary["record_count"] == 10
-    assert {event.event_kind for event in loaded.events} == {"structural"}
+    assert {event.event_kind for event in loaded.events} == {"environment"}
 
     report = json.loads(
         (root / "pair_generation_reports.jsonl").read_text(encoding="utf-8")
@@ -1157,6 +1203,130 @@ def test_load_complete_sop05_events_validates_evidence_and_restores(
     assert tuple(
         sorted(event.generated_event_id for event in loaded.events)
     ) == tuple(sorted(expected_ids))
+
+
+def test_loader_formal_versions_are_exact() -> None:
+    from src.generation import sop05_output_loader as loader
+
+    assert loader.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v3"
+    assert loader.SOP05_GENERATION_SUMMARY_VERSION == (
+        "sop05_generation_summary_v3"
+    )
+    assert loader.SOP05_COMPLETION_MARKER_VERSION == (
+        "sop05_producer_complete_v3"
+    )
+    assert loader.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v5"
+    assert loader.SOP05_PAIR_REPORT_VERSION == (
+        "sop05_pair_generation_report_v3"
+    )
+    assert loader.SOP05_TOTAL_QUOTA_SELECTION_VERSION == (
+        "sop05_diversity_total_selection_v1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "match"),
+    [
+        ("pair_stage_count", "transform conservation"),
+        ("global_stage_count", "stage counts"),
+        ("global_stage_id", "stage IDs"),
+        ("candidate_order", "candidate order"),
+        ("causal_identity", "causal_occluder_proposal_id|causal"),
+        ("cpu_accounting", "CPU accounting"),
+    ],
+)
+def test_load_complete_rejects_resealed_v5_evidence_tamper(
+    tmp_path: Path,
+    tamper: str,
+    match: str,
+) -> None:
+    from src.generation.sop05_output_loader import load_complete_sop05_events
+
+    root = tmp_path / "run"
+    _write_complete_publication(root)
+    report_path = root / "pair_generation_reports.jsonl"
+    summary_path = root / "generation_summary.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if tamper == "pair_stage_count":
+        report["summary"]["chord_certified_count"] -= 1
+    elif tamper == "global_stage_count":
+        summary["stage_counts"]["obstacle_proposal_count"] += 1
+    elif tamper == "global_stage_id":
+        summary["stage_ids"]["proposal_ids"][0] += "-tampered"
+    elif tamper == "candidate_order":
+        report["accepted_events"] = list(
+            reversed(report["accepted_events"])
+        )
+    elif tamper == "causal_identity":
+        selected_id = summary["selected_event_ids"][0]
+        selected_row = next(
+            row
+            for row in report["accepted_events"]
+            if row["generated_event_id"] == selected_id
+        )
+        old_id = selected_row["causal_occluder_proposal_id"]
+        new_id = old_id + "-tampered"
+        selected_row["causal_occluder_proposal_id"] = new_id
+        report["summary"]["proposal_ids"] = [
+            new_id if value == old_id else value
+            for value in report["summary"]["proposal_ids"]
+        ]
+        summary["stage_ids"]["proposal_ids"] = [
+            new_id if value == old_id else value
+            for value in summary["stage_ids"]["proposal_ids"]
+        ]
+        report["accepted_events"].sort(
+            key=lambda row: (
+                row["causal_occluder_proposal_id"],
+                row["reachability_candidate_id"],
+                row["reachability_transform_id"],
+            )
+        )
+    else:
+        summary["allocated_cpu_seconds"] += 1.0
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    summary_path.write_text(
+        json.dumps(summary, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _reseal_publication(root)
+
+    with pytest.raises(ValueError, match=match):
+        load_complete_sop05_events(
+            root,
+            grid=_grid(),
+            expected_publication_semantic_digest=(
+                _fixture_publication_digest(root)
+            ),
+        )
+
+
+def test_load_complete_rejects_resealed_v2_completion_marker(
+    tmp_path: Path,
+) -> None:
+    from src.generation.sop05_output_loader import load_complete_sop05_events
+
+    root = tmp_path / "run"
+    _write_complete_publication(root)
+    marker_path = root / ".producer-complete"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["marker_version"] = "sop05_producer_complete_v2"
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="producer-complete marker version"):
+        load_complete_sop05_events(
+            root,
+            grid=_grid(),
+            expected_publication_semantic_digest=marker[
+                "publication_semantic_digest"
+            ],
+        )
 
 
 def test_load_complete_sop05_events_requires_external_publication_digest(
@@ -1200,7 +1370,7 @@ def test_load_complete_sop05_events_rejects_fully_resealed_content_with_original
     _, _, trusted_digest = _write_complete_publication(root)
     summary_path = root / "generation_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary["attempted_count"] += 1
+    summary["candidate_count"] += 1
     summary_path.write_text(
         json.dumps(summary, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
@@ -1216,13 +1386,9 @@ def test_load_complete_sop05_events_rejects_fully_resealed_content_with_original
         )
 
 
-@pytest.mark.parametrize(
-    ("selected_kind", "accepted_quota"),
-    [("environment", 7), ("mixed", 3)],
-)
-def test_load_complete_sop05_events_allows_any_kind_to_fill_total_quota(
+@pytest.mark.parametrize("accepted_quota", [7, 3])
+def test_load_complete_sop05_events_fills_total_environment_quota(
     tmp_path: Path,
-    selected_kind: str,
     accepted_quota: int,
 ) -> None:
     from src.generation.sop05_output_loader import load_complete_sop05_events
@@ -1231,7 +1397,6 @@ def test_load_complete_sop05_events_allows_any_kind_to_fill_total_quota(
     _, _, publication_digest = _write_complete_publication(
         root,
         accepted_quota=accepted_quota,
-        selected_kind=selected_kind,
     )
 
     loaded = load_complete_sop05_events(
@@ -1241,7 +1406,7 @@ def test_load_complete_sop05_events_allows_any_kind_to_fill_total_quota(
     )
 
     assert len(loaded.events) == accepted_quota
-    assert {event.event_kind for event in loaded.events} == {selected_kind}
+    assert {event.event_kind for event in loaded.events} == {"environment"}
     assert loaded.generation_summary["quota_met"] is True
     assert "required_event_kind_counts" not in loaded.generation_summary
     assert "quota_deficits" not in loaded.generation_summary
@@ -1344,7 +1509,7 @@ def test_load_complete_sop05_events_rejects_resealed_pair_report_drift(
     elif drift == "accepted_event_schema":
         del row["accepted_events"][0]["event_kind"]
     elif drift == "accepted_event_kind":
-        row["accepted_events"][0]["event_kind"] = "environment"
+        row["accepted_events"][0]["event_kind"] = "structural"
     elif drift == "selection_version":
         row["selection_version"] = "sop05_kind_quota_selection_v1"
     elif drift == "schedule_rank":
@@ -1368,8 +1533,8 @@ def test_load_complete_sop05_events_rejects_resealed_pair_report_drift(
     with pytest.raises(
         ValueError,
         match=(
-            "pair generation report|pair report|accepted_count|"
-            "generation summary|selection"
+                "pair generation report|pair report|accepted_count|"
+                "generation summary|selection|formal v5|environment"
         ),
     ):
         load_complete_sop05_events(
@@ -1529,17 +1694,17 @@ def test_load_complete_sop05_events_rejects_resealed_hard_quota_fields(
 @pytest.mark.parametrize(
     ("artifact", "field", "old_value"),
     [
-        ("run_manifest.json", "manifest_version", "sop05_run_manifest_v1"),
-        ("run_manifest.json", "producer_version", "sop05_generation_run_v2"),
+        ("run_manifest.json", "manifest_version", "sop05_run_manifest_v2"),
+        ("run_manifest.json", "producer_version", "sop05_generation_run_v4"),
         (
             "run_manifest.json",
             "selection_version",
-            "sop05_kind_quota_selection_v1",
+            "sop05_total_quota_selection_v1",
         ),
         (
             "generation_summary.json",
             "summary_version",
-            "sop05_generation_summary_v1",
+            "sop05_generation_summary_v2",
         ),
     ],
 )

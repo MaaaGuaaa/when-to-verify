@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
@@ -51,24 +52,23 @@ from src.generation.sop05_publication_identity import (
     compute_sop05_publication_semantic_digest,
 )
 from src.generation.sop05_selection import (
-    SOP05_EVENT_KIND_ORDER,
     SOP05_PAIR_REPORT_VERSION,
     SOP05_RUN_PRODUCER_VERSION,
     SOP05_TOTAL_QUOTA_SELECTION_VERSION,
+    Sop05SelectionCandidate,
     select_sop05_event_ids,
 )
 from src.utils.config import load_config
 
 
 SOP05_RUN_VERSION = SOP05_RUN_PRODUCER_VERSION
-SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v2"
-SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v2"
+SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v3"
+SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v3"
 SOP05_INPUT_LOCK_VERSION = "sop05_input_lock_v2"
+SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v3"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_IDENTITY_VERSION = "sop05_producer_source_identity_v1"
-_EVENT_KIND_WEIGHTS = dict(
-    zip(SOP05_EVENT_KIND_ORDER, (0.6, 0.3, 0.1), strict=True)
-)
+_EVENT_KIND_WEIGHTS = {"environment": 1.0}
 
 
 class Sop05RunError(ValueError):
@@ -132,6 +132,7 @@ class PairGenerationReport:
     trajectory_id: str
     pair_seed: int
     report: EventGenerationReport
+    allocated_cpu_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,7 @@ class _PairReportTransport:
     pair_seed: int
     events: tuple[_EventTransport, ...]
     summary: dict[str, object]
+    allocated_cpu_seconds: float
 
 
 _PAIR_WORKER_PREPARED: PreparedSop05Run | None = None
@@ -436,8 +438,6 @@ def _validate_request(request: Sop05RunRequest) -> None:
         "workers",
     ):
         _positive_int(getattr(request, name), name)
-    if request.events_per_pair % 10:
-        raise Sop05RunError("events_per_pair must be a multiple of 10")
     if not isinstance(request.split, str) or not request.split:
         raise Sop05RunError("split must be a non-empty string")
     digest = request.sop04_external_handoff_digest_sha256
@@ -525,9 +525,17 @@ def _sop04_evidence_identity(
 
 
 def _validate_generator_mix(generator_config: Mapping[str, object]) -> None:
-    observed = generator_config.get("event_type_weights")
-    if observed != _EVENT_KIND_WEIGHTS:
-        raise Sop05RunError("generator event_type_weights must equal 60/30/10")
+    if generator_config.get("schema_version") != "3.0.0":
+        raise Sop05RunError("generator schema_version must equal 3.0.0")
+    if generator_config.get("production_event_kind") != "environment":
+        raise Sop05RunError("generator production_event_kind must be environment")
+    blind = generator_config.get("blind_reachability")
+    if not isinstance(blind, Mapping) or blind.get("algorithm_version") != (
+        SOP05_GENERATOR_ALGORITHM_VERSION
+    ):
+        raise Sop05RunError(
+            "generator blind_reachability algorithm version mismatch"
+        )
 
 
 def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
@@ -689,6 +697,8 @@ def preflight_summary(prepared: PreparedSop05Run) -> dict[str, object]:
         raise TypeError("prepared must be PreparedSop05Run")
     return {
         "status": "preflight_ok",
+        "producer_version": SOP05_RUN_VERSION,
+        "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
         "run_id": prepared.run_id,
         "producer_source_identity": prepared.producer_source_identity,
         "output_dir": str(prepared.request.output_dir),
@@ -704,6 +714,7 @@ def preflight_summary(prepared: PreparedSop05Run) -> dict[str, object]:
 def _generate_pair(
     prepared: PreparedSop05Run, pair: RankedPair
 ) -> PairGenerationReport:
+    cpu_started = time.process_time()
     base_state, oracle_context = prepared.sop03.load_pair(
         pair.state_id, prepared.grid
     )
@@ -729,6 +740,7 @@ def _generate_pair(
         trajectory_id=pair.trajectory_id,
         pair_seed=pair.pair_seed,
         report=report,
+        allocated_cpu_seconds=max(0.0, time.process_time() - cpu_started),
     )
 
 
@@ -791,6 +803,7 @@ def _transport_pair_report(item: PairGenerationReport) -> _PairReportTransport:
         pair_seed=item.pair_seed,
         events=tuple(events),
         summary=dict(item.report.summary),
+        allocated_cpu_seconds=item.allocated_cpu_seconds,
     )
 
 
@@ -834,6 +847,7 @@ def _restore_pair_report(transport: _PairReportTransport) -> PairGenerationRepor
         report=EventGenerationReport(
             events=tuple(events), summary=dict(transport.summary)
         ),
+        allocated_cpu_seconds=transport.allocated_cpu_seconds,
     )
 
 
@@ -858,13 +872,6 @@ def _summary_count_map(
     return result
 
 
-def _summary_rate(summary: Mapping[str, object], name: str) -> float:
-    value = summary.get(name)
-    if type(value) is not float or not math.isfinite(value):
-        raise Sop05RunError(f"report {name} must be a finite float")
-    return value
-
-
 def _summary_digest(summary: Mapping[str, object], name: str) -> str:
     value = summary.get(name)
     if (
@@ -876,6 +883,183 @@ def _summary_digest(summary: Mapping[str, object], name: str) -> str:
     return value
 
 
+_PAIR_SUMMARY_KEYS = frozenset(
+    {
+        "schema_version",
+        "seed",
+        "requested_event_count",
+        "accepted_count",
+        "rejected_count",
+        "unaccepted_event_count",
+        "attempt_index_start",
+        "attempt_index_stop_exclusive",
+        "rejection_reasons",
+        "obstacle_proposal_count",
+        "obstacle_proposal_rejected_count",
+        "obstacle_proposal_passed_count",
+        "transform_candidate_count",
+        "transform_rejected_count",
+        "chord_certified_count",
+        "chord_unresolved_count",
+        "exact_validation_count",
+        "exact_validation_accepted_count",
+        "exact_validation_rejected_count",
+        "proposal_ids",
+        "reachability_candidate_ids",
+        "reachability_transform_ids",
+        "exact_validation_ids",
+        "robot_sweep_cache",
+        "target_type_policy",
+        "target_type_policy_digest",
+        "generator_config_digest",
+        "generator_algorithm_version",
+        "production_event_kind",
+    }
+)
+_STAGE_COUNT_NAMES = (
+    "obstacle_proposal_count",
+    "obstacle_proposal_rejected_count",
+    "obstacle_proposal_passed_count",
+    "transform_candidate_count",
+    "transform_rejected_count",
+    "chord_certified_count",
+    "chord_unresolved_count",
+    "exact_validation_count",
+    "exact_validation_accepted_count",
+    "exact_validation_rejected_count",
+)
+_STAGE_ID_NAMES = (
+    "proposal_ids",
+    "reachability_candidate_ids",
+    "reachability_transform_ids",
+    "exact_validation_ids",
+)
+
+
+def _summary_id_sequence(
+    summary: Mapping[str, object], name: str
+) -> tuple[str, ...]:
+    value = summary.get(name)
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise Sop05RunError(f"report {name} must be a string sequence")
+    return tuple(value)
+
+
+def _event_stage_row(
+    item: PairGenerationReport,
+    event: GeneratedEvent,
+) -> dict[str, object]:
+    """Validate and return the canonical report evidence for one event."""
+
+    if not isinstance(event, GeneratedEvent):
+        raise Sop05RunError("report events must contain GeneratedEvent")
+    if event.event_kind != "environment":
+        raise Sop05RunError("formal v5 events must be environment-only")
+    record = event.target_motion_record
+    if event.generated_event_id != record.generated_event_id:
+        raise Sop05RunError("event/record generated_event_id mismatch")
+    if record.base_state_id != item.state_id:
+        raise Sop05RunError("event base_state_id does not match pair")
+    if record.trajectory_id != item.trajectory_id:
+        raise Sop05RunError("event trajectory_id does not match pair")
+    metadata = event.world.metadata
+    if not isinstance(metadata, Mapping):
+        raise Sop05RunError("event world metadata must be a mapping")
+    provenance = metadata.get("target_provenance")
+    if not isinstance(provenance, Mapping):
+        raise Sop05RunError("event target_provenance must be a mapping")
+    identifiers: dict[str, str] = {}
+    for name in (
+        "causal_occluder_proposal_id",
+        "blind_region_id",
+        "reachability_candidate_id",
+        "reachability_transform_id",
+        "exact_validation_id",
+    ):
+        value = metadata.get(name)
+        if not isinstance(value, str) or not value:
+            raise Sop05RunError(f"event {name} must be a nonempty string")
+        identifiers[name] = value
+    if len(event.world.occluders) != 1:
+        raise Sop05RunError("formal v5 event must have one causal occluder")
+    occluder = event.world.occluders[0]
+    if not isinstance(occluder, Mapping):
+        raise Sop05RunError("event causal occluder must be a mapping")
+    proposal_id = identifiers["causal_occluder_proposal_id"]
+    if (
+        occluder.get("occluder_id") != proposal_id
+        or occluder.get("proposal_id") != proposal_id
+    ):
+        raise Sop05RunError("event causal occluder identity mismatch")
+    occluder_type = occluder.get("type")
+    if not isinstance(occluder_type, str) or not occluder_type:
+        raise Sop05RunError("event causal occluder type is invalid")
+    blind = event.world.blind_spot_config
+    if not isinstance(blind, Mapping) or set(blind) != {
+        "kind",
+        "occluder_ids",
+        "blind_region_digest",
+    }:
+        raise Sop05RunError("event blind-region schema mismatch")
+    if (
+        blind.get("kind") != "environment"
+        or blind.get("occluder_ids") != [proposal_id]
+        or blind.get("blind_region_digest") != identifiers["blind_region_id"]
+    ):
+        raise Sop05RunError("event blind-region identity mismatch")
+    if provenance.get("reachability_candidate_id") != identifiers[
+        "reachability_candidate_id"
+    ]:
+        raise Sop05RunError("event reachability candidate identity mismatch")
+    if provenance.get("transform_id") != identifiers[
+        "reachability_transform_id"
+    ]:
+        raise Sop05RunError("event reachability transform identity mismatch")
+    if provenance.get("base_state_id") != item.state_id or provenance.get(
+        "trajectory_id"
+    ) != item.trajectory_id:
+        raise Sop05RunError("event reachability pair identity mismatch")
+    crossing_side = provenance.get("crossing_side")
+    if type(crossing_side) is not int or crossing_side not in {-1, 1}:
+        raise Sop05RunError("event crossing_side is invalid")
+    conflict_index = provenance.get("conflict_index")
+    if type(conflict_index) is not int or conflict_index != event.conflict_index:
+        raise Sop05RunError("event conflict_index provenance mismatch")
+    if provenance.get("conflict_time_s") != event.conflict_time_s:
+        raise Sop05RunError("event conflict_time_s provenance mismatch")
+    if metadata.get("conflict_index") != event.conflict_index or metadata.get(
+        "conflict_time_s"
+    ) != event.conflict_time_s:
+        raise Sop05RunError("event conflict metadata mismatch")
+    return {
+        "generated_event_id": event.generated_event_id,
+        "event_kind": "environment",
+        "object_type": event.target.object_type,
+        "occluder_type": occluder_type,
+        "crossing_side": crossing_side,
+        "conflict_index": conflict_index,
+        **identifiers,
+    }
+
+
+def _selection_candidate(
+    item: PairGenerationReport,
+    event: GeneratedEvent,
+) -> Sop05SelectionCandidate:
+    row = _event_stage_row(item, event)
+    return Sop05SelectionCandidate(
+        base_state_id=item.state_id,
+        trajectory_id=item.trajectory_id,
+        generated_event_id=event.generated_event_id,
+        object_type=str(row["object_type"]),
+        occluder_type=str(row["occluder_type"]),
+        crossing_side=int(row["crossing_side"]),
+        conflict_index=int(row["conflict_index"]),
+    )
+
+
 def _validate_pair_report(
     prepared: PreparedSop05Run, item: PairGenerationReport
 ) -> None:
@@ -885,9 +1069,19 @@ def _validate_pair_report(
     summary = report.summary
     if not isinstance(summary, Mapping):
         raise Sop05RunError("report summary must be a mapping")
+    if set(summary) != _PAIR_SUMMARY_KEYS:
+        raise Sop05RunError("report summary schema mismatch")
+    cpu_seconds = item.allocated_cpu_seconds
+    if (
+        isinstance(cpu_seconds, bool)
+        or not isinstance(cpu_seconds, (int, float))
+        or not math.isfinite(float(cpu_seconds))
+        or float(cpu_seconds) < 0.0
+    ):
+        raise Sop05RunError("pair allocated_cpu_seconds must be finite and nonnegative")
     if summary.get("seed") != item.pair_seed:
         raise Sop05RunError("report seed mismatch")
-    if summary.get("schema_version") != SCHEMA_VERSION:
+    if summary.get("schema_version") != "3.0.0":
         raise Sop05RunError("report schema_version mismatch")
     requested = _summary_int(summary, "requested_event_count")
     if requested != prepared.request.events_per_pair:
@@ -897,39 +1091,59 @@ def _validate_pair_report(
         raise Sop05RunError("report accepted_count mismatch")
     if accepted > requested:
         raise Sop05RunError("report accepted_count exceeds requested count")
-    attempted = _summary_int(summary, "attempted_count")
-    for alias in (
-        "complete_joint_candidates_attempted",
-        "joint_candidate_attempted_count",
-    ):
-        if _summary_int(summary, alias) != attempted:
-            raise Sop05RunError("report attempted_count aliases mismatch")
     rejected = _summary_int(summary, "rejected_count")
-    if rejected != attempted - accepted:
-        raise Sop05RunError("report rejected_count mismatch")
     if _summary_int(summary, "unaccepted_event_count") != requested - accepted:
         raise Sop05RunError("report unaccepted_event_count mismatch")
-    expected_attempt_rate = accepted / attempted if attempted else 0.0
-    expected_request_rate = accepted / requested
-    if _summary_rate(summary, "attempt_acceptance_rate") != expected_attempt_rate:
-        raise Sop05RunError("report attempt_acceptance_rate mismatch")
-    for name in ("acceptance_rate", "request_acceptance_rate"):
-        if _summary_rate(summary, name) != expected_request_rate:
-            raise Sop05RunError(f"report {name} mismatch")
-    rejection_reasons = _summary_count_map(summary, "rejection_reasons")
-    if sum(rejection_reasons.values()) != rejected:
-        raise Sop05RunError("report rejection_reasons total mismatch")
-    rejection_stages = _summary_count_map(summary, "rejection_stage_counts")
-    expected_stage_names = {
-        "occluder_geometry",
-        "target_conditioning",
-        "visibility",
+    _summary_count_map(summary, "rejection_reasons")
+    stage_counts = {
+        name: _summary_int(summary, name) for name in _STAGE_COUNT_NAMES
     }
-    if set(rejection_stages) != expected_stage_names:
-        raise Sop05RunError("report rejection_stage_counts keys mismatch")
-    if sum(rejection_stages.values()) != rejected:
-        raise Sop05RunError("report rejection_stage_counts total mismatch")
-    _summary_count_map(summary, "occluder_candidate_rejection_reasons")
+    if stage_counts["obstacle_proposal_count"] != (
+        stage_counts["obstacle_proposal_rejected_count"]
+        + stage_counts["obstacle_proposal_passed_count"]
+    ):
+        raise Sop05RunError("report obstacle proposal conservation mismatch")
+    if stage_counts["transform_candidate_count"] != (
+        stage_counts["transform_rejected_count"]
+        + stage_counts["chord_certified_count"]
+        + stage_counts["chord_unresolved_count"]
+    ):
+        raise Sop05RunError("report transform candidate conservation mismatch")
+    if stage_counts["exact_validation_count"] != (
+        stage_counts["exact_validation_accepted_count"]
+        + stage_counts["exact_validation_rejected_count"]
+    ):
+        raise Sop05RunError("report exact validation conservation mismatch")
+    if rejected != stage_counts["exact_validation_rejected_count"]:
+        raise Sop05RunError("report rejected_count/exact rejection mismatch")
+    if accepted > stage_counts["exact_validation_accepted_count"]:
+        raise Sop05RunError("report accepted_count exceeds exact acceptances")
+    attempt_start = _summary_int(summary, "attempt_index_start")
+    attempt_stop = _summary_int(summary, "attempt_index_stop_exclusive")
+    if attempt_stop < attempt_start or stage_counts[
+        "obstacle_proposal_count"
+    ] != attempt_stop - attempt_start:
+        raise Sop05RunError("report obstacle proposal schedule mismatch")
+    stage_ids = {
+        name: _summary_id_sequence(summary, name) for name in _STAGE_ID_NAMES
+    }
+    if len(stage_ids["proposal_ids"]) != stage_counts[
+        "obstacle_proposal_count"
+    ]:
+        raise Sop05RunError("report proposal ID count mismatch")
+    cache = summary.get("robot_sweep_cache")
+    if not isinstance(cache, Mapping) or set(cache) != {
+        "size",
+        "hits",
+        "misses",
+        "builds",
+    }:
+        raise Sop05RunError("report robot_sweep_cache schema mismatch")
+    for name in cache:
+        if type(cache[name]) is not int or cache[name] < 0:
+            raise Sop05RunError("report robot_sweep_cache count is invalid")
+    if cache["builds"] > cache["misses"] or cache["size"] > cache["builds"]:
+        raise Sop05RunError("report robot_sweep_cache conservation mismatch")
     report_policy_digest = _summary_digest(
         summary, "target_type_policy_digest"
     )
@@ -954,29 +1168,25 @@ def _validate_pair_report(
             "report generator_algorithm_version does not match the frozen "
             f"{SOP05_GENERATOR_ALGORITHM_VERSION!r} contract"
         )
-    expected_requested = {
-        kind: prepared.request.events_per_pair * numerator // 10
-        for kind, numerator in (
-            ("environment", 6),
-            ("structural", 3),
-            ("mixed", 1),
-        )
-    }
-    if _summary_count_map(
-        summary, "requested_event_kind_counts"
-    ) != expected_requested:
-        raise Sop05RunError("report requested_event_kind_counts mismatch")
-    observed_kind_counts = Counter(event.event_kind for event in report.events)
-    expected_observed = {
-        kind: observed_kind_counts[kind] for kind in _EVENT_KIND_WEIGHTS
-    }
-    if _summary_count_map(summary, "event_kind_counts") != expected_observed:
-        raise Sop05RunError("report event_kind_counts mismatch")
+    if summary.get("production_event_kind") != "environment":
+        raise Sop05RunError("report production_event_kind mismatch")
+    event_order: list[tuple[str, str, str]] = []
     for event in report.events:
-        if not isinstance(event, GeneratedEvent):
-            raise Sop05RunError("report events must contain GeneratedEvent")
-        if event.event_kind not in _EVENT_KIND_WEIGHTS:
-            raise Sop05RunError("report event_kind is invalid")
+        row = _event_stage_row(item, event)
+        proposal_id = str(row["causal_occluder_proposal_id"])
+        candidate_id = str(row["reachability_candidate_id"])
+        transform_id = str(row["reachability_transform_id"])
+        if proposal_id not in stage_ids["proposal_ids"]:
+            raise Sop05RunError("accepted event proposal ID is unreported")
+        if candidate_id not in stage_ids["reachability_candidate_ids"]:
+            raise Sop05RunError("accepted event candidate ID is unreported")
+        if transform_id not in stage_ids["reachability_transform_ids"]:
+            raise Sop05RunError("accepted event transform ID is unreported")
+        if str(row["exact_validation_id"]) not in stage_ids[
+            "exact_validation_ids"
+        ]:
+            raise Sop05RunError("accepted event exact-validation ID is unreported")
+        event_order.append((proposal_id, candidate_id, transform_id))
         record = event.target_motion_record
         if record.target_type_policy_digest != prepared.target_type_policy_digest:
             raise Sop05RunError(
@@ -1002,6 +1212,8 @@ def _validate_pair_report(
         ):
             raise Sop05RunError("event target does not match target-motion record")
         validate_event_target_motion_world_join(record, event.world, prepared.grid)
+    if event_order != sorted(event_order):
+        raise Sop05RunError("accepted event candidate order mismatch")
 
 
 def _initialize_pair_worker(prepared: PreparedSop05Run) -> None:
@@ -1041,9 +1253,10 @@ def _build_generation_summary(
 
     invariant_values: dict[str, object] | None = None
     rejection_reasons: dict[str, int] = {}
-    rejection_stages: dict[str, int] = {}
-    attempted_count = 0
+    stage_counts = {name: 0 for name in _STAGE_COUNT_NAMES}
+    stage_ids = {name: [] for name in _STAGE_ID_NAMES}
     requested_count = 0
+    allocated_cpu_seconds = 0.0
     for item in pair_reports:
         summary = item.report.summary
         invariants = {
@@ -1053,6 +1266,7 @@ def _build_generation_summary(
                 "target_type_policy_digest",
                 "generator_config_digest",
                 "generator_algorithm_version",
+                "production_event_kind",
             )
         }
         if invariant_values is None:
@@ -1060,15 +1274,15 @@ def _build_generation_summary(
         elif invariants != invariant_values:
             raise Sop05RunError("generator report invariants differ")
         requested_count += _summary_int(summary, "requested_event_count")
-        attempted_count += _summary_int(summary, "attempted_count")
+        allocated_cpu_seconds += float(item.allocated_cpu_seconds)
+        for name in _STAGE_COUNT_NAMES:
+            stage_counts[name] += _summary_int(summary, name)
+        for name in _STAGE_ID_NAMES:
+            stage_ids[name].extend(_summary_id_sequence(summary, name))
         for reason, count in _summary_count_map(
             summary, "rejection_reasons"
         ).items():
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + count
-        for stage, count in _summary_count_map(
-            summary, "rejection_stage_counts"
-        ).items():
-            rejection_stages[stage] = rejection_stages.get(stage, 0) + count
 
     generated_counts = Counter(event.event_kind for event in all_events)
     selected_counts = Counter(event.event_kind for event in selected_events)
@@ -1078,18 +1292,33 @@ def _build_generation_summary(
     selected_kind_counts = {
         kind: selected_counts[kind] for kind in _EVENT_KIND_WEIGHTS
     }
+    canonical_candidate_order = [
+        {
+            "base_state_id": event.target_motion_record.base_state_id,
+            "trajectory_id": event.target_motion_record.trajectory_id,
+            "generated_event_id": event.generated_event_id,
+        }
+        for event in all_events
+    ]
     return {
         "processed_pair_count": len(pair_reports),
         "requested_event_count": requested_count,
-        "attempted_count": attempted_count,
         "generator_accepted_count": len(all_events),
+        "candidate_count": len(all_events),
         "selected_count": len(selected_events),
         "quota_trimmed_count": len(all_events) - len(selected_events),
         "generated_event_kind_counts": generated_kind_counts,
         "selected_event_kind_counts": selected_kind_counts,
         "quota_met": len(selected_events) == prepared.request.accepted_quota,
+        "production_event_kind": "environment",
+        "canonical_candidate_order": canonical_candidate_order,
+        "selected_event_ids": [
+            event.generated_event_id for event in selected_events
+        ],
         "rejection_reasons": dict(sorted(rejection_reasons.items())),
-        "rejection_stage_counts": dict(sorted(rejection_stages.items())),
+        "stage_counts": stage_counts,
+        "stage_ids": stage_ids,
+        "allocated_cpu_seconds": allocated_cpu_seconds,
         "generator_invariants": invariant_values or {},
     }
 
@@ -1105,6 +1334,7 @@ def collect_sop05_generation(
     all_events: list[GeneratedEvent] = []
     seen_event_ids: set[str] = set()
     seen_world_ids: set[str] = set()
+    candidate_by_event_id: dict[str, Sop05SelectionCandidate] = {}
 
     executor_context = (
         _make_pair_process_pool(prepared)
@@ -1134,12 +1364,19 @@ def collect_sop05_generation(
                 seen_event_ids.add(event.generated_event_id)
                 seen_world_ids.add(event.world.world_id)
                 all_events.append(event)
+                candidate_by_event_id[event.generated_event_id] = (
+                    _selection_candidate(item, event)
+                )
 
+    all_events.sort(
+        key=lambda event: (
+            event.target_motion_record.base_state_id,
+            event.target_motion_record.trajectory_id,
+            event.generated_event_id,
+        )
+    )
     selected_ids = select_sop05_event_ids(
-        (
-            (event.generated_event_id, event.event_kind)
-            for event in all_events
-        ),
+        (candidate_by_event_id[event.generated_event_id] for event in all_events),
         seed=prepared.request.seed,
         accepted_quota=prepared.request.accepted_quota,
     )
@@ -1183,12 +1420,10 @@ def _pair_report_rows(
             "state_id": item.state_id,
             "trajectory_id": item.trajectory_id,
             "seed": item.pair_seed,
+            "allocated_cpu_seconds": float(item.allocated_cpu_seconds),
             "summary": item.report.summary,
             "accepted_events": [
-                {
-                    "generated_event_id": event.generated_event_id,
-                    "event_kind": event.event_kind,
-                }
+                _event_stage_row(item, event)
                 for event in item.report.events
             ],
         }
@@ -1235,7 +1470,7 @@ def _completion_marker(
         ),
     }
     return {
-        "marker_version": "sop05_producer_complete_v2",
+        "marker_version": SOP05_COMPLETION_MARKER_VERSION,
         "publication_identity_version": SOP05_PUBLICATION_IDENTITY_VERSION,
         **identity_fields,
         "publication_semantic_digest": (
@@ -1271,15 +1506,16 @@ def _validate_collection_for_publication(
         for item in collection.pair_reports
         for event in item.report.events
     ]
-    reported_events = [
-        (event.generated_event_id, event.event_kind)
-        for event in reported_event_objects
-    ]
-    observed_events = [
-        (event.generated_event_id, event.event_kind)
-        for event in collection.all_events
-    ]
-    if reported_events != observed_events:
+    reported_event_objects.sort(
+        key=lambda event: (
+            event.target_motion_record.base_state_id,
+            event.target_motion_record.trajectory_id,
+            event.generated_event_id,
+        )
+    )
+    if [event.generated_event_id for event in reported_event_objects] != (
+        all_event_ids
+    ):
         raise Sop05RunError(
             "collection generated events differ from pair reports"
         )
@@ -1308,14 +1544,29 @@ def _validate_collection_for_publication(
         raise Sop05RunError(
             "selected event payload differs from pair reports"
         )
+    pair_by_identity = {
+        (item.state_id, item.trajectory_id): item
+        for item in collection.pair_reports
+    }
+    selection_candidates = []
+    for event in collection.all_events:
+        identity = (
+            event.target_motion_record.base_state_id,
+            event.target_motion_record.trajectory_id,
+        )
+        try:
+            pair_item = pair_by_identity[identity]
+        except KeyError as exc:
+            raise Sop05RunError("event pair is absent from pair reports") from exc
+        selection_candidates.append(_selection_candidate(pair_item, event))
     expected_selected_event_ids = select_sop05_event_ids(
-        observed_events,
+        selection_candidates,
         seed=prepared.request.seed,
         accepted_quota=prepared.request.accepted_quota,
     )
     if tuple(selected_event_ids) != expected_selected_event_ids:
         raise Sop05RunError(
-            "selection differs from the frozen total-quota selection"
+            "selection differs from the frozen diversity-total selection"
         )
     for event in collection.selected_events:
         validate_event_target_motion_world_join(

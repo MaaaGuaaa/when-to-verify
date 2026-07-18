@@ -30,6 +30,9 @@ from .structural_blindspot import (
 
 
 JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION = "joint_multi_los_envelope_v2"
+OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION = (
+    "occluder_collision_sweep_preparation_v1"
+)
 
 
 class OccluderSamplingError(ValueError):
@@ -90,6 +93,54 @@ class OccluderCollisionSweep:
     footprint: Footprint
     poses: np.ndarray
     rejection_reason: str
+
+
+@dataclass(frozen=True)
+class PreparedOccluderCollisionSweep:
+    """Immutable candidate-independent geometry for one continuous sweep."""
+
+    footprint: Footprint
+    dense_poses: np.ndarray
+    interval_motion_bounds_m: np.ndarray
+    rejection_reason: str
+    grid: GridSpec
+    preparation_version: str = OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.footprint, (CircleFootprint, RectangleFootprint)):
+            raise TypeError("footprint must be a Footprint")
+        dense_poses = _poses(self.dense_poses, name="dense_poses")
+        if dense_poses.shape[0] == 0:
+            raise ValueError("dense_poses must not be empty")
+        dense_poses = np.array(
+            dense_poses,
+            dtype=np.float64,
+            order="C",
+            copy=True,
+        )
+        dense_poses.setflags(write=False)
+
+        bounds = np.asarray(self.interval_motion_bounds_m)
+        if bounds.shape != (dense_poses.shape[0] - 1,) or bounds.dtype.kind not in "iuf":
+            raise ValueError(
+                "interval_motion_bounds_m must have shape (len(dense_poses) - 1,)"
+            )
+        bounds = np.array(bounds, dtype=np.float64, order="C", copy=True)
+        if not np.isfinite(bounds).all() or np.any(bounds < 0.0):
+            raise ValueError(
+                "interval_motion_bounds_m must contain finite non-negative values"
+            )
+        bounds.setflags(write=False)
+
+        if not isinstance(self.rejection_reason, str) or not self.rejection_reason:
+            raise ValueError("rejection_reason must be non-empty")
+        if not isinstance(self.grid, GridSpec):
+            raise TypeError("grid must be a GridSpec")
+        if not isinstance(self.preparation_version, str) or not self.preparation_version:
+            raise ValueError("preparation_version must be non-empty")
+
+        object.__setattr__(self, "dense_poses", dense_poses)
+        object.__setattr__(self, "interval_motion_bounds_m", bounds)
 
 
 def _finite_real(value: Any, *, name: str) -> float:
@@ -234,36 +285,102 @@ def _densify_pose_sequence(
     return np.asarray(dense, dtype=np.float64)
 
 
-def _intersects_robot_sweep(
-    occluder_footprint: Footprint,
-    occluder_pose: np.ndarray,
-    robot_footprint: Footprint,
-    robot_poses: np.ndarray,
+def _sweep_motion_radius(footprint: Footprint) -> float:
+    if isinstance(footprint, CircleFootprint):
+        return footprint.radius_m
+    return 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
+
+
+def _pose_interval_motion_bound(
+    start_pose: np.ndarray,
+    end_pose: np.ndarray,
+    *,
+    motion_radius_m: float,
+) -> float:
+    yaw_delta = float(wrap_angle(end_pose[2] - start_pose[2]))
+    result = float(np.linalg.norm(end_pose[:2] - start_pose[:2]))
+    return result + motion_radius_m * abs(yaw_delta)
+
+
+def prepare_occluder_collision_sweep(
+    sweep: OccluderCollisionSweep,
     *,
     grid: GridSpec,
-) -> bool:
-    """Conservatively certify clearance over an interpolated robot sweep."""
+) -> PreparedOccluderCollisionSweep:
+    """Prepare reusable dense SE(2) and interval geometry for one raw sweep."""
 
-    dense_robot_poses = _densify_pose_sequence(
-        robot_poses,
-        max_translation_step_m=0.5 * grid.resolution_m,
+    if not isinstance(sweep, OccluderCollisionSweep):
+        raise TypeError("sweep must be an OccluderCollisionSweep")
+    if not isinstance(sweep.footprint, (CircleFootprint, RectangleFootprint)):
+        raise TypeError("sweep.footprint must be a Footprint")
+    if not isinstance(grid, GridSpec):
+        raise TypeError("grid must be a GridSpec")
+    resolution_m = _finite_real(grid.resolution_m, name="grid.resolution_m")
+    if resolution_m <= 0.0:
+        raise ValueError("grid.resolution_m must be positive")
+    poses = _poses(sweep.poses, name="sweep.poses")
+    if poses.shape[0] == 0:
+        raise ValueError("sweep.poses must not be empty")
+    if not isinstance(sweep.rejection_reason, str) or not sweep.rejection_reason:
+        raise ValueError("sweep.rejection_reason must be non-empty")
+
+    dense_poses = _densify_pose_sequence(
+        poses,
+        max_translation_step_m=0.5 * resolution_m,
         max_yaw_step_rad=np.deg2rad(5.0),
     )
+    motion_radius_m = _sweep_motion_radius(sweep.footprint)
+    interval_motion_bounds_m = np.asarray(
+        [
+            _pose_interval_motion_bound(
+                start_pose,
+                end_pose,
+                motion_radius_m=motion_radius_m,
+            )
+            for start_pose, end_pose in zip(
+                dense_poses[:-1], dense_poses[1:], strict=True
+            )
+        ],
+        dtype=np.float64,
+    )
+    return PreparedOccluderCollisionSweep(
+        footprint=sweep.footprint,
+        dense_poses=dense_poses,
+        interval_motion_bounds_m=interval_motion_bounds_m,
+        rejection_reason=sweep.rejection_reason,
+        grid=grid,
+    )
+
+
+def _validate_prepared_collision_sweep(
+    sweep: PreparedOccluderCollisionSweep,
+    *,
+    grid: GridSpec,
+) -> None:
+    if sweep.preparation_version != OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION:
+        raise ValueError("prepared collision sweep preparation version mismatch")
+    if sweep.grid != grid:
+        raise ValueError("prepared collision sweep grid mismatch")
+
+
+def _prepared_intersects_robot_sweep(
+    occluder_footprint: Footprint,
+    occluder_pose: np.ndarray,
+    sweep: PreparedOccluderCollisionSweep,
+) -> bool:
+    """Apply the unchanged signed-clearance recursion to prepared geometry."""
+
+    dense_robot_poses = sweep.dense_poses
     clearances = trajectory_signed_clearances(
         occluder_footprint,
         np.tile(occluder_pose, (dense_robot_poses.shape[0], 1)),
-        robot_footprint,
+        sweep.footprint,
         dense_robot_poses,
     )
     if np.any(clearances <= 0.0):
         return True
 
-    if isinstance(robot_footprint, CircleFootprint):
-        robot_radius = robot_footprint.radius_m
-    else:
-        robot_radius = 0.5 * float(
-            np.hypot(robot_footprint.length_m, robot_footprint.width_m)
-        )
+    robot_radius = _sweep_motion_radius(sweep.footprint)
 
     def interval_intersects(
         start_pose: np.ndarray,
@@ -271,10 +388,15 @@ def _intersects_robot_sweep(
         start_clearance: float,
         end_clearance: float,
         depth: int,
+        motion_bound: float | None = None,
     ) -> bool:
         yaw_delta = float(wrap_angle(end_pose[2] - start_pose[2]))
-        motion_bound = float(np.linalg.norm(end_pose[:2] - start_pose[:2]))
-        motion_bound += robot_radius * abs(yaw_delta)
+        if motion_bound is None:
+            motion_bound = _pose_interval_motion_bound(
+                start_pose,
+                end_pose,
+                motion_radius_m=robot_radius,
+            )
         # Signed clearance is 1-Lipschitz under this conservative rigid-body
         # displacement bound. Either endpoint can therefore certify the whole
         # interval without additional samples.
@@ -289,7 +411,7 @@ def _intersects_robot_sweep(
         midpoint_clearance = signed_clearance(
             occluder_footprint,
             occluder_pose,
-            robot_footprint,
+            sweep.footprint,
             midpoint,
         )
         if midpoint_clearance <= 0.0:
@@ -315,21 +437,51 @@ def _intersects_robot_sweep(
             float(clearances[index]),
             float(clearances[index + 1]),
             0,
+            float(sweep.interval_motion_bounds_m[index]),
         )
         for index in range(dense_robot_poses.shape[0] - 1)
     )
 
 
+def _intersects_robot_sweep(
+    occluder_footprint: Footprint,
+    occluder_pose: np.ndarray,
+    robot_footprint: Footprint,
+    robot_poses: np.ndarray,
+    *,
+    grid: GridSpec,
+) -> bool:
+    """Conservatively certify clearance over an interpolated robot sweep."""
+
+    prepared = prepare_occluder_collision_sweep(
+        OccluderCollisionSweep(
+            footprint=robot_footprint,
+            poses=robot_poses,
+            rejection_reason="_intersects_robot_sweep",
+        ),
+        grid=grid,
+    )
+    return _prepared_intersects_robot_sweep(
+        occluder_footprint,
+        occluder_pose,
+        prepared,
+    )
+
+
 def _normalize_collision_sweeps(
     collision_sweeps: Any,
-) -> tuple[OccluderCollisionSweep, ...]:
+) -> tuple[OccluderCollisionSweep | PreparedOccluderCollisionSweep, ...]:
     if not isinstance(collision_sweeps, (list, tuple)) or not collision_sweeps:
         raise ValueError("collision_sweeps must be a non-empty sequence")
     normalized = []
     for index, sweep in enumerate(collision_sweeps):
+        if isinstance(sweep, PreparedOccluderCollisionSweep):
+            normalized.append(sweep)
+            continue
         if not isinstance(sweep, OccluderCollisionSweep):
             raise TypeError(
-                f"collision_sweeps[{index}] must be OccluderCollisionSweep"
+                f"collision_sweeps[{index}] must be raw or prepared "
+                "OccluderCollisionSweep"
             )
         if not isinstance(sweep.footprint, (CircleFootprint, RectangleFootprint)):
             raise TypeError(
@@ -360,18 +512,31 @@ def _normalize_collision_sweeps(
 def _normalized_collision_sweep_rejection_reason(
     occluder_footprint: Footprint,
     occluder_pose: np.ndarray,
-    collision_sweeps: tuple[OccluderCollisionSweep, ...],
+    collision_sweeps: tuple[
+        OccluderCollisionSweep | PreparedOccluderCollisionSweep, ...
+    ],
     *,
     grid: GridSpec,
 ) -> str | None:
     for sweep in collision_sweeps:
-        if _intersects_robot_sweep(
-            occluder_footprint,
-            occluder_pose,
-            sweep.footprint,
-            sweep.poses,
-            grid=grid,
-        ):
+        if isinstance(sweep, PreparedOccluderCollisionSweep):
+            _validate_prepared_collision_sweep(sweep, grid=grid)
+    for sweep in collision_sweeps:
+        if isinstance(sweep, PreparedOccluderCollisionSweep):
+            intersects = _prepared_intersects_robot_sweep(
+                occluder_footprint,
+                occluder_pose,
+                sweep,
+            )
+        else:
+            intersects = _intersects_robot_sweep(
+                occluder_footprint,
+                occluder_pose,
+                sweep.footprint,
+                sweep.poses,
+                grid=grid,
+            )
+        if intersects:
             return sweep.rejection_reason
     return None
 

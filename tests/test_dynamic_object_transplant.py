@@ -62,6 +62,7 @@ from src.planning.differential_drive import rollout_constant_control
 from src.planning.query_maps import build_local_trajectory
 from src.planning.trajectory_sampler import CandidateRollout, sample_candidate_rollouts
 from src.utils.config import load_config
+from src.utils.seeding import stable_digest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1162,13 +1163,125 @@ def test_legacy_transplant_identity_and_provenance_bind_source_session() -> None
     )
 
     baseline = transplant_snippet(snippet, **kwargs)
-    changed = transplant_snippet(
+    repeated = transplant_snippet(snippet, **kwargs)
+    changed_recording = transplant_snippet(
+        replace(snippet, source_recording_id="source-recording-other"), **kwargs
+    )
+    changed_session = transplant_snippet(
         replace(snippet, source_session_id="source-session-other"), **kwargs
     )
 
     assert baseline.provenance["source_session_id"] == "source-session"
-    assert changed.provenance["source_session_id"] == "source-session-other"
-    assert changed.target_dynamic_object_id != baseline.target_dynamic_object_id
+    assert changed_recording.provenance["source_recording_id"] == (
+        "source-recording-other"
+    )
+    assert changed_session.provenance["source_session_id"] == (
+        "source-session-other"
+    )
+    assert repeated.target_dynamic_object_id == baseline.target_dynamic_object_id
+    assert changed_recording.target_dynamic_object_id != (
+        baseline.target_dynamic_object_id
+    )
+    assert changed_session.target_dynamic_object_id != (
+        baseline.target_dynamic_object_id
+    )
+
+
+def test_legacy_transplant_identity_frames_recording_session_boundaries() -> None:
+    snippet = _snippet()
+    policy = normalize_target_type_policy(_policy())
+    kwargs = dict(
+        conflict_point=(1.2, 0.0),
+        conflict_time_s=1.6,
+        crossing_direction=(0.0, 1.0),
+        time_scale=1.0,
+        future_dt_s=0.2,
+        future_steps=15,
+        base_state_id="train-base-1",
+        trajectory_id="traj-1",
+        target_type_policy_digest=policy.digest,
+        seed=13,
+        context_object_ids=(),
+    )
+    recording_contains_delimiter = transplant_snippet(
+        replace(
+            snippet,
+            source_recording_id="rec|session",
+            source_session_id="x",
+        ),
+        **kwargs,
+    )
+    session_contains_delimiter = transplant_snippet(
+        replace(
+            snippet,
+            source_recording_id="rec",
+            source_session_id="session|x",
+        ),
+        **kwargs,
+    )
+
+    assert recording_contains_delimiter.target_dynamic_object_id != (
+        session_contains_delimiter.target_dynamic_object_id
+    )
+
+
+def test_legacy_transplant_identity_v2_does_not_reuse_prior_identities() -> None:
+    snippet = _snippet()
+    policy = normalize_target_type_policy(_policy())
+    kwargs = dict(
+        conflict_point=(1.2, 0.0),
+        conflict_time_s=1.6,
+        crossing_direction=(0.0, 1.0),
+        time_scale=1.0,
+        future_dt_s=0.2,
+        future_steps=15,
+        base_state_id="train-base-1",
+        trajectory_id="traj-1",
+        target_type_policy_digest=policy.digest,
+        seed=13,
+        context_object_ids=(),
+    )
+
+    result = transplant_snippet(snippet, **kwargs)
+    old_v1_digest = stable_digest(
+        "train-base-1",
+        "traj-1",
+        snippet.snippet_id,
+        snippet.source_object_id,
+        policy.digest,
+        13,
+        "1.600000000",
+        "1.200000000",
+        "0.000000000",
+        "0.000000000",
+        "1.000000000",
+        "1.000000000",
+        0,
+        size=12,
+    )
+    unversioned_lineage_digest = stable_digest(
+        "train-base-1",
+        "traj-1",
+        snippet.snippet_id,
+        snippet.source_recording_id,
+        snippet.source_session_id,
+        snippet.source_object_id,
+        policy.digest,
+        13,
+        "1.600000000",
+        "1.200000000",
+        "0.000000000",
+        "0.000000000",
+        "1.000000000",
+        "1.000000000",
+        0,
+        size=12,
+    )
+
+    assert result.target_dynamic_object_id not in {
+        f"generated::human::{old_v1_digest}",
+        f"generated::human::{unversioned_lineage_digest}",
+    }
 
 
 def _canonical_event_identity_inputs() -> dict[str, object]:

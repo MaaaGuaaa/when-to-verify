@@ -29,6 +29,9 @@ MOTION_SNIPPET_SAMPLE_DT_S = 0.2
 MOTION_SNIPPET_DURATION_S = 4.4
 MOTION_SNIPPET_CURRENT_TIME_S = 1.4
 TRANSFORM_ALGORITHM_VERSION = "reachability_candidate_se2_v2"
+_LEGACY_SNIPPET_TARGET_IDENTITY_DOMAIN = (
+    "legacy-snippet-target-identity-v2"
+)
 
 
 class TargetPolicyError(ValueError):
@@ -270,22 +273,33 @@ def _stable_target_id(
 ) -> str:
     salt = 0
     while True:
-        digest = stable_digest(
-            base_state_id,
-            trajectory_id,
-            snippet.snippet_id,
-            snippet.source_recording_id,
-            snippet.source_session_id,
-            snippet.source_object_id,
-            target_type_policy_digest,
-            int(seed),
-            f"{conflict_time_s:.9f}",
-            *(f"{value:.9f}" for value in conflict_point),
-            *(f"{value:.9f}" for value in crossing_direction),
-            f"{time_scale:.9f}",
-            salt,
-            size=12,
+        payload = json.dumps(
+            {
+                "base_state_id": base_state_id,
+                "conflict_point_xy_m": [
+                    f"{value:.9f}" for value in conflict_point
+                ],
+                "conflict_time_s": f"{conflict_time_s:.9f}",
+                "crossing_direction_xy": [
+                    f"{value:.9f}" for value in crossing_direction
+                ],
+                "identity_domain": _LEGACY_SNIPPET_TARGET_IDENTITY_DOMAIN,
+                "salt": salt,
+                "seed": int(seed),
+                "source_object_id": snippet.source_object_id,
+                "source_recording_id": snippet.source_recording_id,
+                "source_session_id": snippet.source_session_id,
+                "source_snippet_id": snippet.snippet_id,
+                "target_object_type": snippet.object_type,
+                "target_type_policy_digest": target_type_policy_digest,
+                "time_scale": f"{time_scale:.9f}",
+                "trajectory_id": trajectory_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         )
+        digest = stable_digest(payload, size=12)
         candidate = f"generated::{snippet.object_type}::{digest}"
         if candidate not in context_object_ids:
             return candidate

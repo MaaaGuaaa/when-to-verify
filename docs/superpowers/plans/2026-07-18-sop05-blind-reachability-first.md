@@ -169,37 +169,16 @@ Run the Step 2 test twice, then commit the exact two files.
 - Create: `tests/test_blind_region.py`
 - Create: `tests/test_robot_sweep_cache.py`
 - Modify: `src/generation/occluder_sampler.py`
-- Modify: `tests/test_occluder_sampler.py`
-- Modify: `configs/generator_train.yaml`
-- Modify: `configs/generator_test.yaml`
+- Create: `tests/test_occluder_sampler.py`
 
-- [ ] **Step 1: Add explicit config**
-
-Add this identical scientific section to train/test configs; only
-`obstacle_proposals_per_trajectory` may be larger in train after benchmark:
-
-```yaml
-production_event_kind: environment
-blind_reachability:
-  algorithm_version: blind_reachability_first_v1
-  obstacle_proposals_per_trajectory: 64
-  interaction_range_m: [1.0, 4.0]
-  bearing_bin_count: 12
-  yaw_step_deg: 30.0
-  crossing_angle_step_deg: 5.0
-  minimum_shadow_center_cells: 32
-  chord_deviation_fastpath_m: 0.15
-  unresolved_exact_fallback_per_anchor: 16
-```
-
-- [ ] **Step 2: Write RED causal-obstacle tests**
+- [ ] **Step 1: Write RED causal-obstacle tests**
 
 In a toy empty 160x160 grid, assert the seeded schedule covers at least four
 bearing quadrants, never overlaps the continuous robot/context sweeps, is not
 derived from a conflict-point normal, emits one stable proposal identity, and
 records explicit free-space/shadow rejection reasons.
 
-- [ ] **Step 3: Write RED robot-sweep cache tests**
+- [ ] **Step 2: Write RED robot-sweep cache tests**
 
 Build a toy bank with repeated use of the same trajectory. Require exactly one
 future-sweep preparation for one strict key, read-only cached arrays, stable
@@ -216,7 +195,7 @@ future geometry globally per worker; prepare robot history per base and context
 motion per base/object. A stored SOP04 `swept_mask` is broad-phase evidence
 only and cannot decide collision by itself.
 
-- [ ] **Step 4: Write RED blind-mask tests**
+- [ ] **Step 3: Write RED blind-mask tests**
 
 Require `build_blind_region` to call the same ray-casting kernel used by the
 formal renderer and to combine base static, causal obstacle, current context,
@@ -224,7 +203,7 @@ FOV, and range while rejecting any oracle-future input. Assert byte equality
 with a direct renderer-kernel call. Test circle masks and yaw-binned rectangle
 masks, followed by exact polygon visibility.
 
-- [ ] **Step 5: Run RED**
+- [ ] **Step 4: Run RED**
 
 ```bash
 srun -p gpu -c 8 --mem=12G -t 00:15:00 \
@@ -234,7 +213,7 @@ srun -p gpu -c 8 --mem=12G -t 00:15:00 \
   tests/test_occluder_visibility.py tests/test_observation_renderer.py
 ```
 
-- [ ] **Step 6: Implement minimal modules using existing geometry**
+- [ ] **Step 5: Implement minimal modules using existing geometry**
 
 Reuse `OccluderCollisionSweep`, continuous signed-clearance certification,
 `rasterize_footprint`, `raycast_visibility`, and
@@ -249,11 +228,13 @@ occluder-specific clearances, target motion, visibility, static occupancy, or
 context from another base. Keep the old unprepared validator entry point for
 v4 callers and require numerical/verdict equivalence in tests.
 
-- [ ] **Step 7: Run GREEN and commit**
+- [ ] **Step 6: Run GREEN and commit**
 
-Run Step 5. Require no change to legacy v4 tests except version-specific
-fixtures. Commit the three new modules, three new tests, the directly modified
-occluder sampler/test, and two generator configs.
+Run Step 4. Require no change to legacy v4 tests except version-specific
+fixtures. Commit the three new modules, three new tests, and the directly
+modified occluder sampler/test. The formal config files advance atomically with
+the v5 event-sampler normalizer in Task 4 so Task 3 cannot leave checked-in
+configs unreadable by the production entry point.
 
 ### Task 4: Orchestrate environment collision mothers
 
@@ -262,8 +243,34 @@ occluder sampler/test, and two generator configs.
 - Modify: `src/generation/dynamic_object_transplant.py`
 - Modify: `tests/test_dynamic_object_transplant.py`
 - Modify: `tests/test_occluder_visibility.py`
+- Modify: `configs/generator_train.yaml`
+- Modify: `configs/generator_test.yaml`
 
-- [ ] **Step 1: Write RED mother-event fixtures**
+- [ ] **Step 1: Add explicit config with the v5 normalizer tests**
+
+Replace the v4 event-kind mixture with this identical scientific section in
+train/test configs; only `obstacle_proposals_per_trajectory` may be larger in
+train after the benchmark:
+
+```yaml
+production_event_kind: environment
+blind_reachability:
+  algorithm_version: blind_reachability_first_v1
+  obstacle_proposals_per_trajectory: 64
+  interaction_range_m: [1.0, 4.0]
+  bearing_bin_count: 12
+  yaw_step_deg: 30.0
+  crossing_angle_step_deg: 5.0
+  minimum_shadow_center_cells: 32
+  chord_deviation_fastpath_m: 0.15
+  unresolved_exact_fallback_per_anchor: 16
+```
+
+Write a RED test that the v5 normalizer accepts exactly these keys and rejects
+v4 `event_type_weights`/`structural_fov`. Change the configs and normalizer in
+the same GREEN commit so no checked-in config is transiently invalid.
+
+- [ ] **Step 2: Write RED mother-event fixtures**
 
 Add left-, right-, and oblique-occluder toy cases. Each accepted event must use
 one real `MotionSnippet`, one causal environment occluder, exact same-index
@@ -275,7 +282,7 @@ partial current visibility, chord-unresolved-but-exact-safe curved motion,
 continuous between-frame obstacle contact, and an unexpected exception that
 must abort rather than count as physical rejection.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 3: Run RED**
 
 ```bash
 srun -p gpu -c 8 --mem=16G -t 00:20:00 \
@@ -284,7 +291,7 @@ srun -p gpu -c 8 --mem=16G -t 00:20:00 \
   tests/test_occluder_visibility.py
 ```
 
-- [ ] **Step 3: Replace the production branch, not v4 semantics in place**
+- [ ] **Step 4: Replace the production branch, not v4 semantics in place**
 
 Set `SOP05_GENERATOR_ALGORITHM_VERSION = "blind_reachability_first_v1"`.
 Normalize `production_event_kind=environment` and the exact config keys. In a
@@ -304,7 +311,7 @@ bounded work item:
 
 Do not retain a structural/mixed fallback in the formal v5 function.
 
-- [ ] **Step 4: Emit stable stage identities and conservation counters**
+- [ ] **Step 5: Emit stable stage identities and conservation counters**
 
 Every report contains obstacle proposal IDs, arc-query IDs, transform IDs,
 exact-validation IDs, stage counts, rejection reasons, and equations:
@@ -315,9 +322,9 @@ transform_candidates = chord_certified + chord_unresolved + transform_rejected
 exact_validations = exact_accepted + exact_rejected
 ```
 
-- [ ] **Step 5: Run GREEN plus shape/dtype/determinism checks and commit**
+- [ ] **Step 6: Run GREEN plus shape/dtype/determinism checks and commit**
 
-Run Step 2 twice and the focused reachability tests. Commit only Task 4 files.
+Run Step 3 twice and the focused reachability tests. Commit only Task 4 files.
 
 ### Task 5: Advance producer, selector, loader, and publication evidence
 

@@ -929,6 +929,53 @@ def test_formal_mother_consumer_rejects_v1_mother() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_recording_id", None),
+        ("source_recording_id", " \t "),
+        ("source_session_id", None),
+        ("source_session_id", " \t "),
+    ],
+)
+def test_formal_mother_consumer_rejects_missing_or_blank_source_lineage(
+    field: str,
+    value: str | None,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, _ = _formal_partial_group_fixture()
+    provenance = dict(inputs["world"].metadata["target_provenance"])
+    if value is None:
+        provenance.pop(field)
+    else:
+        provenance[field] = value
+    world = replace(
+        inputs["world"],
+        metadata={
+            **inputs["world"].metadata,
+            "target_provenance": provenance,
+        },
+    )
+    label = (
+        "source recording"
+        if field == "source_recording_id"
+        else "source session"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"mother target {label} must be non-empty",
+    ):
+        pipeline.render_sop06_mother_event(
+            record=inputs["record"],
+            world=world,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+        )
+
+
 @pytest.mark.parametrize("entry", ["partial", "complete"])
 def test_formal_pair_group_consumers_reject_v1_mother(entry: str) -> None:
     import src.generation.sop06_pipeline as pipeline

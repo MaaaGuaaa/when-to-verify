@@ -705,6 +705,16 @@ def _validate_formal_mother_world(world: OracleWorld) -> None:
             "formal SOP06 mother generator_algorithm_version must equal "
             f"{BLIND_REACHABILITY_ALGORITHM_VERSION}"
         )
+    target_provenance = world.metadata.get("target_provenance")
+    if not isinstance(target_provenance, Mapping):
+        raise ValueError("mother target provenance must be a mapping")
+    for field, label in (
+        ("source_recording_id", "source recording"),
+        ("source_session_id", "source session"),
+    ):
+        value = target_provenance.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"mother target {label} must be non-empty")
 
 
 def render_sop06_mother_event(

@@ -241,6 +241,8 @@ def _validate_causal_decision(
     np.ndarray,
     str,
     str,
+    np.ndarray,
+    str,
 ]:
     if not isinstance(decision, CausalOccluderDecision):
         raise TypeError("causal_occluder must be a CausalOccluderDecision")
@@ -271,6 +273,8 @@ def _validate_causal_decision(
         mask,
         decision.context_digest,
         binding_digest,
+        decision.interaction_region,
+        decision.interaction_region_digest,
     )
 
 
@@ -336,6 +340,8 @@ class BlindRegion:
             causal,
             causal_context_digest,
             causal_proposal_binding_digest,
+            interaction_region,
+            _interaction_region_digest,
         ) = _validate_causal_decision(
             self.causal_decision,
             base_state_id=self.base_state_id,
@@ -398,7 +404,17 @@ class BlindRegion:
             raise ValueError(
                 "causal useful shadow must be a subset of the renderer delta"
             )
-        blind_free = causal_shadow
+        formal_shadow = np.asarray(
+            renderer_delta & interaction_region,
+            dtype=np.bool_,
+            order="C",
+        )
+        if not np.array_equal(causal_shadow, formal_shadow):
+            raise ValueError(
+                "causal useful shadow must exactly equal the formal renderer delta "
+                "within the interaction region"
+            )
+        blind_free = formal_shadow
 
         arrays = {
             "sensor_pose": sensor_pose,

@@ -187,7 +187,7 @@ def test_causal_occluder_module_is_available() -> None:
     module = importlib.import_module("src.generation.causal_occluder")
 
     assert module.CAUSAL_OCCLUDER_SCHEDULE_VERSION == "causal_occluder_schedule_v1"
-    assert module.CAUSAL_OCCLUDER_PROPOSAL_VERSION == "causal_occluder_proposal_v1"
+    assert module.CAUSAL_OCCLUDER_PROPOSAL_VERSION == "causal_occluder_proposal_v2"
 
 
 def test_public_apis_expose_only_current_causal_inputs() -> None:
@@ -783,9 +783,42 @@ def test_useful_shadow_is_byte_exact_direct_renderer_delta_without_target() -> N
 
     assert decision.useful_shadow_mask.tobytes() == expected.tobytes()
     assert decision.useful_shadow_count == int(np.count_nonzero(expected))
+    assert decision.interaction_region_digest == context.interaction_region_digest
+    np.testing.assert_array_equal(
+        decision.interaction_region,
+        context.interaction_region,
+    )
     assert not np.any(decision.useful_shadow_mask & context.baseline_occupancy)
     assert not np.any(decision.useful_shadow_mask & decision.accepted.mask)
     assert not np.any(decision.useful_shadow_mask & ~context.interaction_region)
+
+
+def test_decision_interaction_region_is_immutable_and_binding_verified() -> None:
+    context = _proposal_context()
+    decision = _propose(context)
+
+    assert decision.interaction_region.flags.c_contiguous
+    assert not decision.interaction_region.flags.writeable
+    assert not decision.interaction_region.flags.owndata
+    with pytest.raises(ValueError, match="WRITEABLE"):
+        decision.interaction_region.setflags(write=True)
+
+    changed_region = np.array(decision.interaction_region, copy=True)
+    changed_region[0, 0] = ~changed_region[0, 0]
+    changed_digest = causal_occluder._array_digest(
+        "interaction_region",
+        changed_region,
+    )
+    with pytest.raises(ValueError, match="interaction_region_digest"):
+        replace(decision, interaction_region=changed_region)
+    with pytest.raises(ValueError, match="interaction region.*binding"):
+        replace(
+            decision,
+            interaction_region=changed_region,
+            interaction_region_digest=changed_digest,
+        )
+    with pytest.raises(ValueError, match="interaction_region_digest"):
+        replace(decision, interaction_region_digest="0" * 64)
 
 
 def test_accepted_decision_and_candidate_arrays_are_frozen_bytes_backed() -> None:
@@ -877,7 +910,7 @@ def test_decision_rejects_accepted_structured_identity_metadata_splices(
     )
     changed_values = {
         "schedule_version": "causal_occluder_schedule_v2",
-        "proposal_version": "causal_occluder_proposal_v2",
+        "proposal_version": "causal_occluder_proposal_v3",
         "seed": 18,
         "base_state_id": "base-spliced",
         "trajectory_id": "trajectory-spliced",
@@ -926,6 +959,7 @@ def test_decision_rejects_structured_identity_field_splices(
         ("parameters", "parameters"),
         ("config", "config"),
         ("context_digest", "context digest"),
+        ("interaction_region_digest", "interaction region digest"),
     ),
 )
 def test_rejected_decision_canonically_parses_every_proposal_binding_part(
@@ -945,7 +979,7 @@ def test_rejected_decision_canonically_parses_every_proposal_binding_part(
     if splice == "schedule_version":
         parts[0] = b"causal_occluder_schedule_v2"
     elif splice == "proposal_version":
-        parts[1] = b"causal_occluder_proposal_v2"
+        parts[1] = b"causal_occluder_proposal_v3"
     elif splice == "noncanonical_seed":
         parts[2] = b"017"
     elif splice == "invalid_base_utf8":
@@ -954,8 +988,10 @@ def test_rejected_decision_canonically_parses_every_proposal_binding_part(
         parts[5] = parts[5][:-1]
     elif splice == "config":
         parts[7] = b" " + parts[7]
-    else:
+    elif splice == "context_digest":
         parts[8] = b"0" * 63
+    else:
+        parts[9] = b"0" * 63
     changed_binding = b"".join(
         len(part).to_bytes(8, byteorder="big", signed=False) + part
         for part in parts

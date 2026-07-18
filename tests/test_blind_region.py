@@ -419,6 +419,48 @@ def test_builder_rejects_shadow_tamper_that_claims_preexisting_blind_cell() -> N
         blind_region.build_blind_region(base, forged_decision, grid=grid)
 
 
+def test_builder_rejects_shadow_tamper_outside_formal_interaction_region() -> None:
+    grid = _grid()
+    base = _base_state(grid)
+    decision = _decision(base, grid)
+
+    region = blind_region.build_blind_region(base, decision, grid=grid)
+    baseline_occupancy = (
+        region.static_occupancy | region.current_context_occupancy
+    )
+    baseline_visibility = raycast_visibility(
+        baseline_occupancy,
+        grid,
+        sensor_pose=base.robot_history[-1],
+        fov_rad=2.0 * np.pi,
+        max_range_m=None,
+    )
+    renderer_delta_outside_interaction = (
+        baseline_visibility
+        & ~region.visibility_mask
+        & ~region.total_current_occupancy
+        & ~decision.interaction_region
+    )
+    assert np.any(renderer_delta_outside_interaction)
+    forged_shadow = np.array(decision.useful_shadow_mask, copy=True)
+    forged_row, forged_column = np.argwhere(
+        renderer_delta_outside_interaction
+    )[0]
+    forged_shadow[forged_row, forged_column] = True
+
+    forged_decision = replace(
+        decision,
+        useful_shadow_mask=forged_shadow,
+        useful_shadow_count=int(np.count_nonzero(forged_shadow)),
+    )
+    with pytest.raises(ValueError, match="useful shadow.*formal renderer delta"):
+        blind_region.build_blind_region(
+            base,
+            forged_decision,
+            grid=grid,
+        )
+
+
 def test_builder_uses_only_last_visible_context_pose() -> None:
     grid = _grid()
     base = _base_state(grid)
@@ -475,7 +517,7 @@ def test_builder_rejects_spliced_causal_candidates(
     elif mutation == "dimension_metadata":
         metadata["length_m"] = 2.0
     elif mutation == "version":
-        metadata["proposal_version"] = "causal_occluder_proposal_v2"
+        metadata["proposal_version"] = "causal_occluder_proposal_v3"
     elif mutation == "type":
         metadata["type"] = "decorative"
     elif mutation == "proposal_index":
@@ -579,7 +621,7 @@ def test_region_arrays_are_bytes_backed_read_only_and_deterministic() -> None:
             values.flat[0] = values.flat[0]
 
 
-def test_causal_shadow_change_updates_region_and_center_mask_identities() -> None:
+def test_builder_rejects_an_arbitrarily_narrowed_formal_shadow() -> None:
     grid = _grid(size=25)
     base = _base_state(grid, with_context=False)
     decision = _decision(base, grid)
@@ -592,33 +634,12 @@ def test_causal_shadow_change_updates_region_and_center_mask_identities() -> Non
         useful_shadow_count=int(np.count_nonzero(shadow)),
     )
 
-    full = blind_region.build_blind_region(base, decision, grid=grid)
-    narrowed = blind_region.build_blind_region(
-        base,
-        narrowed_decision,
-        grid=grid,
-    )
-    spec = _circle_spec(radius_m=0.1)
-    digest = compute_footprint_spec_digest(spec)
-    full_centers = blind_region.build_footprint_center_mask(
-        full,
-        footprint_spec=spec,
-        footprint_spec_digest=digest,
-        yaw_bin_rad=0.0,
-    )
-    narrowed_centers = blind_region.build_footprint_center_mask(
-        narrowed,
-        footprint_spec=spec,
-        footprint_spec_digest=digest,
-        yaw_bin_rad=0.0,
-    )
-
-    assert full.visibility_digest == narrowed.visibility_digest
-    assert full.raw_unobservable_digest == narrowed.raw_unobservable_digest
-    assert full.blind_free_digest != narrowed.blind_free_digest
-    assert full.region_digest != narrowed.region_digest
-    assert full_centers.center_mask_digest != narrowed_centers.center_mask_digest
-    assert full_centers.identity_digest != narrowed_centers.identity_digest
+    with pytest.raises(ValueError, match="useful shadow.*formal renderer delta"):
+        blind_region.build_blind_region(
+            base,
+            narrowed_decision,
+            grid=grid,
+        )
 
 
 def test_none_static_map_is_treated_as_empty_renderer_occupancy() -> None:

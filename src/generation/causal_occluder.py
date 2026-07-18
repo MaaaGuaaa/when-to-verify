@@ -30,7 +30,7 @@ from src.utils.seeding import make_rng
 
 
 CAUSAL_OCCLUDER_SCHEDULE_VERSION = "causal_occluder_schedule_v1"
-CAUSAL_OCCLUDER_PROPOSAL_VERSION = "causal_occluder_proposal_v1"
+CAUSAL_OCCLUDER_PROPOSAL_VERSION = "causal_occluder_proposal_v2"
 
 _OCCLUDER_TYPES = ("wall", "shelf", "pillar")
 _ANCHOR_QUANTILES = (0.0, 0.25, 0.5, 0.75, 1.0)
@@ -593,6 +593,8 @@ class CausalOccluderDecision:
     parameters: CausalOccluderParameters
     config_digest: str
     context_digest: str
+    interaction_region: np.ndarray
+    interaction_region_digest: str
     proposal_pose: np.ndarray
     proposal_length_m: float
     proposal_width_m: float
@@ -610,6 +612,11 @@ class CausalOccluderDecision:
         compare=False,
     )
     _useful_shadow_storage: bytes = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _interaction_region_storage: bytes = field(
         init=False,
         repr=False,
         compare=False,
@@ -667,9 +674,26 @@ class CausalOccluderDecision:
             grid=self.grid,
             input_dtype=False,
         )
+        interaction_region = _canonical_bool_grid(
+            self.interaction_region,
+            name="interaction_region",
+            grid=self.grid,
+            input_dtype=False,
+        )
+        interaction_region_digest = _canonical_digest(
+            self.interaction_region_digest,
+            name="interaction_region_digest",
+        )
+        if interaction_region_digest != _array_digest(
+            "interaction_region",
+            interaction_region,
+        ):
+            raise ValueError(
+                "interaction_region_digest does not match interaction_region"
+            )
         binding_parts = _length_prefixed_parts(self._proposal_binding)
-        if len(binding_parts) != 9:
-            raise ValueError("proposal binding must contain nine canonical parts")
+        if len(binding_parts) != 10:
+            raise ValueError("proposal binding must contain ten canonical parts")
         if binding_parts[0] != CAUSAL_OCCLUDER_SCHEDULE_VERSION.encode("ascii"):
             raise ValueError("proposal binding schedule version does not match")
         if binding_parts[1] != CAUSAL_OCCLUDER_PROPOSAL_VERSION.encode("ascii"):
@@ -744,6 +768,23 @@ class CausalOccluderDecision:
         if context_digest != bound_context_digest:
             raise ValueError(
                 "proposal identity context_digest does not match proposal binding"
+            )
+        try:
+            bound_interaction_region_digest = binding_parts[9].decode(
+                "ascii",
+                errors="strict",
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "proposal binding interaction region digest must be canonical ASCII"
+            ) from exc
+        bound_interaction_region_digest = _canonical_digest(
+            bound_interaction_region_digest,
+            name="proposal binding interaction region digest",
+        )
+        if interaction_region_digest != bound_interaction_region_digest:
+            raise ValueError(
+                "interaction region digest does not match proposal binding"
             )
         expected_geometry_bytes = np.asarray(
             [
@@ -927,6 +968,9 @@ class CausalOccluderDecision:
                 proposal_index=proposal_index,
             )
 
+        interaction_region_storage, immutable_interaction_region = (
+            _immutable_array(interaction_region)
+        )
         storage, immutable_shadow = _immutable_array(canonical_shadow)
         object.__setattr__(self, "proposal_index", proposal_index)
         object.__setattr__(self, "seed", seed)
@@ -935,6 +979,16 @@ class CausalOccluderDecision:
         object.__setattr__(self, "parameters", bound_parameters)
         object.__setattr__(self, "config_digest", config_digest)
         object.__setattr__(self, "context_digest", context_digest)
+        object.__setattr__(
+            self,
+            "interaction_region",
+            immutable_interaction_region,
+        )
+        object.__setattr__(
+            self,
+            "interaction_region_digest",
+            interaction_region_digest,
+        )
         object.__setattr__(self, "proposal_pose", immutable_proposal_pose)
         object.__setattr__(self, "proposal_length_m", proposal_length_m)
         object.__setattr__(self, "proposal_width_m", proposal_width_m)
@@ -948,6 +1002,11 @@ class CausalOccluderDecision:
             (proposal_pose_storage, proposal_mask_storage),
         )
         object.__setattr__(self, "_useful_shadow_storage", storage)
+        object.__setattr__(
+            self,
+            "_interaction_region_storage",
+            interaction_region_storage,
+        )
 
 
 def build_causal_occluder_schedule(
@@ -1192,6 +1251,7 @@ def _proposal_id(
     width_m: float,
     config_canonical_bytes: bytes,
     context_digest: str,
+    interaction_region_digest: str,
     seed: int,
     base_state_id: str,
     trajectory_id: str,
@@ -1210,6 +1270,7 @@ def _proposal_id(
         pose_and_dimensions,
         config_canonical_bytes,
         context_digest.encode("ascii"),
+        interaction_region_digest.encode("ascii"),
     )
     binding = b"".join(
         len(part).to_bytes(8, byteorder="big", signed=False) + part
@@ -1245,6 +1306,8 @@ def _decision(
     parameters: CausalOccluderParameters,
     config_digest: str,
     context_digest: str,
+    interaction_region: np.ndarray,
+    interaction_region_digest: str,
     proposal_pose: np.ndarray,
     proposal_length_m: float,
     proposal_width_m: float,
@@ -1269,6 +1332,8 @@ def _decision(
         parameters=parameters,
         config_digest=config_digest,
         context_digest=context_digest,
+        interaction_region=interaction_region,
+        interaction_region_digest=interaction_region_digest,
         proposal_pose=proposal_pose,
         proposal_length_m=proposal_length_m,
         proposal_width_m=proposal_width_m,
@@ -1366,6 +1431,7 @@ def propose_causal_occluder(
         width_m=width_m,
         config_canonical_bytes=config_bytes,
         context_digest=context.context_digest,
+        interaction_region_digest=context.interaction_region_digest,
         seed=seed,
         base_state_id=base_state_id,
         trajectory_id=trajectory_id,
@@ -1385,6 +1451,8 @@ def propose_causal_occluder(
         "parameters": parameters,
         "config_digest": context.config_digest,
         "context_digest": context.context_digest,
+        "interaction_region": context.interaction_region,
+        "interaction_region_digest": context.interaction_region_digest,
     }
 
     if not _inside_grid(footprint, pose, context.grid):

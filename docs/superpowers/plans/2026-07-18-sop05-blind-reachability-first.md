@@ -178,6 +178,14 @@ bearing quadrants, never overlaps the continuous robot/context sweeps, is not
 derived from a conflict-point normal, emits one stable proposal identity, and
 records explicit free-space/shadow rejection reasons.
 
+Require a balanced four-quadrant prefix when at least four proposals are
+requested. The target-independent useful-shadow mask must equal the direct
+`raycast_visibility` delta between `base static | current visible context` and
+that same occupancy plus the proposed obstacle, restricted to free interaction
+cells. Neither target data nor oracle future may appear in the public API.
+Raster overlap is unresolved; only the existing exact continuous validator may
+reject robot/context sweep contact.
+
 - [ ] **Step 2: Write RED robot-sweep cache tests**
 
 Build a toy bank with repeated use of the same trajectory. Require exactly one
@@ -202,6 +210,14 @@ formal renderer and to combine base static, causal obstacle, current context,
 FOV, and range while rejecting any oracle-future input. Assert byte equality
 with a direct renderer-kernel call. Test circle masks and yaw-binned rectangle
 masks, followed by exact polygon visibility.
+
+Freeze environment v1 to the current renderer defaults `fov_rad=2*pi` and
+`max_range_m=None`; finite sensor limits require a joint renderer/proposal
+version change. Test `raw_unobservable = ~visibility` separately from
+`blind_free = raw_unobservable & ~total_current_occupancy`. Current context is
+assembled only from the final visible `BaseState` history poses/specs. The
+public blind-region API must expose no `OracleContext`, future, target, world,
+or generic scene parameter.
 
 - [ ] **Step 4: Run RED**
 

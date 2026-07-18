@@ -32,7 +32,7 @@ from .structural_blindspot import (
 
 JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION = "joint_multi_los_envelope_v2"
 OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION = (
-    "occluder_collision_sweep_preparation_v1"
+    "occluder_collision_sweep_preparation_v2"
 )
 
 
@@ -144,7 +144,7 @@ class PreparedOccluderCollisionSweep:
             raise ValueError(
                 "interval_motion_bounds_m must contain finite non-negative values"
             )
-        motion_radius_m = _sweep_motion_radius(self.footprint)
+        motion_radius_m = _rotation_motion_radius(self.footprint)
         expected_bounds = np.asarray(
             [
                 _pose_interval_motion_bound(
@@ -652,9 +652,13 @@ def prepare_occluder_collision_sweep(
     dense_poses = _densify_pose_sequence(
         poses,
         max_translation_step_m=0.5 * resolution_m,
-        max_yaw_step_rad=np.deg2rad(5.0),
+        max_yaw_step_rad=(
+            np.inf
+            if isinstance(sweep.footprint, CircleFootprint)
+            else np.deg2rad(5.0)
+        ),
     )
-    motion_radius_m = _sweep_motion_radius(sweep.footprint)
+    motion_radius_m = _rotation_motion_radius(sweep.footprint)
     interval_motion_bounds_m = np.asarray(
         [
             _pose_interval_motion_bound(
@@ -705,7 +709,7 @@ def _prepared_intersects_robot_sweep(
     if np.any(clearances <= 0.0):
         return True
 
-    robot_radius = _sweep_motion_radius(sweep.footprint)
+    robot_radius = _rotation_motion_radius(sweep.footprint)
 
     def interval_intersects(
         start_pose: np.ndarray,

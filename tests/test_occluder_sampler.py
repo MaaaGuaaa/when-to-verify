@@ -235,7 +235,7 @@ def test_prepare_collision_sweep_owns_canonical_read_only_interval_geometry() ->
     assert (
         prepared.preparation_version
         == OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION
-        == "occluder_collision_sweep_preparation_v1"
+        == "occluder_collision_sweep_preparation_v2"
     )
     assert prepared.dense_poses.dtype == np.float64
     assert prepared.dense_poses.flags.c_contiguous
@@ -351,7 +351,10 @@ def test_prepared_sweep_rejects_stale_grid_and_preparation_version() -> None:
             grid=replace(grid, resolution_m=0.2),
         )
 
-    stale = replace(prepared, preparation_version="legacy_preparation_v0")
+    stale = replace(
+        prepared,
+        preparation_version="occluder_collision_sweep_preparation_v1",
+    )
     with pytest.raises(ValueError, match="preparation version mismatch"):
         occluder_collision_sweep_rejection_reason(
             occluder,
@@ -359,6 +362,182 @@ def test_prepared_sweep_rejects_stale_grid_and_preparation_version() -> None:
             (stale,),
             grid=grid,
         )
+
+
+def test_circle_yaw_only_preparation_has_no_dense_substeps_or_motion_bound() -> None:
+    grid = _grid()
+    poses = np.asarray(
+        [[0.0, 0.0, -0.75 * np.pi], [0.0, 0.0, 0.75 * np.pi]],
+        dtype=np.float64,
+    )
+
+    prepared = prepare_occluder_collision_sweep(
+        _raw_sweep(poses, footprint=CircleFootprint(0.1)),
+        grid=grid,
+    )
+
+    assert prepared.dense_poses.shape == (2, 3)
+    np.testing.assert_array_equal(prepared.dense_poses, poses)
+    np.testing.assert_array_equal(
+        prepared.interval_motion_bounds_m,
+        np.zeros(1, dtype=np.float64),
+    )
+
+
+def test_circle_preparation_interval_bounds_keep_translation_only() -> None:
+    grid = _grid()
+    poses = np.asarray(
+        [[0.0, 0.0, -0.75 * np.pi], [0.13, 0.04, 0.75 * np.pi]],
+        dtype=np.float64,
+    )
+
+    prepared = prepare_occluder_collision_sweep(
+        _raw_sweep(poses, footprint=CircleFootprint(0.1)),
+        grid=grid,
+    )
+    dense_translations = np.linalg.norm(
+        np.diff(prepared.dense_poses[:, :2], axis=0),
+        axis=1,
+    )
+
+    assert prepared.dense_poses.shape == (4, 3)
+    np.testing.assert_array_equal(
+        prepared.interval_motion_bounds_m,
+        dense_translations,
+    )
+    assert np.sum(prepared.interval_motion_bounds_m) == pytest.approx(
+        np.linalg.norm(poses[1, :2] - poses[0, :2])
+    )
+
+
+def test_circle_yaw_only_prepared_and_raw_sweeps_preserve_tiny_gap() -> None:
+    grid = _grid()
+    footprint = CircleFootprint(0.1)
+    poses = np.asarray(
+        [[0.0, 0.0, -0.75 * np.pi], [0.0, 0.0, 0.75 * np.pi]],
+        dtype=np.float64,
+    )
+    raw = _raw_sweep(poses, footprint=footprint)
+    prepared = prepare_occluder_collision_sweep(raw, grid=grid)
+    candidate_pose = np.asarray([0.0, 0.200000001, 0.0])
+    candidate = CircleFootprint(0.1)
+    assert np.all(
+        trajectory_signed_clearances(
+            candidate,
+            np.tile(candidate_pose, (poses.shape[0], 1)),
+            footprint,
+            poses,
+        )
+        > 0.0
+    )
+
+    raw_reason = occluder_collision_sweep_rejection_reason(
+        candidate,
+        candidate_pose,
+        (raw,),
+        grid=grid,
+    )
+    prepared_reason = occluder_collision_sweep_rejection_reason(
+        candidate,
+        candidate_pose,
+        (prepared,),
+        grid=grid,
+    )
+
+    assert raw_reason is None
+    assert prepared_reason == raw_reason
+
+
+def test_rectangle_yaw_preparation_rejects_between_endpoint_contact() -> None:
+    grid = _grid()
+    footprint = RectangleFootprint(2.0, 0.04)
+    poses = np.asarray(
+        [[0.0, 0.0, -0.25 * np.pi], [0.0, 0.0, 0.25 * np.pi]],
+        dtype=np.float64,
+    )
+    candidate = CircleFootprint(0.02)
+    candidate_pose = np.asarray([0.9, 0.0, 0.0])
+    assert all(
+        signed_clearance(candidate, candidate_pose, footprint, pose) > 0.0
+        for pose in poses
+    )
+
+    prepared = prepare_occluder_collision_sweep(
+        _raw_sweep(poses, footprint=footprint),
+        grid=grid,
+    )
+
+    assert prepared.dense_poses.shape[0] > poses.shape[0]
+    assert occluder_collision_sweep_rejection_reason(
+        candidate,
+        candidate_pose,
+        (prepared,),
+        grid=grid,
+    ) == "occluder_robot_swept_overlap"
+
+
+@pytest.mark.parametrize(
+    "moving_footprint",
+    (CircleFootprint(0.12), RectangleFootprint(0.30, 0.16)),
+    ids=("circle", "rectangle"),
+)
+def test_prepared_random_sweeps_do_not_miss_dense_reference_contacts(
+    moving_footprint,
+) -> None:
+    grid = _grid(resolution_m=0.08)
+    candidate = CircleFootprint(0.06)
+    rng = np.random.default_rng(20260719)
+    dense_fractions = np.linspace(0.0, 1.0, 2001, dtype=np.float64)
+    reference_contacts = 0
+
+    for _ in range(48):
+        start = rng.uniform((-0.6, -0.6, -np.pi), (0.6, 0.6, np.pi))
+        end = rng.uniform((-0.6, -0.6, -np.pi), (0.6, 0.6, np.pi))
+        poses = np.vstack((start, end))
+        yaw_delta = float(
+            occluder_sampler_module.wrap_angle(end[2] - start[2])
+        )
+        dense_poses = np.empty((dense_fractions.size, 3), dtype=np.float64)
+        dense_poses[:, :2] = start[:2] + dense_fractions[:, None] * (
+            end[:2] - start[:2]
+        )
+        dense_poses[:, 2] = occluder_sampler_module.wrap_angle(
+            start[2] + dense_fractions * yaw_delta
+        )
+        candidate_pose = rng.uniform(
+            (-0.8, -0.8, -np.pi),
+            (0.8, 0.8, np.pi),
+        )
+        dense_candidate_poses = np.tile(
+            candidate_pose,
+            (dense_poses.shape[0], 1),
+        )
+        reference_intersects = bool(
+            np.any(
+                trajectory_signed_clearances(
+                    candidate,
+                    dense_candidate_poses,
+                    moving_footprint,
+                    dense_poses,
+                )
+                <= 0.0
+            )
+        )
+        if not reference_intersects:
+            continue
+        reference_contacts += 1
+        prepared = prepare_occluder_collision_sweep(
+            _raw_sweep(poses, footprint=moving_footprint),
+            grid=grid,
+        )
+        assert occluder_collision_sweep_rejection_reason(
+            candidate,
+            candidate_pose,
+            (prepared,),
+            grid=grid,
+        ) == "occluder_robot_swept_overlap"
+
+    assert reference_contacts >= 4
 
 
 def test_prepared_sweep_rejects_forged_zero_interval_motion_bounds() -> None:

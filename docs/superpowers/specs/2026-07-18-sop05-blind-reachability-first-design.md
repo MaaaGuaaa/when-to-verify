@@ -126,6 +126,14 @@ band around the robot trajectory. The obstacle proposal is stratified over
 relative bearing, range, orientation, type, and dimensions, but it is not
 anchored to `conflict_point + normal_offset`.
 
+The deterministic schedule uses a balanced bearing prefix: whenever the
+proposal budget is at least four, the prefix covers all four robot-relative
+bearing quadrants before repeating a quadrant. Seeded permutation may reorder
+complete strata but cannot remove this coverage. Proposal identity is created
+before validation and binds the algorithm version, seed, base/trajectory IDs,
+schedule index, and exact float64 pose/dimensions, so rejected proposals remain
+part of the auditable denominator.
+
 Reject the proposal before target work if it:
 
 - overlaps base static occupancy;
@@ -133,6 +141,15 @@ Reject the proposal before target work if it:
 - lies outside the BEV;
 - blocks the robot candidate path; or
 - produces no useful line-of-sight shadow in the interaction region.
+
+Useful shadow is target-independent. Compute a baseline visibility mask from
+base static occupancy plus current visible-context occupancy, compute a second
+mask after adding the proposed obstacle, and retain only newly hidden cells
+that were otherwise free and lie in the configured interaction region. A
+target pose, snippet, oracle future, collision point, or trajectory normal may
+not enter this test. Raster-mask overlap with a robot/context sweep is only a
+coarse unresolved signal; it cannot override the exact continuous-clearance
+validator or create a false rejection.
 
 The first production version has exactly one causal programmatic occluder.
 Optional background clutter is a later, best-effort augmentation: failure to
@@ -146,6 +163,20 @@ current-frame inputs: base static occupancy, the causal programmatic obstacle,
 current visible context occupancy, sensor pose, FOV, and range. Oracle future
 must not participate. The proposal and renderer call the same visibility
 kernel and must produce byte-identical masks for the same persisted inputs.
+
+For environment-only v1, freeze the renderer's existing environment sensor
+semantics: `fov_rad = 2*pi` and `max_range_m = None`. A finite FOV/range may be
+introduced only by advancing the renderer and proposal contract together; it
+must not be added solely in the proposal path. Current context is assembled
+only from `BaseState` visible dynamic-object histories/specifications at their
+last observed poses. `OracleContext`, inserted-target history, and any future
+field are forbidden inputs to the current blind-region builder.
+
+Persist both `raw_unobservable_mask = ~visibility_mask` and the placement mask
+`blind_free_mask = raw_unobservable_mask & ~total_current_occupancy`. Only the
+former corresponds to renderer unobservability; only the latter is eligible
+for a hidden-object center broad phase. They must not be conflated in evidence
+or tests.
 
 Remove occupied cells from the unobservable mask. For each allowed target
 footprint digest and orientation bin, derive a center mask whose membership

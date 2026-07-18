@@ -22,6 +22,9 @@ from src.generation.event_target_motion_shard import (
     compute_footprint_spec_digest,
     create_event_target_motion_record,
 )
+from src.generation.blind_reachability import (
+    BLIND_REACHABILITY_ALGORITHM_VERSION,
+)
 from src.generation.dynamic_object_transplant import (
     TransplantedDynamicObject,
     footprint_from_spec,
@@ -182,6 +185,10 @@ def _inputs(
         **build_event_target_motion_world_metadata(record),
         "schema_version": SCHEMA_VERSION,
         "event_kind": event_kind,
+        "target_provenance": {
+            "source_recording_id": "source-recording",
+            "source_session_id": "source-session",
+        },
         "joint_pair_generator_algorithm_version": (
             "joint_environment_pair_v2"
         ),
@@ -452,6 +459,8 @@ def _paired_variant(
             future_poses=future,
             provenance={
                 "target_type_policy_digest": record.target_type_policy_digest,
+                "source_recording_id": "source-recording",
+                "source_session_id": "source-session",
             },
         )
         kind = "collision"
@@ -617,12 +626,92 @@ def test_pipeline_accepts_real_paired_variant_and_empty_without_boolean_switch(
     assert not np.shares_memory(present.bev_history, empty.bev_history)
 
 
+def test_pipeline_rejects_paired_target_source_session_drift() -> None:
+    from src.generation.sop06_pipeline import render_sop06_paired_variant
+
+    inputs = _inputs()
+    variant = _paired_variant(inputs, empty=False)
+    target = replace(
+        variant.target,
+        provenance={
+            **variant.target.provenance,
+            "source_session_id": "tampered-source-session",
+        },
+    )
+    variant = replace(
+        variant,
+        target=target,
+        world=replace(
+            variant.world,
+            metadata={
+                **variant.world.metadata,
+                "target_provenance": dict(target.provenance),
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="source session"):
+        render_sop06_paired_variant(
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            variant=variant,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
+def test_pipeline_rejects_blank_paired_and_mother_source_session() -> None:
+    from src.generation.sop06_pipeline import render_sop06_paired_variant
+
+    inputs = _inputs()
+    variant = _paired_variant(inputs, empty=False)
+    mother_provenance = {
+        **inputs["world"].metadata["target_provenance"],
+        "source_session_id": "   ",
+    }
+    inputs["world"] = replace(
+        inputs["world"],
+        metadata={
+            **inputs["world"].metadata,
+            "target_provenance": mother_provenance,
+        },
+    )
+    target = replace(
+        variant.target,
+        provenance={**variant.target.provenance, "source_session_id": "   "},
+    )
+    variant = replace(
+        variant,
+        target=target,
+        world=replace(
+            variant.world,
+            metadata={
+                **variant.world.metadata,
+                "target_provenance": dict(target.provenance),
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        render_sop06_paired_variant(
+            mother_record=inputs["record"],
+            mother_world=inputs["world"],
+            variant=variant,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
+
+
 def _formal_partial_group_fixture() -> tuple[dict[str, object], PairedEventGroup]:
     inputs = _inputs()
     mother_metadata = dict(inputs["world"].metadata)
     mother_metadata.pop("joint_pair_generator_algorithm_version", None)
     mother_metadata["generator_algorithm_version"] = (
-        "blind_reachability_first_v1"
+        BLIND_REACHABILITY_ALGORITHM_VERSION
     )
     inputs["world"] = replace(inputs["world"], metadata=mother_metadata)
     variant = _paired_variant(inputs, empty=False)
@@ -816,6 +905,64 @@ def test_formal_mother_consumer_executes_real_history_only_renderer() -> None:
     assert rendered.state_channels.dtype == np.float32
     assert np.isfinite(rendered.bev_history).all()
     assert np.isfinite(rendered.state_channels).all()
+
+
+def test_formal_mother_consumer_rejects_v1_mother() -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, _ = _formal_partial_group_fixture()
+    old_world = replace(
+        inputs["world"],
+        metadata={
+            **inputs["world"].metadata,
+            "generator_algorithm_version": "blind_reachability_first_v1",
+        },
+    )
+
+    with pytest.raises(ValueError, match=BLIND_REACHABILITY_ALGORITHM_VERSION):
+        pipeline.render_sop06_mother_event(
+            record=inputs["record"],
+            world=old_world,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+        )
+
+
+@pytest.mark.parametrize("entry", ["partial", "complete"])
+def test_formal_pair_group_consumers_reject_v1_mother(entry: str) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs, group = _formal_partial_group_fixture()
+    old_world = replace(
+        inputs["world"],
+        metadata={
+            **inputs["world"].metadata,
+            "generator_algorithm_version": "blind_reachability_first_v1",
+        },
+    )
+    if entry == "complete":
+        group = replace(
+            group,
+            coverage_mask=(True,) * len(paired_variants_module.VARIANT_ORDER),
+            missing_variant_reasons={},
+            is_complete=True,
+            eligible_for_strict_evaluation=True,
+        )
+        render = pipeline.render_sop06_complete_audit_group
+    else:
+        render = pipeline.render_sop06_partial_pair_group
+
+    with pytest.raises(ValueError, match=BLIND_REACHABILITY_ALGORITHM_VERSION):
+        render(
+            group=group,
+            mother_record=inputs["record"],
+            mother_world=old_world,
+            base_state=inputs["base_state"],
+            oracle_context=inputs["oracle_context"],
+            config=inputs["config"],
+            expected_paired_config_digest=PAIRED_CONFIG_DIGEST,
+        )
 
 
 def test_complete_audit_consumer_rejects_partial_before_render(

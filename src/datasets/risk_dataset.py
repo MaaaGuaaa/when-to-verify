@@ -306,11 +306,24 @@ def _validate_formal_inputs(
     source_recording_id = _require_nonempty_string(
         source_snippet.source_recording_id, name="source recording"
     )
-    _require_nonempty_string(
+    if not source_recording_id.strip():
+        raise ValueError("source recording must be a non-empty string")
+    source_session_id = _require_nonempty_string(
         source_snippet.source_session_id, name="source session"
     )
+    if not source_session_id.strip():
+        raise ValueError("source session must be a non-empty string")
+    for field, label in (
+        ("source_recording_id", "source recording"),
+        ("source_session_id", "source session"),
+    ):
+        value = target_provenance.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"mother target {label} must be non-empty")
     if target_provenance.get("source_recording_id") != source_recording_id:
         raise ValueError("source recording differs from mother target provenance")
+    if target_provenance.get("source_session_id") != source_session_id:
+        raise ValueError("source session differs from mother target provenance")
     base_recording_id = _require_nonempty_string(
         base_state.recording_id, name="base recording"
     )
@@ -1162,6 +1175,23 @@ def _validate_variant_semantics(
         }:
             raise ValueError("empty_blind_spot target-removal transform mismatch")
         return
+
+    mother_provenance = mother_event.target.provenance
+    for field, label in (
+        ("source_recording_id", "source recording"),
+        ("source_session_id", "source session"),
+    ):
+        variant_value = variant.target.provenance.get(field)
+        mother_value = mother_provenance.get(field)
+        if (
+            not isinstance(variant_value, str)
+            or not variant_value.strip()
+            or not isinstance(mother_value, str)
+            or not mother_value.strip()
+        ):
+            raise ValueError(f"{kind} target {label} must be non-empty")
+        if variant_value != mother_value:
+            raise ValueError(f"{kind} target {label} differs from mother target")
 
     if kind == "collision":
         if variant.world.metadata.get("paired_transform") != {

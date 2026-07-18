@@ -529,6 +529,127 @@ def test_partial_generator_rejects_retired_joint_mother(complete_pair) -> None:
     assert exc_info.value.reason == "retired_joint_mother"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "reason", "message"),
+    [
+        (
+            "source_recording_id",
+            "tampered-source-recording",
+            "mother_snippet_source_recording_mismatch",
+            "source recording",
+        ),
+        (
+            "source_session_id",
+            "tampered-source-session",
+            "mother_snippet_source_session_mismatch",
+            "source session",
+        ),
+    ],
+)
+def test_partial_generator_rejects_source_lineage_mismatch(
+    complete_pair,
+    field: str,
+    value: str,
+    reason: str,
+    message: str,
+) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    snippet = replace(_exact_safe_curve_snippet(), **{field: value})
+
+    with pytest.raises(PairGenerationError, match=message) as exc_info:
+        generate_paired_variants(
+            mother_event=mother,
+            source_snippet=snippet,
+            base_state=base,
+            trajectory=trajectory,
+            oracle_context=oracle,
+            base_config=config,
+            paired_config=paired_config,
+            seed=20260716,
+        )
+
+    assert exc_info.value.reason == reason
+
+
+def test_partial_generator_rejects_v1_mother(complete_pair) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    old_world = replace(
+        mother.world,
+        metadata={
+            **mother.world.metadata,
+            "generator_algorithm_version": "blind_reachability_first_v1",
+        },
+    )
+
+    with pytest.raises(
+        PairGenerationError,
+        match=paired_variants_module.BLIND_REACHABILITY_ALGORITHM_VERSION,
+    ) as exc_info:
+        generate_paired_variants(
+            mother_event=replace(mother, world=old_world),
+            source_snippet=_exact_safe_curve_snippet(),
+            base_state=base,
+            trajectory=trajectory,
+            oracle_context=oracle,
+            base_config=config,
+            paired_config=paired_config,
+            seed=20260716,
+        )
+
+    assert exc_info.value.reason == "retired_mother_generator_version"
+
+
+def test_partial_generator_rejects_blank_source_session_lineage(complete_pair) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    target = replace(
+        mother.target,
+        provenance={**mother.target.provenance, "source_session_id": "   "},
+    )
+    world = replace(
+        mother.world,
+        metadata={
+            **mother.world.metadata,
+            "target_provenance": dict(target.provenance),
+        },
+    )
+    snippet = replace(_exact_safe_curve_snippet(), source_session_id="   ")
+
+    with pytest.raises(PairGenerationError, match="must be non-empty") as exc_info:
+        generate_paired_variants(
+            mother_event=replace(mother, target=target, world=world),
+            source_snippet=snippet,
+            base_state=base,
+            trajectory=trajectory,
+            oracle_context=oracle,
+            base_config=config,
+            paired_config=paired_config,
+            seed=20260716,
+        )
+
+    assert exc_info.value.reason == "mother_snippet_source_session_invalid"
+
+
+def test_every_present_variant_preserves_source_lineage(complete_pair) -> None:
+    _, _, _, _, _, mother, _, group = complete_pair
+    expected = {
+        key: mother.target.provenance[key]
+        for key in ("source_recording_id", "source_session_id")
+    }
+
+    for variant in group.variants:
+        if variant.target is None:
+            assert variant.variant_kind == "empty_blind_spot"
+            assert variant.world.metadata["target_provenance"] is None
+            continue
+        assert {
+            key: variant.target.provenance[key] for key in expected
+        } == expected
+        assert {
+            key: variant.world.metadata["target_provenance"][key]
+            for key in expected
+        } == expected
+
+
 def test_optional_variant_failures_preserve_collision_and_empty(
     complete_pair,
     monkeypatch: pytest.MonkeyPatch,
@@ -940,7 +1061,7 @@ def test_v5_environment_partial_group_renders_without_joint_pair_version(
     config, _, base, oracle, _, mother, paired_config, group = complete_pair
     assert mother.event_kind == "environment"
     assert mother.world.metadata["generator_algorithm_version"] == (
-        "blind_reachability_first_v1"
+        paired_variants_module.BLIND_REACHABILITY_ALGORITHM_VERSION
     )
     assert "joint_pair_generator_algorithm_version" not in (
         mother.world.metadata

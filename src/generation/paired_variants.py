@@ -36,6 +36,7 @@ from src.geometry import (
 )
 from src.utils.seeding import derive_seed, stable_digest
 
+from .blind_reachability import BLIND_REACHABILITY_ALGORITHM_VERSION
 from .dynamic_object_transplant import (
     TransplantError,
     TransplantedDynamicObject,
@@ -665,6 +666,31 @@ def _validate_source_snippet(
         or target.footprint_spec != expected_spec
     ):
         raise PairGenerationError("mother_snippet_contract_mismatch")
+    provenance = target.provenance
+    if not isinstance(provenance, Mapping):
+        raise PairGenerationError("mother_target_provenance_invalid")
+    for field, label in (
+        ("source_recording_id", "source recording"),
+        ("source_session_id", "source session"),
+    ):
+        reason_field = field.removesuffix("_id")
+        source_value = getattr(source_snippet, field)
+        target_value = provenance.get(field)
+        if (
+            not isinstance(source_value, str)
+            or not source_value.strip()
+            or not isinstance(target_value, str)
+            or not target_value.strip()
+        ):
+            raise PairGenerationError(
+                f"mother_snippet_{reason_field}_invalid",
+                f"mother target/source snippet {label} must be non-empty",
+            )
+        if target_value != source_value:
+            raise PairGenerationError(
+                f"mother_snippet_{reason_field}_mismatch",
+                f"mother target/source snippet {label} mismatch",
+            )
 
 
 def _target_clearances(
@@ -911,6 +937,29 @@ def _variant_world(
     environment: _PairEnvironment,
 ) -> OracleWorld:
     target_id = mother_event.target.target_dynamic_object_id
+    if target is not None:
+        mother_provenance = mother_event.target.provenance
+        for field, label in (
+            ("source_recording_id", "source recording"),
+            ("source_session_id", "source session"),
+        ):
+            target_value = target.provenance.get(field)
+            mother_value = mother_provenance.get(field)
+            if (
+                not isinstance(target_value, str)
+                or not target_value.strip()
+                or not isinstance(mother_value, str)
+                or not mother_value.strip()
+            ):
+                raise PairGenerationError(
+                    f"paired_target_{field}_invalid",
+                    f"paired/mother target {label} must be non-empty",
+                )
+            if target_value != mother_value:
+                raise PairGenerationError(
+                    f"paired_target_{field}_mismatch",
+                    f"paired target {label} differs from mother target",
+                )
     trajectories = {
         object_id: poses.copy()
         for object_id, poses in sorted(
@@ -1568,6 +1617,20 @@ def generate_paired_variants(
         seed, (int, np.integer)
     ):
         raise TypeError("seed must be an integer")
+    mother_generator_version = mother_event.world.metadata.get(
+        "generator_algorithm_version"
+    )
+    if mother_generator_version != BLIND_REACHABILITY_ALGORITHM_VERSION:
+        reason = (
+            "retired_mother_generator_version"
+            if mother_generator_version == "blind_reachability_first_v1"
+            else "unsupported_mother_generator_version"
+        )
+        raise PairGenerationError(
+            reason,
+            "mother generator_algorithm_version must equal "
+            f"{BLIND_REACHABILITY_ALGORITHM_VERSION}",
+        )
     joint_version = mother_event.world.metadata.get(
         "joint_pair_generator_algorithm_version"
     )
@@ -2096,7 +2159,7 @@ def generate_joint_environment_pair(
         and generator_config.get("production_event_kind") == "environment"
         and isinstance(generator_config.get("blind_reachability"), Mapping)
         and generator_config["blind_reachability"].get("algorithm_version")
-        == "blind_reachability_first_v1"
+        == BLIND_REACHABILITY_ALGORITHM_VERSION
     ):
         raise PairGenerationError(
             "joint_environment_pair_v2_retired",

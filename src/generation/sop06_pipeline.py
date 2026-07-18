@@ -19,6 +19,7 @@ from src.contracts import (
     validate_oracle_context,
 )
 
+from .blind_reachability import BLIND_REACHABILITY_ALGORITHM_VERSION
 from .event_target_motion_shard import (
     EventTargetMotionRecord,
     compute_motion_array_digest,
@@ -53,9 +54,6 @@ _STRUCTURAL_KEYS = frozenset(
     {"forward_fov_deg", "range_m", "blind_sectors"}
 )
 _EVENT_KINDS = frozenset({"environment", "structural", "mixed"})
-_FORMAL_SOP05_GENERATOR_VERSION = "blind_reachability_first_v1"
-
-
 @dataclass(frozen=True)
 class RenderedSop06Group:
     """Rendered group with an explicit audit-certification boundary."""
@@ -91,11 +89,11 @@ def _validate_joint_six_pack_versions(
                 f"{PAIRED_GROUP_CONTRACT_VERSION}"
             )
         if mother_world.metadata.get("generator_algorithm_version") != (
-            _FORMAL_SOP05_GENERATOR_VERSION
+            BLIND_REACHABILITY_ALGORITHM_VERSION
         ):
             raise ValueError(
                 "formal SOP06 mother generator_algorithm_version must equal "
-                f"{_FORMAL_SOP05_GENERATOR_VERSION}"
+                f"{BLIND_REACHABILITY_ALGORITHM_VERSION}"
             )
         return
     if mother_world.metadata.get("event_kind") != "environment":
@@ -299,6 +297,21 @@ def _validate_paired_target(
         record.target_type_policy_digest
     ):
         raise ValueError("paired target policy digest differs from mother record")
+    mother_provenance = mother_world.metadata.get("target_provenance")
+    if not isinstance(mother_provenance, Mapping):
+        raise ValueError("mother target provenance must be a mapping")
+    for field, label in (
+        ("source_recording_id", "source recording"),
+        ("source_session_id", "source session"),
+    ):
+        mother_value = mother_provenance.get(field)
+        if not isinstance(mother_value, str) or not mother_value.strip():
+            raise ValueError(f"mother target {label} must be non-empty")
+        target_value = target.provenance.get(field)
+        if not isinstance(target_value, str) or not target_value.strip():
+            raise ValueError(f"paired target {label} must be non-empty")
+        if target_value != mother_value:
+            raise ValueError(f"paired target {label} differs from mother target")
     for name, array, shape in (
         ("history_poses", target.history_poses, (8, 3)),
         ("current_pose", target.current_pose, (3,)),
@@ -686,11 +699,11 @@ def _validate_formal_mother_world(world: OracleWorld) -> None:
             )
         raise ValueError("mother contains unsupported joint-pair identity")
     if world.metadata.get("generator_algorithm_version") != (
-        _FORMAL_SOP05_GENERATOR_VERSION
+        BLIND_REACHABILITY_ALGORITHM_VERSION
     ):
         raise ValueError(
             "formal SOP06 mother generator_algorithm_version must equal "
-            f"{_FORMAL_SOP05_GENERATOR_VERSION}"
+            f"{BLIND_REACHABILITY_ALGORITHM_VERSION}"
         )
 
 

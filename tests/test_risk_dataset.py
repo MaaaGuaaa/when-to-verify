@@ -335,6 +335,7 @@ def _formal_sop06_group_inputs(
     target_provenance = {
         "snippet_id": record.source_snippet_id,
         "source_recording_id": source_recording_id,
+        "source_session_id": source_session_id,
         "source_object_id": record.source_object_id,
         "source_current_index": 7,
         "candidate_current_xy": [2.0, 0.0],
@@ -1089,6 +1090,64 @@ def test_formal_group_adapter_rejects_motion_snippet_identity_tampering() -> Non
     )
 
     with pytest.raises(ValueError, match="source recording"):
+        _build_formal_group_samples(inputs)
+
+
+def test_formal_group_adapter_rejects_source_session_lineage_tampering() -> None:
+    inputs = _formal_sop06_group_inputs()
+    snippet = inputs["source_snippet"]
+    inputs["source_snippet"] = replace(
+        snippet, source_session_id="source-session-tampered"
+    )
+
+    with pytest.raises(ValueError, match="source session"):
+        _build_formal_group_samples(inputs)
+
+
+def test_formal_group_adapter_rejects_blank_source_session_lineage() -> None:
+    inputs = _formal_sop06_group_inputs(source_session_id="   ")
+
+    with pytest.raises(ValueError, match="source session must be a non-empty string"):
+        _build_formal_group_samples(inputs)
+
+
+@pytest.mark.parametrize(
+    "variant_kind",
+    ["collision", "near_miss", "temporal_safe", "spatial_safe", "irrelevant_hidden"],
+)
+def test_formal_group_adapter_rejects_variant_source_session_drift(
+    variant_kind: str,
+) -> None:
+    inputs = _formal_sop06_group_inputs(
+        extra_variant_kind=None if variant_kind == "collision" else variant_kind
+    )
+    group = inputs["group"]
+    variant = group.by_kind[variant_kind]
+    target = replace(
+        variant.target,
+        provenance={
+            **variant.target.provenance,
+            "source_session_id": "variant-session-tampered",
+        },
+    )
+    world = replace(
+        variant.world,
+        metadata={
+            **variant.world.metadata,
+            "target_provenance": dict(target.provenance),
+        },
+    )
+    inputs["group"] = replace(
+        group,
+        variants=tuple(
+            replace(item, target=target, world=world)
+            if item.variant_kind == variant_kind
+            else item
+            for item in group.variants
+        ),
+    )
+
+    with pytest.raises(ValueError, match="source session"):
         _build_formal_group_samples(inputs)
 
 

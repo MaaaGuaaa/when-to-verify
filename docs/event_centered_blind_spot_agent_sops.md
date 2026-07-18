@@ -690,10 +690,24 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       `0.3/0.4`、angle multiplier `0/0.25/0.5/0.7`、time-scale quantile
       `0/0.16/0.25/0.5`、最晚 conflict-time；每个模板紧邻相反侧 fallback，再进入
       wall/shelf/pillar 通用分层候选；禁用 pillar 时跳过前缀，不得套用到其他类型
-- [ ] 验证遮挡物不与机器人 swept volume 相交；先加密 SE(2) 轨迹并做真实 footprint
-      signed clearance，再以保守运动上界递归认证帧间连续净空，栅格接触不得直接判碰撞
+- [ ] SOP05 母事件生成协议固定为 `joint_occluder_first_v4`；旧 v3 及更早事件不得由
+      producer 或正式 loader 静默接收
+- [ ] 验证遮挡物不与机器人、所有上下文对象和目标对象的完整 23 帧
+      history/current/future swept volume 相交；每条 sweep 先加密 SE(2) 轨迹并做真实
+      footprint signed clearance，再以保守运动上界递归认证帧间连续净空，栅格接触
+      不得直接判碰撞；仅供 LOS/FOV 计算的传感器位姿不得混入碰撞 sweep
 - [ ] 实现 FOV `160/180/220°`、range `6/8/10 m` 和可选 blind sector
-- [ ] 按 `60/30/10` 生成 environment/structural/mixed
+- [ ] 将 `60/30/10` 仅作为 environment/structural/mixed 的默认 proposal distribution
+      和类型计数审计基准，不得作为 publication quota；发布时从全部物理合法事件中按
+      seed 与 `generated_event_id` 派生的稳定全局 selection key 选取请求的总 quota，
+      `event_kind` 不影响发布资格、排序或 complete 判定，各类型 generated/selected
+      数量只作诊断；总数不足总 quota 时才标记 `quota_unmet`
+- [ ] `complete` producer 必须通过 CLI/handoff 返回目录外保存的版本化
+      `publication_semantic_digest`；SOP06 loader 必须显式接收该原值并重算
+      event/world identity 与完整 shard 语义摘要，禁止从待验输出目录读取 expected digest
+- [ ] `complete` producer 写完 marker 后、原子暴露输出目录前，必须用正式 SOP05 loader
+      及外部 handoff digest 对 staging 目录做一次完整 consumer round-trip；失败时删除
+      staging，禁止暴露 loader 自身无法读取的“complete”产物
 - [ ] 从 split 内按对象类型分库的 `MotionSnippet` 选择目标，记录
       `target_dynamic_object_id/type/footprint_spec`
 - [ ] 主论文分布默认仅采样 `human`；`carried_object/unknown_dynamic` 只能通过显式
@@ -765,10 +779,18 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [ ] 空间变体以当前隐藏位姿为枢轴对完整 snippet/yaw 做刚性旋转；必要时先沿盲区
       射线向后做配置上限内的刚性平移，且每个变体重新验证物理与可见性
 - [ ] temporal-safe 只使用独立配置的冻结偏移序列重设冲突锚点，不外推，并验证空间
-      路径相交但同步 footprint 不相交
+      路径相交但同步 footprint 不相交；每个时间变体同步重建 target history 和 future；
+      单个偏移发生 typed transplant 拒绝时记录稳定、低基数 rejection reason 并继续后续
+      冻结偏移，禁止让整个 pair 生成任务崩溃
 - [ ] 环境遮挡 six-pack 采用联合搜索：优先冲突锚点连续消费完整 16 候选高可行前缀，
       再用单个配置内矩形同时遮住 collision/temporal-safe 的两条当前 LOS；共同遮挡物
-      必须避开机器人、上下文、静态图和两条目标轨迹，并让两条目标都连续出现
+      必须避开静态图、机器人完整 history/future swept volume、上下文对象完整
+      history/future 和两条目标完整 history/future，并让两条目标都连续出现；完整扫掠
+      必须在 multi-LOS 内层逐候选检查，碰撞后继续同一 normal offset 的后续几何候选，
+      不得直接丢弃整个 offset
+- [ ] SOP06 环境 six-pack 正式 consumer 只接受 `joint_environment_pair_v2` 与
+      `joint_multi_los_envelope_v2`；metadata 即使内部自洽，只要仍为 v1 或未知版本也
+      必须拒绝，不得兼容解释
 - [ ] 生成 irrelevant-hidden，确保有隐藏目标且同步 signed clearance `≥1.5 m`
 - [ ] 生成 empty-blind-spot，只移除 `target_dynamic_object_id`，保留其他动态对象
 - [ ] 允许训练使用部分配对，但最低包含 collision、empty-blind-spot，以及

@@ -16,7 +16,6 @@ from src.geometry import (
     footprint_aabb,
     grid_bounds,
     rasterize_footprint,
-    rasterize_footprint_sweep,
     raycast_visibility,
     signed_clearance,
     trajectory_signed_clearances,
@@ -28,6 +27,9 @@ from .structural_blindspot import (
     footprint_visibility_sequence,
     has_continuous_emergence,
 )
+
+
+JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION = "joint_multi_los_envelope_v2"
 
 
 class OccluderSamplingError(ValueError):
@@ -67,7 +69,6 @@ class JointOccluderParameters:
     offset_quantile: float
     dimension_quantile: float
     angle_multiplier: float
-    time_scale_quantile: float
     conflict_time_quantile: float = 0.5
 
 
@@ -80,6 +81,15 @@ class OccluderGeometryCandidate:
     pose: np.ndarray
     mask: np.ndarray
     proposal_index: int
+
+
+@dataclass(frozen=True)
+class OccluderCollisionSweep:
+    """One named physical motion sweep that a candidate must clear."""
+
+    footprint: Footprint
+    poses: np.ndarray
+    rejection_reason: str
 
 
 def _finite_real(value: Any, *, name: str) -> float:
@@ -310,6 +320,81 @@ def _intersects_robot_sweep(
     )
 
 
+def _normalize_collision_sweeps(
+    collision_sweeps: Any,
+) -> tuple[OccluderCollisionSweep, ...]:
+    if not isinstance(collision_sweeps, (list, tuple)) or not collision_sweeps:
+        raise ValueError("collision_sweeps must be a non-empty sequence")
+    normalized = []
+    for index, sweep in enumerate(collision_sweeps):
+        if not isinstance(sweep, OccluderCollisionSweep):
+            raise TypeError(
+                f"collision_sweeps[{index}] must be OccluderCollisionSweep"
+            )
+        if not isinstance(sweep.footprint, (CircleFootprint, RectangleFootprint)):
+            raise TypeError(
+                f"collision_sweeps[{index}].footprint must be a Footprint"
+            )
+        poses = _poses(
+            sweep.poses,
+            name=f"collision_sweeps[{index}].poses",
+        )
+        if poses.shape[0] == 0:
+            raise ValueError(
+                f"collision_sweeps[{index}].poses must not be empty"
+            )
+        if not isinstance(sweep.rejection_reason, str) or not sweep.rejection_reason:
+            raise ValueError(
+                f"collision_sweeps[{index}].rejection_reason must be non-empty"
+            )
+        normalized.append(
+            OccluderCollisionSweep(
+                footprint=sweep.footprint,
+                poses=poses,
+                rejection_reason=sweep.rejection_reason,
+            )
+        )
+    return tuple(normalized)
+
+
+def _normalized_collision_sweep_rejection_reason(
+    occluder_footprint: Footprint,
+    occluder_pose: np.ndarray,
+    collision_sweeps: tuple[OccluderCollisionSweep, ...],
+    *,
+    grid: GridSpec,
+) -> str | None:
+    for sweep in collision_sweeps:
+        if _intersects_robot_sweep(
+            occluder_footprint,
+            occluder_pose,
+            sweep.footprint,
+            sweep.poses,
+            grid=grid,
+        ):
+            return sweep.rejection_reason
+    return None
+
+
+def occluder_collision_sweep_rejection_reason(
+    occluder_footprint: Footprint,
+    occluder_pose: Any,
+    collision_sweeps: Any,
+    *,
+    grid: GridSpec,
+) -> str | None:
+    """Return the first deterministic full-motion collision reason, if any."""
+
+    pose = _vector(occluder_pose, name="occluder_pose", size=3)
+    normalized = _normalize_collision_sweeps(collision_sweeps)
+    return _normalized_collision_sweep_rejection_reason(
+        occluder_footprint,
+        pose,
+        normalized,
+        grid=grid,
+    )
+
+
 def build_joint_occluder_schedule(
     *,
     types: tuple[str, ...] | list[str],
@@ -331,7 +416,6 @@ def build_joint_occluder_schedule(
     offsets = (0.5, 0.3, 0.7, 0.1, 0.9)
     dimensions = (0.0, 0.5, 1.0, 0.25, 0.75)
     angles = (0.0, -0.5, 0.5, -0.95, 0.95)
-    time_scales = (0.5, 0.25, 0.75, 0.0, 1.0)
     conflict_times = (0.5, 0.25, 0.75, 0.0, 1.0)
     base = []
     for side_index, side in enumerate((-1, 1)):
@@ -348,9 +432,6 @@ def build_joint_occluder_schedule(
                         angle_multiplier=angles[
                             (rank + 2 * type_index + side_index) % 5
                         ],
-                        time_scale_quantile=time_scales[
-                            (rank + type_index + 2 * side_index) % 5
-                        ],
                         conflict_time_quantile=conflict_times[
                             (rank + 2 * type_index + side_index) % 5
                         ],
@@ -358,23 +439,21 @@ def build_joint_occluder_schedule(
                 )
 
     feasible_templates = (
-        (0.3, 0.0, 0.0),
-        (0.3, 0.25, 0.16),
-        (0.3, 0.5, 0.25),
-        (0.3, 0.7, 0.5),
-        (0.4, 0.0, 0.16),
-        (0.4, 0.25, 0.25),
-        (0.4, 0.5, 0.5),
-        (0.4, 0.7, 0.0),
+        (0.3, 0.0),
+        (0.3, 0.25),
+        (0.3, 0.5),
+        (0.3, 0.7),
+        (0.4, 0.0),
+        (0.4, 0.25),
+        (0.4, 0.5),
+        (0.4, 0.7),
     )
     scheduled = []
     if "pillar" in type_values:
         for template_index in rng.permutation(len(feasible_templates)):
-            (
-                offset_quantile,
-                angle_magnitude,
-                time_scale_quantile,
-            ) = feasible_templates[int(template_index)]
+            offset_quantile, angle_magnitude = feasible_templates[
+                int(template_index)
+            ]
             for side in (-1, 1):
                 scheduled.append(
                     JointOccluderParameters(
@@ -383,7 +462,6 @@ def build_joint_occluder_schedule(
                         offset_quantile=offset_quantile,
                         dimension_quantile=0.0,
                         angle_multiplier=-angle_magnitude * side,
-                        time_scale_quantile=time_scale_quantile,
                         conflict_time_quantile=1.0,
                     )
                 )
@@ -400,10 +478,7 @@ def propose_environment_occluder_geometry(
     sensor_pose: Any,
     conflict_point: Any,
     trajectory_normal: Any,
-    robot_poses: Any,
-    robot_footprint: Footprint,
-    context_trajectories: Mapping[str, np.ndarray],
-    context_footprints: Mapping[str, Footprint],
+    collision_sweeps: Any,
     config: Mapping[str, Any],
     parameters: JointOccluderParameters,
     proposal_index: int,
@@ -424,7 +499,6 @@ def propose_environment_occluder_geometry(
     quantiles = (
         parameters.offset_quantile,
         parameters.dimension_quantile,
-        parameters.time_scale_quantile,
         parameters.conflict_time_quantile,
     )
     if any(not 0.0 <= float(value) <= 1.0 for value in quantiles):
@@ -445,15 +519,9 @@ def propose_environment_occluder_geometry(
     if normal_norm <= 1e-9:
         raise ValueError("trajectory_normal must be non-zero")
     normal /= normal_norm
-    robot_pose_array = np.vstack(
-        (sensor, _poses(robot_poses, name="robot_poses"))
+    normalized_collision_sweeps = _normalize_collision_sweeps(
+        collision_sweeps
     )
-    if set(context_trajectories) != set(context_footprints):
-        raise ValueError("context trajectory and footprint keys must match")
-    context_pose_arrays = {
-        object_id: _poses(poses, name=f"context_trajectories[{object_id!r}]")
-        for object_id, poses in sorted(context_trajectories.items())
-    }
 
     kind = parameters.occluder_type
     dimensions = normalized[kind]
@@ -482,27 +550,13 @@ def propose_environment_occluder_geometry(
         reason = "occluder_out_of_bounds"
     elif np.any(mask & (occupancy != 0)):
         reason = "occluder_static_overlap"
-    elif _intersects_robot_sweep(
-        footprint,
-        pose,
-        robot_footprint,
-        robot_pose_array,
-        grid=grid,
-    ):
-        reason = "occluder_robot_swept_overlap"
-    elif any(
-        np.any(
-            trajectory_signed_clearances(
-                footprint,
-                np.tile(pose, (poses.shape[0], 1)),
-                context_footprints[object_id],
-                poses,
-            )
-            <= 0.0
+    else:
+        reason = _normalized_collision_sweep_rejection_reason(
+            footprint,
+            pose,
+            normalized_collision_sweeps,
+            grid=grid,
         )
-        for object_id, poses in context_pose_arrays.items()
-    ):
-        reason = "occluder_context_collision"
     if reason is not None:
         raise OccluderSamplingError(
             reason, attempts=1, rejection_reasons={reason: 1}
@@ -542,30 +596,46 @@ def propose_environment_occluder_geometry(
 def validate_environment_occluder_target(
     candidate: OccluderGeometryCandidate,
     *,
-    target_current_pose: Any,
+    target_history_poses: Any,
     target_future_poses: Any,
     target_footprint: Footprint,
+    grid: GridSpec,
 ) -> OccluderPlacement:
     """Promote a geometry candidate after exact target-sweep clearance checks."""
 
     if not isinstance(candidate, OccluderGeometryCandidate):
         raise TypeError("candidate must be OccluderGeometryCandidate")
-    target_current = _vector(
-        target_current_pose, name="target_current_pose", size=3
+    target_history = _poses(
+        target_history_poses, name="target_history_poses"
     )
     target_future = _poses(target_future_poses, name="target_future_poses")
-    target_poses = np.vstack((target_current, target_future))
-    clearances = trajectory_signed_clearances(
+    if target_history.shape != (grid.history_steps, 3):
+        raise ValueError(
+            "target_history_poses must have shape "
+            f"({grid.history_steps}, 3)"
+        )
+    if target_future.shape != (grid.future_steps, 3):
+        raise ValueError(
+            "target_future_poses must have shape "
+            f"({grid.future_steps}, 3)"
+        )
+    reason = occluder_collision_sweep_rejection_reason(
         candidate.footprint,
-        np.tile(candidate.pose, (target_poses.shape[0], 1)),
-        target_footprint,
-        target_poses,
+        candidate.pose,
+        (
+            OccluderCollisionSweep(
+                footprint=target_footprint,
+                poses=np.vstack((target_history, target_future)),
+                rejection_reason="occluder_target_collision",
+            ),
+        ),
+        grid=grid,
     )
-    if np.any(clearances <= 0.0):
+    if reason is not None:
         raise OccluderSamplingError(
-            "occluder_target_collision",
+            reason,
             attempts=1,
-            rejection_reasons={"occluder_target_collision": 1},
+            rejection_reasons={reason: 1},
         )
     return OccluderPlacement(
         occluder=dict(candidate.occluder),
@@ -584,11 +654,8 @@ def align_environment_occluder_to_target_los(
     grid: GridSpec,
     sensor_pose: Any,
     trajectory_normal: Any,
-    robot_poses: Any,
-    robot_footprint: Footprint,
     target_current_pose: Any,
-    context_trajectories: Mapping[str, np.ndarray],
-    context_footprints: Mapping[str, Footprint],
+    collision_sweeps: Any,
 ) -> OccluderGeometryCandidate:
     """Keep a proposed normal band while solving its LOS tangential coordinate."""
 
@@ -630,41 +697,21 @@ def align_environment_occluder_to_target_los(
     yaw = wrap_angle(float(np.arctan2(los[1], los[0])) + 0.5 * np.pi)
     pose = np.asarray([center[0], center[1], yaw], dtype=np.float64)
     mask = rasterize_footprint(candidate.footprint, pose, grid)
-    robot_pose_array = np.vstack(
-        (sensor, _poses(robot_poses, name="robot_poses"))
+    normalized_collision_sweeps = _normalize_collision_sweeps(
+        collision_sweeps
     )
-    if set(context_trajectories) != set(context_footprints):
-        raise ValueError("context trajectory and footprint keys must match")
-    context_pose_arrays = {
-        object_id: _poses(poses, name=f"context_trajectories[{object_id!r}]")
-        for object_id, poses in sorted(context_trajectories.items())
-    }
     reason = None
     if not _inside_grid(candidate.footprint, pose, grid):
         reason = "occluder_out_of_bounds"
     elif np.any(mask & (occupancy != 0)):
         reason = "occluder_static_overlap"
-    elif _intersects_robot_sweep(
-        candidate.footprint,
-        pose,
-        robot_footprint,
-        robot_pose_array,
-        grid=grid,
-    ):
-        reason = "occluder_robot_swept_overlap"
-    elif any(
-        np.any(
-            trajectory_signed_clearances(
-                candidate.footprint,
-                np.tile(pose, (poses.shape[0], 1)),
-                context_footprints[object_id],
-                poses,
-            )
-            <= 0.0
+    else:
+        reason = _normalized_collision_sweep_rejection_reason(
+            candidate.footprint,
+            pose,
+            normalized_collision_sweeps,
+            grid=grid,
         )
-        for object_id, poses in context_pose_arrays.items()
-    ):
-        reason = "occluder_context_collision"
     if reason is not None:
         raise OccluderSamplingError(
             reason, attempts=1, rejection_reasons={reason: 1}
@@ -706,12 +753,11 @@ def align_environment_occluder_to_target_los_envelope(
     sensor_pose: Any,
     conflict_point: Any,
     trajectory_normal: Any,
-    robot_poses: Any,
-    robot_footprint: Footprint,
-    target_pose_sequences: Any,
+    target_visibility_pose_sequences: Any,
     target_footprint: Footprint,
-    context_trajectories: Mapping[str, np.ndarray],
-    context_footprints: Mapping[str, Footprint],
+    current_context_poses: Mapping[str, np.ndarray],
+    current_context_footprints: Mapping[str, Footprint],
+    collision_sweeps: Any,
     config: Mapping[str, Any],
     min_contiguous_visible_frames: int,
 ) -> tuple[OccluderPlacement, tuple[np.ndarray, ...]]:
@@ -720,9 +766,10 @@ def align_environment_occluder_to_target_los_envelope(
     Length and width remain inside the configured range for ``occluder_type``.
     Candidate centres lie on the envelope between the per-target LOS
     intersections at one frozen trajectory-normal coordinate.  Every returned
-    candidate clears the robot, all target trajectories, context objects, and
-    the static map while keeping every target currently hidden and eventually
-    visible.
+    candidate clears every supplied full-motion sweep and the static map while
+    keeping every target currently hidden and eventually visible.  Visibility
+    paths are deliberately separate from collision sweeps because they begin
+    at the current frame rather than the oldest history frame.
     """
 
     normalized = normalize_occluder_config(config)
@@ -760,21 +807,35 @@ def align_environment_occluder_to_target_los_envelope(
     if normal_norm <= 1e-9:
         raise ValueError("trajectory_normal must be non-zero")
     normal /= normal_norm
-    robot_pose_array = np.vstack(
-        (sensor, _poses(robot_poses, name="robot_poses"))
-    )
-    if set(context_trajectories) != set(context_footprints):
-        raise ValueError("context trajectory and footprint keys must match")
-    context_pose_arrays = {
-        object_id: _poses(poses, name=f"context_trajectories[{object_id!r}]")
-        for object_id, poses in sorted(context_trajectories.items())
+    if set(current_context_poses) != set(current_context_footprints):
+        raise ValueError("current context pose and footprint keys must match")
+    current_context_pose_arrays = {
+        object_id: _vector(
+            pose,
+            name=f"current_context_poses[{object_id!r}]",
+            size=3,
+        )
+        for object_id, pose in sorted(current_context_poses.items())
     }
     pose_sequences = tuple(
-        _poses(poses, name="target_pose_sequences")
-        for poses in target_pose_sequences
+        _poses(poses, name="target_visibility_pose_sequences")
+        for poses in target_visibility_pose_sequences
     )
     if len(pose_sequences) < 2:
-        raise ValueError("target_pose_sequences must contain at least two paths")
+        raise ValueError(
+            "target_visibility_pose_sequences must contain at least two paths"
+        )
+    if any(
+        poses.shape != (grid.future_steps + 1, 3)
+        for poses in pose_sequences
+    ):
+        raise ValueError(
+            "target_visibility_pose_sequences must contain current+future paths "
+            f"with shape ({grid.future_steps + 1}, 3)"
+        )
+    normalized_collision_sweeps = _normalize_collision_sweeps(
+        collision_sweeps
+    )
 
     desired_coordinate = float(
         np.dot(conflict + offset * normal, normal)
@@ -847,9 +908,9 @@ def align_environment_occluder_to_target_los_envelope(
         1.0,
     )
     context_current = np.zeros((grid.height, grid.width), dtype=bool)
-    for object_id, poses in context_pose_arrays.items():
+    for object_id, pose in current_context_pose_arrays.items():
         context_current |= rasterize_footprint(
-            context_footprints[object_id], poses[0], grid
+            current_context_footprints[object_id], pose, grid
         )
 
     rejection_reasons: dict[str, int] = {}
@@ -873,40 +934,13 @@ def align_environment_occluder_to_target_los_envelope(
                         reason = "occluder_out_of_bounds"
                     elif np.any(mask & base_occupied):
                         reason = "occluder_static_overlap"
-                    elif _intersects_robot_sweep(
-                        footprint,
-                        pose,
-                        robot_footprint,
-                        robot_pose_array,
-                        grid=grid,
-                    ):
-                        reason = "occluder_robot_swept_overlap"
-                    elif any(
-                        np.any(
-                            trajectory_signed_clearances(
-                                footprint,
-                                np.tile(pose, (poses.shape[0], 1)),
-                                context_footprints[object_id],
-                                poses,
-                            )
-                            <= 0.0
+                    else:
+                        reason = _normalized_collision_sweep_rejection_reason(
+                            footprint,
+                            pose,
+                            normalized_collision_sweeps,
+                            grid=grid,
                         )
-                        for object_id, poses in context_pose_arrays.items()
-                    ):
-                        reason = "occluder_context_collision"
-                    elif any(
-                        np.any(
-                            trajectory_signed_clearances(
-                                footprint,
-                                np.tile(pose, (poses.shape[0], 1)),
-                                target_footprint,
-                                poses,
-                            )
-                            <= 0.0
-                        )
-                        for poses in pose_sequences
-                    ):
-                        reason = "occluder_target_collision"
                     if reason is not None:
                         _record_rejection(rejection_reasons, reason)
                         continue
@@ -946,7 +980,7 @@ def align_environment_occluder_to_target_los_envelope(
                         + stable_digest(
                             occluder_type,
                             proposal_index,
-                            "joint_multi_los_envelope_v1",
+                            JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION,
                             *(f"{value:.9f}" for value in pose32),
                             f"{length_m:.9f}",
                             f"{width_m:.9f}",
@@ -957,7 +991,9 @@ def align_environment_occluder_to_target_los_envelope(
                         "length_m": float(length_m),
                         "width_m": float(width_m),
                         "geometry_source": "generator_config",
-                        "placement_strategy": "joint_multi_los_envelope_v1",
+                        "placement_strategy": (
+                            JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION
+                        ),
                         "normal_offset_m": float(offset),
                         "proposal_index": proposal_index,
                         "hidden_los_count": len(pose_sequences),
@@ -992,13 +1028,11 @@ def sample_environment_occluder(
     sensor_pose: Any,
     conflict_point: Any,
     trajectory_normal: Any,
-    robot_poses: Any,
-    robot_footprint: Footprint,
+    target_history_poses: Any,
     target_current_pose: Any,
     target_future_poses: Any,
     target_footprint: Footprint,
-    context_trajectories: Mapping[str, np.ndarray],
-    context_footprints: Mapping[str, Footprint],
+    collision_sweeps: Any,
     config: Mapping[str, Any],
     rng: np.random.Generator,
     max_attempts: int,
@@ -1028,19 +1062,35 @@ def sample_environment_occluder(
     if normal_norm <= 1e-9:
         raise ValueError("trajectory_normal must be non-zero")
     normal /= normal_norm
-    robot_pose_array = _poses(robot_poses, name="robot_poses")
-    robot_pose_array = np.vstack((sensor, robot_pose_array))
+    target_history = _poses(
+        target_history_poses, name="target_history_poses"
+    )
     target_current = _vector(target_current_pose, name="target_current_pose", size=3)
     target_future = _poses(target_future_poses, name="target_future_poses")
-    if set(context_trajectories) != set(context_footprints):
-        raise ValueError("context trajectory and footprint keys must match")
-    context_pose_arrays = {
-        object_id: _poses(poses, name=f"context_trajectories[{object_id!r}]")
-        for object_id, poses in sorted(context_trajectories.items())
-    }
-
-    robot_sweep = rasterize_footprint_sweep(
-        robot_footprint, robot_pose_array, grid
+    if target_history.shape != (grid.history_steps, 3):
+        raise ValueError(
+            "target_history_poses must have shape "
+            f"({grid.history_steps}, 3)"
+        )
+    if target_future.shape != (grid.future_steps, 3):
+        raise ValueError(
+            "target_future_poses must have shape "
+            f"({grid.future_steps}, 3)"
+        )
+    if not np.array_equal(target_current, target_history[-1]):
+        raise ValueError(
+            "target_current_pose must equal the final target history pose"
+        )
+    base_collision_sweeps = _normalize_collision_sweeps(
+        collision_sweeps
+    )
+    normalized_collision_sweeps = (
+        *base_collision_sweeps,
+        OccluderCollisionSweep(
+            footprint=target_footprint,
+            poses=np.vstack((target_history, target_future)),
+            rejection_reason="occluder_target_collision",
+        ),
     )
     target_poses = np.vstack((target_current, target_future))
     target_side = float(np.dot(target_current[:2] - conflict, normal))
@@ -1098,33 +1148,14 @@ def sample_environment_occluder(
         if np.any(mask & occupied):
             _record_rejection(rejection_reasons, "occluder_static_overlap")
             continue
-        if np.any(mask & robot_sweep):
-            _record_rejection(
-                rejection_reasons, "occluder_robot_swept_overlap"
-            )
-            continue
-        target_clearances = trajectory_signed_clearances(
+        collision_reason = _normalized_collision_sweep_rejection_reason(
             footprint,
-            np.tile(pose, (target_poses.shape[0], 1)),
-            target_footprint,
-            target_poses,
+            pose,
+            normalized_collision_sweeps,
+            grid=grid,
         )
-        if np.any(target_clearances <= 0.0):
-            _record_rejection(rejection_reasons, "occluder_target_collision")
-            continue
-        if any(
-            np.any(
-                trajectory_signed_clearances(
-                    footprint,
-                    np.tile(pose, (poses.shape[0], 1)),
-                    context_footprints[object_id],
-                    poses,
-                )
-                <= 0.0
-            )
-            for object_id, poses in context_pose_arrays.items()
-        ):
-            _record_rejection(rejection_reasons, "occluder_context_collision")
+        if collision_reason is not None:
+            _record_rejection(rejection_reasons, collision_reason)
             continue
         visibility = raycast_visibility(
             occupied | mask,

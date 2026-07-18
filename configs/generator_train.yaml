@@ -15,7 +15,7 @@ event_type_weights:
 conflict_time_range_s: [1.0, 2.2]
 max_local_curvature_per_m: 1.0
 crossing_angle_max_deg: 35.0
-time_scale_range: [0.8, 1.2]
+time_scale_range: [1.0, 1.0]
 max_resample_attempts: 64
 min_contiguous_visible_frames: 2
 

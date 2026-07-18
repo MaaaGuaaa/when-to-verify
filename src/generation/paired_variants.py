@@ -38,6 +38,7 @@ from src.geometry import (
 from src.utils.seeding import derive_seed, stable_digest
 
 from .dynamic_object_transplant import (
+    TransplantError,
     TransplantedDynamicObject,
     footprint_from_spec,
     transplant_snippet,
@@ -47,9 +48,19 @@ from .event_sampler import (
     generate_events,
     normalize_generator_config,
 )
+from .event_target_motion_shard import (
+    build_event_target_motion_world_metadata,
+    compute_motion_array_digest,
+    create_event_target_motion_record,
+    validate_event_target_motion_world_join,
+)
 from .occluder_sampler import (
+    JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION,
+    OccluderCollisionSweep,
     OccluderSamplingError,
+    _densify_pose_sequence,
     align_environment_occluder_to_target_los_envelope,
+    occluder_collision_sweep_rejection_reason,
 )
 from .structural_blindspot import (
     StructuralBlindSpot,
@@ -70,8 +81,24 @@ VARIANT_ORDER = (
 _TEMPORAL_OFFSETS = (0.8, -0.8, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5)
 _REQUIRED_VARIANTS = ("collision", "empty_blind_spot")
 _CONTRAST_VARIANTS = ("near_miss", "temporal_safe", "spatial_safe")
-_JOINT_ENVIRONMENT_PAIR_VERSION = "joint_environment_pair_v1"
+JOINT_ENVIRONMENT_PAIR_VERSION = "joint_environment_pair_v2"
 _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE = 16
+_SOP05_JOIN_METADATA_KEYS = frozenset(
+    {
+        "generated_event_id",
+        "source_snippet_id",
+        "source_object_id",
+        "target_object_type",
+        "target_footprint_spec",
+        "target_footprint_spec_digest",
+        "target_type_policy_digest",
+        "event_target_motion_layout_version",
+        "target_history_array_digest",
+        "target_future_array_digest",
+        "target_motion_record_digest",
+        "target_current_pose",
+    }
+)
 
 
 class PairedVariantConfigError(ValueError):
@@ -138,6 +165,7 @@ class PairedVariant:
     variant_kind: str
     world: OracleWorld
     target: TransplantedDynamicObject | None
+    target_visibility_history: np.ndarray | None
     visibility_sequence: np.ndarray | None
     clearance_sequence_m: np.ndarray | None
     min_clearance_m: float | None
@@ -181,8 +209,11 @@ class _PairEnvironment:
     robot_footprint: Footprint
     target_footprint: Footprint
     context_footprints: dict[str, Footprint]
+    scene_history_footprints: dict[str, Footprint]
+    scene_dynamic_history: dict[str, np.ndarray]
     base_static_occupancy: np.ndarray
     occluder_geometry: tuple[tuple[RectangleFootprint, np.ndarray], ...]
+    visibility_history: np.ndarray
     visibility_mask: np.ndarray
 
 
@@ -426,28 +457,64 @@ def _pair_environment(
     *,
     mother_event: GeneratedEvent,
     trajectory: LocalTrajectory,
+    base_state: BaseState,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     critical_clearance_threshold_m: float,
 ) -> _PairEnvironment:
     grid = build_grid_spec(dict(base_config))
+    if not isinstance(base_state, BaseState):
+        raise TypeError("base_state must be a BaseState")
+    if base_state.state_id != mother_event.world.base_state_id:
+        raise PairGenerationError("mother_base_state_id_mismatch")
     validate_oracle_context(oracle_context, grid)
     validate_oracle_world(mother_event.world, grid)
     if mother_event.world.base_state_id != oracle_context.base_state_id:
         raise PairGenerationError("mother_context_id_mismatch")
     if mother_event.world.metadata.get("trajectory_id") != trajectory.trajectory_id:
         raise PairGenerationError("mother_trajectory_id_mismatch")
+    try:
+        validate_event_target_motion_world_join(
+            mother_event.target_motion_record,
+            mother_event.world,
+            grid,
+        )
+    except (TypeError, ValueError) as exc:
+        raise PairGenerationError(
+            "mother_target_motion_join_invalid", str(exc)
+        ) from exc
     target_id = mother_event.target.target_dynamic_object_id
-    if target_id not in mother_event.world.dynamic_object_trajectories:
-        raise PairGenerationError("mother_target_missing")
+    target = mother_event.target
+    record = mother_event.target_motion_record
+    if (
+        record.generated_event_id != mother_event.generated_event_id
+        or record.target_dynamic_object_id != target_id
+        or record.source_snippet_id != target.snippet_id
+        or record.source_object_id != target.source_object_id
+        or record.object_type != target.object_type
+        or record.footprint_spec != target.footprint_spec
+        or record.footprint_spec_digest != target.footprint_spec_digest
+        or record.target_type_policy_digest
+        != target.provenance.get("target_type_policy_digest")
+        or not np.array_equal(record.history_poses, target.history_poses)
+        or not np.array_equal(record.current_pose, target.current_pose)
+        or not np.array_equal(record.future_poses, target.future_poses)
+    ):
+        raise PairGenerationError("mother_target_motion_record_mismatch")
+    context_ids = set(oracle_context.dynamic_object_future)
+    if target_id in context_ids:
+        raise PairGenerationError("mother_target_context_id_collision")
+    expected_world_ids = context_ids | {target_id}
+    if set(mother_event.world.dynamic_object_trajectories) != expected_world_ids:
+        raise PairGenerationError("mother_dynamic_object_ids_mismatch")
     if not np.array_equal(
         mother_event.world.dynamic_object_trajectories[target_id],
-        mother_event.target.future_poses,
+        target.future_poses,
     ):
         raise PairGenerationError("mother_target_changed")
-    for object_id in sorted(oracle_context.dynamic_object_future):
-        if object_id not in mother_event.world.dynamic_object_trajectories:
-            raise PairGenerationError("mother_context_missing")
+    if mother_event.world.dynamic_object_specs[target_id] != target.footprint_spec:
+        raise PairGenerationError("mother_target_changed")
+    for object_id in sorted(context_ids):
         if not np.array_equal(
             mother_event.world.dynamic_object_trajectories[object_id],
             oracle_context.dynamic_object_future[object_id],
@@ -459,10 +526,43 @@ def _pair_environment(
         ):
             raise PairGenerationError("mother_context_changed")
 
+    base_ids = set(base_state.dynamic_object_ids)
+    if (
+        base_ids != set(base_state.visible_dynamic_object_history)
+        or base_ids != set(base_state.visible_dynamic_object_specs)
+    ):
+        raise PairGenerationError("base_dynamic_object_contract_invalid")
+    oracle_ids = set(oracle_context.dynamic_object_history)
+    for object_id in sorted(base_ids & oracle_ids):
+        if not np.array_equal(
+            base_state.visible_dynamic_object_history[object_id],
+            oracle_context.dynamic_object_history[object_id],
+        ):
+            raise PairGenerationError("base_oracle_history_mismatch")
+        if (
+            base_state.visible_dynamic_object_specs[object_id]
+            != oracle_context.dynamic_object_specs[object_id]
+        ):
+            raise PairGenerationError("base_oracle_spec_mismatch")
+    if target_id in base_ids:
+        raise PairGenerationError("mother_target_base_id_collision")
+
     context_footprints = {
         object_id: footprint_from_spec(oracle_context.dynamic_object_specs[object_id])
         for object_id in sorted(oracle_context.dynamic_object_specs)
     }
+    scene_dynamic_history = {
+        object_id: oracle_context.dynamic_object_history[object_id]
+        for object_id in sorted(oracle_ids)
+    }
+    scene_history_footprints = dict(context_footprints)
+    for object_id in sorted(base_ids - oracle_ids):
+        scene_dynamic_history[object_id] = (
+            base_state.visible_dynamic_object_history[object_id]
+        )
+        scene_history_footprints[object_id] = footprint_from_spec(
+            base_state.visible_dynamic_object_specs[object_id]
+        )
     robot_footprint = _robot_footprint(base_config)
     for object_id in sorted(context_footprints):
         clearances = trajectory_signed_clearances(
@@ -480,34 +580,47 @@ def _pair_environment(
     ).copy()
     for footprint, pose in occluders:
         base_static &= ~rasterize_footprint(footprint, pose, grid)
-    occupied = np.asarray(
+    sensor_static_occupancy = np.asarray(
         mother_event.world.static_occupancy != 0, dtype=bool
-    ) | _context_current_occupancy(
-        oracle_context,
-        context_footprints=context_footprints,
-        grid=grid,
     )
     structural = _structural_blind_spot(mother_event.world)
-    if structural is None:
-        visibility = raycast_visibility(
-            occupied, grid, sensor_pose=np.zeros(3, dtype=np.float64)
-        )
-    else:
-        visibility = build_structural_visibility(
-            occupied,
-            grid,
-            sensor_pose=np.zeros(3, dtype=np.float64),
-            blind_spot=structural,
-        )
+    visibility_history = np.empty(
+        (grid.history_steps, grid.height, grid.width),
+        dtype=bool,
+        order="C",
+    )
+    for history_index, robot_pose in enumerate(base_state.robot_history):
+        occupied = sensor_static_occupancy.copy()
+        for object_id in sorted(scene_history_footprints):
+            occupied |= rasterize_footprint(
+                scene_history_footprints[object_id],
+                scene_dynamic_history[object_id][history_index],
+                grid,
+            )
+        if structural is None:
+            visibility = raycast_visibility(
+                occupied, grid, sensor_pose=robot_pose
+            )
+        else:
+            visibility = build_structural_visibility(
+                occupied,
+                grid,
+                sensor_pose=robot_pose,
+                blind_spot=structural,
+            )
+        visibility_history[history_index] = visibility
     return _PairEnvironment(
         grid=grid,
         future_dt_s=float(base_config["bev"]["future_dt_s"]),
         robot_footprint=robot_footprint,
         target_footprint=footprint_from_spec(mother_event.target.footprint_spec),
         context_footprints=context_footprints,
+        scene_history_footprints=scene_history_footprints,
+        scene_dynamic_history=scene_dynamic_history,
         base_static_occupancy=base_static,
         occluder_geometry=occluders,
-        visibility_mask=visibility,
+        visibility_history=visibility_history,
+        visibility_mask=visibility_history[-1].copy(),
     )
 
 
@@ -548,17 +661,24 @@ def _validate_target_candidate(
     target: TransplantedDynamicObject,
     *,
     trajectory: LocalTrajectory,
+    base_state: BaseState,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     environment: _PairEnvironment,
-) -> np.ndarray:
-    all_poses = np.vstack((target.current_pose, target.future_poses))
+) -> tuple[np.ndarray, np.ndarray]:
+    history = np.asarray(target.history_poses)
+    current = np.asarray(target.current_pose)
+    future = np.asarray(target.future_poses)
     if (
-        all_poses.shape != (environment.grid.future_steps + 1, 3)
-        or all_poses.dtype != np.float32
-        or not np.isfinite(all_poses).all()
+        history.shape != (environment.grid.history_steps, 3)
+        or current.shape != (3,)
+        or future.shape != (environment.grid.future_steps, 3)
+        or any(array.dtype != np.float32 for array in (history, current, future))
+        or not all(np.isfinite(array).all() for array in (history, current, future))
+        or not np.array_equal(history[-1], current)
     ):
         raise _CandidateRejected("target_contract_invalid")
+    all_poses = np.vstack((history, future))
     if not bool(np.all(points_in_grid(all_poses[:, :2], environment.grid))):
         raise _CandidateRejected("target_out_of_bounds")
     if intersects(
@@ -569,39 +689,65 @@ def _validate_target_candidate(
     ):
         raise _CandidateRejected("target_current_robot_overlap")
 
+    dense_all_poses = _densify_pose_sequence(
+        all_poses.astype(np.float64),
+        max_translation_step_m=0.5 * environment.grid.resolution_m,
+        max_yaw_step_rad=np.deg2rad(5.0),
+    )
     if environment.base_static_occupancy.any():
         sweep = rasterize_footprint_sweep(
-            environment.target_footprint, all_poses, environment.grid
+            environment.target_footprint, dense_all_poses, environment.grid
         )
         if np.any(sweep & environment.base_static_occupancy):
             raise _CandidateRejected("target_static_collision")
     for occluder_footprint, occluder_pose in environment.occluder_geometry:
         clearances = trajectory_signed_clearances(
             occluder_footprint,
-            np.tile(occluder_pose, (all_poses.shape[0], 1)),
+            np.tile(occluder_pose, (dense_all_poses.shape[0], 1)),
             environment.target_footprint,
-            all_poses,
+            dense_all_poses,
         )
         if np.any(clearances <= 0.0):
             raise _CandidateRejected("target_occluder_collision")
 
     for object_id in sorted(environment.context_footprints):
         context_footprint = environment.context_footprints[object_id]
-        if intersects(
-            environment.target_footprint,
-            target.current_pose,
-            context_footprint,
-            oracle_context.dynamic_object_history[object_id][-1],
-        ):
-            raise _CandidateRejected("target_context_collision")
+        context_poses = np.vstack(
+            (
+                oracle_context.dynamic_object_history[object_id],
+                oracle_context.dynamic_object_future[object_id],
+            )
+        )
         clearances = trajectory_signed_clearances(
             environment.target_footprint,
-            target.future_poses,
+            all_poses,
             context_footprint,
-            oracle_context.dynamic_object_future[object_id],
+            context_poses,
         )
         if np.any(clearances <= 0.0):
             raise _CandidateRejected("target_context_collision")
+
+    base_only_ids = set(environment.scene_history_footprints) - set(
+        environment.context_footprints
+    )
+    for object_id in sorted(base_only_ids):
+        clearances = trajectory_signed_clearances(
+            environment.target_footprint,
+            history,
+            environment.scene_history_footprints[object_id],
+            environment.scene_dynamic_history[object_id],
+        )
+        if np.any(clearances <= 0.0):
+            raise _CandidateRejected("target_base_history_collision")
+
+    robot_history_clearances = trajectory_signed_clearances(
+        environment.robot_footprint,
+        base_state.robot_history,
+        environment.target_footprint,
+        history,
+    )
+    if np.any(robot_history_clearances <= 0.0):
+        raise _CandidateRejected("target_robot_history_collision")
 
     velocities = np.diff(all_poses[:, :2].astype(np.float64), axis=0) / (
         environment.future_dt_s
@@ -619,19 +765,70 @@ def _validate_target_candidate(
     ):
         raise _CandidateRejected("target_acceleration_limit")
 
+    history_visibility = np.asarray(
+        [
+            footprint_visibility_sequence(
+                environment.target_footprint,
+                history[index : index + 1],
+                environment.visibility_history[index],
+                environment.grid,
+            )[0]
+            for index in range(environment.grid.history_steps)
+        ],
+        dtype=bool,
+    )
     sequence = footprint_visibility_sequence(
         environment.target_footprint,
-        all_poses,
+        np.vstack((current, future)),
         environment.visibility_mask,
         environment.grid,
     )
+    if history_visibility.shape != (environment.grid.history_steps,):
+        raise _CandidateRejected("target_visibility_history_contract_invalid")
+    if history_visibility[-1] != sequence[0]:
+        raise _CandidateRejected("target_visibility_seam_invalid")
     if bool(sequence[0]):
         raise _CandidateRejected("target_current_visible")
     if not has_continuous_emergence(sequence, min_visible_frames=2):
         raise _CandidateRejected("target_does_not_emerge")
     if not bool(sequence[-1]):
         raise _CandidateRejected("target_final_not_visible")
-    return sequence
+    return history_visibility, sequence
+
+
+def compute_pair_group_id(
+    *,
+    generated_event_id: str,
+    base_state_id: str,
+    trajectory_id: str,
+    occluders: Iterable[Mapping[str, Any]],
+    blind_spot_config: Mapping[str, Any],
+    source_snippet_id: str,
+    target_dynamic_object_id: str,
+    paired_config_digest: str,
+) -> str:
+    """Compute the stable SOP06 group ID from trusted mother lineage."""
+
+    geometry_payload = json.dumps(
+        {
+            "occluders": list(occluders),
+            "blind_spot_config": blind_spot_config,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    digest = stable_digest(
+        generated_event_id,
+        base_state_id,
+        trajectory_id,
+        stable_digest(geometry_payload, size=16),
+        source_snippet_id,
+        target_dynamic_object_id,
+        paired_config_digest,
+        size=12,
+    )
+    return f"pair-{digest}"
 
 
 def _pair_group_identifier(
@@ -640,25 +837,39 @@ def _pair_group_identifier(
     trajectory: LocalTrajectory,
     paired_config: PairedVariantConfig,
 ) -> str:
-    geometry_payload = json.dumps(
-        {
-            "occluders": list(mother_event.world.occluders),
-            "blind_spot_config": mother_event.world.blind_spot_config,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
+    return compute_pair_group_id(
+        generated_event_id=mother_event.generated_event_id,
+        base_state_id=mother_event.world.base_state_id,
+        trajectory_id=trajectory.trajectory_id,
+        occluders=mother_event.world.occluders,
+        blind_spot_config=mother_event.world.blind_spot_config,
+        source_snippet_id=mother_event.target.snippet_id,
+        target_dynamic_object_id=(
+            mother_event.target.target_dynamic_object_id
+        ),
+        paired_config_digest=paired_config.digest,
     )
-    digest = stable_digest(
-        mother_event.world.base_state_id,
-        trajectory.trajectory_id,
-        stable_digest(geometry_payload, size=16),
-        mother_event.target.snippet_id,
-        mother_event.target.target_dynamic_object_id,
-        paired_config.digest,
-        size=12,
+
+
+def _paired_target_motion_digest(target: TransplantedDynamicObject) -> str:
+    """Bind one paired target identity to its complete observed/future motion."""
+
+    history_digest = compute_motion_array_digest(
+        target.history_poses, field_name="target_history_poses"
     )
-    return f"pair-{digest}"
+    future_digest = compute_motion_array_digest(
+        target.future_poses, field_name="target_future_poses"
+    )
+    if not np.array_equal(target.history_poses[-1], target.current_pose):
+        raise PairGenerationError("paired_target_current_history_mismatch")
+    return stable_digest(
+        "paired_target_motion_history8_future15_v1",
+        history_digest,
+        target.current_pose.tobytes(order="C"),
+        future_digest,
+        target.footprint_spec_digest,
+        size=16,
+    )
 
 
 def _variant_world(
@@ -667,6 +878,7 @@ def _variant_world(
     pair_group_id: str,
     variant_kind: str,
     target: TransplantedDynamicObject | None,
+    target_visibility_history: np.ndarray | None,
     visibility_sequence: np.ndarray | None,
     min_clearance_m: float | None,
     time_to_min_clearance_s: float | None,
@@ -691,10 +903,16 @@ def _variant_world(
     if target is not None:
         trajectories[target_id] = target.future_poses.copy()
         specs[target_id] = dict(target.footprint_spec)
-        target_digest = stable_digest(
-            target.current_pose.tobytes(), target.future_poses.tobytes(), size=16
+        target_history_digest = compute_motion_array_digest(
+            target.history_poses, field_name="target_history_poses"
         )
+        target_future_digest = compute_motion_array_digest(
+            target.future_poses, field_name="target_future_poses"
+        )
+        target_digest = _paired_target_motion_digest(target)
     else:
+        target_history_digest = None
+        target_future_digest = None
         target_digest = "target-empty"
     world_id = "world-" + stable_digest(
         pair_group_id,
@@ -704,16 +922,38 @@ def _variant_world(
         paired_config.digest,
         size=12,
     )
+    mother_metadata = {
+        key: value
+        for key, value in mother_event.world.metadata.items()
+        if key not in _SOP05_JOIN_METADATA_KEYS
+    }
     metadata = {
-        **mother_event.world.metadata,
+        **mother_metadata,
         "schema_version": SCHEMA_VERSION,
+        "world_id": world_id,
+        "mother_generated_event_id": mother_event.generated_event_id,
+        "mother_world_id": mother_event.world.world_id,
+        "mother_target_motion_record_digest": (
+            mother_event.target_motion_record.record_digest
+        ),
+        "mother_source_snippet_id": mother_event.target.snippet_id,
+        "mother_source_object_id": mother_event.target.source_object_id,
+        "mother_target_type_policy_digest": (
+            mother_event.target_motion_record.target_type_policy_digest
+        ),
+        "mother_target_footprint_spec_digest": (
+            mother_event.target.footprint_spec_digest
+        ),
         "pair_group_id": pair_group_id,
         "paired_variant_kind": variant_kind,
         "paired_config_digest": paired_config.digest,
         "paired_seed": int(seed),
         "target_dynamic_object_id": target_id,
         "target_present": target is not None,
-        "target_current_pose": (
+        "paired_target_history_array_digest": target_history_digest,
+        "paired_target_future_array_digest": target_future_digest,
+        "paired_target_motion_digest": target_digest,
+        "paired_target_current_pose": (
             None
             if target is None
             else [float(value) for value in target.current_pose]
@@ -725,6 +965,11 @@ def _variant_world(
             None
             if visibility_sequence is None
             else [bool(value) for value in visibility_sequence]
+        ),
+        "target_visibility_history": (
+            None
+            if target_visibility_history is None
+            else [bool(value) for value in target_visibility_history]
         ),
         "min_clearance_m": min_clearance_m,
         "time_to_min_clearance_s": time_to_min_clearance_s,
@@ -749,6 +994,7 @@ def _make_variant(
     *,
     variant_kind: str,
     target: TransplantedDynamicObject | None,
+    target_visibility_history: np.ndarray | None,
     visibility_sequence: np.ndarray | None,
     mother_event: GeneratedEvent,
     trajectory: LocalTrajectory,
@@ -780,6 +1026,7 @@ def _make_variant(
         pair_group_id=pair_group_id,
         variant_kind=variant_kind,
         target=target,
+        target_visibility_history=target_visibility_history,
         visibility_sequence=visibility_sequence,
         min_clearance_m=minimum,
         time_to_min_clearance_s=time_to_minimum,
@@ -792,6 +1039,11 @@ def _make_variant(
         variant_kind=variant_kind,
         world=world,
         target=target,
+        target_visibility_history=(
+            None
+            if target_visibility_history is None
+            else target_visibility_history.copy()
+        ),
         visibility_sequence=(
             None if visibility_sequence is None else visibility_sequence.copy()
         ),
@@ -820,9 +1072,9 @@ def _transformed_target(
     sine = np.sin(angle)
     rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
     poses = np.vstack(
-        (mother_target.current_pose, mother_target.future_poses)
+        (mother_target.history_poses, mother_target.future_poses)
     ).astype(np.float64)
-    pivot = poses[0, :2].copy()
+    pivot = poses[mother_target.history_poses.shape[0] - 1, :2].copy()
     poses[:, :2] = (
         (poses[:, :2] - pivot) @ rotation.T
         + pivot
@@ -841,8 +1093,9 @@ def _transformed_target(
     }
     return replace(
         mother_target,
-        current_pose=poses[0],
-        future_poses=poses[1:],
+        history_poses=poses[: mother_target.history_poses.shape[0]],
+        current_pose=poses[mother_target.history_poses.shape[0] - 1].copy(),
+        future_poses=poses[mother_target.history_poses.shape[0] :],
         provenance=provenance,
     )
 
@@ -975,6 +1228,7 @@ def _geometric_variant(
     variant_kind: str,
     mother_event: GeneratedEvent,
     trajectory: LocalTrajectory,
+    base_state: BaseState,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
@@ -999,9 +1253,10 @@ def _geometric_variant(
             ray_direction=candidate_pool.ray_direction,
         )
         try:
-            visibility = _validate_target_candidate(
+            history_visibility, visibility = _validate_target_candidate(
                 target,
                 trajectory=trajectory,
+                base_state=base_state,
                 oracle_context=oracle_context,
                 base_config=base_config,
                 environment=environment,
@@ -1020,6 +1275,7 @@ def _geometric_variant(
             _make_variant(
                 variant_kind=variant_kind,
                 target=target,
+                target_visibility_history=history_visibility,
                 visibility_sequence=visibility,
                 mother_event=mother_event,
                 trajectory=trajectory,
@@ -1061,6 +1317,7 @@ def _temporal_variant(
     mother_event: GeneratedEvent,
     source_snippet: MotionSnippet,
     trajectory: LocalTrajectory,
+    base_state: BaseState,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
@@ -1080,25 +1337,37 @@ def _temporal_variant(
         return None, "mother_target_provenance_incomplete"
     horizon_s = environment.grid.future_steps * environment.future_dt_s
     last_reason = "temporal_offset_unavailable"
+    last_transplant_reason: str | None = None
+    transplanted_candidate_count = 0
     for offset in paired_config.temporal_offset_candidates_s:
         conflict_time = mother_event.conflict_time_s + offset
         if not 0.0 < conflict_time <= horizon_s:
             last_reason = "temporal_offset_out_of_horizon"
             continue
-        target = transplant_snippet(
-            source_snippet,
-            conflict_point=provenance["conflict_point"],
-            conflict_time_s=conflict_time,
-            crossing_direction=provenance["crossing_direction"],
-            time_scale=provenance["time_scale"],
-            future_dt_s=environment.future_dt_s,
-            future_steps=environment.grid.future_steps,
-            base_state_id=mother_event.world.base_state_id,
-            trajectory_id=trajectory.trajectory_id,
-            target_type_policy_digest=provenance["target_type_policy_digest"],
-            seed=provenance["seed"],
-            context_object_ids=tuple(oracle_context.dynamic_object_future),
-        )
+        try:
+            target = transplant_snippet(
+                source_snippet,
+                conflict_point=provenance["conflict_point"],
+                conflict_time_s=conflict_time,
+                crossing_direction=provenance["crossing_direction"],
+                time_scale=provenance["time_scale"],
+                future_dt_s=environment.future_dt_s,
+                future_steps=environment.grid.future_steps,
+                base_state_id=mother_event.world.base_state_id,
+                trajectory_id=trajectory.trajectory_id,
+                target_type_policy_digest=provenance[
+                    "target_type_policy_digest"
+                ],
+                seed=provenance["seed"],
+                context_object_ids=tuple(
+                    oracle_context.dynamic_object_future
+                ),
+            )
+        except TransplantError as exc:
+            last_reason = f"temporal_transplant:{exc.reason}"
+            last_transplant_reason = last_reason
+            continue
+        transplanted_candidate_count += 1
         target = replace(
             target,
             target_dynamic_object_id=mother_event.target.target_dynamic_object_id,
@@ -1123,9 +1392,10 @@ def _temporal_variant(
             last_reason = "temporal_spatial_paths_do_not_intersect"
             continue
         try:
-            visibility = _validate_target_candidate(
+            history_visibility, visibility = _validate_target_candidate(
                 target,
                 trajectory=trajectory,
+                base_state=base_state,
                 oracle_context=oracle_context,
                 base_config=base_config,
                 environment=environment,
@@ -1143,6 +1413,7 @@ def _temporal_variant(
             _make_variant(
                 variant_kind="temporal_safe",
                 target=target,
+                target_visibility_history=history_visibility,
                 visibility_sequence=visibility,
                 mother_event=mother_event,
                 trajectory=trajectory,
@@ -1155,6 +1426,8 @@ def _temporal_variant(
             ),
             None,
         )
+    if transplanted_candidate_count == 0 and last_transplant_reason is not None:
+        return None, last_transplant_reason
     return None, last_reason
 
 
@@ -1249,6 +1522,7 @@ def generate_paired_variants(
     *,
     mother_event: GeneratedEvent,
     source_snippet: MotionSnippet,
+    base_state: BaseState,
     trajectory: LocalTrajectory,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
@@ -1259,6 +1533,8 @@ def generate_paired_variants(
 
     if not isinstance(mother_event, GeneratedEvent):
         raise TypeError("mother_event must be a GeneratedEvent")
+    if not isinstance(base_state, BaseState):
+        raise TypeError("base_state must be a BaseState")
     if not isinstance(trajectory, LocalTrajectory):
         raise TypeError("trajectory must be a LocalTrajectory")
     if not isinstance(oracle_context, OracleContext):
@@ -1272,6 +1548,7 @@ def generate_paired_variants(
     environment = _pair_environment(
         mother_event=mother_event,
         trajectory=trajectory,
+        base_state=base_state,
         oracle_context=oracle_context,
         base_config=base_config,
         critical_clearance_threshold_m=(
@@ -1283,9 +1560,10 @@ def generate_paired_variants(
     )
 
     try:
-        mother_visibility = _validate_target_candidate(
+        mother_history_visibility, mother_visibility = _validate_target_candidate(
             mother_event.target,
             trajectory=trajectory,
+            base_state=base_state,
             oracle_context=oracle_context,
             base_config=base_config,
             environment=environment,
@@ -1304,6 +1582,7 @@ def generate_paired_variants(
     variants["collision"] = _make_variant(
         variant_kind="collision",
         target=mother_event.target,
+        target_visibility_history=mother_history_visibility,
         visibility_sequence=mother_visibility,
         mother_event=mother_event,
         trajectory=trajectory,
@@ -1326,6 +1605,7 @@ def generate_paired_variants(
             variant_kind=kind,
             mother_event=mother_event,
             trajectory=trajectory,
+            base_state=base_state,
             oracle_context=oracle_context,
             base_config=base_config,
             paired_config=normalized,
@@ -1343,6 +1623,7 @@ def generate_paired_variants(
         mother_event=mother_event,
         source_snippet=source_snippet,
         trajectory=trajectory,
+        base_state=base_state,
         oracle_context=oracle_context,
         base_config=base_config,
         paired_config=normalized,
@@ -1358,6 +1639,7 @@ def generate_paired_variants(
     variants["empty_blind_spot"] = _make_variant(
         variant_kind="empty_blind_spot",
         target=None,
+        target_visibility_history=None,
         visibility_sequence=None,
         mother_event=mother_event,
         trajectory=trajectory,
@@ -1427,6 +1709,29 @@ def _joint_environment_anchor_schedule(
     return scheduled
 
 
+def _joint_environment_normal_offset_schedule(
+    original_offset_m: float,
+    configured_range_m: tuple[float, float],
+) -> tuple[float, ...]:
+    """Deterministically search the configured normal band around the mother."""
+
+    lower, upper = (float(value) for value in configured_range_m)
+    sign = -1.0 if original_offset_m < 0.0 else 1.0
+    magnitudes = tuple(
+        float(value) for value in np.linspace(lower, upper, 5, dtype=np.float64)
+    )
+    ranked = tuple(
+        sorted(
+            magnitudes,
+            key=lambda value: (abs(value - abs(original_offset_m)), value),
+        )
+    )
+    values = (float(original_offset_m),) + tuple(
+        sign * value for value in ranked
+    ) + tuple(-sign * value for value in ranked)
+    return tuple(dict.fromkeys(values))
+
+
 def _source_snippet_for_event(
     mother_event: GeneratedEvent,
     snippet_libraries: Mapping[str, SnippetLibrary],
@@ -1453,7 +1758,7 @@ def _retimed_target_candidate(
     oracle_context: OracleContext,
     environment: _PairEnvironment,
     offset_s: float,
-) -> TransplantedDynamicObject | None:
+) -> tuple[TransplantedDynamicObject | None, str | None]:
     provenance = mother_event.target.provenance
     required = {
         "conflict_point",
@@ -1467,34 +1772,42 @@ def _retimed_target_candidate(
     conflict_time = mother_event.conflict_time_s + offset_s
     horizon_s = environment.grid.future_steps * environment.future_dt_s
     if not 0.0 < conflict_time <= horizon_s:
-        return None
-    target = transplant_snippet(
-        source_snippet,
-        conflict_point=provenance["conflict_point"],
-        conflict_time_s=conflict_time,
-        crossing_direction=provenance["crossing_direction"],
-        time_scale=provenance["time_scale"],
-        future_dt_s=environment.future_dt_s,
-        future_steps=environment.grid.future_steps,
-        base_state_id=mother_event.world.base_state_id,
-        trajectory_id=trajectory.trajectory_id,
-        target_type_policy_digest=provenance[
-            "target_type_policy_digest"
-        ],
-        seed=provenance["seed"],
-        context_object_ids=tuple(oracle_context.dynamic_object_future),
-    )
-    return replace(
-        target,
-        target_dynamic_object_id=mother_event.target.target_dynamic_object_id,
-        provenance={
-            **target.provenance,
-            "paired_transform": {
-                "kind": "temporal_offset_v1",
-                "temporal_offset_s": float(offset_s),
-                "mother_conflict_time_s": mother_event.conflict_time_s,
+        return None, None
+    try:
+        target = transplant_snippet(
+            source_snippet,
+            conflict_point=provenance["conflict_point"],
+            conflict_time_s=conflict_time,
+            crossing_direction=provenance["crossing_direction"],
+            time_scale=provenance["time_scale"],
+            future_dt_s=environment.future_dt_s,
+            future_steps=environment.grid.future_steps,
+            base_state_id=mother_event.world.base_state_id,
+            trajectory_id=trajectory.trajectory_id,
+            target_type_policy_digest=provenance[
+                "target_type_policy_digest"
+            ],
+            seed=provenance["seed"],
+            context_object_ids=tuple(oracle_context.dynamic_object_future),
+        )
+    except TransplantError as exc:
+        return None, f"temporal_transplant:{exc.reason}"
+    return (
+        replace(
+            target,
+            target_dynamic_object_id=(
+                mother_event.target.target_dynamic_object_id
+            ),
+            provenance={
+                **target.provenance,
+                "paired_transform": {
+                    "kind": "temporal_offset_v1",
+                    "temporal_offset_s": float(offset_s),
+                    "mother_conflict_time_s": mother_event.conflict_time_s,
+                },
             },
-        },
+        ),
+        None,
     )
 
 
@@ -1515,6 +1828,171 @@ def _event_trajectory_normal(
     return np.asarray([-tangent[1], tangent[0]], dtype=np.float64)
 
 
+def _joint_occluder_full_motion_rejection_reason(
+    *,
+    placement,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    environment: _PairEnvironment,
+    collision_target: TransplantedDynamicObject,
+    temporal_target: TransplantedDynamicObject,
+) -> str | None:
+    """Reject a replacement occluder against every available 23-point sweep."""
+
+    collision_sweeps = _joint_occluder_collision_sweeps(
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle_context,
+        environment=environment,
+        collision_target=collision_target,
+        temporal_target=temporal_target,
+    )
+    return occluder_collision_sweep_rejection_reason(
+        placement.footprint,
+        placement.pose,
+        collision_sweeps,
+        grid=environment.grid,
+    )
+
+
+def _joint_occluder_collision_sweeps(
+    *,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    environment: _PairEnvironment,
+    collision_target: TransplantedDynamicObject,
+    temporal_target: TransplantedDynamicObject,
+) -> tuple[OccluderCollisionSweep, ...]:
+    """Build the deterministic complete-motion closure for one LOS search."""
+
+    sweeps = [
+        OccluderCollisionSweep(
+            footprint=environment.robot_footprint,
+            poses=np.vstack((base_state.robot_history, trajectory.poses)),
+            rejection_reason="occluder_robot_history_overlap",
+        )
+    ]
+    for object_id in sorted(environment.context_footprints):
+        sweeps.append(
+            OccluderCollisionSweep(
+                footprint=environment.context_footprints[object_id],
+                poses=np.vstack(
+                    (
+                        oracle_context.dynamic_object_history[object_id],
+                        oracle_context.dynamic_object_future[object_id],
+                    )
+                ),
+                rejection_reason="occluder_context_full_motion_collision",
+            )
+        )
+    base_only_ids = set(environment.scene_history_footprints) - set(
+        environment.context_footprints
+    )
+    for object_id in sorted(base_only_ids):
+        sweeps.append(
+            OccluderCollisionSweep(
+                footprint=environment.scene_history_footprints[object_id],
+                poses=environment.scene_dynamic_history[object_id],
+                rejection_reason="occluder_base_history_collision",
+            )
+        )
+    for target in (collision_target, temporal_target):
+        sweeps.append(
+            OccluderCollisionSweep(
+                footprint=environment.target_footprint,
+                poses=np.vstack((target.history_poses, target.future_poses)),
+                rejection_reason="occluder_target_full_motion_collision",
+            )
+        )
+    return tuple(sweeps)
+
+
+def _rebind_mother_world(
+    mother_event: GeneratedEvent,
+    world: OracleWorld,
+    *,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, Any],
+    critical_clearance_threshold_m: float,
+    grid,
+) -> GeneratedEvent:
+    """Rebuild the strict join and visibility after joint world replacement."""
+
+    source_record = mother_event.target_motion_record
+    target = mother_event.target
+    record = create_event_target_motion_record(
+        generated_event_id=mother_event.generated_event_id,
+        world_id=world.world_id,
+        base_state_id=world.base_state_id,
+        trajectory_id=source_record.trajectory_id,
+        target_dynamic_object_id=target.target_dynamic_object_id,
+        source_snippet_id=target.snippet_id,
+        source_object_id=target.source_object_id,
+        object_type=target.object_type,
+        footprint_spec=target.footprint_spec,
+        footprint_spec_digest=target.footprint_spec_digest,
+        target_type_policy_digest=source_record.target_type_policy_digest,
+        history_poses=target.history_poses,
+        current_pose=target.current_pose,
+        future_poses=target.future_poses,
+    )
+    metadata = dict(world.metadata)
+    metadata.update(build_event_target_motion_world_metadata(record))
+    provisional_world = replace(world, metadata=metadata)
+    validate_event_target_motion_world_join(record, provisional_world, grid)
+    provisional_event = replace(
+        mother_event,
+        world=provisional_world,
+        target_motion_record=record,
+    )
+    environment = _pair_environment(
+        mother_event=provisional_event,
+        trajectory=trajectory,
+        base_state=base_state,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        critical_clearance_threshold_m=critical_clearance_threshold_m,
+    )
+    try:
+        target_visibility_history, visibility_sequence = (
+            _validate_target_candidate(
+                target,
+                trajectory=trajectory,
+                base_state=base_state,
+                oracle_context=oracle_context,
+                base_config=base_config,
+                environment=environment,
+            )
+        )
+    except _CandidateRejected as exc:
+        raise PairGenerationError(
+            "joint_rebound_mother_invalid",
+            f"joint rebound mother invalid: {exc.reason}",
+        ) from exc
+    metadata.update(
+        {
+            "target_visibility_history": [
+                bool(value) for value in target_visibility_history
+            ],
+            "visibility_sequence": [
+                bool(value) for value in visibility_sequence
+            ],
+        }
+    )
+    rebound_world = replace(provisional_world, metadata=metadata)
+    validate_event_target_motion_world_join(record, rebound_world, grid)
+    return replace(
+        provisional_event,
+        world=rebound_world,
+        target_visibility_history=target_visibility_history.copy(),
+        visibility_sequence=visibility_sequence.copy(),
+    )
+
+
 def _joint_environment_summary(
     *,
     seed: int,
@@ -1531,7 +2009,7 @@ def _joint_environment_summary(
     temporal = None if group is None else group.by_kind.get("temporal_safe")
     return {
         "schema_version": SCHEMA_VERSION,
-        "generator_algorithm_version": _JOINT_ENVIRONMENT_PAIR_VERSION,
+        "generator_algorithm_version": JOINT_ENVIRONMENT_PAIR_VERSION,
         "seed": int(seed),
         "requested_count": 1,
         "attempted_count": attempted_count,
@@ -1599,31 +2077,26 @@ def generate_joint_environment_pair(
         if base_state.static_map_local is None
         else np.asarray(base_state.static_map_local != 0, dtype=bool)
     )
-    context_footprints = {
-        object_id: footprint_from_spec(
-            oracle_context.dynamic_object_specs[object_id]
-        )
-        for object_id in sorted(oracle_context.dynamic_object_specs)
-    }
-    context_trajectories = {
-        object_id: np.vstack(
-            (
-                oracle_context.dynamic_object_history[object_id][-1],
-                oracle_context.dynamic_object_future[object_id],
-            )
-        )
-        for object_id in sorted(context_footprints)
-    }
-
     rejection_reasons: dict[str, int] = {}
     mother_accepted_count = 0
     pair_candidate_count = 0
     occluder_candidate_count = 0
     attempted_count = 0
     search_round = 0
+    anchor_attempt_index = 0
+    anchor_attempt_limit = min(
+        _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE,
+        max_attempts,
+    )
     while attempted_count < max_attempts:
+        if anchor_attempt_index >= anchor_attempt_limit:
+            search_round += 1
+            anchor_attempt_index = 0
+            anchor_attempt_limit = min(
+                _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE,
+                max_attempts - attempted_count,
+            )
         round_index = search_round
-        search_round += 1
         anchor = anchor_schedule[round_index % len(anchor_schedule)]
         event_seed = (
             int(seed)
@@ -1640,10 +2113,6 @@ def generate_joint_environment_pair(
         # sides. Consume that complete high-feasibility prefix before moving to
         # the next conflict-time anchor; shorter batches repeatedly reseed a
         # truncated prefix and substantially reduce acceptance.
-        mother_candidate_budget = min(
-            _JOINT_ENVIRONMENT_MOTHER_BATCH_SIZE,
-            max_attempts - attempted_count,
-        )
         candidate_generator = {
             **normalized_generator,
             "event_type_weights": {
@@ -1652,8 +2121,9 @@ def generate_joint_environment_pair(
                 "mixed": 0.0,
             },
             "conflict_time_range_s": (anchor, anchor),
-            "max_resample_attempts": mother_candidate_budget,
+            "max_resample_attempts": anchor_attempt_limit,
         }
+        segment_start = anchor_attempt_index
         event_report = generate_events(
             base_state=base_state,
             oracle_context=oracle_context,
@@ -1663,8 +2133,22 @@ def generate_joint_environment_pair(
             generator_config=candidate_generator,
             seed=event_seed,
             event_count=1,
+            attempt_index_start=segment_start,
         )
-        attempted_count += int(event_report.summary["attempted_count"])
+        segment_attempted = int(event_report.summary["attempted_count"])
+        segment_stop = event_report.summary.get(
+            "attempt_index_stop_exclusive"
+        )
+        if (
+            event_report.summary.get("attempt_index_start") != segment_start
+            or segment_stop != segment_start + segment_attempted
+            or not segment_start < segment_stop <= anchor_attempt_limit
+        ):
+            raise PairGenerationError(
+                "joint_mother_attempt_summary_invalid"
+            )
+        anchor_attempt_index = int(segment_stop)
+        attempted_count += segment_attempted
         for reason, count in event_report.summary[
             "rejection_reasons"
         ].items():
@@ -1684,6 +2168,7 @@ def generate_joint_environment_pair(
             environment = _pair_environment(
                 mother_event=mother,
                 trajectory=trajectory,
+                base_state=base_state,
                 oracle_context=oracle_context,
                 base_config=base_config,
                 critical_clearance_threshold_m=(
@@ -1702,14 +2187,21 @@ def generate_joint_environment_pair(
             continue
         original_occluder = mother.world.occluders[0]
         for offset_s in normalized_paired.temporal_offset_candidates_s:
-            temporal_target = _retimed_target_candidate(
-                mother_event=mother,
-                source_snippet=source_snippet,
-                trajectory=trajectory,
-                oracle_context=oracle_context,
-                environment=environment,
-                offset_s=offset_s,
+            temporal_target, temporal_rejection_reason = (
+                _retimed_target_candidate(
+                    mother_event=mother,
+                    source_snippet=source_snippet,
+                    trajectory=trajectory,
+                    oracle_context=oracle_context,
+                    environment=environment,
+                    offset_s=offset_s,
+                )
             )
+            if temporal_rejection_reason is not None:
+                rejection_reasons[temporal_rejection_reason] = (
+                    rejection_reasons.get(temporal_rejection_reason, 0) + 1
+                )
+                continue
             if temporal_target is None:
                 continue
             temporal_clearances = _target_clearances(
@@ -1726,68 +2218,126 @@ def generate_joint_environment_pair(
             ):
                 continue
             pair_candidate_count += 1
-            try:
-                placement, visibility_sequences = (
-                    align_environment_occluder_to_target_los_envelope(
-                        occluder_type=str(original_occluder["type"]),
-                        normal_offset_m=float(
-                            original_occluder["normal_offset_m"]
-                        ),
-                        proposal_index=int(
-                            original_occluder["proposal_index"]
-                        ),
-                        static_occupancy=base_static,
-                        grid=grid,
-                        sensor_pose=np.zeros(3, dtype=np.float64),
-                        conflict_point=mother.target.provenance[
-                            "conflict_point"
-                        ],
-                        trajectory_normal=normal,
-                        robot_poses=trajectory.poses,
-                        robot_footprint=environment.robot_footprint,
-                        target_pose_sequences=(
-                            np.vstack(
-                                (
-                                    mother.target.current_pose,
-                                    mother.target.future_poses,
-                                )
+            placement = None
+            visibility_sequences = None
+            offset_rejection_reasons: dict[str, int] = {}
+            offset_candidate_attempts = 0
+            normal_offset_schedule = _joint_environment_normal_offset_schedule(
+                float(original_occluder["normal_offset_m"]),
+                normalized_generator["occluders"][
+                    "normal_offset_range_m"
+                ],
+            )
+            collision_sweeps = _joint_occluder_collision_sweeps(
+                base_state=base_state,
+                trajectory=trajectory,
+                oracle_context=oracle_context,
+                environment=environment,
+                collision_target=mother.target,
+                temporal_target=temporal_target,
+            )
+            current_context_poses = {
+                object_id: environment.scene_dynamic_history[object_id][-1]
+                for object_id in sorted(environment.scene_history_footprints)
+            }
+            for normal_offset_m in normal_offset_schedule:
+                try:
+                    candidate_placement, candidate_visibility = (
+                        align_environment_occluder_to_target_los_envelope(
+                            occluder_type=str(original_occluder["type"]),
+                            normal_offset_m=normal_offset_m,
+                            proposal_index=int(
+                                original_occluder["proposal_index"]
                             ),
-                            np.vstack(
-                                (
-                                    temporal_target.current_pose,
-                                    temporal_target.future_poses,
-                                )
+                            static_occupancy=base_static,
+                            grid=grid,
+                            sensor_pose=np.zeros(3, dtype=np.float64),
+                            conflict_point=mother.target.provenance[
+                                "conflict_point"
+                            ],
+                            trajectory_normal=normal,
+                            target_visibility_pose_sequences=(
+                                np.vstack(
+                                    (
+                                        mother.target.current_pose,
+                                        mother.target.future_poses,
+                                    )
+                                ),
+                                np.vstack(
+                                    (
+                                        temporal_target.current_pose,
+                                        temporal_target.future_poses,
+                                    )
+                                ),
                             ),
-                        ),
-                        target_footprint=environment.target_footprint,
-                        context_trajectories=context_trajectories,
-                        context_footprints=context_footprints,
-                        config=normalized_generator["occluders"],
-                        min_contiguous_visible_frames=int(
-                            normalized_generator[
-                                "min_contiguous_visible_frames"
-                            ]
-                        ),
+                            target_footprint=environment.target_footprint,
+                            current_context_poses=current_context_poses,
+                            current_context_footprints=(
+                                environment.scene_history_footprints
+                            ),
+                            collision_sweeps=collision_sweeps,
+                            config=normalized_generator["occluders"],
+                            min_contiguous_visible_frames=int(
+                                normalized_generator[
+                                    "min_contiguous_visible_frames"
+                                ]
+                            ),
+                        )
                     )
+                except OccluderSamplingError as exc:
+                    offset_candidate_attempts += exc.attempts
+                    detailed = exc.rejection_reasons or {exc.reason: 1}
+                    for reason, count in detailed.items():
+                        offset_rejection_reasons[reason] = (
+                            offset_rejection_reasons.get(reason, 0)
+                            + int(count)
+                        )
+                    continue
+                offset_candidate_attempts += candidate_placement.attempt
+                for reason, count in (
+                    candidate_placement.rejection_reasons.items()
+                ):
+                    offset_rejection_reasons[reason] = (
+                        offset_rejection_reasons.get(reason, 0) + int(count)
+                    )
+                full_motion_reason = occluder_collision_sweep_rejection_reason(
+                    candidate_placement.footprint,
+                    candidate_placement.pose,
+                    collision_sweeps,
+                    grid=environment.grid,
                 )
-            except OccluderSamplingError as exc:
-                occluder_candidate_count += exc.attempts
-                detailed_reasons = exc.rejection_reasons or {exc.reason: 1}
-                for reason, count in detailed_reasons.items():
-                    key = f"occluder:{reason}"
-                    rejection_reasons[key] = rejection_reasons.get(
-                        key, 0
-                    ) + int(count)
-                continue
-            occluder_candidate_count += placement.attempt
-            for reason, count in placement.rejection_reasons.items():
+                if full_motion_reason is not None:
+                    raise PairGenerationError(
+                        "joint_occluder_full_motion_certification_mismatch",
+                        "inner LOS search returned an uncertified candidate: "
+                        f"{full_motion_reason}",
+                    )
+                placement = replace(
+                    candidate_placement,
+                    attempt=offset_candidate_attempts,
+                    rejection_reasons=dict(
+                        sorted(offset_rejection_reasons.items())
+                    ),
+                )
+                visibility_sequences = candidate_visibility
+                break
+            occluder_candidate_count += offset_candidate_attempts
+            for reason, count in offset_rejection_reasons.items():
                 key = f"occluder:{reason}"
                 rejection_reasons[key] = rejection_reasons.get(key, 0) + int(
                     count
                 )
+            if placement is None or visibility_sequences is None:
+                continue
+            if placement.occluder.get("placement_strategy") != (
+                JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION
+            ):
+                raise PairGenerationError(
+                    "joint_occluder_placement_strategy_mismatch"
+                )
             world_id = "world-" + stable_digest(
                 mother.world.world_id,
-                _JOINT_ENVIRONMENT_PAIR_VERSION,
+                JOINT_ENVIRONMENT_PAIR_VERSION,
                 placement.occluder["occluder_id"],
                 event_seed,
                 size=12,
@@ -1795,11 +2345,22 @@ def generate_joint_environment_pair(
             metadata = {
                 **mother.world.metadata,
                 "joint_pair_generator_algorithm_version": (
-                    _JOINT_ENVIRONMENT_PAIR_VERSION
+                    JOINT_ENVIRONMENT_PAIR_VERSION
                 ),
                 "joint_pair_attempt_index": attempted_count - 1,
+                "joint_pair_anchor_round_index": round_index,
+                "joint_pair_anchor_attempt_index": int(
+                    mother.world.metadata["attempt_index"]
+                ),
+                "joint_pair_anchor_candidate_limit": anchor_attempt_limit,
                 "joint_pair_anchor_schedule_s": list(anchor_schedule),
                 "joint_pair_temporal_offset_s": float(offset_s),
+                "joint_pair_normal_offset_schedule_m": list(
+                    normal_offset_schedule
+                ),
+                "joint_pair_selected_normal_offset_m": float(
+                    placement.occluder["normal_offset_m"]
+                ),
                 "joint_pair_occluder_candidate_attempts": placement.attempt,
                 "joint_pair_occluder_rejection_reasons": dict(
                     placement.rejection_reasons
@@ -1823,15 +2384,23 @@ def generate_joint_environment_pair(
                 random_seed=event_seed,
                 metadata=metadata,
             )
-            updated_mother = replace(
+            updated_mother = _rebind_mother_world(
                 mother,
-                world=updated_world,
-                visibility_sequence=visibility_sequences[0].copy(),
+                updated_world,
+                base_state=base_state,
+                trajectory=trajectory,
+                oracle_context=oracle_context,
+                base_config=base_config,
+                critical_clearance_threshold_m=(
+                    normalized_paired.near_miss_clearance_range_m[1]
+                ),
+                grid=grid,
             )
             try:
                 group = generate_paired_variants(
                     mother_event=updated_mother,
                     source_snippet=source_snippet,
+                    base_state=base_state,
                     trajectory=trajectory,
                     oracle_context=oracle_context,
                     base_config=base_config,

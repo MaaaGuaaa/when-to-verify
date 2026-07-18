@@ -15,6 +15,16 @@ from src.geometry import CircleFootprint, Footprint, RectangleFootprint, wrap_an
 from src.utils.seeding import stable_digest
 
 
+MOTION_SNIPPET_LAYOUT_VERSION = "history8_current7_future15_v1"
+MOTION_SNIPPET_SAMPLE_COUNT = 23
+MOTION_SNIPPET_HISTORY_STEPS = 8
+MOTION_SNIPPET_CURRENT_INDEX = 7
+MOTION_SNIPPET_FUTURE_STEPS = 15
+MOTION_SNIPPET_SAMPLE_DT_S = 0.2
+MOTION_SNIPPET_DURATION_S = 4.4
+MOTION_SNIPPET_CURRENT_TIME_S = 1.4
+
+
 class TargetPolicyError(ValueError):
     """Raised when a target-type policy is incomplete or nonphysical."""
 
@@ -44,7 +54,7 @@ class TargetTypePolicy:
 
 @dataclass(frozen=True)
 class TransplantedDynamicObject:
-    """One target object's current pose, future trajectory, and provenance."""
+    """One target object's measured history, current pose, and future."""
 
     target_dynamic_object_id: str
     source_object_id: str
@@ -52,6 +62,7 @@ class TransplantedDynamicObject:
     object_type: str
     footprint_spec: dict[str, object]
     footprint_spec_digest: str
+    history_poses: np.ndarray
     current_pose: np.ndarray
     future_poses: np.ndarray
     provenance: dict[str, object]
@@ -165,11 +176,9 @@ def _validate_snippet(snippet: MotionSnippet) -> None:
     velocities = np.asarray(snippet.velocities)
     headings = np.asarray(snippet.headings)
     if (
-        positions.ndim != 2
-        or positions.shape[1:] != (2,)
-        or positions.shape[0] < 2
-        or velocities.shape != positions.shape
-        or headings.shape != (positions.shape[0],)
+        positions.shape != (MOTION_SNIPPET_SAMPLE_COUNT, 2)
+        or velocities.shape != (MOTION_SNIPPET_SAMPLE_COUNT, 2)
+        or headings.shape != (MOTION_SNIPPET_SAMPLE_COUNT,)
     ):
         raise TransplantError("snippet_shape_invalid")
     if (
@@ -184,7 +193,12 @@ def _validate_snippet(snippet: MotionSnippet) -> None:
         and np.isfinite(headings).all()
     ):
         raise TransplantError("snippet_nonfinite")
-    if not np.isfinite(snippet.duration_s) or snippet.duration_s <= 0.0:
+    if not np.isfinite(snippet.duration_s) or not np.isclose(
+        float(snippet.duration_s),
+        MOTION_SNIPPET_DURATION_S,
+        rtol=0.0,
+        atol=1e-6,
+    ):
         raise TransplantError("snippet_duration_invalid")
 
 
@@ -279,9 +293,9 @@ def transplant_snippet(
 ) -> TransplantedDynamicObject:
     """Anchor one frozen typed snippet at a trajectory conflict event.
 
-    The snippet's temporal samples remain on the canonical output grid. Time
-    scaling changes displacement about the conflict anchor, preserving the
-    complete real motion shape and per-frame heading without extrapolation.
+    The original 23 samples receive one shared rigid SE(2) transform. The
+    measured history and future are split around source current index 7; no
+    temporal scaling, resampling, duplication, or extrapolation is allowed.
     """
 
     _validate_snippet(snippet)
@@ -294,22 +308,28 @@ def transplant_snippet(
     conflict_time = _finite_real(conflict_time_s, name="conflict_time_s")
     scale = _finite_real(time_scale, name="time_scale")
     dt_s = _finite_real(future_dt_s, name="future_dt_s")
-    if not 0.8 <= scale <= 1.2:
-        raise ValueError("time_scale must be in [0.8, 1.2]")
-    if dt_s <= 0.0:
-        raise ValueError("future_dt_s must be positive")
+    if scale != 1.0:
+        raise ValueError("time_scale must equal 1.0")
+    if not np.isclose(
+        dt_s,
+        MOTION_SNIPPET_SAMPLE_DT_S,
+        rtol=0.0,
+        atol=1e-8,
+    ):
+        raise ValueError("future_dt_s must equal 0.2")
     if isinstance(future_steps, (bool, np.bool_)) or not isinstance(
         future_steps, (int, np.integer)
     ):
         raise TypeError("future_steps must be an integer")
     future_steps = int(future_steps)
-    if future_steps <= 0:
-        raise ValueError("future_steps must be positive")
+    if future_steps != MOTION_SNIPPET_FUTURE_STEPS:
+        raise ValueError("future_steps must equal 15")
     horizon_s = future_steps * dt_s
     if not 0.0 < conflict_time <= horizon_s:
         raise ValueError("conflict_time_s must lie in the future horizon")
-    if snippet.duration_s + 1e-9 < horizon_s:
-        raise TransplantError("snippet_too_short")
+    source_anchor_time_s = MOTION_SNIPPET_CURRENT_TIME_S + conflict_time
+    if source_anchor_time_s > MOTION_SNIPPET_DURATION_S + 1e-9:
+        raise TransplantError("snippet_anchor_out_of_bounds")
     if not isinstance(base_state_id, str) or not base_state_id:
         raise ValueError("base_state_id must be a non-empty string")
     if not isinstance(trajectory_id, str) or not trajectory_id:
@@ -322,41 +342,39 @@ def transplant_snippet(
     if any(not isinstance(object_id, str) or not object_id for object_id in context_ids):
         raise ValueError("context_object_ids must contain non-empty strings")
 
-    output_times = np.arange(future_steps + 1, dtype=np.float64) * dt_s
-    source_times = np.linspace(
-        0.0, float(snippet.duration_s), snippet.positions.shape[0], dtype=np.float64
+    source_times = (
+        np.arange(MOTION_SNIPPET_SAMPLE_COUNT, dtype=np.float64)
+        * MOTION_SNIPPET_SAMPLE_DT_S
     )
-    positions = np.column_stack(
-        (
-            np.interp(output_times, source_times, snippet.positions[:, 0]),
-            np.interp(output_times, source_times, snippet.positions[:, 1]),
-        )
-    )
-    unwrapped_headings = np.unwrap(snippet.headings.astype(np.float64))
-    headings = np.interp(output_times, source_times, unwrapped_headings)
+    positions = snippet.positions.astype(np.float64)
+    headings = snippet.headings.astype(np.float64)
     anchor = np.asarray(
         [
-            np.interp(conflict_time, source_times, snippet.positions[:, 0]),
-            np.interp(conflict_time, source_times, snippet.positions[:, 1]),
+            np.interp(source_anchor_time_s, source_times, positions[:, 0]),
+            np.interp(source_anchor_time_s, source_times, positions[:, 1]),
         ],
         dtype=np.float64,
     )
     source_velocity = np.asarray(
         [
-            np.interp(conflict_time, source_times, snippet.velocities[:, 0]),
-            np.interp(conflict_time, source_times, snippet.velocities[:, 1]),
+            np.interp(
+                source_anchor_time_s, source_times, snippet.velocities[:, 0]
+            ),
+            np.interp(
+                source_anchor_time_s, source_times, snippet.velocities[:, 1]
+            ),
         ],
         dtype=np.float64,
     )
     if float(np.linalg.norm(source_velocity)) <= 1e-9:
-        before = max(0.0, conflict_time - dt_s)
-        after = min(float(snippet.duration_s), conflict_time + dt_s)
+        before = max(0.0, source_anchor_time_s - dt_s)
+        after = min(MOTION_SNIPPET_DURATION_S, source_anchor_time_s + dt_s)
         source_velocity = np.asarray(
             [
-                np.interp(after, source_times, snippet.positions[:, 0])
-                - np.interp(before, source_times, snippet.positions[:, 0]),
-                np.interp(after, source_times, snippet.positions[:, 1])
-                - np.interp(before, source_times, snippet.positions[:, 1]),
+                np.interp(after, source_times, positions[:, 0])
+                - np.interp(before, source_times, positions[:, 0]),
+                np.interp(after, source_times, positions[:, 1])
+                - np.interp(before, source_times, positions[:, 1]),
             ]
         )
     if float(np.linalg.norm(source_velocity)) <= 1e-9:
@@ -367,7 +385,7 @@ def transplant_snippet(
     cosine = np.cos(rotation_angle)
     sine = np.sin(rotation_angle)
     rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
-    transformed_positions = ((positions - anchor) / scale) @ rotation.T + point
+    transformed_positions = (positions - anchor) @ rotation.T + point
     transformed_headings = wrap_angle(headings + rotation_angle)
     poses = np.column_stack((transformed_positions, transformed_headings)).astype(
         np.float32
@@ -416,8 +434,27 @@ def transplant_snippet(
         "crossing_direction": [float(value) for value in direction],
         "rotation_rad": rotation_angle,
         "time_scale": scale,
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
+        "source_current_index": MOTION_SNIPPET_CURRENT_INDEX,
+        "source_current_time_s": MOTION_SNIPPET_CURRENT_TIME_S,
+        "source_conflict_anchor_time_s": source_anchor_time_s,
         "seed": int(seed),
     }
+    history_poses = np.array(
+        poses[:MOTION_SNIPPET_HISTORY_STEPS],
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    current_pose = np.array(
+        history_poses[-1], dtype=np.float32, order="C", copy=True
+    )
+    future_poses = np.array(
+        poses[MOTION_SNIPPET_HISTORY_STEPS:],
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
     return TransplantedDynamicObject(
         target_dynamic_object_id=target_id,
         source_object_id=snippet.source_object_id,
@@ -425,7 +462,8 @@ def transplant_snippet(
         object_type=snippet.object_type,
         footprint_spec=footprint_spec,
         footprint_spec_digest=footprint_digest,
-        current_pose=poses[0],
-        future_poses=poses[1:],
+        history_poses=history_poses,
+        current_pose=current_pose,
+        future_poses=future_poses,
         provenance=provenance,
     )

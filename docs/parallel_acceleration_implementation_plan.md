@@ -515,9 +515,19 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 - 只接受 `history8_current7_future15_v1`；固定使用
   `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，未来冲突锚点的
   source time 为 `1.4 + conflict_time_s`；
-- SOP05 正式生产算法固定为 `blind_reachability_first_v1`，当前只发布
+- SOP05 正式生产算法固定为 `blind_reachability_first_v2`，当前只发布
   environment collision 母事件；历史 `joint_occluder_first_v4` 产物必须拒绝；
-- 对每条候选轨迹预计算并缓存机器人 history+future 连续扫掠体；按交互距离、
+- candidate 变换固定为 `reachability_candidate_se2_v2`；`ReachabilityIdentity` /
+  candidate 显式绑定 `source_session_id`，并通过 `source_snippet_id` 在可信库中
+  间接定位 recording。transform payload 与 generated event/world identity 必须显式同时
+  绑定非空 `source_recording_id` 与 `source_session_id`；
+  `blind_reachability_first_v1` / `reachability_candidate_se2_v1` 或缺少 session
+  lineage 的产物必须 fail closed；
+- 运行前对 schedule 内唯一 `trajectory_id` 稳定排序，每条只预热一次机器人
+  canonical future 连续扫掠体；单进程直接复用，多进程通过 `fork` copy-on-write
+  复用父进程已预热的 `robot_sweep_cache_v1`。base-specific history 与 seam
+  仍按 pair 构建一次，不在同一 pair 的遮挡提议内重复构建；
+- 按交互距离、
   bearing bin、遮挡物类型/尺寸/yaw 生成稳定 causal free-space 候选，先拒绝
   静态重叠或与机器人/上下文对象扫掠冲突的遮挡物；
 - 用与正式 renderer 一致的栅格、ray casting 和遮挡几何生成 current blind-region
@@ -529,6 +539,13 @@ footprint spec、source recording/session/object、完整布局和新 split dige
   `time_scale=1.0`，不外推、不逐帧扭曲；主分布默认 human target；
 - exact 验证必须同时覆盖真实 circle/rectangle footprint、静态和帧间连续净空、
   当前不可见、未来连续出现以及选定 future endpoint 的 collision；
+- 几何版本栈固定为 `causal_occluder_schedule_v1` /
+  `causal_occluder_proposal_v2` / `blind_region_causal_delta_v2` /
+  `footprint_center_mask_causal_delta_v2` /
+  `occluder_collision_sweep_preparation_v2`。proposal identity 绑定正式
+  interaction region，blind region 必须是 baseline/current renderer 的 causal delta
+  与该 region 精确取交；连续碰撞 preparation v2 对 circle 忽略 yaw-only
+  旋转加密，rectangle 仍保留 yaw 加密；
 - summary 中保存 obstacle proposal、reachability transform/chord 与 exact validation 三层
   可对账计数和稳定 rejection reasons；
 - 从完整 `target_type_policy` 解析白名单和三类归一化权重，并把稳定 digest 写入事件
@@ -537,6 +554,9 @@ footprint spec、source recording/session/object、完整布局和新 split dige
   冲突，原 `source_object_id` 独立保留用于 provenance；
 - SOP06 固定 `independent_partial_pairs_v1`：collision 母事件可独立发布，五类
   negative 分别尝试与保留，一类失败不使其他变体失效；
+- 所有带目标的 SOP06 variant（包括重建的 temporal-safe）必须保持母事件
+  同一 `source_recording_id` + `source_session_id` lineage；禁止只比对 recording
+  或从其他 session 替换 snippet；
 - 每组输出固定六位 coverage mask 和逐位稳定 missing reason；训练不要求额外
   contrast，完整六位只是 conditional audit 资格；
 - 正式 v5 必须拒绝历史 `joint_environment_pair_v2`，禁止以联合多 LOS 搜索作为
@@ -611,7 +631,7 @@ empty_blind_spot: 0.10
 
 若复杂遮挡摆放接受率低：
 
-1. 在不变更 `blind_reachability_first_v1` 物理契约的前提下，限制为单矩形货架/柱子；
+1. 在不变更 `blind_reachability_first_v2` 物理契约的前提下，限制为单矩形货架/柱子；
 2. 优先直线/小弧线候选轨迹和侧向 human target，但仍保留稳定随机化与失败报告；
 3. 复杂静态地图作为单独 stress/OOD 层，不与基础自由空间产物混合计数；
 4. structural/mixed 只能通过未来显式版本升级加入，不得在当前 formal
@@ -639,13 +659,23 @@ empty_blind_spot: 0.10
   collision/severity 指标；
 - 通过 history-only renderer 构建 `RiskSample` 输入，再在隔离的 label 分支读取
   `OracleWorld` future；metadata 禁止携带 future/oracle 数组或 hidden-object-ID 集合；
-- 将 `RiskSample` 按 `sample_id` 稳定排序写入 `risk_shard_npz_jsonl_v1`
+- 将 `RiskSample` 按 `sample_id` 稳定排序写入 `risk_shard_npz_jsonl_v2`
   immutable NPZ+JSONL shard；每个目录
   精确包含 `samples.npz`、`metadata.jsonl`、`summary.json`，固定 expected count 和
-  单 split，完整 loader 重读与 digest/leakage 验证后才原子发布，且不覆盖已有目录。
+  单 split，完整 loader 重读与 digest/leakage 验证后才原子发布，且不覆盖已有目录；
+  v1 shard 一律 fail closed。
+- 正式 `scripts/04_generate_risk_dataset.py` 对一个 formal
+  `independent_partial_pairs_v1` group 中所有已成功 variants 做原子组装/发布；
+  缺位保留 coverage + stable reason，不要求每个训练 group 凑齐 six-pack。
+  只有 conditional complete audit 路径要求六位齐全；CLI 的 exact sample count
+  是 shard 总边界，不是每组六类 quota。
+- `split_audit_records` 对 base/source recording 跨 split 泄漏执行 fail-closed
+  校验，并完整报告允许的 THÖR session overlap；当前 CLI 只组装本 shard，
+  collection 调用方仍必须传入全部 split 记录完成 global cross-shard audit。
 
-当前已实现 schema 3 hidden-risk GT、`RiskSample` 组装和 deterministic immutable
-shard API。正式数据集 CLI、10–100 真实样本 smoke 以及目标规模运行仍待验证。
+当前已实现 schema 3 hidden-risk GT、`RiskSample` 组装、deterministic immutable
+shard API 与正式数据集 CLI，但只有 unit/toy-fixture 和确定性验证。
+10–100 真实样本 smoke、global cross-shard audit 以及目标规模运行仍待执行。
 
 ## 8.2 候选轨迹
 
@@ -1442,9 +1472,11 @@ G* 是否包含验证成本
 
 # 17. 推荐 CLI 与产物
 
-本节的命令是目标编排界面，不是当前 CLI 完成声明。截至本次契约对齐，
-schema 3 risk GT、`RiskSample` 和单个 immutable shard API 已实现；批量数据集生成 CLI、
-shard collection manifest 及目标规模运行仍待实现/验证。
+本节的命令是目标编排界面，不是真实数据规模完成声明。截至本次契约对齐，
+schema 3 risk GT、`RiskSample`、单个 immutable shard API 和正式
+`scripts/04_generate_risk_dataset.py` CLI 已实现并有 unit/toy-fixture 验证；
+10–100 真实样本 smoke、global cross-shard audit、shard collection manifest 及
+目标规模运行仍待实现或验证。
 
 ## 17.1 数据
 
@@ -1456,11 +1488,21 @@ python -m scripts.extract_snippets \
   --split train \
   --config configs/thor.yaml
 
-# planned formal dataset CLI
-python -m scripts.build_risk_dataset \
+# 正式单 shard CLI；下列 digest 必须来自可信目录外 handoff
+python scripts/04_generate_risk_dataset.py \
+  --sop03-root <schema3-sop03-root> \
+  --sop04-root <schema3-sop04-root> \
+  --sop04-handoff-digest <64-hex> \
+  --sop05-root <schema3-sop05-root> \
+  --sop05-publication-digest <64-hex> \
   --split train \
-  --num-base-states 5000 \
-  --config configs/event_generator.yaml
+  --config configs/base.yaml \
+  --paired-config configs/paired_variants.yaml \
+  --seed 42 \
+  --output-dir outputs/event_centered_blind_spot/schema-v3/risk-data/main-seed42-v1/train/shard-00000 \
+  --expected-event-count <positive-int> \
+  --expected-sample-count <positive-int> \
+  --checksum-workers 8
 ```
 
 预期产物：

@@ -357,6 +357,70 @@ def _length_prefixed_parts(binding: bytes) -> tuple[bytes, ...]:
     return tuple(parts)
 
 
+def _binding_utf8_identity(part: bytes, *, name: str) -> str:
+    try:
+        value = part.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"proposal binding {name} must be strict UTF-8"
+        ) from exc
+    if not value or value.encode("utf-8") != part:
+        raise ValueError(
+            f"proposal binding {name} must be non-empty canonical UTF-8"
+        )
+    return value
+
+
+def _binding_seed(part: bytes) -> int:
+    try:
+        encoded_seed = part.decode("ascii", errors="strict")
+        seed = int(encoded_seed, 10)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(
+            "proposal binding seed must be a canonical decimal integer"
+        ) from exc
+    if str(seed) != encoded_seed:
+        raise ValueError(
+            "proposal binding seed must be a canonical decimal integer"
+        )
+    return seed
+
+
+def _canonical_digest(value: Any, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _binding_config_bytes(part: bytes) -> bytes:
+    try:
+        decoded = json.loads(part.decode("ascii", errors="strict"))
+        normalized = normalize_causal_occluder_config(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "proposal binding config must contain the frozen canonical schema"
+        ) from exc
+    canonical = _canonical_config_bytes(normalized)
+    if canonical != part:
+        raise ValueError("proposal binding config must use canonical JSON bytes")
+    return canonical
+
+
+def _same_canonical_value(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, tuple):
+        return len(actual) == len(expected) and all(
+            _same_canonical_value(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected, strict=True)
+        )
+    return bool(actual == expected)
+
+
 @dataclass(frozen=True)
 class CausalOccluderContext:
     """Immutable current-causal occupancy and renderer baseline evidence."""
@@ -523,6 +587,12 @@ class CausalOccluderDecision:
 
     proposal_id: str
     proposal_index: int
+    seed: int
+    base_state_id: str
+    trajectory_id: str
+    parameters: CausalOccluderParameters
+    config_digest: str
+    context_digest: str
     proposal_pose: np.ndarray
     proposal_length_m: float
     proposal_width_m: float
@@ -600,6 +670,81 @@ class CausalOccluderDecision:
         binding_parts = _length_prefixed_parts(self._proposal_binding)
         if len(binding_parts) != 9:
             raise ValueError("proposal binding must contain nine canonical parts")
+        if binding_parts[0] != CAUSAL_OCCLUDER_SCHEDULE_VERSION.encode("ascii"):
+            raise ValueError("proposal binding schedule version does not match")
+        if binding_parts[1] != CAUSAL_OCCLUDER_PROPOSAL_VERSION.encode("ascii"):
+            raise ValueError("proposal binding proposal version does not match")
+        bound_seed = _binding_seed(binding_parts[2])
+        if isinstance(self.seed, (bool, np.bool_)) or not isinstance(
+            self.seed, (int, np.integer)
+        ):
+            raise TypeError("seed must be an integer")
+        seed = int(self.seed)
+        if seed != bound_seed:
+            raise ValueError("proposal identity seed does not match proposal binding")
+        bound_base_state_id = _binding_utf8_identity(
+            binding_parts[3],
+            name="base_state_id",
+        )
+        if (
+            not isinstance(self.base_state_id, str)
+            or not self.base_state_id
+            or self.base_state_id != bound_base_state_id
+        ):
+            raise ValueError(
+                "proposal identity base_state_id does not match proposal binding"
+            )
+        bound_trajectory_id = _binding_utf8_identity(
+            binding_parts[4],
+            name="trajectory_id",
+        )
+        if (
+            not isinstance(self.trajectory_id, str)
+            or not self.trajectory_id
+            or self.trajectory_id != bound_trajectory_id
+        ):
+            raise ValueError(
+                "proposal identity trajectory_id does not match proposal binding"
+            )
+        bound_parameters = _parameters_from_bytes(binding_parts[5])
+        if not isinstance(self.parameters, CausalOccluderParameters):
+            raise TypeError("parameters must be CausalOccluderParameters")
+        if _parameter_bytes(self.parameters) != binding_parts[5]:
+            raise ValueError(
+                "proposal identity parameters do not match proposal binding"
+            )
+        if proposal_index != bound_parameters.proposal_index:
+            raise ValueError("proposal_index must match parameters.proposal_index")
+        canonical_config_bytes = _binding_config_bytes(binding_parts[7])
+        config_digest = _canonical_digest(
+            self.config_digest,
+            name="config_digest",
+        )
+        if config_digest != _digest_parts(canonical_config_bytes):
+            raise ValueError(
+                "proposal identity config_digest does not match proposal binding"
+            )
+        try:
+            bound_context_digest = binding_parts[8].decode(
+                "ascii",
+                errors="strict",
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "proposal binding context digest must be canonical ASCII"
+            ) from exc
+        bound_context_digest = _canonical_digest(
+            bound_context_digest,
+            name="proposal binding context digest",
+        )
+        context_digest = _canonical_digest(
+            self.context_digest,
+            name="context_digest",
+        )
+        if context_digest != bound_context_digest:
+            raise ValueError(
+                "proposal identity context_digest does not match proposal binding"
+            )
         expected_geometry_bytes = np.asarray(
             [
                 proposal_pose[0],
@@ -686,6 +831,30 @@ class CausalOccluderDecision:
                 raise ValueError("proposal_id must match accepted candidate metadata")
             if accepted.occluder.get("occluder_id") != self.proposal_id:
                 raise ValueError("proposal_id must match accepted occluder_id")
+            expected_proposal_parameters = tuple(
+                (field_name, getattr(bound_parameters, field_name))
+                for field_name in bound_parameters.__dataclass_fields__
+            )
+            expected_metadata_identity = {
+                "schedule_version": CAUSAL_OCCLUDER_SCHEDULE_VERSION,
+                "proposal_version": CAUSAL_OCCLUDER_PROPOSAL_VERSION,
+                "seed": seed,
+                "base_state_id": bound_base_state_id,
+                "trajectory_id": bound_trajectory_id,
+                "proposal_index": bound_parameters.proposal_index,
+                "proposal_parameters": expected_proposal_parameters,
+                "config_digest": config_digest,
+                "context_digest": context_digest,
+                "type": bound_parameters.occluder_type,
+            }
+            for field_name, expected_value in expected_metadata_identity.items():
+                if not _same_canonical_value(
+                    accepted.occluder.get(field_name),
+                    expected_value,
+                ):
+                    raise ValueError(
+                        f"accepted metadata {field_name} must match proposal identity"
+                    )
             pose = np.asarray(accepted.pose)
             mask = np.asarray(accepted.mask)
             if (
@@ -760,6 +929,12 @@ class CausalOccluderDecision:
 
         storage, immutable_shadow = _immutable_array(canonical_shadow)
         object.__setattr__(self, "proposal_index", proposal_index)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "base_state_id", bound_base_state_id)
+        object.__setattr__(self, "trajectory_id", bound_trajectory_id)
+        object.__setattr__(self, "parameters", bound_parameters)
+        object.__setattr__(self, "config_digest", config_digest)
+        object.__setattr__(self, "context_digest", context_digest)
         object.__setattr__(self, "proposal_pose", immutable_proposal_pose)
         object.__setattr__(self, "proposal_length_m", proposal_length_m)
         object.__setattr__(self, "proposal_width_m", proposal_width_m)
@@ -973,6 +1148,42 @@ def _parameter_bytes(parameters: CausalOccluderParameters) -> bytes:
     )
 
 
+def _parameters_from_bytes(part: bytes) -> CausalOccluderParameters:
+    if len(part) < 72:
+        raise ValueError("proposal binding parameters have invalid length")
+    type_size = int.from_bytes(
+        part[56:64],
+        byteorder="big",
+        signed=False,
+    )
+    type_end = 64 + type_size
+    if type_end + 8 != len(part):
+        raise ValueError("proposal binding parameters have invalid length")
+    try:
+        occluder_type = part[64:type_end].decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "proposal binding parameters type must be canonical UTF-8 ASCII"
+        ) from exc
+    try:
+        parameters = CausalOccluderParameters(
+            proposal_index=struct.unpack_from(">q", part, 0)[0],
+            anchor_index=struct.unpack_from(">q", part, 8)[0],
+            anchor_quantile=struct.unpack_from(">d", part, 16)[0],
+            bearing_bin=struct.unpack_from(">q", part, 24)[0],
+            range_quantile=struct.unpack_from(">d", part, 32)[0],
+            yaw_index=struct.unpack_from(">q", part, 40)[0],
+            yaw_offset_rad=struct.unpack_from(">d", part, 48)[0],
+            occluder_type=occluder_type,
+            dimension_quantile=struct.unpack_from(">d", part, type_end)[0],
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposal binding parameters are invalid") from exc
+    if _parameter_bytes(parameters) != part:
+        raise ValueError("proposal binding parameters are not canonical")
+    return parameters
+
+
 def _proposal_id(
     *,
     parameters: CausalOccluderParameters,
@@ -1028,6 +1239,12 @@ def _decision(
     proposal_id: str,
     proposal_binding: bytes,
     proposal_index: int,
+    seed: int,
+    base_state_id: str,
+    trajectory_id: str,
+    parameters: CausalOccluderParameters,
+    config_digest: str,
+    context_digest: str,
     proposal_pose: np.ndarray,
     proposal_length_m: float,
     proposal_width_m: float,
@@ -1046,6 +1263,12 @@ def _decision(
     return CausalOccluderDecision(
         proposal_id=proposal_id,
         proposal_index=proposal_index,
+        seed=seed,
+        base_state_id=base_state_id,
+        trajectory_id=trajectory_id,
+        parameters=parameters,
+        config_digest=config_digest,
+        context_digest=context_digest,
         proposal_pose=proposal_pose,
         proposal_length_m=proposal_length_m,
         proposal_width_m=proposal_width_m,
@@ -1155,6 +1378,14 @@ def propose_causal_occluder(
         "proposal_width_m": width_m,
         "proposal_mask": mask,
     }
+    proposal_identity = {
+        "seed": seed,
+        "base_state_id": base_state_id,
+        "trajectory_id": trajectory_id,
+        "parameters": parameters,
+        "config_digest": context.config_digest,
+        "context_digest": context.context_digest,
+    }
 
     if not _inside_grid(footprint, pose, context.grid):
         return _decision(
@@ -1162,6 +1393,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_identity,
             **proposal_geometry,
             rejection_stage="bounds",
             rejection_reason="occluder_out_of_bounds",
@@ -1172,6 +1404,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_identity,
             **proposal_geometry,
             rejection_stage="static",
             rejection_reason="occluder_static_overlap",
@@ -1188,6 +1421,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_identity,
             **proposal_geometry,
             rejection_stage="continuous_clearance",
             rejection_reason=clearance_reason,
@@ -1214,6 +1448,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_identity,
             **proposal_geometry,
             useful_shadow_mask=useful_shadow,
             rejection_stage="shadow",
@@ -1263,6 +1498,7 @@ def propose_causal_occluder(
         proposal_binding=proposal_binding,
         proposal_index=parameters.proposal_index,
         grid=context.grid,
+        **proposal_identity,
         **proposal_geometry,
         accepted=candidate,
         useful_shadow_mask=useful_shadow,

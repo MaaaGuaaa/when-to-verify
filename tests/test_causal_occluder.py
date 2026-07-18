@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 import json
@@ -810,6 +811,166 @@ def test_accepted_decision_and_candidate_arrays_are_frozen_bytes_backed() -> Non
         replace(decision, useful_shadow_count=decision.useful_shadow_count + 1)
     with pytest.raises(ValueError, match="proposal_id"):
         replace(decision, proposal_id="forged-proposal")
+
+
+def test_rejected_decision_rejects_a_spliced_proposal_index() -> None:
+    grid = _proposal_grid()
+    config = _proposal_config(
+        minimum_shadow_center_cells=grid.height * grid.width
+    )
+    decision = _propose(
+        _proposal_context(config=config),
+        config=config,
+    )
+
+    assert decision.accepted is None
+    with pytest.raises(ValueError, match="proposal_index.*parameters"):
+        replace(decision, proposal_index=7)
+
+
+def test_rejected_decision_retains_the_complete_structured_identity() -> None:
+    grid = _proposal_grid()
+    config = _proposal_config(
+        minimum_shadow_center_cells=grid.height * grid.width
+    )
+    context = _proposal_context(config=config)
+    parameters = _parameters()
+    decision = _propose(
+        context,
+        config=config,
+        parameters=parameters,
+    )
+
+    assert decision.accepted is None
+    assert decision.seed == 17
+    assert decision.base_state_id == "base-1"
+    assert decision.trajectory_id == "trajectory-1"
+    assert decision.parameters == parameters
+    assert decision.config_digest == context.config_digest
+    assert decision.context_digest == context.context_digest
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "schedule_version",
+        "proposal_version",
+        "seed",
+        "base_state_id",
+        "trajectory_id",
+        "proposal_index",
+        "proposal_parameters",
+        "config_digest",
+        "context_digest",
+        "type",
+    ),
+)
+def test_decision_rejects_accepted_structured_identity_metadata_splices(
+    field_name: str,
+) -> None:
+    decision = _propose(_proposal_context())
+    assert decision.accepted is not None
+    candidate = decision.accepted
+    changed_parameters = tuple(
+        (name, 7 if name == "proposal_index" else value)
+        for name, value in candidate.occluder["proposal_parameters"]
+    )
+    changed_values = {
+        "schedule_version": "causal_occluder_schedule_v2",
+        "proposal_version": "causal_occluder_proposal_v2",
+        "seed": 18,
+        "base_state_id": "base-spliced",
+        "trajectory_id": "trajectory-spliced",
+        "proposal_index": 7,
+        "proposal_parameters": changed_parameters,
+        "config_digest": "0" * 64,
+        "context_digest": "0" * 64,
+        "type": "wall",
+    }
+    changed_metadata = dict(candidate.occluder)
+    changed_metadata[field_name] = changed_values[field_name]
+    spliced = replace(candidate, occluder=changed_metadata)
+
+    with pytest.raises(ValueError, match="accepted metadata"):
+        replace(decision, accepted=spliced)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    (
+        ("seed", 18),
+        ("base_state_id", "base-spliced"),
+        ("trajectory_id", "trajectory-spliced"),
+        ("parameters", _parameters(bearing_bin=1)),
+        ("config_digest", "0" * 64),
+        ("context_digest", "0" * 64),
+    ),
+)
+def test_decision_rejects_structured_identity_field_splices(
+    field_name: str,
+    changed_value: object,
+) -> None:
+    decision = _propose(_proposal_context())
+
+    with pytest.raises(ValueError, match="proposal identity"):
+        replace(decision, **{field_name: changed_value})
+
+
+@pytest.mark.parametrize(
+    ("splice", "error_match"),
+    (
+        ("schedule_version", "schedule version"),
+        ("proposal_version", "proposal version"),
+        ("noncanonical_seed", "seed"),
+        ("invalid_base_utf8", "UTF-8"),
+        ("parameters", "parameters"),
+        ("config", "config"),
+        ("context_digest", "context digest"),
+    ),
+)
+def test_rejected_decision_canonically_parses_every_proposal_binding_part(
+    splice: str,
+    error_match: str,
+) -> None:
+    grid = _proposal_grid()
+    config = _proposal_config(
+        minimum_shadow_center_cells=grid.height * grid.width
+    )
+    decision = _propose(
+        _proposal_context(config=config),
+        config=config,
+    )
+    assert decision.accepted is None
+    parts = list(causal_occluder._length_prefixed_parts(decision._proposal_binding))
+    if splice == "schedule_version":
+        parts[0] = b"causal_occluder_schedule_v2"
+    elif splice == "proposal_version":
+        parts[1] = b"causal_occluder_proposal_v2"
+    elif splice == "noncanonical_seed":
+        parts[2] = b"017"
+    elif splice == "invalid_base_utf8":
+        parts[3] = b"\xff"
+    elif splice == "parameters":
+        parts[5] = parts[5][:-1]
+    elif splice == "config":
+        parts[7] = b" " + parts[7]
+    else:
+        parts[8] = b"0" * 63
+    changed_binding = b"".join(
+        len(part).to_bytes(8, byteorder="big", signed=False) + part
+        for part in parts
+    )
+    changed_id = (
+        "causal-occluder-"
+        + hashlib.sha256(changed_binding).hexdigest()[:32]
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        replace(
+            decision,
+            proposal_id=changed_id,
+            _proposal_binding=changed_binding,
+        )
 
 
 @pytest.mark.parametrize("splice", ("pose", "footprint", "mask", "metadata"))

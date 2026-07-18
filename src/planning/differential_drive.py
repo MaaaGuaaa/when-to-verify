@@ -6,11 +6,17 @@ import numpy as np
 
 from src.contracts import ARRAY_DTYPE
 
+POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
+
 
 def rollout_constant_control(
     *, v: float, omega: float, dt_s: float, steps: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Roll out one constant ``(v, omega)`` command from the local origin."""
+    """Roll out future endpoints for constant control intervals.
+
+    ``controls[i]`` acts on ``[i * dt_s, (i + 1) * dt_s]`` and ``poses[i]``
+    is the resulting pose at ``(i + 1) * dt_s``.
+    """
     if not np.isfinite([v, omega]).all():
         raise ValueError("v and omega must be finite")
     if (
@@ -21,7 +27,7 @@ def rollout_constant_control(
         or steps <= 0
     ):
         raise ValueError("time grid requires finite dt_s > 0 and integer steps > 0")
-    times = np.arange(steps, dtype=np.float64) * dt_s
+    times = (np.arange(steps, dtype=np.float64) + 1.0) * dt_s
     poses = np.zeros((steps, 3), dtype=np.float64)
     if omega == 0.0:
         poses[:, 0] = v * times

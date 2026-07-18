@@ -22,7 +22,7 @@ def test_straight_rollout_matches_analytic_solution() -> None:
         steps=15,
     )
 
-    expected_x = 0.6 * np.arange(15, dtype=np.float64) * 0.2
+    expected_x = 0.6 * (np.arange(15, dtype=np.float64) + 1.0) * 0.2
     np.testing.assert_allclose(poses[:, 0], expected_x, atol=1e-6)
     np.testing.assert_allclose(poses[:, 1:], 0.0, atol=1e-6)
     np.testing.assert_allclose(
@@ -38,7 +38,7 @@ def test_constant_turn_rollout_matches_analytic_arc(omega: float) -> None:
     dt_s = 0.2
     poses, _ = rollout_constant_control(v=v, omega=omega, dt_s=dt_s, steps=15)
 
-    times = np.arange(15, dtype=np.float64) * dt_s
+    times = (np.arange(15, dtype=np.float64) + 1.0) * dt_s
     expected = np.column_stack(
         (
             (v / omega) * np.sin(omega * times),
@@ -63,6 +63,22 @@ def test_rollout_matches_frozen_shape_and_dtype_contract() -> None:
     assert controls.dtype == ARRAY_DTYPE
     assert np.isfinite(poses).all()
     assert np.isfinite(controls).all()
+
+
+def test_rollout_poses_are_future_endpoints_from_dt_through_horizon() -> None:
+    poses, controls = rollout_constant_control(
+        v=1.0,
+        omega=0.0,
+        dt_s=0.2,
+        steps=15,
+    )
+
+    assert poses[0, 0] == pytest.approx(0.2)
+    assert poses[-1, 0] == pytest.approx(3.0)
+    np.testing.assert_array_equal(
+        controls,
+        np.tile(np.array([1.0, 0.0], dtype=ARRAY_DTYPE), (15, 1)),
+    )
 
 
 @pytest.mark.parametrize(

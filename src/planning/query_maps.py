@@ -8,6 +8,7 @@ import numpy as np
 
 from src.contracts import ARRAY_DTYPE, GridSpec, LocalTrajectory, build_grid_spec
 from src.geometry import (
+    CircleFootprint,
     Footprint,
     RectangleFootprint,
     inflate_footprint,
@@ -15,6 +16,7 @@ from src.geometry import (
     world_to_grid,
 )
 
+from .differential_drive import POSE_TIME_LAYOUT_VERSION
 from .trajectory_sampler import CandidateRollout
 
 
@@ -34,19 +36,84 @@ class TrajectoryQueryMaps:
     centerline_map: np.ndarray
 
 
-def _densify_centerline(poses: np.ndarray, resolution_m: float) -> np.ndarray:
-    """Sample pose-centre segments at no more than half-cell spacing."""
-    if poses.shape[0] == 0:
-        return np.empty((0, 2), dtype=np.float64)
-    points = []
+def _footprint_sweep_radius(footprint: Footprint) -> float:
+    """Return a conservative radius for rotational sweep sampling."""
+    if isinstance(footprint, RectangleFootprint):
+        return 0.5 * float(
+            np.hypot(footprint.length_m, footprint.width_m)
+        )
+    if isinstance(footprint, CircleFootprint):
+        return float(footprint.radius_m)
+    raise TypeError("footprint must be a CircleFootprint or RectangleFootprint")
+
+
+def _densify_trajectory(
+    poses: np.ndarray,
+    controls: np.ndarray,
+    *,
+    footprint: Footprint,
+    resolution_m: float,
+    dt_s: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Include the current origin and sample every future control interval."""
+    anchors = np.concatenate(
+        (np.zeros((1, 3), dtype=np.float64), poses.astype(np.float64)),
+        axis=0,
+    )
+    sweep_radius = _footprint_sweep_radius(footprint)
     maximum_step = 0.5 * resolution_m
-    for start, end in zip(poses[:-1, :2], poses[1:, :2]):
-        distance = float(np.linalg.norm(end - start))
-        subdivisions = max(1, int(np.ceil(distance / maximum_step)))
-        fractions = np.arange(subdivisions, dtype=np.float64) / subdivisions
-        points.append(start + fractions[:, None] * (end - start))
-    points.append(np.asarray(poses[-1:, :2], dtype=np.float64))
-    return np.concatenate(points, axis=0)
+    dense_poses = [anchors[0]]
+    arrival_times = [0.0]
+    path_distances = [0.0]
+    speeds = [abs(float(controls[0, 0])) if controls.shape[0] else 0.0]
+    cumulative_distance = 0.0
+    for interval_index, (start, end) in enumerate(
+        zip(anchors[:-1], anchors[1:])
+    ):
+        signed_speed = float(controls[interval_index, 0])
+        yaw_rate = float(controls[interval_index, 1])
+        speed = abs(signed_speed)
+        corner_motion_bound = (
+            speed * dt_s + abs(yaw_rate) * dt_s * sweep_radius
+        )
+        subdivisions = max(1, int(np.ceil(corner_motion_bound / maximum_step)))
+        interval_path_distance = speed * dt_s
+        for subdivision in range(1, subdivisions + 1):
+            fraction = subdivision / subdivisions
+            elapsed = fraction * dt_s
+            pose = np.empty(3, dtype=np.float64)
+            pose[2] = start[2] + yaw_rate * elapsed
+            if yaw_rate == 0.0:
+                distance = signed_speed * elapsed
+                pose[0] = start[0] + distance * np.cos(start[2])
+                pose[1] = start[1] + distance * np.sin(start[2])
+            else:
+                radius = signed_speed / yaw_rate
+                pose[0] = start[0] + radius * (
+                    np.sin(pose[2]) - np.sin(start[2])
+                )
+                pose[1] = start[1] - radius * (
+                    np.cos(pose[2]) - np.cos(start[2])
+                )
+            dense_poses.append(pose)
+            arrival_times.append((interval_index + fraction) * dt_s)
+            path_distances.append(
+                cumulative_distance + fraction * interval_path_distance
+            )
+            speeds.append(speed)
+        cumulative_distance += interval_path_distance
+        if not np.allclose(
+            dense_poses[-1], end, rtol=0.0, atol=1e-5
+        ):
+            raise ValueError(
+                "poses and controls violate differential-drive interval dynamics"
+            )
+    return (
+        np.asarray(dense_poses, dtype=np.float64),
+        np.asarray(arrival_times, dtype=np.float64),
+        np.asarray(path_distances, dtype=np.float64),
+        np.asarray(speeds, dtype=np.float64),
+    )
 
 
 def build_trajectory_query_maps(
@@ -80,8 +147,23 @@ def build_trajectory_query_maps(
         raise TypeError("poses and controls must contain real numbers")
     if not np.isfinite(poses_array).all() or not np.isfinite(controls_array).all():
         raise ValueError("poses and controls must contain only finite values")
+    resolution_m = float(grid.resolution_m)
+    if not np.isfinite(resolution_m) or resolution_m <= 0.0:
+        raise ValueError("grid resolution_m must be finite and positive")
+    (
+        sampled_poses,
+        arrival_times,
+        path_distances,
+        sampled_speeds,
+    ) = _densify_trajectory(
+        poses_array,
+        controls_array,
+        footprint=footprint,
+        resolution_m=resolution_m,
+        dt_s=dt_s,
+    )
     footprint_masks = tuple(
-        rasterize_footprint(footprint, pose, grid) for pose in poses_array
+        rasterize_footprint(footprint, pose, grid) for pose in sampled_poses
     )
     if footprint_masks:
         swept_mask = np.logical_or.reduce(footprint_masks)
@@ -89,20 +171,16 @@ def build_trajectory_query_maps(
         swept_mask = np.zeros((grid.height, grid.width), dtype=bool)
     tta_map = np.full((grid.height, grid.width), -1.0, dtype=ARRAY_DTYPE)
     braking_map = np.zeros((grid.height, grid.width), dtype=ARRAY_DTYPE)
-    path_distance = np.concatenate(
-        (
-            np.zeros(1, dtype=np.float64),
-            np.cumsum(np.abs(controls_array[:-1, 0]), dtype=np.float64) * dt_s,
-        )
-    )
     for index, footprint_mask in enumerate(footprint_masks):
         first_arrival = footprint_mask & (tta_map < 0.0)
-        tta_map[first_arrival] = index * dt_s
-        speed = abs(float(controls_array[index, 0]))
+        tta_map[first_arrival] = arrival_times[index]
+        speed = sampled_speeds[index]
         stopping_distance = speed * speed / (2.0 * braking_deceleration_mps2)
-        braking_map[first_arrival] = path_distance[index] - stopping_distance
+        braking_map[first_arrival] = (
+            path_distances[index] - stopping_distance
+        )
     centerline_map = np.zeros((grid.height, grid.width), dtype=ARRAY_DTYPE)
-    centerline_points = _densify_centerline(poses_array, grid.resolution_m)
+    centerline_points = sampled_poses[:, :2]
     centerline_indices = world_to_grid(centerline_points, grid)
     centerline_map[centerline_indices[:, 0], centerline_indices[:, 1]] = 1.0
     return TrajectoryQueryMaps(
@@ -153,7 +231,11 @@ def build_local_trajectory(
             "is_reverse": candidate.is_reverse,
             "v": float(candidate.controls[0, 0]),
             "omega": float(candidate.controls[0, 1]),
+            "pose_time_layout_version": POSE_TIME_LAYOUT_VERSION,
+            "first_pose_time_s": dt_s,
+            "last_pose_time_s": dt_s * int(candidate.poses.shape[0]),
             "dt_s": dt_s,
+            "trajectory_steps": int(candidate.poses.shape[0]),
             "braking_deceleration_mps2": float(braking_deceleration_mps2),
         },
     )

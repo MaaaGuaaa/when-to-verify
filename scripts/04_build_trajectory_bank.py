@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -13,8 +15,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.planning.trajectory_bank import (  # noqa: E402
+    TRAJECTORY_BANK_VERSION,
     build_trajectory_bank,
+    trajectory_bank_semantic_digest,
     write_trajectory_bank,
+)
+from src.planning.differential_drive import (  # noqa: E402
+    POSE_TIME_LAYOUT_VERSION,
 )
 from src.utils.config import load_config  # noqa: E402
 
@@ -62,11 +69,25 @@ def main() -> int:
     parser.add_argument("--code-commit", default="unversioned")
     args = parser.parse_args()
 
+    generation_started_at_utc = datetime.now(timezone.utc).isoformat()
     config = load_config(args.config)
     bank = build_trajectory_bank(
         config,
         braking_deceleration_mps2=args.braking_deceleration_mps2,
         workers=args.workers,
+    )
+    determinism_reference = (
+        build_trajectory_bank(
+            config,
+            braking_deceleration_mps2=args.braking_deceleration_mps2,
+            workers=1,
+        )
+        if args.workers > 1
+        else build_trajectory_bank(
+            config,
+            braking_deceleration_mps2=args.braking_deceleration_mps2,
+            workers=2,
+        )
     )
     paths = write_trajectory_bank(
         bank,
@@ -74,11 +95,28 @@ def main() -> int:
         provenance={
             "code_commit": args.code_commit,
             "config": str(args.config),
+            "config_snapshot": config,
             "canonical_shared_bank": True,
+            "generation_started_at_utc": generation_started_at_utc,
+            "generation_slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         },
+        determinism_reference=determinism_reference,
     )
     print(f"bank={paths['bank']}")
     print(f"manifest={paths['manifest']}")
+    print(f"checksums={paths['checksums']}")
+    print(f"audit={paths['audit']}")
+    print(f"handoff_digest={paths['handoff_digest']}")
+    print(f"trajectory_bank_version={TRAJECTORY_BANK_VERSION}")
+    print(f"pose_time_layout_version={POSE_TIME_LAYOUT_VERSION}")
+    print(
+        "bank_semantic_digest_sha256="
+        f"{trajectory_bank_semantic_digest(bank)}"
+    )
+    print(
+        "external_handoff_digest_sha256="
+        f"{paths['handoff_digest'].read_text(encoding='utf-8').split()[0]}"
+    )
     print(f"candidate_count={bank.summary['candidate_count']}")
     print(f"accepted_count={bank.summary['accepted_count']}")
     print(f"rejected_count={bank.summary['rejected_count']}")

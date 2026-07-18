@@ -420,6 +420,30 @@ def test_schedule_respects_every_requested_finite_budget() -> None:
             }
 
 
+def test_schedule_is_prefix_stable_when_the_budget_only_extends() -> None:
+    arguments = {
+        "config": _config(),
+        "seed": 314159,
+        "base_state_id": "base-prefix",
+        "trajectory_id": "trajectory-prefix",
+    }
+    first_four = causal_occluder.build_causal_occluder_schedule(
+        **arguments,
+        max_candidates=4,
+    )
+    first_seventeen = causal_occluder.build_causal_occluder_schedule(
+        **arguments,
+        max_candidates=17,
+    )
+    first_sixty_four = causal_occluder.build_causal_occluder_schedule(
+        **arguments,
+        max_candidates=64,
+    )
+
+    assert first_four == first_seventeen[:4]
+    assert first_seventeen == first_sixty_four[:17]
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -533,6 +557,39 @@ def test_context_dataclass_rejects_spliced_arrays_and_forged_digests() -> None:
         replace(context, context_digest="0" * 64)
     with pytest.raises(FrozenInstanceError):
         context.context_digest = "changed"  # type: ignore[misc]
+
+
+def test_context_baseline_visibility_is_internal_and_cannot_be_forged() -> None:
+    context = causal_occluder.build_causal_occluder_context(**_context_inputs())
+    forged_visibility = np.zeros_like(context.baseline_visibility)
+    forged_visibility_digest = causal_occluder._array_digest(
+        "baseline_visibility",
+        forged_visibility,
+    )
+    forged_context_digest = causal_occluder._context_digest(
+        grid=context.grid,
+        config_digest=context.config_digest,
+        static_occupancy_digest=context.static_occupancy_digest,
+        current_context_occupancy_digest=context.current_context_occupancy_digest,
+        baseline_occupancy_digest=context.baseline_occupancy_digest,
+        baseline_visibility_digest=forged_visibility_digest,
+        interaction_region_digest=context.interaction_region_digest,
+        interaction_poses_digest=context.interaction_poses_digest,
+        sensor_pose_digest=context.sensor_pose_digest,
+    )
+
+    with pytest.raises(ValueError, match="baseline_visibility.*init=False"):
+        replace(
+            context,
+            baseline_visibility=forged_visibility,
+            baseline_visibility_digest=forged_visibility_digest,
+            context_digest=forged_context_digest,
+        )
+    constructor_parameters = inspect.signature(
+        causal_occluder.CausalOccluderContext
+    ).parameters
+    assert "baseline_visibility" not in constructor_parameters
+    assert "baseline_visibility_digest" not in constructor_parameters
 
 
 @pytest.mark.parametrize(
@@ -755,6 +812,71 @@ def test_accepted_decision_and_candidate_arrays_are_frozen_bytes_backed() -> Non
         replace(decision, proposal_id="forged-proposal")
 
 
+@pytest.mark.parametrize("splice", ("pose", "footprint", "mask", "metadata"))
+def test_decision_rejects_accepted_geometry_and_metadata_splices(
+    splice: str,
+) -> None:
+    decision = _propose(_proposal_context())
+    assert decision.accepted is not None
+    candidate = decision.accepted
+
+    if splice == "pose":
+        changed_pose = np.array(candidate.pose, copy=True)
+        changed_pose[0] += 0.25
+        spliced = replace(candidate, pose=changed_pose)
+    elif splice == "footprint":
+        spliced = replace(
+            candidate,
+            footprint=RectangleFootprint(
+                candidate.footprint.length_m + 0.1,
+                candidate.footprint.width_m,
+            ),
+        )
+    elif splice == "mask":
+        changed_mask = np.array(candidate.mask, copy=True)
+        changed_mask[0, 0] = ~changed_mask[0, 0]
+        spliced = replace(candidate, mask=changed_mask)
+    else:
+        changed_metadata = dict(candidate.occluder)
+        changed_metadata["pose"] = (
+            candidate.pose[0] + 0.25,
+            candidate.pose[1],
+            candidate.pose[2],
+        )
+        spliced = replace(candidate, occluder=changed_metadata)
+
+    with pytest.raises(ValueError, match="accepted"):
+        replace(decision, accepted=spliced)
+
+
+def test_decision_proposal_geometry_evidence_is_bound_and_immutable() -> None:
+    decision = _propose(_proposal_context())
+    assert decision.accepted is not None
+
+    np.testing.assert_array_equal(decision.proposal_pose, decision.accepted.pose)
+    assert decision.proposal_length_m == decision.accepted.footprint.length_m
+    assert decision.proposal_width_m == decision.accepted.footprint.width_m
+    assert decision.proposal_mask.tobytes() == decision.accepted.mask.tobytes()
+    assert decision.grid == _proposal_grid()
+    for array in (decision.proposal_pose, decision.proposal_mask):
+        assert array.flags.c_contiguous
+        assert not array.flags.writeable
+        assert not array.flags.owndata
+        with pytest.raises(ValueError, match="WRITEABLE"):
+            array.setflags(write=True)
+
+    changed_pose = np.array(decision.proposal_pose, copy=True)
+    changed_pose[0] += 0.25
+    with pytest.raises(ValueError, match="proposal geometry.*binding"):
+        replace(decision, proposal_pose=changed_pose)
+    with pytest.raises(ValueError, match="proposal geometry.*binding"):
+        replace(decision, proposal_length_m=decision.proposal_length_m + 0.1)
+    changed_mask = np.array(decision.proposal_mask, copy=True)
+    changed_mask[0, 0] = ~changed_mask[0, 0]
+    with pytest.raises(ValueError, match="proposal_mask.*rasterized"):
+        replace(decision, proposal_mask=changed_mask)
+
+
 def test_rejection_stages_follow_bounds_static_clearance_shadow_order() -> None:
     bounds_config = _proposal_config(interaction_range_m=[20.0, 20.0])
     bounds = _propose(
@@ -809,6 +931,18 @@ def test_rejection_stages_follow_bounds_static_clearance_shadow_order() -> None:
         assert rejected.accepted is None
         assert rejected.proposal_id.startswith("causal-occluder-")
         assert rejected.proposal_index == 0
+        proposal_footprint = RectangleFootprint(
+            rejected.proposal_length_m,
+            rejected.proposal_width_m,
+        )
+        expected_mask = rasterize_footprint(
+            proposal_footprint,
+            rejected.proposal_pose,
+            rejected.grid,
+        )
+        assert rejected.proposal_mask.tobytes() == expected_mask.tobytes()
+        assert not rejected.proposal_pose.flags.writeable
+        assert not rejected.proposal_mask.flags.writeable
     with pytest.raises(ValueError, match="proposal_id"):
         replace(bounds, proposal_id="forged-rejected-proposal")
     with pytest.raises(ValueError, match="rejection_reason"):

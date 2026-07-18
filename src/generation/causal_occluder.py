@@ -337,6 +337,26 @@ def _immutable_array(values: np.ndarray) -> tuple[bytes, np.ndarray]:
     return storage, immutable
 
 
+def _length_prefixed_parts(binding: bytes) -> tuple[bytes, ...]:
+    parts = []
+    offset = 0
+    while offset < len(binding):
+        if len(binding) - offset < 8:
+            raise ValueError("proposal binding has a truncated length prefix")
+        size = int.from_bytes(
+            binding[offset : offset + 8],
+            byteorder="big",
+            signed=False,
+        )
+        offset += 8
+        end = offset + size
+        if end > len(binding):
+            raise ValueError("proposal binding has a truncated part")
+        parts.append(binding[offset:end])
+        offset = end
+    return tuple(parts)
+
+
 @dataclass(frozen=True)
 class CausalOccluderContext:
     """Immutable current-causal occupancy and renderer baseline evidence."""
@@ -344,7 +364,7 @@ class CausalOccluderContext:
     static_occupancy: np.ndarray
     current_context_occupancy: np.ndarray
     baseline_occupancy: np.ndarray
-    baseline_visibility: np.ndarray
+    baseline_visibility: np.ndarray = field(init=False)
     interaction_region: np.ndarray
     interaction_poses: np.ndarray
     sensor_pose: np.ndarray
@@ -355,11 +375,11 @@ class CausalOccluderContext:
     static_occupancy_digest: str
     current_context_occupancy_digest: str
     baseline_occupancy_digest: str
-    baseline_visibility_digest: str
+    baseline_visibility_digest: str = field(init=False)
     interaction_region_digest: str
     interaction_poses_digest: str
     sensor_pose_digest: str
-    context_digest: str
+    context_digest: str = field(init=False)
     _array_storage: tuple[bytes, ...] = field(
         init=False,
         repr=False,
@@ -405,12 +425,6 @@ class CausalOccluderContext:
             "baseline_occupancy": _canonical_bool_grid(
                 self.baseline_occupancy,
                 name="baseline_occupancy",
-                grid=self.grid,
-                input_dtype=False,
-            ),
-            "baseline_visibility": _canonical_bool_grid(
-                self.baseline_visibility,
-                name="baseline_visibility",
                 grid=self.grid,
                 input_dtype=False,
             ),
@@ -461,19 +475,32 @@ class CausalOccluderContext:
                 "interaction_region must match grid centres and interaction poses"
             )
 
-        expected_context_digest = _context_digest(
+        arrays["baseline_visibility"] = np.asarray(
+            raycast_visibility(
+                arrays["baseline_occupancy"],
+                self.grid,
+                sensor_pose=arrays["sensor_pose"],
+                fov_rad=2.0 * np.pi,
+                max_range_m=None,
+            ),
+            dtype=np.bool_,
+            order="C",
+        )
+        baseline_visibility_digest = _array_digest(
+            "baseline_visibility",
+            arrays["baseline_visibility"],
+        )
+        context_digest = _context_digest(
             grid=self.grid,
             config_digest=self.config_digest,
             static_occupancy_digest=self.static_occupancy_digest,
             current_context_occupancy_digest=self.current_context_occupancy_digest,
             baseline_occupancy_digest=self.baseline_occupancy_digest,
-            baseline_visibility_digest=self.baseline_visibility_digest,
+            baseline_visibility_digest=baseline_visibility_digest,
             interaction_region_digest=self.interaction_region_digest,
             interaction_poses_digest=self.interaction_poses_digest,
             sensor_pose_digest=self.sensor_pose_digest,
         )
-        if self.context_digest != expected_context_digest:
-            raise ValueError("context_digest does not match bound context fields")
 
         storages = []
         for name, values in arrays.items():
@@ -481,6 +508,12 @@ class CausalOccluderContext:
             storages.append(storage)
             object.__setattr__(self, name, immutable)
         object.__setattr__(self, "interaction_range_m", interaction_range)
+        object.__setattr__(
+            self,
+            "baseline_visibility_digest",
+            baseline_visibility_digest,
+        )
+        object.__setattr__(self, "context_digest", context_digest)
         object.__setattr__(self, "_array_storage", tuple(storages))
 
 
@@ -490,12 +523,22 @@ class CausalOccluderDecision:
 
     proposal_id: str
     proposal_index: int
+    proposal_pose: np.ndarray
+    proposal_length_m: float
+    proposal_width_m: float
+    proposal_mask: np.ndarray
+    grid: GridSpec
     accepted: OccluderGeometryCandidate | None
     useful_shadow_mask: np.ndarray
     useful_shadow_count: int
     rejection_stage: str | None
     rejection_reason: str | None
     _proposal_binding: bytes = field(repr=False, compare=False)
+    _proposal_geometry_storage: tuple[bytes, bytes] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _useful_shadow_storage: bytes = field(
         init=False,
         repr=False,
@@ -518,12 +561,74 @@ class CausalOccluderDecision:
             name="proposal_index",
             minimum=0,
         )
+        if not isinstance(self.grid, GridSpec):
+            raise TypeError("grid must be a GridSpec")
+        grid_bounds(self.grid)
+        try:
+            proposal_pose_array = np.asarray(self.proposal_pose)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("proposal_pose must be an array") from exc
+        if (
+            proposal_pose_array.shape != (3,)
+            or proposal_pose_array.dtype != np.dtype(np.float64)
+        ):
+            raise ValueError("proposal_pose must be canonical float64 with shape (3,)")
+        proposal_pose = np.array(
+            proposal_pose_array,
+            dtype=np.dtype("<f8"),
+            order="C",
+            copy=True,
+        )
+        if not np.isfinite(proposal_pose).all():
+            raise ValueError("proposal_pose must contain only finite values")
+        proposal_length_m = _finite_real(
+            self.proposal_length_m,
+            name="proposal_length_m",
+        )
+        proposal_width_m = _finite_real(
+            self.proposal_width_m,
+            name="proposal_width_m",
+        )
+        if proposal_length_m <= 0.0 or proposal_width_m <= 0.0:
+            raise ValueError("proposal dimensions must be positive")
+        proposal_mask = _canonical_bool_grid(
+            self.proposal_mask,
+            name="proposal_mask",
+            grid=self.grid,
+            input_dtype=False,
+        )
+        binding_parts = _length_prefixed_parts(self._proposal_binding)
+        if len(binding_parts) != 9:
+            raise ValueError("proposal binding must contain nine canonical parts")
+        expected_geometry_bytes = np.asarray(
+            [
+                proposal_pose[0],
+                proposal_pose[1],
+                proposal_pose[2],
+                proposal_length_m,
+                proposal_width_m,
+            ],
+            dtype=np.dtype(">f8"),
+        ).tobytes(order="C")
+        if binding_parts[6] != expected_geometry_bytes:
+            raise ValueError("proposal geometry does not match proposal binding")
+        proposal_footprint = RectangleFootprint(
+            proposal_length_m,
+            proposal_width_m,
+        )
+        expected_proposal_mask = rasterize_footprint(
+            proposal_footprint,
+            proposal_pose,
+            self.grid,
+        )
+        if not np.array_equal(proposal_mask, expected_proposal_mask):
+            raise ValueError("proposal_mask must equal the rasterized proposal geometry")
         try:
             shadow = np.asarray(self.useful_shadow_mask)
         except (TypeError, ValueError) as exc:
             raise TypeError("useful_shadow_mask must be an array") from exc
-        if shadow.ndim != 2:
-            raise ValueError("useful_shadow_mask must have shape (height, width)")
+        if shadow.shape != (self.grid.height, self.grid.width):
+            raise ValueError("useful_shadow_mask must have grid shape")
         if shadow.dtype != np.dtype(np.bool_):
             raise TypeError("useful_shadow_mask must have bool dtype")
         canonical_shadow = np.array(
@@ -542,6 +647,12 @@ class CausalOccluderDecision:
             raise ValueError(
                 "useful_shadow_count must equal the useful_shadow_mask count"
             )
+        proposal_pose_storage, immutable_proposal_pose = _immutable_array(
+            proposal_pose
+        )
+        proposal_mask_storage, immutable_proposal_mask = _immutable_array(
+            proposal_mask
+        )
 
         accepted = self.accepted
         if accepted is None:
@@ -583,32 +694,84 @@ class CausalOccluderDecision:
                 or not np.isfinite(pose).all()
             ):
                 raise ValueError("accepted pose must be finite canonical float64")
-            if mask.shape != canonical_shadow.shape or mask.dtype != np.dtype(np.bool_):
-                raise ValueError("accepted mask must be a bool grid matching shadow")
+            canonical_accepted_pose = np.array(
+                pose,
+                dtype=np.dtype("<f8"),
+                order="C",
+                copy=True,
+            )
+            if canonical_accepted_pose.tobytes(order="C") != proposal_pose.tobytes(
+                order="C"
+            ):
+                raise ValueError("accepted pose must match proposal geometry")
+            if mask.shape != proposal_mask.shape or mask.dtype != np.dtype(np.bool_):
+                raise ValueError("accepted mask must be a bool proposal grid")
+            canonical_accepted_mask = np.array(
+                mask,
+                dtype=np.bool_,
+                order="C",
+                copy=True,
+            )
+            if canonical_accepted_mask.tobytes(order="C") != proposal_mask.tobytes(
+                order="C"
+            ):
+                raise ValueError("accepted mask must match proposal geometry")
             if not isinstance(accepted.footprint, RectangleFootprint):
                 raise TypeError("accepted footprint must be a RectangleFootprint")
-            pose_storage, immutable_pose = _immutable_array(
-                np.array(pose, dtype=np.dtype("<f8"), order="C", copy=True)
+            accepted_dimensions = struct.pack(
+                ">dd",
+                accepted.footprint.length_m,
+                accepted.footprint.width_m,
             )
-            mask_storage, immutable_mask = _immutable_array(
-                np.array(mask, dtype=np.bool_, order="C", copy=True)
+            proposal_dimensions = struct.pack(
+                ">dd",
+                proposal_length_m,
+                proposal_width_m,
             )
+            if accepted_dimensions != proposal_dimensions:
+                raise ValueError("accepted footprint must match proposal geometry")
+            metadata_pose = accepted.occluder.get("pose")
+            metadata_length_m = accepted.occluder.get("length_m")
+            metadata_width_m = accepted.occluder.get("width_m")
+            if (
+                not isinstance(metadata_pose, tuple)
+                or len(metadata_pose) != 3
+                or any(type(value) is not float for value in metadata_pose)
+                or type(metadata_length_m) is not float
+                or type(metadata_width_m) is not float
+            ):
+                raise ValueError(
+                    "accepted metadata geometry must contain canonical primitives"
+                )
+            metadata_geometry_bytes = np.asarray(
+                [*metadata_pose, metadata_length_m, metadata_width_m],
+                dtype=np.dtype(">f8"),
+            ).tobytes(order="C")
+            if metadata_geometry_bytes != expected_geometry_bytes:
+                raise ValueError("accepted metadata geometry must match proposal")
             metadata = MappingProxyType(dict(accepted.occluder))
             accepted = OccluderGeometryCandidate(
                 occluder=metadata,
-                footprint=accepted.footprint,
-                pose=immutable_pose,
-                mask=immutable_mask,
+                footprint=proposal_footprint,
+                pose=immutable_proposal_pose,
+                mask=immutable_proposal_mask,
                 proposal_index=proposal_index,
             )
-            # The immutable NumPy views retain these bytes through ``.base``.
-            _ = (pose_storage, mask_storage)
 
         storage, immutable_shadow = _immutable_array(canonical_shadow)
         object.__setattr__(self, "proposal_index", proposal_index)
+        object.__setattr__(self, "proposal_pose", immutable_proposal_pose)
+        object.__setattr__(self, "proposal_length_m", proposal_length_m)
+        object.__setattr__(self, "proposal_width_m", proposal_width_m)
+        object.__setattr__(self, "proposal_mask", immutable_proposal_mask)
         object.__setattr__(self, "useful_shadow_count", count)
         object.__setattr__(self, "accepted", accepted)
         object.__setattr__(self, "useful_shadow_mask", immutable_shadow)
+        object.__setattr__(
+            self,
+            "_proposal_geometry_storage",
+            (proposal_pose_storage, proposal_mask_storage),
+        )
         object.__setattr__(self, "_useful_shadow_storage", storage)
 
 
@@ -632,14 +795,17 @@ def build_causal_occluder_schedule(
         raise ValueError("base_state_id must be a non-empty string")
     if not isinstance(trajectory_id, str) or not trajectory_id:
         raise ValueError("trajectory_id must be a non-empty string")
-    rng = make_rng(
-        int(seed),
-        CAUSAL_OCCLUDER_SCHEDULE_VERSION,
-        base_state_id,
-        trajectory_id,
-    )
+    def dimension_rng(name: str) -> np.random.Generator:
+        return make_rng(
+            int(seed),
+            CAUSAL_OCCLUDER_SCHEDULE_VERSION,
+            base_state_id,
+            trajectory_id,
+            name,
+        )
 
     bearing_count = int(normalized["bearing_bin_count"])
+    bearing_rng = dimension_rng("bearing")
 
     def one_balanced_bearing_cycle() -> list[int]:
         bins_by_quadrant = [
@@ -651,12 +817,12 @@ def build_causal_occluder_schedule(
             for quadrant in range(4)
         ]
         for quadrant, values in enumerate(bins_by_quadrant):
-            order = rng.permutation(len(values))
+            order = bearing_rng.permutation(len(values))
             bins_by_quadrant[quadrant] = [values[int(index)] for index in order]
         result: list[int] = []
         depth = 0
         while any(depth < len(values) for values in bins_by_quadrant):
-            quadrant_order = rng.permutation(4)
+            quadrant_order = bearing_rng.permutation(4)
             for quadrant in quadrant_order:
                 values = bins_by_quadrant[int(quadrant)]
                 if depth < len(values):
@@ -668,7 +834,11 @@ def build_causal_occluder_schedule(
     while len(bearing_stream) < count:
         bearing_stream.extend(one_balanced_bearing_cycle())
 
-    def stratified_stream(values: tuple[Any, ...]) -> list[Any]:
+    def stratified_stream(
+        values: tuple[Any, ...],
+        *,
+        rng: np.random.Generator,
+    ) -> list[Any]:
         result: list[Any] = []
         while len(result) < count:
             order = rng.permutation(len(values))
@@ -677,11 +847,17 @@ def build_causal_occluder_schedule(
 
     quantiles = (0.0, 0.25, 0.5, 0.75, 1.0)
     anchors = tuple(enumerate(quantiles))
-    anchor_stream = stratified_stream(anchors)
-    range_stream = stratified_stream(quantiles)
-    yaw_stream = stratified_stream((-2, -1, 0, 1, 2))
-    type_stream = stratified_stream(tuple(normalized["types"]))
-    dimension_stream = stratified_stream(quantiles)
+    anchor_stream = stratified_stream(anchors, rng=dimension_rng("anchor"))
+    range_stream = stratified_stream(quantiles, rng=dimension_rng("range"))
+    yaw_stream = stratified_stream(
+        (-2, -1, 0, 1, 2), rng=dimension_rng("yaw")
+    )
+    type_stream = stratified_stream(
+        tuple(normalized["types"]), rng=dimension_rng("type")
+    )
+    dimension_stream = stratified_stream(
+        quantiles, rng=dimension_rng("dimension")
+    )
     yaw_step_rad = np.deg2rad(float(normalized["yaw_step_deg"]))
 
     return tuple(
@@ -741,17 +917,6 @@ def build_causal_occluder_context(
         vector=True,
     )
     baseline_occupancy = np.asarray(static | current_context, dtype=np.bool_)
-    baseline_visibility = np.asarray(
-        raycast_visibility(
-            baseline_occupancy,
-            grid,
-            sensor_pose=sensor,
-            fov_rad=2.0 * np.pi,
-            max_range_m=None,
-        ),
-        dtype=np.bool_,
-        order="C",
-    )
     interaction_range = normalized["interaction_range_m"]
     centers = grid_cell_centers(grid)
     interaction_region = np.zeros((grid.height, grid.width), dtype=np.bool_)
@@ -765,7 +930,6 @@ def build_causal_occluder_context(
         "static_occupancy": static,
         "current_context_occupancy": current_context,
         "baseline_occupancy": baseline_occupancy,
-        "baseline_visibility": baseline_visibility,
         "interaction_region": interaction_region,
         "interaction_poses": poses,
         "sensor_pose": sensor,
@@ -776,11 +940,6 @@ def build_causal_occluder_context(
     }
     config_bytes = _canonical_config_bytes(normalized)
     config_digest = _digest_parts(config_bytes)
-    context_digest = _context_digest(
-        grid=grid,
-        config_digest=config_digest,
-        **digests,
-    )
     return CausalOccluderContext(
         **arrays,
         interaction_range_m=interaction_range,
@@ -788,7 +947,6 @@ def build_causal_occluder_context(
         config_canonical_bytes=config_bytes,
         config_digest=config_digest,
         **digests,
-        context_digest=context_digest,
     )
 
 
@@ -870,6 +1028,10 @@ def _decision(
     proposal_id: str,
     proposal_binding: bytes,
     proposal_index: int,
+    proposal_pose: np.ndarray,
+    proposal_length_m: float,
+    proposal_width_m: float,
+    proposal_mask: np.ndarray,
     grid: GridSpec,
     accepted: OccluderGeometryCandidate | None = None,
     useful_shadow_mask: np.ndarray | None = None,
@@ -884,6 +1046,11 @@ def _decision(
     return CausalOccluderDecision(
         proposal_id=proposal_id,
         proposal_index=proposal_index,
+        proposal_pose=proposal_pose,
+        proposal_length_m=proposal_length_m,
+        proposal_width_m=proposal_width_m,
+        proposal_mask=proposal_mask,
+        grid=grid,
         accepted=accepted,
         useful_shadow_mask=shadow,
         useful_shadow_count=int(np.count_nonzero(shadow)),
@@ -982,6 +1149,12 @@ def propose_causal_occluder(
     )
     footprint = RectangleFootprint(length_m=length_m, width_m=width_m)
     mask = rasterize_footprint(footprint, pose, context.grid)
+    proposal_geometry = {
+        "proposal_pose": pose,
+        "proposal_length_m": length_m,
+        "proposal_width_m": width_m,
+        "proposal_mask": mask,
+    }
 
     if not _inside_grid(footprint, pose, context.grid):
         return _decision(
@@ -989,6 +1162,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_geometry,
             rejection_stage="bounds",
             rejection_reason="occluder_out_of_bounds",
         )
@@ -998,6 +1172,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_geometry,
             rejection_stage="static",
             rejection_reason="occluder_static_overlap",
         )
@@ -1013,6 +1188,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_geometry,
             rejection_stage="continuous_clearance",
             rejection_reason=clearance_reason,
         )
@@ -1038,6 +1214,7 @@ def propose_causal_occluder(
             proposal_binding=proposal_binding,
             proposal_index=parameters.proposal_index,
             grid=context.grid,
+            **proposal_geometry,
             useful_shadow_mask=useful_shadow,
             rejection_stage="shadow",
             rejection_reason="occluder_no_useful_shadow",
@@ -1086,6 +1263,7 @@ def propose_causal_occluder(
         proposal_binding=proposal_binding,
         proposal_index=parameters.proposal_index,
         grid=context.grid,
+        **proposal_geometry,
         accepted=candidate,
         useful_shadow_mask=useful_shadow,
     )

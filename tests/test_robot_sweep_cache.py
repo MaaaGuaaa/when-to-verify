@@ -7,9 +7,11 @@ from dataclasses import FrozenInstanceError, replace
 import numpy as np
 import pytest
 
-from src.contracts import GridSpec, LocalTrajectory
+from src.contracts import BaseState, GridSpec, LocalTrajectory
+import src.generation.robot_sweep_cache as robot_sweep_cache
 from src.generation.occluder_sampler import (
     OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION,
+    OccluderCollisionSweep,
     occluder_collision_sweep_rejection_reason,
 )
 from src.generation.robot_sweep_cache import (
@@ -56,10 +58,14 @@ def _trajectory(
     if metadata is None:
         metadata = {
             "pose_time_layout_version": _LAYOUT_VERSION,
-            "pose_time_offsets_s": (
-                np.arange(grid.future_steps, dtype=np.float64) + 1.0
-            )
-            * future_dt_s,
+            # SOP05 adapter injects JSON-safe tuple offsets into each v2 item.
+            "pose_time_offsets_s": tuple(
+                float(value)
+                for value in (
+                    (np.arange(grid.future_steps, dtype=np.float64) + 1.0)
+                    * future_dt_s
+                )
+            ),
         }
     maps = np.zeros((grid.height, grid.width), dtype=np.float32)
     return LocalTrajectory(
@@ -72,6 +78,61 @@ def _trajectory(
         centerline_map=maps.copy(),
         task_cost=0.0,
         metadata=metadata,
+    )
+
+
+def _base_state(
+    *,
+    state_id: str = "base-001",
+    grid: GridSpec | None = None,
+    robot_history: np.ndarray | None = None,
+) -> BaseState:
+    grid = grid or _grid()
+    if robot_history is None:
+        robot_history = np.asarray(
+            [[-0.4, 0.0, 0.0], [-0.2, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+    return BaseState(
+        state_id=state_id,
+        split="train",
+        recording_id="recording-001",
+        dynamic_object_ids=(),
+        timestamp=1.0,
+        robot_history=robot_history,
+        robot_state=np.zeros((2,), dtype=np.float32),
+        visible_dynamic_object_history={},
+        visible_dynamic_object_specs={},
+        static_map_local=np.zeros((grid.height, grid.width), dtype=np.float32),
+    )
+
+
+def _bundle(
+    *,
+    base_state: BaseState | None = None,
+    trajectory: LocalTrajectory | None = None,
+    footprint=None,
+    grid: GridSpec | None = None,
+    future_dt_s: float = 0.2,
+    cache: RobotSweepCache | None = None,
+    rejection_reason: str = _REJECTION_REASON,
+):
+    active_grid = _grid() if grid is None else grid
+    fixture_grid = active_grid if isinstance(active_grid, GridSpec) else _grid()
+    return robot_sweep_cache.prepare_robot_collision_sweep_bundle(
+        _base_state(grid=fixture_grid) if base_state is None else base_state,
+        (
+            _trajectory(grid=fixture_grid, future_dt_s=future_dt_s)
+            if trajectory is None
+            else trajectory
+        ),
+        robot_footprint=(
+            CircleFootprint(0.02) if footprint is None else footprint
+        ),
+        grid=active_grid,
+        future_dt_s=future_dt_s,
+        cache=cache,
+        rejection_reason=rejection_reason,
     )
 
 
@@ -491,3 +552,286 @@ def test_persisted_mask_is_broad_phase_evidence_not_a_collision_verdict() -> Non
         entry.prepared_future_sweep.dense_poses[0],
         np.asarray(trajectory.poses, dtype=np.float64)[0],
     )
+
+
+def test_collision_bundle_closes_current_to_first_future_seam() -> None:
+    poses = np.asarray(
+        [[0.4, 0.0, 0.0], [0.6, 0.0, 0.0], [0.8, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    trajectory = _trajectory(poses=poses)
+    robot_footprint = CircleFootprint(0.02)
+    obstacle_footprint = CircleFootprint(0.02)
+    obstacle_pose = (0.2, 0.0, 0.0)
+    bundle = _bundle(trajectory=trajectory, footprint=robot_footprint)
+
+    without_seam = occluder_collision_sweep_rejection_reason(
+        obstacle_footprint,
+        obstacle_pose,
+        (bundle.history_sweep, bundle.future_sweep),
+        grid=_grid(),
+    )
+    seam_only = occluder_collision_sweep_rejection_reason(
+        obstacle_footprint,
+        obstacle_pose,
+        (bundle.seam_sweep,),
+        grid=_grid(),
+    )
+    complete = occluder_collision_sweep_rejection_reason(
+        obstacle_footprint,
+        obstacle_pose,
+        bundle.collision_sweeps,
+        grid=_grid(),
+    )
+
+    assert without_seam is None
+    assert seam_only == _REJECTION_REASON
+    assert complete == _REJECTION_REASON
+
+
+def test_collision_bundle_has_exact_ordered_interval_coverage() -> None:
+    base_state = _base_state()
+    trajectory = _trajectory()
+    bundle = _bundle(base_state=base_state, trajectory=trajectory)
+    history, seam, future = bundle.collision_sweeps
+
+    assert history is bundle.history_sweep
+    assert seam is bundle.seam_sweep
+    assert future is bundle.future_sweep
+    assert future is bundle.future_entry.prepared_future_sweep
+    np.testing.assert_array_equal(history.dense_poses[0], base_state.robot_history[0])
+    np.testing.assert_array_equal(history.dense_poses[-1], base_state.robot_history[-1])
+    np.testing.assert_array_equal(seam.dense_poses[0], base_state.robot_history[-1])
+    np.testing.assert_array_equal(seam.dense_poses[-1], trajectory.poses[0])
+    np.testing.assert_array_equal(future.dense_poses[0], trajectory.poses[0])
+    np.testing.assert_array_equal(future.dense_poses[-1], trajectory.poses[-1])
+
+    stitched = np.vstack(
+        (history.dense_poses, seam.dense_poses[1:], future.dense_poses[1:])
+    )
+    interval_count = sum(
+        sweep.interval_motion_bounds_m.shape[0] for sweep in bundle.collision_sweeps
+    )
+    assert interval_count == stitched.shape[0] - 1
+    assert np.all(np.linalg.norm(np.diff(stitched[:, :2], axis=0), axis=1) > 0.0)
+    np.testing.assert_array_equal(
+        np.frombuffer(
+            bundle.future_entry.key.pose_time_offsets_bytes,
+            dtype=np.dtype("<f8"),
+        ),
+        (np.arange(_grid().future_steps, dtype=np.float64) + 1.0) * 0.2,
+    )
+
+
+def test_collision_bundle_accepts_equivalent_unwrapped_seam_endpoint() -> None:
+    poses = np.asarray(
+        [
+            [0.2, 0.0, 2.0 * np.pi + 0.1],
+            [0.4, 0.0, 2.0 * np.pi + 0.2],
+            [0.6, 0.0, 2.0 * np.pi + 0.3],
+        ],
+        dtype=np.float64,
+    )
+    trajectory = _trajectory(poses=poses)
+
+    bundle = _bundle(trajectory=trajectory)
+
+    np.testing.assert_array_equal(
+        bundle.seam_sweep.dense_poses[-1, :2],
+        poses[0, :2],
+    )
+    assert np.isclose(
+        np.sin(
+            bundle.seam_sweep.dense_poses[-1, 2]
+            - bundle.future_sweep.dense_poses[0, 2]
+        ),
+        0.0,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    assert np.cos(
+        bundle.seam_sweep.dense_poses[-1, 2]
+        - bundle.future_sweep.dense_poses[0, 2]
+    ) > 0.0
+
+
+def test_explicit_cache_reuses_only_future_and_preserves_cold_warm_verdicts() -> None:
+    cache = RobotSweepCache()
+    base_state = _base_state()
+    trajectory = _trajectory()
+    cold = _bundle(base_state=base_state, trajectory=trajectory, cache=cache)
+    warm = _bundle(base_state=base_state, trajectory=trajectory, cache=cache)
+    changed_history = np.asarray(base_state.robot_history).copy()
+    changed_history[0, 1] = 0.1
+    changed_base = replace(base_state, robot_history=changed_history)
+    changed = _bundle(base_state=changed_base, trajectory=trajectory, cache=cache)
+    obstacle = CircleFootprint(0.02)
+
+    assert cache.stats.builds == 1
+    assert cache.stats.hits == 2
+    assert cold.future_entry is warm.future_entry is changed.future_entry
+    assert cold.future_sweep is warm.future_sweep is changed.future_sweep
+    assert cold.history_sweep is not warm.history_sweep
+    assert cold.seam_sweep is not warm.seam_sweep
+    assert (
+        cold.history_sweep.dense_poses.tobytes()
+        == warm.history_sweep.dense_poses.tobytes()
+    )
+    assert (
+        cold.seam_sweep.dense_poses.tobytes()
+        == warm.seam_sweep.dense_poses.tobytes()
+    )
+    assert (
+        cold.history_sweep.dense_poses.tobytes()
+        != changed.history_sweep.dense_poses.tobytes()
+    )
+    assert (
+        cold.seam_sweep.dense_poses.tobytes()
+        == changed.seam_sweep.dense_poses.tobytes()
+    )
+    for obstacle_pose in ((0.1, 0.0, 0.0), (0.0, 1.0, 0.0)):
+        cold_verdict = occluder_collision_sweep_rejection_reason(
+            obstacle, obstacle_pose, cold.collision_sweeps, grid=_grid()
+        )
+        warm_verdict = occluder_collision_sweep_rejection_reason(
+            obstacle, obstacle_pose, warm.collision_sweeps, grid=_grid()
+        )
+        assert cold_verdict == warm_verdict
+
+    uncached_first = _bundle(base_state=base_state, trajectory=trajectory)
+    uncached_second = _bundle(base_state=base_state, trajectory=trajectory)
+    assert uncached_first.future_entry is not uncached_second.future_entry
+    assert (
+        uncached_first.future_sweep.dense_poses.tobytes()
+        == uncached_second.future_sweep.dense_poses.tobytes()
+    )
+    assert uncached_first.canonical_digest == uncached_second.canonical_digest
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("base_state", object(), "base_state"),
+        ("trajectory", object(), "trajectory"),
+        ("footprint", object(), "robot_footprint"),
+        ("grid", object(), "grid"),
+        ("future_dt_s", 0.0, "future_dt_s"),
+        ("future_dt_s", np.nan, "future_dt_s"),
+        ("cache", object(), "cache"),
+        ("rejection_reason", "", "rejection_reason"),
+    ],
+)
+def test_collision_bundle_rejects_invalid_public_inputs(
+    field: str,
+    value,
+    message: str,
+) -> None:
+    kwargs = {field: value}
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        _bundle(**kwargs)
+
+
+@pytest.mark.parametrize("invalid_current", [0.01, np.nan, np.inf])
+def test_collision_bundle_rejects_nonlocal_or_nonfinite_base_current(
+    invalid_current: float,
+) -> None:
+    history = np.asarray(_base_state().robot_history).copy()
+    history[-1, 0] = invalid_current
+
+    with pytest.raises((TypeError, ValueError), match="robot_history|local origin"):
+        _bundle(base_state=_base_state(robot_history=history))
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "pose_time_layout_version": "legacy_t0_v0",
+            "pose_time_offsets_s": np.asarray([0.0, 0.2, 0.4]),
+        },
+        {
+            "pose_time_layout_version": _LAYOUT_VERSION,
+            "pose_time_offsets_s": np.asarray([0.2, 0.4, np.nan]),
+        },
+        {
+            "pose_time_layout_version": _LAYOUT_VERSION,
+            "pose_time_offsets_s": np.asarray([0.0, 0.2, 0.4]),
+        },
+    ],
+)
+def test_collision_bundle_rejects_stale_or_invalid_future_time_layout(
+    metadata: dict,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="layout|offsets"):
+        _bundle(trajectory=_trajectory(metadata=metadata))
+
+
+@pytest.mark.parametrize(
+    ("obstacle_pose", "expected"),
+    [
+        ((0.0, 1.0, 0.0), None),
+        ((-0.2, 0.0, 0.0), _REJECTION_REASON),
+        ((0.1, 0.0, 0.0), _REJECTION_REASON),
+    ],
+    ids=("clear", "frame-contact", "between-frame-contact"),
+)
+def test_collision_bundle_matches_equivalent_raw_full_stack_verdict(
+    obstacle_pose: tuple[float, float, float],
+    expected: str | None,
+) -> None:
+    base_state = _base_state()
+    trajectory = _trajectory()
+    footprint = CircleFootprint(0.02)
+    bundle = _bundle(
+        base_state=base_state,
+        trajectory=trajectory,
+        footprint=footprint,
+    )
+    raw = OccluderCollisionSweep(
+        footprint=footprint,
+        poses=np.vstack((base_state.robot_history, trajectory.poses)),
+        rejection_reason=_REJECTION_REASON,
+    )
+    obstacle = CircleFootprint(0.02)
+
+    prepared_verdict = occluder_collision_sweep_rejection_reason(
+        obstacle, obstacle_pose, bundle.collision_sweeps, grid=_grid()
+    )
+    raw_verdict = occluder_collision_sweep_rejection_reason(
+        obstacle, obstacle_pose, (raw,), grid=_grid()
+    )
+
+    assert prepared_verdict == raw_verdict == expected
+
+
+def test_collision_bundle_is_immutable_and_rejects_component_splices() -> None:
+    base_state = _base_state()
+    trajectory = _trajectory()
+    bundle = _bundle(base_state=base_state, trajectory=trajectory)
+    other_base = _base_state(state_id="base-002")
+    other_trajectory = _trajectory(trajectory_id="traj-002")
+    other_bundle = _bundle(base_state=other_base, trajectory=other_trajectory)
+
+    with pytest.raises(FrozenInstanceError):
+        bundle.base_state_id = "base-002"  # type: ignore[misc]
+    for sweep in bundle.collision_sweeps:
+        assert not sweep.dense_poses.flags.writeable
+        assert not sweep.interval_motion_bounds_m.flags.writeable
+        with pytest.raises(ValueError, match="WRITEABLE"):
+            sweep.dense_poses.setflags(write=True)
+
+    for changes, message in (
+        ({"base_state_id": "base-002"}, "canonical_digest"),
+        ({"trajectory_id": "traj-002"}, "future entry|canonical_digest"),
+        ({"robot_footprint": CircleFootprint(0.03)}, "future entry|canonical_digest"),
+        ({"future_entry": other_bundle.future_entry}, "future entry"),
+        ({"canonical_digest": "0" * 64}, "canonical_digest"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            replace(bundle, **changes)
+
+    with pytest.raises(ValueError, match="init=False"):
+        replace(bundle, history_sweep=other_bundle.history_sweep)
+    with pytest.raises(ValueError, match="init=False"):
+        replace(bundle, seam_sweep=other_bundle.seam_sweep)

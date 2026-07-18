@@ -16,8 +16,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.contracts import GridSpec, LocalTrajectory
-from src.geometry import CircleFootprint, Footprint, RectangleFootprint
+from src.contracts import BaseState, GridSpec, LocalTrajectory, validate_base_state
+from src.geometry import CircleFootprint, Footprint, RectangleFootprint, wrap_angle
 
 from .occluder_sampler import (
     OCCLUDER_COLLISION_SWEEP_PREPARATION_VERSION,
@@ -28,6 +28,7 @@ from .occluder_sampler import (
 
 
 ROBOT_SWEEP_CACHE_VERSION = "robot_sweep_cache_v1"
+ROBOT_COLLISION_SWEEP_BUNDLE_VERSION = "robot_collision_sweep_bundle_v1"
 SOP04_POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
 
@@ -499,3 +500,263 @@ class RobotSweepCache:
         self._keys_by_trajectory_id[trajectory.trajectory_id] = key
         self._builds += 1
         return entry
+
+
+def _canonical_bundle_digest(
+    *,
+    base_state_id: str,
+    trajectory_id: str,
+    base_history_pose_bytes: bytes,
+    future_entry_digest: str,
+    robot_footprint: Footprint,
+    grid: GridSpec,
+    future_dt_s: float,
+    rejection_reason: str,
+) -> str:
+    digest = hashlib.sha256()
+    for part in (
+        ROBOT_COLLISION_SWEEP_BUNDLE_VERSION.encode("utf-8"),
+        base_state_id.encode("utf-8"),
+        trajectory_id.encode("utf-8"),
+        base_history_pose_bytes,
+        future_entry_digest.encode("ascii"),
+        _footprint_bytes(robot_footprint),
+        _grid_bytes(grid),
+        struct.pack(">d", future_dt_s),
+        rejection_reason.encode("utf-8"),
+    ):
+        _digest_part(digest, part)
+    return digest.hexdigest()
+
+
+def _same_se2_endpoint(first: np.ndarray, second: np.ndarray) -> bool:
+    return bool(
+        np.array_equal(first[:2], second[:2])
+        and np.isclose(
+            float(wrap_angle(first[2] - second[2])),
+            0.0,
+            rtol=0.0,
+            atol=1e-12,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class RobotCollisionSweepBundle:
+    """Immutable no-gap robot sweep ordered as history, seam, and future.
+
+    The canonical future is owned by ``future_entry``.  Base history and the
+    current-to-first-future seam are derived afresh from immutable canonical
+    bytes, so no base-specific geometry enters the process-local cache.
+    """
+
+    base_state_id: str
+    trajectory_id: str
+    robot_footprint: Footprint
+    grid: GridSpec
+    future_dt_s: float
+    rejection_reason: str
+    base_history_pose_bytes: bytes
+    future_entry: RobotSweepCacheEntry
+    canonical_digest: str
+    bundle_version: str = ROBOT_COLLISION_SWEEP_BUNDLE_VERSION
+    history_sweep: PreparedOccluderCollisionSweep = field(init=False)
+    seam_sweep: PreparedOccluderCollisionSweep = field(init=False)
+    collision_sweeps: tuple[PreparedOccluderCollisionSweep, ...] = field(
+        init=False
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_state_id, str) or not self.base_state_id:
+            raise ValueError("base_state_id must be non-empty")
+        if not isinstance(self.trajectory_id, str) or not self.trajectory_id:
+            raise ValueError("trajectory_id must be non-empty")
+        if not isinstance(
+            self.robot_footprint,
+            (CircleFootprint, RectangleFootprint),
+        ):
+            raise TypeError("robot_footprint must be a Footprint")
+        grid = _validate_grid(self.grid)
+        future_dt_s = _finite_float(
+            self.future_dt_s,
+            name="future_dt_s",
+            positive=True,
+        )
+        if not isinstance(self.rejection_reason, str) or not self.rejection_reason:
+            raise ValueError("rejection_reason must be non-empty")
+        if self.bundle_version != ROBOT_COLLISION_SWEEP_BUNDLE_VERSION:
+            raise ValueError("bundle_version mismatch")
+        if not isinstance(self.base_history_pose_bytes, bytes):
+            raise TypeError("base_history_pose_bytes must be canonical bytes")
+        expected_history_nbytes = (
+            grid.history_steps * 3 * np.dtype("<f8").itemsize
+        )
+        if len(self.base_history_pose_bytes) != expected_history_nbytes:
+            raise ValueError(
+                "base_history_pose_bytes length does not match grid.history_steps"
+            )
+        history_poses = np.frombuffer(
+            self.base_history_pose_bytes,
+            dtype=np.dtype("<f8"),
+        ).reshape((grid.history_steps, 3))
+        if not np.isfinite(history_poses).all():
+            raise ValueError("base_history_pose_bytes must encode finite poses")
+        if not np.allclose(
+            history_poses[-1],
+            0.0,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError("base_state current robot pose must be the local origin")
+
+        entry = self.future_entry
+        if not isinstance(entry, RobotSweepCacheEntry):
+            raise TypeError("future_entry must be a RobotSweepCacheEntry")
+        key = entry.key
+        if (
+            entry.trajectory_id != self.trajectory_id
+            or key.trajectory_id != self.trajectory_id
+            or key.footprint != self.robot_footprint
+            or key.grid != grid
+            or key.future_dt_s != future_dt_s
+            or key.rejection_reason != self.rejection_reason
+            or key.pose_time_layout_version != SOP04_POSE_TIME_LAYOUT_VERSION
+        ):
+            raise ValueError("future entry does not match bundle components")
+
+        expected_digest = _canonical_bundle_digest(
+            base_state_id=self.base_state_id,
+            trajectory_id=self.trajectory_id,
+            base_history_pose_bytes=self.base_history_pose_bytes,
+            future_entry_digest=key.canonical_digest,
+            robot_footprint=self.robot_footprint,
+            grid=grid,
+            future_dt_s=future_dt_s,
+            rejection_reason=self.rejection_reason,
+        )
+        if self.canonical_digest != expected_digest:
+            raise ValueError("canonical_digest does not match bound bundle fields")
+
+        future_poses = np.frombuffer(
+            key.pose_bytes,
+            dtype=np.dtype("<f8"),
+        ).reshape((grid.future_steps, 3))
+        history_sweep = prepare_occluder_collision_sweep(
+            OccluderCollisionSweep(
+                footprint=self.robot_footprint,
+                poses=history_poses,
+                rejection_reason=self.rejection_reason,
+            ),
+            grid=grid,
+        )
+        seam_poses = np.vstack((history_poses[-1], future_poses[0]))
+        seam_sweep = prepare_occluder_collision_sweep(
+            OccluderCollisionSweep(
+                footprint=self.robot_footprint,
+                poses=seam_poses,
+                rejection_reason=self.rejection_reason,
+            ),
+            grid=grid,
+        )
+        future_sweep = entry.prepared_future_sweep
+        if not (
+            _same_se2_endpoint(
+                history_sweep.dense_poses[-1],
+                seam_sweep.dense_poses[0],
+            )
+            and _same_se2_endpoint(
+                seam_sweep.dense_poses[-1],
+                future_sweep.dense_poses[0],
+            )
+        ):
+            raise ValueError("robot collision sweep endpoint seam mismatch")
+        object.__setattr__(self, "history_sweep", history_sweep)
+        object.__setattr__(self, "seam_sweep", seam_sweep)
+        object.__setattr__(
+            self,
+            "collision_sweeps",
+            (history_sweep, seam_sweep, future_sweep),
+        )
+
+    @property
+    def future_sweep(self) -> PreparedOccluderCollisionSweep:
+        """Return the cache-owned canonical future sweep."""
+
+        return self.future_entry.prepared_future_sweep
+
+
+def prepare_robot_collision_sweep_bundle(
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    *,
+    robot_footprint: Footprint,
+    grid: GridSpec,
+    future_dt_s: float,
+    cache: RobotSweepCache | None = None,
+    rejection_reason: str = "occluder_robot_swept_overlap",
+) -> RobotCollisionSweepBundle:
+    """Prepare exact history/seam/future robot sweeps without time gaps."""
+
+    if not isinstance(base_state, BaseState):
+        raise TypeError("base_state must be a BaseState")
+    if not isinstance(trajectory, LocalTrajectory):
+        raise TypeError("trajectory must be a LocalTrajectory")
+    if not isinstance(robot_footprint, (CircleFootprint, RectangleFootprint)):
+        raise TypeError("robot_footprint must be a Footprint")
+    grid = _validate_grid(grid)
+    future_dt_s = _finite_float(
+        future_dt_s,
+        name="future_dt_s",
+        positive=True,
+    )
+    if cache is not None and not isinstance(cache, RobotSweepCache):
+        raise TypeError("cache must be a RobotSweepCache or None")
+    if not isinstance(rejection_reason, str) or not rejection_reason:
+        raise ValueError("rejection_reason must be non-empty")
+    if not isinstance(base_state.state_id, str) or not base_state.state_id:
+        raise ValueError("base_state.state_id must be non-empty")
+    validate_base_state(base_state, grid)
+    if not np.allclose(
+        base_state.robot_history[-1],
+        0.0,
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError("base_state current robot pose must be the local origin")
+
+    base_history = np.array(
+        base_state.robot_history,
+        dtype=np.dtype("<f8"),
+        order="C",
+        copy=True,
+    )
+    base_history_pose_bytes = base_history.tobytes(order="C")
+    active_cache = RobotSweepCache() if cache is None else cache
+    future_entry = active_cache.get(
+        trajectory,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=future_dt_s,
+        rejection_reason=rejection_reason,
+    )
+    canonical_digest = _canonical_bundle_digest(
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+        base_history_pose_bytes=base_history_pose_bytes,
+        future_entry_digest=future_entry.key.canonical_digest,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=future_dt_s,
+        rejection_reason=rejection_reason,
+    )
+    return RobotCollisionSweepBundle(
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+        robot_footprint=robot_footprint,
+        grid=grid,
+        future_dt_s=future_dt_s,
+        rejection_reason=rejection_reason,
+        base_history_pose_bytes=base_history_pose_bytes,
+        future_entry=future_entry,
+        canonical_digest=canonical_digest,
+    )

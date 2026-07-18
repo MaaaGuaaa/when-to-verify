@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,11 +20,20 @@ from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
 from src.generation import event_sampler as event_sampler_module
 from src.generation import event_target_motion_shard as target_motion_shard_module
 from src.generation.dynamic_object_transplant import (
+    TRANSFORM_ALGORITHM_VERSION,
     TargetPolicyError,
     TransplantError,
     footprint_from_spec,
     normalize_target_type_policy,
+    transplant_reachability_candidate,
     transplant_snippet,
+)
+from src.generation.blind_reachability import (
+    BLIND_REACHABILITY_ALGORITHM_VERSION,
+    REACHABLE_ARC_SCHEDULE_VERSION,
+    ReachabilityCandidate,
+    ReachabilityIdentity,
+    build_reachability_candidate,
 )
 from src.generation.event_sampler import (
     GeneratorConfigError,
@@ -96,6 +106,383 @@ def _snippet(
             },
         },
     )
+
+
+def _reachability_candidate(
+    snippet: MotionSnippet,
+    *,
+    conflict_index: int = 7,
+    conflict_time_s: float | None = None,
+    conflict_point: tuple[float, float] = (1.25, -0.35),
+    desired_crossing_direction: tuple[float, float] = (0.0, 1.0),
+    base_state_id: str = "train-base-reachability",
+    trajectory_id: str = "trajectory-reachability",
+) -> ReachabilityCandidate:
+    anchor_index = min(22, 7 + conflict_index + 1)
+    identity = ReachabilityIdentity(
+        base_state_id=base_state_id,
+        trajectory_id=trajectory_id,
+        source_snippet_id=snippet.snippet_id,
+        conflict_index=conflict_index,
+        conflict_time_s=(
+            (conflict_index + 1) * 0.2
+            if conflict_time_s is None
+            else conflict_time_s
+        ),
+        crossing_side=-1,
+        angle_offset_deg=15.0,
+    )
+    return build_reachability_candidate(
+        conflict_point=np.asarray(conflict_point, dtype=np.float64),
+        source_current_xy=snippet.positions[7].astype(np.float64),
+        source_anchor_xy=snippet.positions[anchor_index].astype(np.float64),
+        desired_crossing_direction=np.asarray(
+            desired_crossing_direction, dtype=np.float64
+        ),
+        identity=identity,
+    )
+
+
+def _reachability_transplant_kwargs(
+    base_candidate: ReachabilityCandidate,
+    **changes: object,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "candidate": base_candidate,
+        "future_dt_s": 0.2,
+        "future_steps": 15,
+        "target_type_policy_digest": "reachability-policy-digest",
+        "seed": 23,
+        "context_object_ids": ("context-b", "context-a"),
+    }
+    kwargs.update(changes)
+    return kwargs
+
+
+def test_reachability_transplant_uses_candidate_se2_without_resampling() -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet)
+    positions_before = snippet.positions.copy()
+    headings_before = snippet.headings.copy()
+    candidate_arrays_before = tuple(
+        array.copy()
+        for array in (
+            candidate.rotation_matrix,
+            candidate.current_xy,
+            candidate.conflict_point,
+            candidate.source_delta_xy,
+            candidate.desired_crossing_direction,
+        )
+    )
+
+    result = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(candidate),
+    )
+
+    full_poses = np.vstack((result.history_poses, result.future_poses))
+    expected_positions = (
+        (snippet.positions.astype(np.float64) - snippet.positions[7].astype(np.float64))
+        @ candidate.rotation_matrix.T
+        + candidate.current_xy
+    )
+    expected_headings = snippet.headings.astype(np.float64) + candidate.rotation_rad
+    old_velocity_rotation = float(
+        np.pi / 2.0
+        - np.arctan2(
+            float(snippet.velocities[15, 1]),
+            float(snippet.velocities[15, 0]),
+        )
+    )
+
+    assert abs(candidate.rotation_rad - old_velocity_rotation) > 0.01
+    np.testing.assert_array_equal(
+        result.current_pose[:2], candidate.current_xy.astype(np.float32)
+    )
+    np.testing.assert_array_equal(
+        result.future_poses[candidate.identity.conflict_index, :2],
+        candidate.conflict_point.astype(np.float32),
+    )
+    np.testing.assert_allclose(full_poses[:, :2], expected_positions, atol=1e-6)
+    np.testing.assert_allclose(full_poses[:, 2], expected_headings, atol=1e-6)
+    np.testing.assert_allclose(
+        np.diff(full_poses[:, :2], axis=0),
+        np.diff(snippet.positions.astype(np.float64), axis=0)
+        @ candidate.rotation_matrix.T,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.linalg.norm(
+            full_poses[:, None, :2] - full_poses[None, :, :2], axis=-1
+        ),
+        np.linalg.norm(
+            snippet.positions[:, None, :].astype(np.float64)
+            - snippet.positions[None, :, :].astype(np.float64),
+            axis=-1,
+        ),
+        atol=2e-6,
+    )
+    np.testing.assert_array_equal(snippet.positions, positions_before)
+    np.testing.assert_array_equal(snippet.headings, headings_before)
+    for actual, expected in zip(
+        (
+            candidate.rotation_matrix,
+            candidate.current_xy,
+            candidate.conflict_point,
+            candidate.source_delta_xy,
+            candidate.desired_crossing_direction,
+        ),
+        candidate_arrays_before,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_reachability_transplant_has_frozen_output_and_json_provenance() -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet, conflict_index=4)
+
+    result = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(candidate),
+    )
+
+    assert TRANSFORM_ALGORITHM_VERSION == "reachability_candidate_se2_v1"
+    assert result.history_poses.shape == (8, 3)
+    assert result.current_pose.shape == (3,)
+    assert result.future_poses.shape == (15, 3)
+    assert result.history_poses.dtype == np.float32
+    assert result.current_pose.dtype == np.float32
+    assert result.future_poses.dtype == np.float32
+    assert np.isfinite(result.history_poses).all()
+    assert np.isfinite(result.current_pose).all()
+    assert np.isfinite(result.future_poses).all()
+    np.testing.assert_array_equal(result.current_pose, result.history_poses[-1])
+    assert result.target_dynamic_object_id.startswith("generated::human::")
+    assert result.provenance["transform_id"].startswith("transform-")
+    assert result.provenance["transform_id"] != result.target_dynamic_object_id
+    assert result.provenance["transform_algorithm_version"] == (
+        TRANSFORM_ALGORITHM_VERSION
+    )
+    assert result.provenance["reachability_candidate_id"] == candidate.candidate_id
+    assert result.provenance["reachability_algorithm_version"] == (
+        BLIND_REACHABILITY_ALGORITHM_VERSION
+    )
+    assert result.provenance["reachable_arc_schedule_version"] == (
+        REACHABLE_ARC_SCHEDULE_VERSION
+    )
+    assert result.provenance["source_current_index"] == 7
+    assert result.provenance["source_anchor_index"] == 12
+    assert result.provenance["source_delta_xy"] == candidate.source_delta_xy.tolist()
+    assert result.provenance["candidate_current_xy"] == candidate.current_xy.tolist()
+    assert result.provenance["conflict_point"] == candidate.conflict_point.tolist()
+    assert result.provenance["rotation_rad"] == candidate.rotation_rad
+    assert result.provenance["desired_crossing_direction"] == (
+        candidate.desired_crossing_direction.tolist()
+    )
+    assert result.provenance["crossing_side"] == -1
+    assert result.provenance["angle_offset_deg"] == 15.0
+    assert result.provenance["conflict_index"] == 4
+    assert result.provenance["conflict_time_s"] == pytest.approx(1.0)
+    assert result.provenance["time_scale"] == 1.0
+    assert result.provenance["motion_snippet_layout_version"] == (
+        "history8_current7_future15_v1"
+    )
+    assert result.provenance["source_recording_id"] == snippet.source_recording_id
+    assert result.provenance["source_object_id"] == snippet.source_object_id
+    json.dumps(result.provenance, sort_keys=True, allow_nan=False)
+
+
+def test_reachability_transplant_ids_bind_candidate_seed_context_and_arrays() -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet)
+    base = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(candidate),
+    )
+    repeated = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(
+            candidate, context_object_ids=("context-a", "context-b")
+        ),
+    )
+    changed_seed = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(candidate, seed=24),
+    )
+    changed_context = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(
+            candidate, context_object_ids=("context-a", "context-b", "context-c")
+        ),
+    )
+    changed_candidate_value = _reachability_candidate(
+        snippet, conflict_point=(1.35, -0.35)
+    )
+    changed_candidate = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(changed_candidate_value),
+    )
+    changed_positions = snippet.positions.copy()
+    changed_positions[0, 1] += np.float32(0.125)
+    changed_array_snippet = replace(snippet, positions=changed_positions)
+    changed_array = transplant_reachability_candidate(
+        changed_array_snippet,
+        **_reachability_transplant_kwargs(candidate),
+    )
+    collision_resolved = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(
+            candidate,
+            context_object_ids=(
+                "context-a",
+                "context-b",
+                base.target_dynamic_object_id,
+            ),
+        ),
+    )
+
+    assert repeated.target_dynamic_object_id == base.target_dynamic_object_id
+    assert repeated.provenance["transform_id"] == base.provenance["transform_id"]
+    for changed in (
+        changed_seed,
+        changed_context,
+        changed_candidate,
+        changed_array,
+        collision_resolved,
+    ):
+        assert changed.target_dynamic_object_id != base.target_dynamic_object_id
+        assert changed.provenance["transform_id"] != base.provenance["transform_id"]
+    assert collision_resolved.target_dynamic_object_id != base.target_dynamic_object_id
+
+
+def test_reachability_transplant_preserves_unwrapped_headings() -> None:
+    snippet = _snippet()
+    headings = snippet.headings.copy()
+    headings[:] = np.linspace(2.9, 3.5, 23, dtype=np.float32)
+    snippet = replace(snippet, headings=headings)
+    candidate = _reachability_candidate(
+        snippet, desired_crossing_direction=(-1.0, 0.0)
+    )
+
+    result = transplant_reachability_candidate(
+        snippet,
+        **_reachability_transplant_kwargs(candidate),
+    )
+    full_poses = np.vstack((result.history_poses, result.future_poses))
+
+    np.testing.assert_allclose(
+        full_poses[:, 2],
+        headings.astype(np.float64) + candidate.rotation_rad,
+        atol=1e-6,
+    )
+    assert np.max(np.abs(full_poses[:, 2])) > np.pi
+
+
+def test_reachability_transplant_rejects_candidate_identity_mismatches() -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet)
+
+    with pytest.raises(ValueError, match="snippet_id"):
+        transplant_reachability_candidate(
+            replace(snippet, snippet_id="different-snippet"),
+            **_reachability_transplant_kwargs(candidate),
+        )
+
+    bad_time = _reachability_candidate(
+        snippet, conflict_time_s=candidate.identity.conflict_time_s + 1e-4
+    )
+    with pytest.raises(ValueError, match="conflict_time_s"):
+        transplant_reachability_candidate(
+            snippet,
+            **_reachability_transplant_kwargs(bad_time),
+        )
+
+    bad_index = _reachability_candidate(snippet, conflict_index=15)
+    with pytest.raises(ValueError, match="source_anchor_index"):
+        transplant_reachability_candidate(
+            snippet,
+            **_reachability_transplant_kwargs(bad_index),
+        )
+
+    changed_positions = snippet.positions.copy()
+    changed_positions[15, 0] += np.float32(1e-4)
+    with pytest.raises(ValueError, match="source_delta_xy"):
+        transplant_reachability_candidate(
+            replace(snippet, positions=changed_positions),
+            **_reachability_transplant_kwargs(candidate),
+        )
+
+
+def test_reachability_transplant_requires_byte_exact_source_delta() -> None:
+    snippet = _snippet()
+    straight_positions = snippet.positions.copy()
+    straight_positions[:, 1] = np.float32(0.0)
+    straight_velocities = snippet.velocities.copy()
+    straight_velocities[:, 1] = np.float32(0.0)
+    straight_headings = np.zeros(23, dtype=np.float32)
+    snippet = replace(
+        snippet,
+        positions=straight_positions,
+        velocities=straight_velocities,
+        headings=straight_headings,
+    )
+    candidate = _reachability_candidate(snippet)
+    signed_zero_positions = straight_positions.copy()
+    signed_zero_positions[15, 1] = np.float32(-0.0)
+
+    assert np.array_equal(
+        candidate.source_delta_xy,
+        signed_zero_positions[15].astype(np.float64)
+        - signed_zero_positions[7].astype(np.float64),
+    )
+    with pytest.raises(ValueError, match="source_delta_xy"):
+        transplant_reachability_candidate(
+            replace(snippet, positions=signed_zero_positions),
+            **_reachability_transplant_kwargs(candidate),
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "error", "message"),
+    [
+        ({"candidate": object()}, TypeError, "ReachabilityCandidate"),
+        ({"future_dt_s": 0.1}, ValueError, "future_dt_s"),
+        ({"future_dt_s": np.nan}, ValueError, "future_dt_s"),
+        ({"future_steps": 14}, ValueError, "future_steps"),
+        ({"future_steps": 15.0}, TypeError, "future_steps"),
+        ({"seed": np.nan}, TypeError, "seed"),
+        ({"context_object_ids": "context-a"}, TypeError, "context_object_ids"),
+    ],
+)
+def test_reachability_transplant_rejects_noncanonical_inputs(
+    changes: dict[str, object],
+    error: type[Exception],
+    message: str,
+) -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet)
+
+    with pytest.raises(error, match=message):
+        transplant_reachability_candidate(
+            snippet,
+            **_reachability_transplant_kwargs(candidate, **changes),
+        )
+
+
+def test_reachability_transplant_rejects_nonfinite_snippet() -> None:
+    snippet = _snippet()
+    candidate = _reachability_candidate(snippet)
+    positions = snippet.positions.copy()
+    positions[0, 0] = np.nan
+
+    with pytest.raises(TransplantError) as exc_info:
+        transplant_reachability_candidate(
+            replace(snippet, positions=positions),
+            **_reachability_transplant_kwargs(candidate),
+        )
+
+    assert exc_info.value.reason == "snippet_nonfinite"
 
 
 def _generator_config(event_kind: str = "structural") -> dict:

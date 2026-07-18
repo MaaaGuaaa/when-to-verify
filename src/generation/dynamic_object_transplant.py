@@ -11,6 +11,11 @@ import numpy as np
 
 from src.contracts import DYNAMIC_OBJECT_TYPES, validate_dynamic_object_spec
 from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
+from src.generation.blind_reachability import (
+    BLIND_REACHABILITY_ALGORITHM_VERSION,
+    REACHABLE_ARC_SCHEDULE_VERSION,
+    ReachabilityCandidate,
+)
 from src.geometry import CircleFootprint, Footprint, RectangleFootprint, wrap_angle
 from src.utils.seeding import stable_digest
 
@@ -23,6 +28,7 @@ MOTION_SNIPPET_FUTURE_STEPS = 15
 MOTION_SNIPPET_SAMPLE_DT_S = 0.2
 MOTION_SNIPPET_DURATION_S = 4.4
 MOTION_SNIPPET_CURRENT_TIME_S = 1.4
+TRANSFORM_ALGORITHM_VERSION = "reachability_candidate_se2_v1"
 
 
 class TargetPolicyError(ValueError):
@@ -451,6 +457,279 @@ def transplant_snippet(
     )
     future_poses = np.array(
         poses[MOTION_SNIPPET_HISTORY_STEPS:],
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    return TransplantedDynamicObject(
+        target_dynamic_object_id=target_id,
+        source_object_id=snippet.source_object_id,
+        snippet_id=snippet.snippet_id,
+        object_type=snippet.object_type,
+        footprint_spec=footprint_spec,
+        footprint_spec_digest=footprint_digest,
+        history_poses=history_poses,
+        current_pose=current_pose,
+        future_poses=future_poses,
+        provenance=provenance,
+    )
+
+
+def _canonical_context_object_ids(
+    value: tuple[str, ...] | list[str] | set[str],
+) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list, set)):
+        raise TypeError("context_object_ids must be a tuple, list, or set")
+    if any(not isinstance(object_id, str) or not object_id for object_id in value):
+        raise ValueError("context_object_ids must contain non-empty strings")
+    return tuple(sorted(set(value)))
+
+
+def _reachability_transform_id(
+    *,
+    snippet: MotionSnippet,
+    candidate: ReachabilityCandidate,
+    footprint_spec_digest: str,
+    target_type_policy_digest: str,
+    seed: int,
+    context_object_ids: tuple[str, ...],
+    transformed_poses: np.ndarray,
+) -> str:
+    canonical_poses = np.ascontiguousarray(transformed_poses, dtype=np.dtype("<f4"))
+    payload = {
+        "domain": "reachability-candidate-se2-transform-identity-v1",
+        "transform_algorithm_version": TRANSFORM_ALGORITHM_VERSION,
+        "reachability_algorithm_version": BLIND_REACHABILITY_ALGORITHM_VERSION,
+        "reachable_arc_schedule_version": REACHABLE_ARC_SCHEDULE_VERSION,
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
+        "reachability_candidate_id": candidate.candidate_id,
+        "snippet_identity": {
+            "snippet_id": snippet.snippet_id,
+            "split": snippet.split,
+            "source_recording_id": snippet.source_recording_id,
+            "source_object_id": snippet.source_object_id,
+            "object_type": snippet.object_type,
+        },
+        "footprint_spec_digest": footprint_spec_digest,
+        "target_type_policy_digest": target_type_policy_digest,
+        "seed": seed,
+        "context_object_ids": list(context_object_ids),
+        "transformed_poses": {
+            "shape": list(canonical_poses.shape),
+            "dtype": "<f4",
+            "order": "C",
+            "bytes_hex": canonical_poses.tobytes(order="C").hex(),
+        },
+    }
+    canonical_payload = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return f"transform-{stable_digest(canonical_payload, size=16)}"
+
+
+def _stable_reachability_target_id(
+    *,
+    object_type: str,
+    transform_id: str,
+    context_object_ids: tuple[str, ...],
+) -> str:
+    context_ids = set(context_object_ids)
+    salt = 0
+    while True:
+        digest = stable_digest(
+            "reachability-candidate-target-identity-v1",
+            transform_id,
+            salt,
+            size=12,
+        )
+        target_id = f"generated::{object_type}::{digest}"
+        if target_id not in context_ids:
+            return target_id
+        salt += 1
+
+
+def transplant_reachability_candidate(
+    snippet: MotionSnippet,
+    *,
+    candidate: ReachabilityCandidate,
+    future_dt_s: float,
+    future_steps: int,
+    target_type_policy_digest: str,
+    seed: int,
+    context_object_ids: tuple[str, ...] | list[str] | set[str],
+) -> TransplantedDynamicObject:
+    """Apply one frozen reachability candidate to all 23 source samples.
+
+    This path consumes the candidate's already-validated SE(2) transform.  It
+    never estimates a direction from instantaneous velocity and performs no
+    interpolation, temporal scaling, resampling, or extrapolation.
+    """
+
+    _validate_snippet(snippet)
+    if not isinstance(candidate, ReachabilityCandidate):
+        raise TypeError("candidate must be a ReachabilityCandidate")
+    if snippet.snippet_id != candidate.identity.source_snippet_id:
+        raise ValueError("snippet_id must match candidate source_snippet_id")
+
+    dt_s = _finite_real(future_dt_s, name="future_dt_s")
+    if dt_s != MOTION_SNIPPET_SAMPLE_DT_S:
+        raise ValueError("future_dt_s must equal 0.2")
+    if isinstance(future_steps, (bool, np.bool_)) or not isinstance(
+        future_steps, (int, np.integer)
+    ):
+        raise TypeError("future_steps must be an integer")
+    if int(future_steps) != MOTION_SNIPPET_FUTURE_STEPS:
+        raise ValueError("future_steps must equal 15")
+    if (
+        not isinstance(target_type_policy_digest, str)
+        or not target_type_policy_digest
+    ):
+        raise ValueError("target_type_policy_digest must be a non-empty string")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(
+        seed, (int, np.integer)
+    ):
+        raise TypeError("seed must be an integer")
+    canonical_seed = int(seed)
+    canonical_context_ids = _canonical_context_object_ids(context_object_ids)
+
+    conflict_index = candidate.identity.conflict_index
+    expected_conflict_time_s = (
+        float(conflict_index + 1) * MOTION_SNIPPET_SAMPLE_DT_S
+    )
+    time_tolerance = (
+        8.0
+        * np.finfo(np.float64).eps
+        * max(1.0, abs(expected_conflict_time_s))
+    )
+    if (
+        abs(candidate.identity.conflict_time_s - expected_conflict_time_s)
+        > time_tolerance
+    ):
+        raise ValueError(
+            "candidate conflict_time_s must equal (conflict_index + 1) * 0.2"
+        )
+    source_anchor_index = (
+        MOTION_SNIPPET_CURRENT_INDEX + conflict_index + 1
+    )
+    if not 0 <= source_anchor_index < MOTION_SNIPPET_SAMPLE_COUNT:
+        raise ValueError("candidate source_anchor_index must lie in [0, 22]")
+
+    positions = snippet.positions.astype(np.float64)
+    headings = snippet.headings.astype(np.float64)
+    expected_source_delta = (
+        positions[source_anchor_index] - positions[MOTION_SNIPPET_CURRENT_INDEX]
+    )
+    candidate_delta_bytes = np.ascontiguousarray(
+        candidate.source_delta_xy, dtype=np.dtype(">f8")
+    ).tobytes(order="C")
+    expected_delta_bytes = np.ascontiguousarray(
+        expected_source_delta, dtype=np.dtype(">f8")
+    ).tobytes(order="C")
+    if candidate_delta_bytes != expected_delta_bytes:
+        raise ValueError(
+            "candidate source_delta_xy must exactly match the source snippet anchor"
+        )
+
+    transformed_xy = (
+        (positions - positions[MOTION_SNIPPET_CURRENT_INDEX])
+        @ candidate.rotation_matrix.T
+        + candidate.current_xy
+    )
+    transformed_headings = headings + candidate.rotation_rad
+    transformed_poses = np.column_stack(
+        (transformed_xy, transformed_headings)
+    ).astype(np.float32)
+    if not np.isfinite(transformed_poses).all():
+        raise TransplantError("transplant_nonfinite")
+
+    footprint_spec = {
+        "object_type": snippet.object_type,
+        "footprint": dict(snippet.footprint),
+    }
+    footprint_payload = json.dumps(
+        footprint_spec,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    footprint_digest = stable_digest(footprint_payload, size=16)
+    transform_id = _reachability_transform_id(
+        snippet=snippet,
+        candidate=candidate,
+        footprint_spec_digest=footprint_digest,
+        target_type_policy_digest=target_type_policy_digest,
+        seed=canonical_seed,
+        context_object_ids=canonical_context_ids,
+        transformed_poses=transformed_poses,
+    )
+    target_id = _stable_reachability_target_id(
+        object_type=snippet.object_type,
+        transform_id=transform_id,
+        context_object_ids=canonical_context_ids,
+    )
+
+    track_provenance = snippet.provenance.get("track_provenance", {})
+    provenance = {
+        "transform_algorithm_version": TRANSFORM_ALGORITHM_VERSION,
+        "transform_id": transform_id,
+        "reachability_candidate_id": candidate.candidate_id,
+        "reachability_algorithm_version": BLIND_REACHABILITY_ALGORITHM_VERSION,
+        "reachable_arc_schedule_version": REACHABLE_ARC_SCHEDULE_VERSION,
+        "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
+        "snippet_id": snippet.snippet_id,
+        "source_recording_id": snippet.source_recording_id,
+        "source_object_id": snippet.source_object_id,
+        "source_body_name": snippet.provenance.get("source_body_name"),
+        "raw_role": snippet.provenance.get("raw_role"),
+        "geometry_source": track_provenance.get("geometry_source", "unknown"),
+        "orientation_source": track_provenance.get(
+            "orientation_source", "unknown"
+        ),
+        "source_start_timestamp": float(snippet.start_timestamp),
+        "source_current_index": MOTION_SNIPPET_CURRENT_INDEX,
+        "source_current_time_s": MOTION_SNIPPET_CURRENT_TIME_S,
+        "source_anchor_index": source_anchor_index,
+        "source_anchor_time_s": source_anchor_index * MOTION_SNIPPET_SAMPLE_DT_S,
+        "source_delta_xy": candidate.source_delta_xy.tolist(),
+        "candidate_current_xy": candidate.current_xy.tolist(),
+        "conflict_point": candidate.conflict_point.tolist(),
+        "rotation_rad": candidate.rotation_rad,
+        "desired_crossing_direction": (
+            candidate.desired_crossing_direction.tolist()
+        ),
+        "crossing_side": candidate.identity.crossing_side,
+        "angle_offset_deg": candidate.identity.angle_offset_deg,
+        "conflict_index": conflict_index,
+        "conflict_time_s": candidate.identity.conflict_time_s,
+        "time_scale": 1.0,
+        "future_dt_s": MOTION_SNIPPET_SAMPLE_DT_S,
+        "future_steps": MOTION_SNIPPET_FUTURE_STEPS,
+        "base_state_id": candidate.identity.base_state_id,
+        "trajectory_id": candidate.identity.trajectory_id,
+        "target_type_policy_digest": target_type_policy_digest,
+        "footprint_spec_digest": footprint_digest,
+        "seed": canonical_seed,
+        "context_object_ids": list(canonical_context_ids),
+    }
+    try:
+        json.dumps(provenance, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise TransplantError("provenance_not_json_safe", str(exc)) from exc
+
+    history_poses = np.array(
+        transformed_poses[:MOTION_SNIPPET_HISTORY_STEPS],
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    current_pose = np.array(
+        history_poses[-1], dtype=np.float32, order="C", copy=True
+    )
+    future_poses = np.array(
+        transformed_poses[MOTION_SNIPPET_HISTORY_STEPS:],
         dtype=np.float32,
         order="C",
         copy=True,

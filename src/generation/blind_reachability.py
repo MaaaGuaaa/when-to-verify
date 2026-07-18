@@ -190,13 +190,18 @@ class ReachabilityCandidate:
         conflict = _finite_vector(self.conflict_point, name="conflict_point")
         source_delta = _finite_vector(self.source_delta_xy, name="source_delta_xy")
         source_direction = _unit_vector(source_delta, name="source_delta_xy")
-        desired = _unit_vector(
-            _finite_vector(
-                self.desired_crossing_direction,
-                name="desired_crossing_direction",
-            ),
+        desired = _finite_vector(
+            self.desired_crossing_direction,
             name="desired_crossing_direction",
         )
+        desired_norm = float(np.hypot(desired[0], desired[1]))
+        if not np.isclose(
+            desired_norm,
+            1.0,
+            rtol=0.0,
+            atol=8.0 * np.finfo(np.float64).eps,
+        ):
+            raise ValueError("desired_crossing_direction must have unit norm")
 
         cosine = np.cos(rotation_rad)
         sine = np.sin(rotation_rad)

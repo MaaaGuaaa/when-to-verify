@@ -131,7 +131,7 @@ g1_split_manifest_digest
 dynamic_objects_config_digest
 target_type_policy_digest
 source SOP03/SOP04/SOP05/SOP07 commits and publication digests
-risk_dataset_manifest_digest_sha256
+risk_dataset_manifest_digest
 ```
 
 The manifest semantic digest uses canonical JSON, excludes its own digest
@@ -148,6 +148,20 @@ indices, non-contiguous indices, digest disagreement, non-complete handoffs,
 split disagreement, and attempts to overwrite an existing output. Formal seal
 publication streams all shards through the already audited SOP07
 `load_risk_shard()` implementation before the atomic rename.
+
+The production provenance digest algorithms are field-specific and frozen:
+
+```text
+g1_split_manifest_digest: BLAKE2b-128, 32 lowercase hex characters
+target_type_policy_digest: BLAKE2b-128, 32 lowercase hex characters
+risk_dataset_manifest_digest: SHA-256, 64 lowercase hex characters
+dynamic_objects_config_digest: SHA-256 over canonical JSON, 64 lowercase hex
+```
+
+The first two values are propagated unchanged from their accepted upstream
+publications. They are never zero-padded or re-hashed. Dataset, checkpoint,
+prediction, calibration, and evaluation validators apply the algorithm and
+length belonging to each field rather than treating all four fields alike.
 
 ### Dataset family seal
 
@@ -251,7 +265,7 @@ mapping so the baseline interface is explicit.
 
 Each sidecar shard binds the corresponding risk-shard semantic digest and
 ordered sample IDs. A sidecar collection seal binds the base
-`risk_dataset_manifest_digest_sha256`, all sidecar shard digests, array layout,
+`risk_dataset_manifest_digest`, all sidecar shard digests, array layout,
 and semantic definition. A join fails on any missing, duplicate, reordered, or
 extra sample ID.
 

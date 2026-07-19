@@ -241,6 +241,7 @@ def test_exact_g_star_matches_hand_enumerated_mixed_footprint_bank():
 
     post_calls = [call for call in risk.calls if call[0] != nominal.trajectory_id]
     assert post_calls
+    assert len(post_calls) == bank.size * len(replanning.candidates)
     parent_by_id = {
         item.trajectory.trajectory_id: item.poses_in_parent_frame
         for item in replanning.candidates

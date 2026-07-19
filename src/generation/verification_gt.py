@@ -484,28 +484,45 @@ def evaluate_verification_value(
 
     post_decision_risks = np.empty(bank.size, dtype=np.float64)
     best_ids: list[str] = []
+    prepared_results: dict[
+        int, tuple[tuple[ReplannedCandidate, ...], np.ndarray]
+    ] = {}
     for observed_world_index, result in enumerate(replanning_results):
-        candidates = _validate_replanning_result(
-            result,
-            nominal_trajectory=nominal_trajectory,
-            action=action,
-        )
+        result_key = id(result)
+        prepared = prepared_results.get(result_key)
+        if prepared is None:
+            candidates = _validate_replanning_result(
+                result,
+                nominal_trajectory=nominal_trajectory,
+                action=action,
+            )
+            candidate_world_losses = np.empty(
+                (len(candidates), bank.size), dtype=np.float64
+            )
+            for candidate_index, candidate in enumerate(candidates):
+                task = _trajectory_task_cost(candidate.trajectory)
+                for world_index, hypothesis in enumerate(bank.hypotheses):
+                    candidate_world_losses[candidate_index, world_index] = (
+                        task
+                        + weight
+                        * _risk_value(
+                            risk_loss,
+                            candidate.trajectory,
+                            candidate.poses_in_parent_frame,
+                            hypothesis,
+                        )
+                    )
+            prepared = (candidates, candidate_world_losses)
+            prepared_results[result_key] = prepared
+        candidates, candidate_world_losses = prepared
         best_loss = reject
         best_id = "reject"
         posterior_row = posterior[observed_world_index]
-        for candidate in candidates:
-            task = _trajectory_task_cost(candidate.trajectory)
-            expected = task
-            expected += weight * float(
-                sum(
-                    posterior_row[world_index]
-                    * _risk_value(
-                        risk_loss,
-                        candidate.trajectory,
-                        candidate.poses_in_parent_frame,
-                        hypothesis,
-                    )
-                    for world_index, hypothesis in enumerate(bank.hypotheses)
+        for candidate_index, candidate in enumerate(candidates):
+            expected = float(
+                np.dot(
+                    posterior_row,
+                    candidate_world_losses[candidate_index],
                 )
             )
             if not np.isfinite(expected) or expected < 0.0:

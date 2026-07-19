@@ -114,6 +114,16 @@ def test_metrics_match_group_local_hand_calculation_and_slice_counts():
         CANONICAL_ACTION_IDS[1]: 1,
         CANONICAL_ACTION_IDS[2]: 1,
     }
+    assert report["oracle_best_action_counts"] == {
+        CANONICAL_ACTION_IDS[0]: 1,
+        CANONICAL_ACTION_IDS[1]: 0,
+        CANONICAL_ACTION_IDS[2]: 1,
+    }
+    assert report["oracle_second_action_counts"] == {
+        CANONICAL_ACTION_IDS[0]: 0,
+        CANONICAL_ACTION_IDS[1]: 2,
+        CANONICAL_ACTION_IDS[2]: 0,
+    }
     assert report["slices"]["target_object_type"]["human"]["sample_count"] == 3
     assert report["slices"]["target_object_type"]["cart"]["sample_count"] == 3
 

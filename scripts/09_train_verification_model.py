@@ -307,6 +307,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "paper F1/ranking/regret thresholds are not evaluated",
         ]
     )
+    oracle_best_counts = learned["oracle_best_action_counts"]
+    selected_counts = learned["selected_action_counts"]
+    if sum(value > 0 for value in oracle_best_counts.values()) <= 1:
+        limitations.append(
+            "oracle-best action lacks diversity in this smoke collection"
+        )
+    if sum(value > 0 for value in selected_counts.values()) <= 1:
+        limitations.append(
+            "model selections collapse to one action on this train-fit smoke"
+        )
+    limitations.append(
+        "target object, footprint, and blind-type slices are unavailable in the current verification manifest"
+    )
     metrics = {
         "schema_version": SCHEMA_VERSION,
         "training_cli_version": TRAINING_CLI_VERSION,

@@ -268,6 +268,8 @@ def evaluate_verification_predictions(
     grouped = _grouped_indices(groups)
     action_order = tuple(sorted(set(actions), key=_action_key))
     selected_counts = {action_id: 0 for action_id in action_order}
+    oracle_best_counts = {action_id: 0 for action_id in action_order}
+    oracle_second_counts = {action_id: 0 for action_id in action_order}
     regrets: list[float] = []
     top_two: list[float] = []
     for indices in grouped.values():
@@ -282,6 +284,9 @@ def evaluate_verification_predictions(
             indices,
             key=lambda index: (-target[index], _action_key(actions[index])),
         )
+        oracle_best_counts[actions[oracle_order[0]]] += 1
+        if len(oracle_order) > 1:
+            oracle_second_counts[actions[oracle_order[1]]] += 1
         top_two.append(float(selected in set(oracle_order[:2])))
     report = _flat_metrics(
         prediction, probability, target, useful, huber_delta=delta
@@ -294,6 +299,8 @@ def evaluate_verification_predictions(
             "top1_regret_mean": float(np.mean(regrets, dtype=np.float64)),
             "top_two_selection_rate": float(np.mean(top_two, dtype=np.float64)),
             "selected_action_counts": selected_counts,
+            "oracle_best_action_counts": oracle_best_counts,
+            "oracle_second_action_counts": oracle_second_counts,
             "selected_action_proportions": {
                 key: float(value / len(grouped))
                 for key, value in selected_counts.items()

@@ -198,7 +198,10 @@ def _metric_report(
         ),
         action_ids=tuple(sample.verification_action_id for sample in samples),
         huber_delta=huber_delta,
-        slice_fields={"source_mode": source_modes},
+        slice_fields={
+            "action": tuple(sample.verification_action_id for sample in samples),
+            "source_mode": source_modes,
+        },
     )
 
 

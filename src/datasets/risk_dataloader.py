@@ -1,18 +1,17 @@
 """Strict SOP09 collation and production-boundary validation.
 
-Only schema-valid ``RiskSample`` inputs are converted to tensors.  The current
-repository does not publish a dataset-level production v2 manifest, so the
-formal production loader intentionally fails closed instead of interpreting
-the ambiguous ``risk_shard_npz_jsonl_v1`` layout.
+Only schema-valid ``RiskSample`` inputs are converted to tensors.  Production
+data is admitted exclusively through the formally authenticated
+``risk_dataset_v2`` seal loader; shard roots and legacy v1 layouts never fall
+through to an alternate parser.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import math
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -45,6 +44,9 @@ from src.datasets.toy_risk_learning import (
     toy_ordered_sample_ids_digest,
     toy_sample_id_sequence_digest,
 )
+
+if TYPE_CHECKING:
+    from src.datasets.risk_dataset_seal import LoadedRiskDataset
 
 MODEL_INPUT_KEYS: tuple[str, ...] = (
     "bev_history",
@@ -428,26 +430,31 @@ def collate_risk_samples(
     )
 
 
-def load_production_risk_dataset(root: str | Path) -> None:
-    """Fail closed until a dataset-level v2 production publication exists."""
+def load_production_risk_dataset(
+    seal_root: str | Path,
+    *,
+    collection_root: str | Path | None = None,
+    expected_split: str | None = None,
+    expected_manifest_digest: str | None = None,
+) -> "LoadedRiskDataset":
+    """Delegate the production boundary to the strict dataset-seal loader.
 
-    root_path = Path(root)
-    manifest_path = root_path / "dataset_manifest.json"
-    observed_layout: object = None
-    if manifest_path.is_file():
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RiskDataContractError(
-                "production risk data requires a valid dataset-level v2 manifest"
-            ) from error
-        if isinstance(payload, Mapping):
-            observed_layout = payload.get(
-                "dataset_layout_version", payload.get("layout_version")
-            )
-    raise RiskDataContractError(
-        "production risk dataset is unavailable: require a dataset-level v2 "
-        f"manifest ({PRODUCTION_DATASET_LAYOUT_VERSION}); observed {observed_layout!r}"
+    The optional defaults preserve the old one-argument fail-closed call: it is
+    still routed through the v2 loader and cannot interpret a shard or legacy
+    manifest.  Production callers provide all arguments explicitly.
+    """
+
+    from src.datasets.risk_dataset_seal import load_risk_dataset_seal
+
+    return load_risk_dataset_seal(
+        seal_root,
+        collection_root=seal_root if collection_root is None else collection_root,
+        expected_split=(
+            "__unspecified_production_split__"
+            if expected_split is None
+            else expected_split
+        ),
+        expected_manifest_digest=expected_manifest_digest,
     )
 
 

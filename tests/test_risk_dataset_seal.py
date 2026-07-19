@@ -1,0 +1,630 @@
+"""Formal publication and fail-closed loading tests for ``risk_dataset_v2``."""
+
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError, fields, replace
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+import pytest
+
+from src.contracts import (
+    HISTORY_CHANNELS,
+    INPUT_CHANNELS,
+    STATE_CHANNELS,
+    TRAJECTORY_CHANNELS,
+    GridSpec,
+)
+from src.datasets.risk_dataloader import (
+    RiskDataContractError,
+    load_production_risk_dataset,
+)
+import src.datasets.risk_dataset_seal as seal_module
+from src.datasets.risk_dataset_seal import (
+    RISK_DATASET_FAMILY_LAYOUT_VERSION,
+    RISK_DATASET_LAYOUT_VERSION,
+    LoadedRiskDataset,
+    RiskShardDescriptor,
+    canonical_dynamic_objects_digest,
+    load_risk_dataset_seal,
+    publish_risk_dataset_seal,
+)
+from src.datasets.shard_writer import load_risk_shard
+from src.datasets.sop03_publication import publish_checksum_envelope
+from tests.fixtures.formal_risk_publication import (
+    FormalRiskPublication,
+    canonical_json,
+    create_formal_risk_publication,
+    resign_dataset_seal,
+    rewrite_collection_handoff,
+    sha256_file,
+    write_canonical_json,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "04_seal_risk_dataset.py"
+
+
+def _publish(
+    publication: FormalRiskPublication,
+    output_dir: Path,
+    *,
+    expected_split: str = "train",
+    expected_handoff_sha256: str | None = None,
+) -> Path:
+    return publish_risk_dataset_seal(
+        output_dir,
+        collection_root=publication.collection_root,
+        base_config_path=publication.base_config_path,
+        split_provenance_path=publication.split_provenance_path,
+        expected_split=expected_split,
+        expected_collection_handoff_sha256=(
+            expected_handoff_sha256 or publication.handoff_sha256
+        ),
+    )
+
+
+def _manifest(seal_root: Path) -> dict[str, object]:
+    value = json.loads(
+        (seal_root / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    assert isinstance(value, dict)
+    return value
+
+
+def _mutate_manifest(
+    seal_root: Path, path: tuple[str, ...], value: object
+) -> dict[str, object]:
+    manifest = _manifest(seal_root)
+    node: dict[str, object] = manifest
+    for key in path[:-1]:
+        child = node[key]
+        assert isinstance(child, dict)
+        node = child
+    node[path[-1]] = value
+    write_canonical_json(seal_root / "dataset_manifest.json", manifest)
+    resign_dataset_seal(seal_root)
+    return manifest
+
+
+def _republish_sop03_envelope(publication: FormalRiskPublication) -> None:
+    root = publication.split_provenance_path.parent
+    for name in (
+        ".producer-complete",
+        "artifact_checksums.sha256",
+        "artifact_checksum_summary.json",
+    ):
+        (root / name).unlink()
+    publish_checksum_envelope(root, workers=1)
+
+
+def test_public_contract_is_frozen_and_dynamic_digest_is_canonical() -> None:
+    assert RISK_DATASET_LAYOUT_VERSION == "risk_dataset_v2"
+    assert RISK_DATASET_FAMILY_LAYOUT_VERSION == "risk_dataset_family_v1"
+    assert [field.name for field in fields(RiskShardDescriptor)] == [
+        "shard_index",
+        "relative_root",
+        "sample_count",
+        "manifest_digest",
+        "semantic_digest",
+        "payload_sha256",
+        "metadata_sha256",
+        "summary_sha256",
+    ]
+    assert [field.name for field in fields(LoadedRiskDataset)] == [
+        "seal_root",
+        "collection_root",
+        "manifest",
+        "grid",
+        "shards",
+        "split",
+        "sample_count",
+        "risk_dataset_manifest_digest",
+        "provenance",
+    ]
+    descriptor = RiskShardDescriptor(0, "shard-00000", 1, *("a" * 64,) * 5)
+    with pytest.raises(FrozenInstanceError):
+        descriptor.sample_count = 2  # type: ignore[misc]
+
+    dynamic_objects = {"human": {"radius_m": 0.3}, "ü": [2, 1]}
+    expected = hashlib.sha256(
+        json.dumps(
+            dynamic_objects,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert canonical_dynamic_objects_digest(dynamic_objects) == expected
+    assert canonical_dynamic_objects_digest({"ü": [2, 1], "human": {"radius_m": 0.3}}) == expected
+    with pytest.raises((TypeError, ValueError)):
+        canonical_dynamic_objects_digest({"bad": float("nan")})
+
+
+def test_publish_load_round_trip_uses_every_real_shard_and_preserves_temporal_safe(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    loaded = load_risk_dataset_seal(
+        seal_root,
+        collection_root=publication.collection_root,
+        expected_split="train",
+    )
+
+    assert isinstance(loaded, LoadedRiskDataset)
+    assert loaded.seal_root == seal_root
+    assert loaded.collection_root == publication.collection_root
+    assert loaded.grid == publication.grid
+    assert loaded.sample_count == 12
+    assert [shard.shard_index for shard in loaded.shards] == [0, 1]
+    assert [shard.relative_root for shard in loaded.shards] == [
+        "shard-00000",
+        "shard-00001",
+    ]
+    assert set(path.name for path in seal_root.iterdir()) == {
+        "dataset_manifest.json",
+        "checksums.sha256",
+        ".producer-complete",
+    }
+    assert len(loaded.provenance["g1_split_manifest_digest"]) == 32
+    assert len(loaded.provenance["target_type_policy_digest"]) == 32
+    assert len(loaded.provenance["dynamic_objects_config_digest"]) == 64
+    assert len(loaded.provenance["risk_dataset_manifest_digest"]) == 64
+    assert loaded.risk_dataset_manifest_digest == loaded.provenance[
+        "risk_dataset_manifest_digest"
+    ]
+
+    samples = tuple(
+        sample
+        for shard in loaded.shards
+        for sample in load_risk_shard(
+            publication.collection_root / shard.relative_root,
+            grid=loaded.grid,
+        ).samples
+    )
+    temporal_safe = [sample for sample in samples if sample.event_type == "temporal_safe"]
+    assert temporal_safe
+    assert all(sample.collision_label == 0 for sample in temporal_safe)
+    assert all(sample.near_miss == 1 for sample in temporal_safe)
+
+
+def test_manifest_digest_ignores_absolute_roots_and_runtime_metadata(
+    tmp_path: Path,
+) -> None:
+    source = create_formal_risk_publication(
+        tmp_path / "source",
+        runtime_metadata={"created_at": "2026-07-19T01:02:03Z", "host": "node-a"},
+    )
+    clone_root = tmp_path / "different" / "absolute" / "source"
+    clone_root.parent.mkdir(parents=True)
+    shutil.copytree(source.root, clone_root)
+    clone = replace(
+        source,
+        root=clone_root,
+        collection_root=clone_root / "collection",
+        base_config_path=clone_root / "config" / "base.yaml",
+        split_provenance_path=clone_root / "sop03" / "run_manifest.json",
+        handoff_path=clone_root / "collection" / "collection_complete_handoff.json",
+    )
+    handoff = json.loads(clone.handoff_path.read_text(encoding="utf-8"))
+    handoff["runtime_metadata"] = {
+        "created_at": "2037-01-01T00:00:00Z",
+        "host": "node-z",
+        "slurm_job_id": "999999",
+    }
+    handoff["collection_instance_digest_sha256"] = "f" * 64
+    clone = replace(
+        clone,
+        handoff_sha256=rewrite_collection_handoff(clone, handoff),
+    )
+
+    first = load_risk_dataset_seal(
+        _publish(source, tmp_path / "seal-a"),
+        collection_root=source.collection_root,
+        expected_split="train",
+    )
+    second = load_risk_dataset_seal(
+        _publish(clone, tmp_path / "elsewhere" / "seal-b"),
+        collection_root=clone.collection_root,
+        expected_split="train",
+    )
+
+    assert first.manifest["collection_handoff_sha256"] != second.manifest[
+        "collection_handoff_sha256"
+    ]
+    assert first.risk_dataset_manifest_digest == second.risk_dataset_manifest_digest
+    assert first.manifest["shards"] == second.manifest["shards"]
+    serialized = canonical_json(first.manifest)
+    assert str(source.root) not in serialized
+    assert str(first.seal_root) not in serialized
+
+
+def test_publisher_authenticates_handoff_before_parsing_collection(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    publication.handoff_path.write_bytes(publication.handoff_path.read_bytes() + b" ")
+
+    with pytest.raises(RiskDataContractError, match="handoff SHA-256"):
+        _publish(publication, tmp_path / "seal")
+    assert not (tmp_path / "seal").exists()
+
+
+@pytest.mark.parametrize("mutation", ["semantic_digest", "ordered_indices"])
+def test_publisher_rejects_handoff_shard_descriptor_mutation(
+    tmp_path: Path, mutation: str
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    shards = handoff["shards"]
+    assert isinstance(shards, list)
+    if mutation == "semantic_digest":
+        shards[0]["semantic_digest"] = "f" * 64
+    else:
+        shards.reverse()
+    handoff_sha = rewrite_collection_handoff(publication, handoff)
+
+    with pytest.raises(RiskDataContractError, match="shard|ordered|semantic"):
+        _publish(
+            publication,
+            tmp_path / "seal",
+            expected_handoff_sha256=handoff_sha,
+        )
+    assert not (tmp_path / "seal").exists()
+
+
+def test_publisher_rejects_wrong_split_and_inconsistent_dynamic_snapshot(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    with pytest.raises(RiskDataContractError, match="split"):
+        _publish(publication, tmp_path / "wrong-split", expected_split="validation")
+
+    manifest = json.loads(
+        publication.split_provenance_path.read_text(encoding="utf-8")
+    )
+    manifest["producer_protocol"]["config_snapshots"]["base"]["value"][
+        "dynamic_objects"
+    ]["human"]["radius_m"] = 99.0
+    write_canonical_json(publication.split_provenance_path, manifest)
+    _republish_sop03_envelope(publication)
+    with pytest.raises(RiskDataContractError, match="base config snapshot"):
+        _publish(publication, tmp_path / "wrong-dynamic")
+
+
+@pytest.mark.parametrize(
+    ("source_field", "bad_value", "message"),
+    [
+        ("g1", "a" * 64, "g1_split_manifest_digest"),
+        ("target", "b" * 64, "target_type_policy_digest"),
+    ],
+)
+def test_publisher_applies_field_specific_upstream_digest_rules(
+    tmp_path: Path,
+    source_field: str,
+    bad_value: str,
+    message: str,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        g1_split_manifest_digest=(bad_value if source_field == "g1" else "1" * 32),
+        target_type_policy_digest=(
+            bad_value if source_field == "target" else "2" * 32
+        ),
+    )
+    with pytest.raises(RiskDataContractError, match=message):
+        _publish(publication, tmp_path / "seal")
+
+
+@pytest.mark.parametrize(
+    ("path", "bad_value", "message"),
+    [
+        (("split",), "validation", "split"),
+        (("grid", "height"), 5, "grid|shape"),
+        (
+            ("channel_spec", "history"),
+            list(reversed(HISTORY_CHANNELS)),
+            "channel",
+        ),
+        (("g1_split_manifest_digest",), "a" * 64, "g1_split_manifest_digest"),
+        (
+            ("target_type_policy_digest",),
+            "b" * 64,
+            "target_type_policy_digest",
+        ),
+        (
+            ("dynamic_objects_config_digest",),
+            "c" * 32,
+            "dynamic_objects_config_digest",
+        ),
+    ],
+)
+def test_loader_rejects_manifest_semantic_and_provenance_mutations(
+    tmp_path: Path,
+    path: tuple[str, ...],
+    bad_value: object,
+    message: str,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    _mutate_manifest(seal_root, path, bad_value)
+
+    with pytest.raises(RiskDataContractError, match=message):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+
+
+def test_loader_rejects_channel_order_even_when_lengths_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    manifest = _manifest(seal_root)
+    channel_spec = manifest["channel_spec"]
+    assert isinstance(channel_spec, dict)
+    assert channel_spec == {
+        "history": list(HISTORY_CHANNELS),
+        "state": list(STATE_CHANNELS),
+        "trajectory": list(TRAJECTORY_CHANNELS),
+        "flat": list(INPUT_CHANNELS),
+        "targets": [
+            "collision_label",
+            "risk_severity",
+            "min_clearance",
+            "near_miss",
+            "first_collision_time",
+        ],
+    }
+    state = channel_spec["state"]
+    assert isinstance(state, list)
+    state[0], state[1] = state[1], state[0]
+    write_canonical_json(seal_root / "dataset_manifest.json", manifest)
+    resign_dataset_seal(seal_root)
+
+    with pytest.raises(RiskDataContractError, match="channel"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+
+
+def test_load_rejects_expected_manifest_digest_mismatch(tmp_path: Path) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    with pytest.raises(RiskDataContractError, match="expected manifest digest"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+            expected_manifest_digest="f" * 64,
+        )
+
+
+def test_publisher_rejects_overwrite_and_collection_symlinks(tmp_path: Path) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    existing = tmp_path / "existing-seal"
+    existing.mkdir()
+    with pytest.raises(FileExistsError, match="overwrite"):
+        _publish(publication, existing)
+
+    collection_link = tmp_path / "collection-link"
+    collection_link.symlink_to(publication.collection_root, target_is_directory=True)
+    linked = replace(publication, collection_root=collection_link)
+    with pytest.raises(RiskDataContractError, match="symlink"):
+        _publish(linked, tmp_path / "linked-seal")
+
+
+def test_publisher_rejects_symlinked_shard_before_formal_loading(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    shard = publication.collection_root / "shard-00001"
+    real_shard = publication.root / "detached-shard-00001"
+    shard.rename(real_shard)
+    shard.symlink_to(real_shard, target_is_directory=True)
+
+    with pytest.raises(RiskDataContractError, match="symlink"):
+        _publish(publication, tmp_path / "seal")
+
+
+@pytest.mark.parametrize("mutation", ["missing_marker", "unexpected_file", "symlink"])
+def test_loader_rejects_partial_unexpected_and_symlinked_seals(
+    tmp_path: Path, mutation: str
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    if mutation == "missing_marker":
+        (seal_root / ".producer-complete").unlink()
+    elif mutation == "unexpected_file":
+        (seal_root / "orphan.tmp").write_text("partial", encoding="utf-8")
+    else:
+        manifest = seal_root / "dataset_manifest.json"
+        detached = tmp_path / "detached-manifest.json"
+        manifest.rename(detached)
+        manifest.symlink_to(detached)
+
+    with pytest.raises(RiskDataContractError, match="incomplete|unexpected|symlink"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+
+
+def test_loader_rejects_v1_layout_and_shard_root_as_dataset_seal(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    _mutate_manifest(
+        seal_root,
+        ("dataset_layout_version",),
+        "risk_shard_npz_jsonl_v1",
+    )
+    with pytest.raises(RiskDataContractError, match="risk_dataset_v2|unsupported"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+    with pytest.raises(RiskDataContractError, match="dataset|seal|incomplete"):
+        load_risk_dataset_seal(
+            publication.collection_root / "shard-00000",
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+
+
+def test_publisher_formally_loads_every_shard_before_atomic_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    real_loader = seal_module.load_risk_shard
+    calls: list[str] = []
+
+    def fail_on_second_shard(root: str | Path, **kwargs: object) -> object:
+        name = Path(root).name
+        calls.append(name)
+        if name == "shard-00001":
+            raise ValueError("formal second-shard sentinel")
+        return real_loader(root, **kwargs)
+
+    monkeypatch.setattr(seal_module, "load_risk_shard", fail_on_second_shard)
+    output = tmp_path / "seal"
+    with pytest.raises(RiskDataContractError, match="formal second-shard sentinel"):
+        _publish(publication, output)
+
+    assert calls == ["shard-00000", "shard-00001"]
+    assert not output.exists()
+    assert not list(tmp_path.glob(".seal.staging-*"))
+
+
+def test_loader_rejects_post_publication_shard_file_tamper(tmp_path: Path) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = _publish(publication, tmp_path / "seal")
+    summary = publication.collection_root / "shard-00001" / "summary.json"
+    summary.write_bytes(summary.read_bytes() + b" ")
+
+    with pytest.raises(RiskDataContractError, match="checksum|summary"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+        )
+
+
+def test_production_loader_delegates_same_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = object()
+    observed: dict[str, object] = {}
+
+    def fake_loader(
+        seal_root: str | Path,
+        *,
+        collection_root: str | Path,
+        expected_split: str,
+        expected_manifest_digest: str | None = None,
+    ) -> object:
+        observed.update(
+            {
+                "seal_root": seal_root,
+                "collection_root": collection_root,
+                "expected_split": expected_split,
+                "expected_manifest_digest": expected_manifest_digest,
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(seal_module, "load_risk_dataset_seal", fake_loader)
+    result = load_production_risk_dataset(
+        tmp_path / "seal",
+        collection_root=tmp_path / "collection",
+        expected_split="train",
+        expected_manifest_digest="a" * 64,
+    )
+
+    assert result is sentinel
+    assert observed == {
+        "seal_root": tmp_path / "seal",
+        "collection_root": tmp_path / "collection",
+        "expected_split": "train",
+        "expected_manifest_digest": "a" * 64,
+    }
+
+
+def test_cli_success_argument_failure_and_overwrite_failure(tmp_path: Path) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    seal_root = tmp_path / "cli-seal"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--collection-root",
+        str(publication.collection_root),
+        "--output-dir",
+        str(seal_root),
+        "--base-config",
+        str(publication.base_config_path),
+        "--split-provenance",
+        str(publication.split_provenance_path),
+        "--split",
+        "train",
+        "--expected-collection-handoff-sha256",
+        publication.handoff_sha256,
+    ]
+    success = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+    assert success.returncode == 0, success.stderr
+    payload = json.loads(success.stdout)
+    assert payload["status"] == "complete"
+    assert payload["sample_count"] == 12
+    assert payload["risk_dataset_manifest_digest"] == _manifest(seal_root)[
+        "risk_dataset_manifest_digest"
+    ]
+
+    overwrite = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+    assert overwrite.returncode == 2
+    assert "overwrite" in overwrite.stderr
+
+    bad_argument = subprocess.run(
+        [*command[:-1], "not-a-sha256"], cwd=ROOT, text=True, capture_output=True
+    )
+    assert bad_argument.returncode == 2
+    assert "64 lowercase" in bad_argument.stderr
+
+
+def test_fixture_is_two_contiguous_formal_shards_with_twelve_samples(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    assert handoff["handoff_version"] == "sop07_collection_complete_handoff_v1"
+    assert handoff["layout_version"] == "risk_shard_npz_jsonl_v2"
+    assert handoff["sample_count"] == 12
+    assert handoff["shard_count"] == 2
+    assert [item["shard_index"] for item in handoff["shards"]] == [0, 1]
+    assert [item["relative_root"] for item in handoff["shards"]] == [
+        "shard-00000",
+        "shard-00001",
+    ]
+    assert sha256_file(publication.handoff_path) == publication.handoff_sha256
+
+
+def test_grid_type_remains_the_existing_contract(tmp_path: Path) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    loaded = load_risk_dataset_seal(
+        _publish(publication, tmp_path / "seal"),
+        collection_root=publication.collection_root,
+        expected_split="train",
+    )
+    assert type(loaded.grid) is GridSpec

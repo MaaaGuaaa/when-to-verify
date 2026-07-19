@@ -16,6 +16,7 @@ from src.contracts import (
     GridSpec,
     LocalTrajectory,
     VerificationSample,
+    ContractError,
     validate_verification_sample,
 )
 from src.datasets.risk_dataset import build_trajectory_channels
@@ -46,6 +47,26 @@ _FORBIDDEN_PROVENANCE_TOKENS = (
     "post_observation",
     "visible_occupied",
     "dynamic_object_trajectories",
+)
+_METADATA_KEYS = frozenset(
+    {
+        "schema_version",
+        "verification_dataset_version",
+        "ranking_group_id",
+        "action_index",
+        "action_order",
+        "provenance",
+        "label_audit",
+    }
+)
+_LABEL_AUDIT_KEYS = frozenset(
+    {
+        "verification_gt_version",
+        "scenario_bank_digest",
+        "posterior_mode",
+        "posterior_temperature",
+        "bank_size",
+    }
 )
 
 
@@ -230,7 +251,6 @@ def build_verification_samples(
     provenance = _canonical_provenance(source.provenance)
     ranking_group_id = "verification-group-" + stable_digest(
         VERIFICATION_DATASET_VERSION,
-        split,
         base_state_id,
         nominal_id,
         size=16,
@@ -297,6 +317,171 @@ def build_verification_samples(
     return tuple(samples)
 
 
+def validate_verification_sample_for_publication(
+    sample: VerificationSample,
+    *,
+    grid: GridSpec,
+    library: VerificationActionLibrary,
+) -> None:
+    """Apply strict identity, value, and action checks beyond the base contract."""
+
+    if not isinstance(sample, VerificationSample):
+        raise TypeError("sample must be a VerificationSample")
+    if not isinstance(grid, GridSpec):
+        raise TypeError("grid must be a GridSpec")
+    if not isinstance(library, VerificationActionLibrary):
+        raise TypeError("library must be a VerificationActionLibrary")
+    try:
+        validate_verification_sample(sample, grid)
+    except ContractError:
+        raise
+    for name in (
+        "sample_id",
+        "split",
+        "base_state_id",
+        "nominal_trajectory_id",
+        "verification_action_id",
+    ):
+        _nonempty_string(getattr(sample, name), name=name)
+    if sample.split not in SPLIT_NAMES:
+        raise ValueError(f"split must be one of {SPLIT_NAMES}")
+    by_id = library.by_id
+    if sample.verification_action_id not in by_id:
+        raise ValueError("verification_action_id is not canonical")
+    if not np.array_equal(
+        sample.verification_action_vector,
+        by_id[sample.verification_action_id].vector,
+    ):
+        raise ValueError("verification action ID/vector mismatch")
+    if not np.isin(sample.verification_fov_mask, (0.0, 1.0)).all():
+        raise ValueError("verification_fov_mask must be binary")
+    for name in ("value_target", "br_before", "post_risk"):
+        value = getattr(sample, name)
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(f"{name} must be a real number")
+        if not np.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    if sample.br_before < 0.0 or sample.post_risk < 0.0:
+        raise ValueError("br_before and post_risk must be non-negative")
+    if not np.isclose(
+        sample.value_target,
+        sample.br_before - sample.post_risk,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("value_target must equal br_before - post_risk")
+
+    metadata = sample.metadata
+    if not isinstance(metadata, dict) or set(metadata) != _METADATA_KEYS:
+        raise ValueError("verification sample metadata keys are invalid")
+    if metadata["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("verification sample metadata schema mismatch")
+    if metadata["verification_dataset_version"] != VERIFICATION_DATASET_VERSION:
+        raise ValueError("unsupported verification dataset version")
+    expected_group = "verification-group-" + stable_digest(
+        VERIFICATION_DATASET_VERSION,
+        sample.base_state_id,
+        sample.nominal_trajectory_id,
+        size=16,
+    )
+    if metadata["ranking_group_id"] != expected_group:
+        raise ValueError("ranking_group_id does not match base/nominal identity")
+    if metadata["action_order"] != list(CANONICAL_ACTION_IDS):
+        raise ValueError("metadata action_order differs from the canonical order")
+    expected_index = CANONICAL_ACTION_IDS.index(sample.verification_action_id)
+    if metadata["action_index"] != expected_index:
+        raise ValueError("metadata action_index differs from action ID")
+    provenance = _canonical_provenance(metadata["provenance"])
+    if provenance != metadata["provenance"]:
+        raise ValueError("sample provenance is not canonical")
+    audit = metadata["label_audit"]
+    if not isinstance(audit, dict) or set(audit) != _LABEL_AUDIT_KEYS:
+        raise ValueError("label_audit keys are invalid")
+    if audit["verification_gt_version"] != VERIFICATION_GT_VERSION:
+        raise ValueError("unsupported verification GT version")
+    _nonempty_string(audit["scenario_bank_digest"], name="scenario_bank_digest")
+    if audit["posterior_mode"] not in {"exact", "soft"}:
+        raise ValueError("posterior_mode must be exact or soft")
+    temperature = audit["posterior_temperature"]
+    if audit["posterior_mode"] == "exact" and temperature is not None:
+        raise ValueError("exact posterior must not record a temperature")
+    if audit["posterior_mode"] == "soft" and (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not np.isfinite(temperature)
+        or temperature <= 0.0
+    ):
+        raise ValueError("soft posterior temperature must be finite and positive")
+    if (
+        isinstance(audit["bank_size"], bool)
+        or not isinstance(audit["bank_size"], int)
+        or audit["bank_size"] <= 0
+    ):
+        raise ValueError("label_audit bank_size must be a positive integer")
+    expected_sample_id = "verification-" + stable_digest(
+        VERIFICATION_DATASET_VERSION,
+        sample.split,
+        expected_group,
+        sample.verification_action_id,
+        size=16,
+    )
+    if sample.sample_id != expected_sample_id:
+        raise ValueError("sample_id does not match deterministic identity")
+
+
+def audit_verification_groups(
+    samples: tuple[VerificationSample, ...] | list[VerificationSample],
+    *,
+    require_complete: bool = True,
+) -> dict[str, object]:
+    """Reject duplicate IDs and any ranking group crossing data splits."""
+
+    if not isinstance(samples, (tuple, list)) or not samples:
+        raise ValueError("samples must be a non-empty tuple or list")
+    if any(not isinstance(sample, VerificationSample) for sample in samples):
+        raise TypeError("samples must contain VerificationSample values")
+    sample_ids = [sample.sample_id for sample in samples]
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("duplicate sample_id across verification samples")
+    groups: dict[str, list[VerificationSample]] = {}
+    for sample in samples:
+        group_id = sample.metadata.get("ranking_group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("ranking_group_id must be present in metadata")
+        groups.setdefault(group_id, []).append(sample)
+    action_counts = {action_id: 0 for action_id in CANONICAL_ACTION_IDS}
+    for group_id, rows in groups.items():
+        splits = {row.split for row in rows}
+        if len(splits) != 1:
+            raise ValueError(f"cross-split ranking group detected: {group_id}")
+        identities = {
+            (row.base_state_id, row.nominal_trajectory_id) for row in rows
+        }
+        if len(identities) != 1:
+            raise ValueError("ranking group contains mixed base/nominal identities")
+        actions = [row.verification_action_id for row in rows]
+        if len(set(actions)) != len(actions):
+            raise ValueError("ranking group contains duplicate action IDs")
+        if require_complete and set(actions) != set(CANONICAL_ACTION_IDS):
+            raise ValueError("ranking group action imbalance: six actions required")
+        br_values = np.asarray([row.br_before for row in rows], dtype=np.float64)
+        if not np.allclose(br_values, br_values[0], rtol=0.0, atol=1e-12):
+            raise ValueError("ranking group br_before values differ")
+        for action_id in actions:
+            if action_id not in action_counts:
+                raise ValueError("ranking group contains a noncanonical action")
+            action_counts[action_id] += 1
+    return {
+        "group_count": len(groups),
+        "sample_count": len(samples),
+        "action_counts": action_counts,
+        "complete_groups_required": bool(require_complete),
+        "cross_split_group_count": 0,
+    }
+
+
 def verification_model_inputs(
     sample: VerificationSample,
 ) -> Mapping[str, np.ndarray]:
@@ -313,6 +498,8 @@ __all__ = (
     "MODEL_INPUT_KEYS",
     "VERIFICATION_DATASET_VERSION",
     "VerificationGroupInput",
+    "audit_verification_groups",
     "build_verification_samples",
+    "validate_verification_sample_for_publication",
     "verification_model_inputs",
 )

@@ -17,9 +17,12 @@ dependencies = [
 test = [
     "pytest>=7",
 ]
+verification = [
+    "torch>=2.0,<3",
+]
 
-[tool.setuptools]
-packages = ["src", "src.utils"]
+[tool.setuptools.packages.find]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

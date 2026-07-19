@@ -700,6 +700,28 @@ def _prepared_intersects_robot_sweep(
     """Apply the unchanged signed-clearance recursion to prepared geometry."""
 
     dense_robot_poses = sweep.dense_poses
+    sweep_radius_m = _sweep_motion_radius(sweep.footprint)
+    occluder_radius_m = _sweep_motion_radius(occluder_footprint)
+    center_min = np.min(dense_robot_poses[:, :2], axis=0)
+    center_max = np.max(dense_robot_poses[:, :2], axis=0)
+    coordinate_scale = max(
+        1.0,
+        float(np.max(np.abs(dense_robot_poses[:, :2]))),
+        float(np.max(np.abs(occluder_pose[:2]))),
+        sweep_radius_m + occluder_radius_m,
+    )
+    expanded_radius_m = (
+        sweep_radius_m
+        + occluder_radius_m
+        + 64.0 * np.finfo(np.float64).eps * coordinate_scale
+    )
+    if bool(
+        occluder_pose[0] < center_min[0] - expanded_radius_m
+        or occluder_pose[0] > center_max[0] + expanded_radius_m
+        or occluder_pose[1] < center_min[1] - expanded_radius_m
+        or occluder_pose[1] > center_max[1] + expanded_radius_m
+    ):
+        return False
     clearances = trajectory_signed_clearances(
         occluder_footprint,
         np.tile(occluder_pose, (dense_robot_poses.shape[0], 1)),
@@ -1113,13 +1135,26 @@ def validate_environment_occluder_target(
             "target_future_poses must have shape "
             f"({grid.future_steps}, 3)"
         )
+    target_poses = np.vstack((target_history, target_future))
+    endpoint_clearances = trajectory_signed_clearances(
+        candidate.footprint,
+        np.broadcast_to(candidate.pose, target_poses.shape),
+        target_footprint,
+        target_poses,
+    )
+    if np.any(endpoint_clearances <= 0.0):
+        raise OccluderSamplingError(
+            "occluder_target_collision",
+            attempts=1,
+            rejection_reasons={"occluder_target_collision": 1},
+        )
     reason = occluder_collision_sweep_rejection_reason(
         candidate.footprint,
         candidate.pose,
         (
             OccluderCollisionSweep(
                 footprint=target_footprint,
-                poses=np.vstack((target_history, target_future)),
+                poses=target_poses,
                 rejection_reason="occluder_target_collision",
             ),
         ),

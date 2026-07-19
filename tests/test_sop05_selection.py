@@ -59,8 +59,8 @@ def test_diversity_total_selector_versions_and_key_are_frozen() -> None:
     candidate = _candidate(7)
     assert selection.SOP05_DIVERSITY_TOTAL_SELECTION_VERSION == SELECTION_VERSION
     assert selection.SOP05_TOTAL_QUOTA_SELECTION_VERSION == SELECTION_VERSION
-    assert selection.SOP05_PAIR_REPORT_VERSION == "sop05_pair_generation_report_v3"
-    assert selection.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v5"
+    assert selection.SOP05_PAIR_REPORT_VERSION == "sop05_pair_generation_report_v4"
+    assert selection.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v6"
     assert selection.sop05_selection_key(SEED, candidate) == _expected_key(candidate)
 
 

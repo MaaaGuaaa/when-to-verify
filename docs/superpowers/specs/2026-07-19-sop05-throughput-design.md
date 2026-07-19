@@ -117,3 +117,36 @@ therefore can change the frozen hash/diversity selection. If result-equivalent
 optimization is still too slow, the next stage must introduce an explicit
 quota-first selection/producer version and update the authoritative SOP05
 contract before use. It must not masquerade as a runtime-only optimization.
+
+## Escalation decision after the real-data gate
+
+The result-equivalent implementation reduced the real one-pair peak RSS from
+roughly 20 GB to about 340 MB, but Slurm job 35394 still consumed 10:46 CPU over
+6:17 elapsed time without finishing one pair. This fails the throughput goal,
+so the versioned escalation is activated:
+
+- generator algorithm: `blind_reachability_quota_first_v3`;
+- producer: `sop05_generation_run_v6`;
+- pair report: `sop05_pair_generation_report_v4`;
+- deterministic pair-seeded ordering for conflict/snippet/side/angle;
+- rotating `snippet_candidates_per_proposal=64` real-snippet window;
+- stop the pair immediately after `requested_event_count` exact-valid events.
+
+All physical validators and schema 3 tensors remain unchanged. The previous v2
+producer is rejected rather than interpreted as v3.
+
+## Measured result
+
+The completed implementation also batches closed-cell footprint rasterization
+with an exact scalar fallback at numerical boundaries, adds an endpoint
+collision short-circuit, uses a conservative swept-AABB broadphase, and bounds
+the sum of running plus rank-buffered pair reports. The rectangle raster path
+matched the previous scalar authority on 149 seeded random/axis/boundary cases
+and was approximately 131x faster in that microbenchmark.
+
+On the same real train input and seed, one accepted pair fell from about 141 s
+wall / 120 CPU-s to about 59 s wall / 34.7 CPU-s. Roughly 29--31 s is the
+one-time input checksum/load cost. A 100-pair Slurm smoke with 16 workers
+finished in 3:31.87, generated 95 valid events, and selected the requested 90.
+The production scheduler should therefore reserve 5--10% extra pairs and must
+retain quota-unmet reports for the residual failures.

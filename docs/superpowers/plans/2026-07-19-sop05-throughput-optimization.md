@@ -68,6 +68,18 @@ current scientific result and publication identity.
    stage conservation, and publication loading.
 5. Remove temporary logs/scripts after extracting command/result evidence.
 
+If the equivalent one-pair gate exceeds the production envelope, implement the
+already specified versioned escalation before repeating these steps: pair-seed
+ordering, a bounded rotating real-snippet window, and pair-local quota-first
+completion. Update the SOP05 algorithm/producer/report tokens and authoritative
+SOP05 documentation; do not alter schema 3 geometry or validation thresholds.
+
+Executed result: the escalation and result-equivalent geometry fast paths cut
+the same real pair from about 141 s to 59 s wall time while preserving byte-
+identical target-motion manifests/shards and normalized pair evidence. The
+16-worker 100-pair gate completed in 3:31.87 and produced 95 valid candidates,
+of which the requested 90 were selected.
+
 ## Task 6: Commit and handoff
 
 1. Run `git status --short` and inspect the exact diff.

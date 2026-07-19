@@ -706,7 +706,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [x] `scripts/05_generate_events.py` 必须显式接收目录外
       `--sop04-handoff-digest`；`sop05_input_lock_v2` 和 run identity 必须绑定 bank/layout、
       时间参数、offset digest、bank semantic digest 与 external handoff digest
-- [x] SOP05 正式母事件生成协议固定为 `blind_reachability_first_v2`，
+- [x] SOP05 正式母事件生成协议固定为 `blind_reachability_quota_first_v3`，
       `schema_version=3.0.0`，`production_event_kind=environment`；历史
       `joint_occluder_first_v4` 仅作迁移记录，producer 和正式 loader 必须拒绝。
       `reachability_candidate_se2_v2` 的 `ReachabilityIdentity` / candidate 显式绑定
@@ -742,6 +742,15 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [x] summary 必须满足三层守恒：obstacle proposal = rejected + passed；
       transform candidate = rejected + chord-certified + chord-unresolved；exact validation = rejected + accepted。
       同时保存 proposal/candidate/transform/exact IDs 与低基数 rejection reasons
+- [x] v3 搜索必须按 pair seed 稳定排序 conflict/snippet/side/angle；每个提案最多读取
+      `snippet_candidates_per_proposal=64` 条真实 SOP03 snippet，达到本 pair 的
+      `requested_event_count` 后停止未执行候选。不得以 quota-first 为由跳过已进入
+      exact 阶段的碰撞、完整 footprint 隐藏、连续出现、动力学或 23 点无外推检查
+- [x] formal loader 必须拒绝紧邻旧三元组 `blind_reachability_first_v2` /
+      `sop05_generation_run_v5` / `sop05_pair_generation_report_v3`。批量矩形栅格化的
+      数值边界须回退 scalar authority；并行调度须同时限制 running 与 ready reports
+- [x] 真实 train smoke 应覆盖 5、20、100 pair；生产 `max_pairs` 至少为目标 quota
+      预留 5–10% 失败余量，并保存 quota-unmet 与扫满预算 pair，不得静默跳过
 - [x] structural/mixed 与历史 `60/30/10` 只作扩展/诊断；它们不是当前 formal
       producer 的类型 quota，任何 `6/3/1` 组成也不得成为发布门槛
 - [x] `complete` producer 必须通过 CLI/handoff 返回目录外保存的版本化

@@ -47,7 +47,7 @@ def _record_and_world(
     event_index: int = 0,
     event_kind: str = "environment",
     *,
-    generator_algorithm_version: str = "blind_reachability_first_v2",
+    generator_algorithm_version: str = "blind_reachability_quota_first_v3",
 ):
     from src.generation.dynamic_object_transplant import (
         MOTION_SNIPPET_LAYOUT_VERSION,
@@ -152,7 +152,7 @@ def _record_and_world(
         "transform_algorithm_version": "reachability_candidate_se2_v2",
         "transform_id": f"transform-loader-fixture-{suffix}",
         "reachability_candidate_id": f"candidate-loader-fixture-{suffix}",
-        "reachability_algorithm_version": "blind_reachability_first_v2",
+        "reachability_algorithm_version": "blind_reachability_quota_first_v3",
         "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
         "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
@@ -567,13 +567,13 @@ def _write_complete_publication(
         "target_type_policy": target_type_policy,
         "target_type_policy_digest": target_type_policy_digest,
         "generator_config_digest": generator_config_digest,
-        "generator_algorithm_version": "blind_reachability_first_v2",
+        "generator_algorithm_version": "blind_reachability_quota_first_v3",
         "production_event_kind": "environment",
     }
     (root / "pair_generation_reports.jsonl").write_text(
         json.dumps(
             {
-                "report_version": "sop05_pair_generation_report_v3",
+                "report_version": "sop05_pair_generation_report_v4",
                 "selection_version": "sop05_diversity_total_selection_v1",
                 "rank": 0,
                 "state_id": record.base_state_id,
@@ -651,7 +651,7 @@ def _write_complete_publication(
             "schema_version": "3.0.0",
             "target_type_policy_digest": target_type_policy_digest,
             "generator_config_digest": generator_config_digest,
-            "generator_algorithm_version": "blind_reachability_first_v2",
+            "generator_algorithm_version": "blind_reachability_quota_first_v3",
             "production_event_kind": "environment",
         },
     }
@@ -720,7 +720,7 @@ def _write_complete_publication(
     }
     manifest = {
         "manifest_version": "sop05_run_manifest_v3",
-        "producer_version": "sop05_generation_run_v5",
+        "producer_version": "sop05_generation_run_v6",
         "producer_source_identity": {
             "version": "sop05_producer_source_identity_v1",
             "git_commit": "3" * 40,
@@ -1255,9 +1255,9 @@ def test_loader_formal_versions_are_exact() -> None:
     assert loader.SOP05_COMPLETION_MARKER_VERSION == (
         "sop05_producer_complete_v3"
     )
-    assert loader.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v5"
+    assert loader.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v6"
     assert loader.SOP05_PAIR_REPORT_VERSION == (
-        "sop05_pair_generation_report_v3"
+        "sop05_pair_generation_report_v4"
     )
     assert loader.SOP05_TOTAL_QUOTA_SELECTION_VERSION == (
         "sop05_diversity_total_selection_v1"
@@ -1735,7 +1735,12 @@ def test_load_complete_sop05_events_rejects_resealed_hard_quota_fields(
     ("artifact", "field", "old_value"),
     [
         ("run_manifest.json", "manifest_version", "sop05_run_manifest_v2"),
-        ("run_manifest.json", "producer_version", "sop05_generation_run_v4"),
+        ("run_manifest.json", "producer_version", "sop05_generation_run_v5"),
+        (
+            "pair_generation_reports.jsonl",
+            "report_version",
+            "sop05_pair_generation_report_v3",
+        ),
         (
             "run_manifest.json",
             "selection_version",
@@ -1772,10 +1777,12 @@ def test_load_complete_sop05_events_rejects_resealed_old_contract_versions(
         )
     else:
         payload[field] = old_value
-    path.write_text(
-        json.dumps(payload, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if path.suffix == ".jsonl"
+        else json.dumps(payload, sort_keys=True, indent=2)
     )
+    path.write_text(encoded + "\n", encoding="utf-8")
     _reseal_publication(root)
 
     with pytest.raises(ValueError, match="unsupported|completion mismatch"):

@@ -11,12 +11,18 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Executor,
+    Future,
+    ProcessPoolExecutor,
+    wait,
+)
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -1310,6 +1316,79 @@ def _make_pair_process_pool(
     )
 
 
+def _iter_pair_reports_bounded(
+    executor: Executor,
+    schedule: tuple[RankedPair, ...],
+    *,
+    max_in_flight: int,
+) -> Iterator[PairGenerationReport]:
+    """Yield reports in schedule order without eagerly submitting all pairs."""
+
+    if type(max_in_flight) is not int or max_in_flight <= 0:
+        raise ValueError("max_in_flight must be a positive integer")
+
+    rank_order = tuple(sorted(pair.rank for pair in schedule))
+    if len(set(rank_order)) != len(rank_order):
+        raise ValueError("schedule ranks must be unique")
+    schedule_iterator = iter(schedule)
+    pending: dict[Future[_PairReportTransport], int] = {}
+    ready_by_rank: dict[int, PairGenerationReport] = {}
+    next_rank_index = 0
+
+    def submit_next() -> bool:
+        try:
+            pair = next(schedule_iterator)
+        except StopIteration:
+            return False
+        future = executor.submit(_generate_pair_in_worker, pair)
+        pending[future] = pair.rank
+        return True
+
+    def replenish() -> None:
+        while (
+            len(pending) + len(ready_by_rank) < max_in_flight
+            and submit_next()
+        ):
+            pass
+
+    replenish()
+    try:
+        while pending or ready_by_rank:
+            while (
+                next_rank_index < len(rank_order)
+                and rank_order[next_rank_index] in ready_by_rank
+            ):
+                rank = rank_order[next_rank_index]
+                yield ready_by_rank.pop(rank)
+                next_rank_index += 1
+            replenish()
+
+            if not pending:
+                if ready_by_rank:
+                    raise Sop05RunError(
+                        "completed pair reports do not cover rank order"
+                    )
+                break
+
+            completed, _ = wait(
+                tuple(pending),
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                raise RuntimeError("pair scheduler wait returned no futures")
+            completed_by_rank = sorted(
+                ((pending.pop(future), future) for future in completed),
+                key=lambda item: item[0],
+            )
+            for rank, future in completed_by_rank:
+                ready_by_rank[rank] = _restore_pair_report(future.result())
+            replenish()
+    finally:
+        for future in pending:
+            if not future.done():
+                future.cancel()
+
+
 def _build_generation_summary(
     prepared: PreparedSop05Run,
     pair_reports: tuple[PairGenerationReport, ...] | list[PairGenerationReport],
@@ -1411,31 +1490,35 @@ def collect_sop05_generation(
     )
     with executor_context as executor:
         if executor is None:
-            completed = (
-                _generate_pair(prepared, pair, robot_sweep_cache)
-                for pair in prepared.schedule
+            completed_context = nullcontext(
+                (
+                    _generate_pair(prepared, pair, robot_sweep_cache)
+                    for pair in prepared.schedule
+                )
             )
         else:
-            completed = (
-                _restore_pair_report(transport)
-                for transport in executor.map(
-                    _generate_pair_in_worker, prepared.schedule
+            completed_context = closing(
+                _iter_pair_reports_bounded(
+                    executor,
+                    prepared.schedule,
+                    max_in_flight=2 * prepared.request.workers,
                 )
-        )
-        for item in completed:
-            _validate_pair_report(prepared, item)
-            pair_reports.append(item)
-            for event in item.report.events:
-                if event.generated_event_id in seen_event_ids:
-                    raise Sop05RunError("duplicate generated_event_id")
-                if event.world.world_id in seen_world_ids:
-                    raise Sop05RunError("duplicate world_id")
-                seen_event_ids.add(event.generated_event_id)
-                seen_world_ids.add(event.world.world_id)
-                all_events.append(event)
-                candidate_by_event_id[event.generated_event_id] = (
-                    _selection_candidate(item, event)
-                )
+            )
+        with completed_context as completed:
+            for item in completed:
+                _validate_pair_report(prepared, item)
+                pair_reports.append(item)
+                for event in item.report.events:
+                    if event.generated_event_id in seen_event_ids:
+                        raise Sop05RunError("duplicate generated_event_id")
+                    if event.world.world_id in seen_world_ids:
+                        raise Sop05RunError("duplicate world_id")
+                    seen_event_ids.add(event.generated_event_id)
+                    seen_world_ids.add(event.world.world_id)
+                    all_events.append(event)
+                    candidate_by_event_id[event.generated_event_id] = (
+                        _selection_candidate(item, event)
+                    )
 
     all_events.sort(
         key=lambda event: (

@@ -27,8 +27,9 @@ occluders:
     width_range_m: [0.4, 0.8]
 
 blind_reachability:
-  algorithm_version: blind_reachability_first_v2
+  algorithm_version: blind_reachability_quota_first_v3
   obstacle_proposals_per_trajectory: 64
+  snippet_candidates_per_proposal: 64
   interaction_range_m: [1.0, 4.0]
   bearing_bin_count: 12
   yaw_step_deg: 30.0

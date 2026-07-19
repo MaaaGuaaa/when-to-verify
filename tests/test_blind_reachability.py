@@ -63,7 +63,9 @@ def _candidate(**changes: object) -> ReachabilityCandidate:
 
 
 def test_versions_are_frozen() -> None:
-    assert BLIND_REACHABILITY_ALGORITHM_VERSION == "blind_reachability_first_v2"
+    assert BLIND_REACHABILITY_ALGORITHM_VERSION == (
+        "blind_reachability_quota_first_v3"
+    )
     assert REACHABLE_ARC_SCHEDULE_VERSION == "reachable_arc_schedule_v1"
 
 

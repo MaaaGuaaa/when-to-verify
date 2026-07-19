@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_left
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -32,6 +33,7 @@ from src.geometry import (
     rasterize_footprint,
     raycast_visibility,
     trajectory_signed_clearances,
+    world_to_grid,
 )
 from src.utils.seeding import derive_seed, make_rng, stable_digest
 
@@ -148,6 +150,67 @@ class EventGenerationReport:
 
     events: tuple[GeneratedEvent, ...]
     summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _V5ConflictGeometry:
+    """Pair-invariant geometry for one aligned future conflict index."""
+
+    conflict_index: int
+    conflict_time_s: float
+    conflict_point: np.ndarray
+    directions_by_side: tuple[tuple[int, np.ndarray], ...]
+    angle_offsets: np.ndarray
+    rejection_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _V5SnippetDescriptor:
+    """Proposal-invariant source motion and footprint values."""
+
+    snippet: object
+    footprint_spec: dict[str, object]
+    footprint_digest: str
+    footprint: Footprint
+    footprint_radius_m: float
+    source_current: np.ndarray
+    source_anchors: tuple[np.ndarray, ...]
+    source_deltas: tuple[np.ndarray, ...]
+    valid_source_deltas: tuple[bool, ...]
+
+
+def _accepted_candidate_key(item: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        item["decision"].proposal_id,
+        item["candidate"].candidate_id,
+        item["target"].provenance["transform_id"],
+    )
+
+
+class _BoundedAcceptedCandidates:
+    """Keep exactly the prefix selected by the frozen pair-local ordering."""
+
+    def __init__(self, *, limit: int) -> None:
+        self._limit = _positive_integer(limit, name="accepted candidate limit")
+        self._keys: list[tuple[str, str, str]] = []
+        self._items: list[Mapping[str, Any]] = []
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def add(self, item: Mapping[str, Any]) -> None:
+        key = _accepted_candidate_key(item)
+        index = bisect_left(self._keys, key)
+        if len(self._items) >= self._limit and index >= self._limit:
+            return
+        self._keys.insert(index, key)
+        self._items.insert(index, item)
+        if len(self._items) > self._limit:
+            self._keys.pop()
+            self._items.pop()
+
+    def items(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self._items)
 
 
 def _finite_real(value: Any, *, name: str) -> float:
@@ -325,6 +388,7 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
     blind_expected = {
         "algorithm_version",
         "obstacle_proposals_per_trajectory",
+        "snippet_candidates_per_proposal",
         "interaction_range_m",
         "bearing_bin_count",
         "yaw_step_deg",
@@ -427,6 +491,10 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
             "obstacle_proposals_per_trajectory": _positive_integer(
                 blind["obstacle_proposals_per_trajectory"],
                 name="blind_reachability.obstacle_proposals_per_trajectory",
+            ),
+            "snippet_candidates_per_proposal": _positive_integer(
+                blind["snippet_candidates_per_proposal"],
+                name="blind_reachability.snippet_candidates_per_proposal",
             ),
             "interaction_range_m": causal_occluders["interaction_range_m"],
             "bearing_bin_count": causal_occluders["bearing_bin_count"],
@@ -1004,6 +1072,50 @@ def _joint_crossing_direction(
     return rotation @ base
 
 
+def _validate_target_kinematics(
+    target: TransplantedDynamicObject,
+    *,
+    base_config: Mapping[str, Any],
+) -> tuple[Footprint, np.ndarray]:
+    """Validate transform-invariant motion contracts before world geometry."""
+
+    grid = build_grid_spec(base_config)
+    footprint = footprint_from_spec(target.footprint_spec)
+    history = np.asarray(target.history_poses)
+    current = np.asarray(target.current_pose)
+    future = np.asarray(target.future_poses)
+    if history.shape != (grid.history_steps, 3):
+        raise _EventRejection("target_history_shape_invalid")
+    if future.shape != (grid.future_steps, 3):
+        raise _EventRejection("target_future_shape_invalid")
+    if current.shape != (3,):
+        raise _EventRejection("target_current_shape_invalid")
+    if any(array.dtype != np.float32 for array in (history, current, future)):
+        raise _EventRejection("target_motion_dtype_invalid")
+    if not all(np.isfinite(array).all() for array in (history, current, future)):
+        raise _EventRejection("target_motion_nonfinite")
+    if not np.array_equal(current, history[-1]):
+        raise _EventRejection("target_current_history_mismatch")
+    all_poses = np.vstack((history, future))
+    dt_s = float(base_config["bev"]["future_dt_s"])
+    velocities = np.diff(all_poses[:, :2].astype(np.float64), axis=0) / dt_s
+    speeds = np.linalg.norm(velocities, axis=1)
+    accelerations = (
+        np.diff(velocities, axis=0) / dt_s
+        if velocities.shape[0] > 1
+        else np.zeros((0, 2), dtype=np.float64)
+    )
+    type_config = base_config["dynamic_objects"][target.object_type]
+    if np.any(speeds > float(type_config["max_speed_mps"]) + 1e-6):
+        raise _EventRejection("target_speed_limit")
+    if accelerations.size and np.any(
+        np.linalg.norm(accelerations, axis=1)
+        > float(type_config["max_acceleration_mps2"]) + 1e-5
+    ):
+        raise _EventRejection("target_acceleration_limit")
+    return footprint, all_poses
+
+
 def _validate_target_physics(
     target: TransplantedDynamicObject,
     *,
@@ -1071,7 +1183,6 @@ def _validate_target_physics(
         > float(type_config["max_acceleration_mps2"]) + 1e-5
     ):
         raise _EventRejection("target_acceleration_limit")
-
     context_footprints = _footprints_for_specs(oracle_context.dynamic_object_specs)
     for object_id in sorted(context_footprints):
         context_poses = np.vstack(
@@ -1433,6 +1544,256 @@ def _circumscribed_radius(footprint: Footprint) -> float:
     return 0.5 * float(np.hypot(footprint.length_m, footprint.width_m))
 
 
+def _prepare_v5_conflict_schedule(
+    *,
+    trajectory: LocalTrajectory,
+    offsets: np.ndarray,
+    eligible_indices: tuple[int, ...],
+    normalized: Mapping[str, Any],
+    seed: int,
+    base_state_id: str,
+    trajectory_id: str,
+) -> tuple[_V5ConflictGeometry, ...]:
+    """Compute pair-local trajectory geometry once per conflict index."""
+
+    angle_step_deg = float(
+        normalized["blind_reachability"]["crossing_angle_step_deg"]
+    )
+    maximum_angle_deg = float(normalized["crossing_angle_max_deg"])
+    angle_steps = int(round(maximum_angle_deg / angle_step_deg))
+    angle_offsets = (
+        np.arange(-angle_steps, angle_steps + 1, dtype=np.float64)
+        * angle_step_deg
+    )
+    result: list[_V5ConflictGeometry] = []
+    for conflict_index in eligible_indices:
+        conflict_time_s = float(offsets[conflict_index])
+        conflict_point = trajectory.poses[conflict_index, :2].astype(np.float64)
+        try:
+            _tangent, normal = _trajectory_geometry_at_index(
+                trajectory,
+                index=conflict_index,
+                conflict_time_s=conflict_time_s,
+                max_curvature=normalized["max_local_curvature_per_m"],
+            )
+        except _EventRejection as exc:
+            result.append(
+                _V5ConflictGeometry(
+                    conflict_index=conflict_index,
+                    conflict_time_s=conflict_time_s,
+                    conflict_point=conflict_point,
+                    directions_by_side=(),
+                    angle_offsets=angle_offsets,
+                    rejection_reason=exc.reason,
+                )
+            )
+            continue
+        offset_order = sorted(
+            range(len(angle_offsets)),
+            key=lambda index: (
+                derive_seed(
+                    seed,
+                    "quota-first-angle-v1",
+                    base_state_id,
+                    trajectory_id,
+                    conflict_index,
+                    f"{float(angle_offsets[index]):.9f}",
+                ),
+                index,
+            ),
+        )
+        ordered_offsets = angle_offsets[offset_order]
+        directions_by_side = tuple(
+            (
+                crossing_side,
+                scheduled_crossing_directions(
+                    crossing_side * normal,
+                    maximum_angle_deg=maximum_angle_deg,
+                    angle_step_deg=angle_step_deg,
+                )[offset_order],
+            )
+            for crossing_side in sorted(
+                (-1, 1),
+                key=lambda side: (
+                    derive_seed(
+                        seed,
+                        "quota-first-side-v1",
+                        base_state_id,
+                        trajectory_id,
+                        conflict_index,
+                        side,
+                    ),
+                    side,
+                ),
+            )
+        )
+        result.append(
+            _V5ConflictGeometry(
+                conflict_index=conflict_index,
+                conflict_time_s=conflict_time_s,
+                conflict_point=conflict_point,
+                directions_by_side=directions_by_side,
+                angle_offsets=ordered_offsets,
+            )
+        )
+    return tuple(
+        sorted(
+            result,
+            key=lambda item: (
+                derive_seed(
+                    seed,
+                    "quota-first-conflict-v1",
+                    base_state_id,
+                    trajectory_id,
+                    item.conflict_index,
+                ),
+                item.conflict_index,
+            ),
+        )
+    )
+
+
+def _prepare_v5_snippets(
+    snippets: tuple[object, ...],
+    conflict_schedule: tuple[_V5ConflictGeometry, ...],
+    *,
+    seed: int,
+    base_state_id: str,
+    trajectory_id: str,
+) -> tuple[_V5SnippetDescriptor, ...]:
+    """Compute proposal-invariant snippet values once per pair."""
+
+    result: list[_V5SnippetDescriptor] = []
+    for snippet in snippets:
+        footprint_spec = {
+            "object_type": snippet.object_type,
+            "footprint": dict(snippet.footprint),
+        }
+        footprint_payload = json.dumps(
+            footprint_spec,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        footprint_digest = stable_digest(footprint_payload, size=16)
+        footprint = footprint_from_spec(footprint_spec)
+        source_current = snippet.positions[7].astype(np.float64)
+        source_anchors = tuple(
+            snippet.positions[8 + item.conflict_index].astype(np.float64)
+            for item in conflict_schedule
+        )
+        source_deltas = tuple(
+            source_anchor - source_current for source_anchor in source_anchors
+        )
+        valid_source_deltas = tuple(
+            bool(
+                np.isfinite(source_delta).all()
+                and float(np.linalg.norm(source_delta)) > 1e-9
+            )
+            for source_delta in source_deltas
+        )
+        result.append(
+            _V5SnippetDescriptor(
+                snippet=snippet,
+                footprint_spec=footprint_spec,
+                footprint_digest=footprint_digest,
+                footprint=footprint,
+                footprint_radius_m=_circumscribed_radius(footprint),
+                source_current=source_current,
+                source_anchors=source_anchors,
+                source_deltas=source_deltas,
+                valid_source_deltas=valid_source_deltas,
+            )
+        )
+    return tuple(
+        sorted(
+            result,
+            key=lambda item: (
+                derive_seed(
+                    seed,
+                    "quota-first-snippet-v1",
+                    base_state_id,
+                    trajectory_id,
+                    item.snippet.snippet_id,
+                ),
+                item.snippet.snippet_id,
+            ),
+        )
+    )
+
+
+def _proposal_snippet_window(
+    descriptors: tuple[_V5SnippetDescriptor, ...],
+    *,
+    proposal_index: int,
+    limit: int,
+) -> tuple[_V5SnippetDescriptor, ...]:
+    """Return a deterministic rotating bounded source-snippet window."""
+
+    count = _positive_integer(limit, name="snippet candidates per proposal")
+    if not descriptors:
+        return ()
+    if count >= len(descriptors):
+        return descriptors
+    start = (int(proposal_index) * count) % len(descriptors)
+    return tuple(
+        descriptors[(start + offset) % len(descriptors)]
+        for offset in range(count)
+    )
+
+
+def _preview_reachability_current_xy(
+    *,
+    conflict_point: np.ndarray,
+    source_current_xy: np.ndarray,
+    source_anchor_xy: np.ndarray,
+    desired_crossing_direction: np.ndarray,
+) -> np.ndarray:
+    """Compute exact candidate start geometry without constructing its ID."""
+
+    conflict = np.asarray(conflict_point, dtype=np.float64)
+    source_current = np.asarray(source_current_xy, dtype=np.float64)
+    source_anchor = np.asarray(source_anchor_xy, dtype=np.float64)
+    desired = np.asarray(desired_crossing_direction, dtype=np.float64)
+    source_delta = source_anchor - source_current
+    rotation_rad = float(
+        np.arctan2(desired[1], desired[0])
+        - np.arctan2(source_delta[1], source_delta[0])
+    )
+    cosine = np.cos(rotation_rad)
+    sine = np.sin(rotation_rad)
+    rotation_matrix = np.array(
+        [[cosine, -sine], [sine, cosine]], dtype=np.float64
+    )
+    return conflict - rotation_matrix @ source_delta
+
+
+def _preview_near_mask(
+    current_xy: np.ndarray,
+    mask: np.ndarray,
+    grid,
+) -> bool:
+    """Conservatively retain starts whose cell or a neighbour is eligible."""
+
+    x = float(current_xy[0])
+    y = float(current_xy[1])
+    resolution_m = float(grid.resolution_m)
+    half_width_m = 0.5 * float(grid.width) * resolution_m
+    half_height_m = 0.5 * float(grid.height) * resolution_m
+    if not (
+        -half_width_m <= x < half_width_m
+        and -half_height_m <= y < half_height_m
+    ):
+        return True
+    row = int((y + half_height_m) / resolution_m)
+    column = int((x + half_width_m) / resolution_m)
+    row_start = max(0, row - 1)
+    row_stop = min(grid.height, row + 2)
+    column_start = max(0, column - 1)
+    column_stop = min(grid.width, column + 2)
+    return bool(mask[row_start:row_stop, column_start:column_stop].any())
+
+
 def _build_v5_event(
     *,
     accepted: Mapping[str, Any],
@@ -1440,6 +1801,7 @@ def _build_v5_event(
     base_state: BaseState,
     oracle_context: OracleContext,
     trajectory: LocalTrajectory,
+    static_occupancy: np.ndarray,
     grid,
     policy: TargetTypePolicy,
     generator_digest: str,
@@ -1562,7 +1924,7 @@ def _build_v5_event(
     world = OracleWorld(
         world_id=world_id,
         base_state_id=base_state.state_id,
-        static_occupancy=accepted["world_occupancy"].astype(np.float32),
+        static_occupancy=(static_occupancy | placement.mask).astype(np.float32),
         dynamic_object_trajectories=dynamic_trajectories,
         dynamic_object_specs=dynamic_specs,
         occluders=(dict(placement.occluder),),
@@ -1706,6 +2068,22 @@ def _generate_v5_events(
     )
     if not eligible_indices:
         raise ValueError("no aligned conflict time is available")
+    conflict_schedule = _prepare_v5_conflict_schedule(
+        trajectory=trajectory,
+        offsets=offsets,
+        eligible_indices=eligible_indices,
+        normalized=normalized,
+        seed=int(seed),
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+    )
+    snippet_descriptors = _prepare_v5_snippets(
+        snippets,
+        conflict_schedule,
+        seed=int(seed),
+        base_state_id=base_state.state_id,
+        trajectory_id=trajectory.trajectory_id,
+    )
 
     counters = {
         "obstacle_proposal_count": 0,
@@ -1724,9 +2102,9 @@ def _generate_v5_events(
     candidate_ids: list[str] = []
     transform_ids: list[str] = []
     exact_validation_ids: list[str] = []
-    accepted_candidates: list[dict[str, Any]] = []
-    center_masks: dict[tuple[str, str, bytes], object] = {}
+    accepted_candidates = _BoundedAcceptedCandidates(limit=desired_count)
     unresolved_by_anchor: dict[tuple[str, str, int], int] = {}
+    quota_satisfied = False
 
     for parameters in proposal_schedule[attempt_index_start:]:
         counters["obstacle_proposal_count"] += 1
@@ -1745,89 +2123,63 @@ def _generate_v5_events(
             reason = decision.rejection_reason or "causal_occluder_rejected"
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
             continue
+        if bool(np.any(decision.accepted.mask & current_context)):
+            counters["obstacle_proposal_rejected_count"] += 1
+            reason = "causal_occluder_context_raster_overlap"
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            continue
         counters["obstacle_proposal_passed_count"] += 1
         region = build_blind_region(base_state, decision, grid=grid)
-        for snippet in snippets:
-            footprint_spec = {
-                "object_type": snippet.object_type,
-                "footprint": dict(snippet.footprint),
-            }
-            footprint_payload = json.dumps(
-                footprint_spec,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            footprint_digest = stable_digest(footprint_payload, size=16)
-            footprint = footprint_from_spec(footprint_spec)
-            source_current = snippet.positions[7].astype(np.float64)
-            for conflict_index in eligible_indices:
-                conflict_time_s = float(offsets[conflict_index])
-                try:
-                    _tangent, normal = _trajectory_geometry_at_index(
-                        trajectory,
-                        index=conflict_index,
-                        conflict_time_s=conflict_time_s,
-                        max_curvature=normalized["max_local_curvature_per_m"],
-                    )
-                except _EventRejection as exc:
-                    rejection_reasons[exc.reason] = (
-                        rejection_reasons.get(exc.reason, 0) + 1
+        center_masks: dict[tuple[str, bytes], object] = {}
+        proposal_snippets = _proposal_snippet_window(
+            snippet_descriptors,
+            proposal_index=parameters.proposal_index,
+            limit=normalized["blind_reachability"][
+                "snippet_candidates_per_proposal"
+            ],
+        )
+        for descriptor in proposal_snippets:
+            snippet = descriptor.snippet
+            for conflict_offset, conflict in enumerate(conflict_schedule):
+                if conflict.rejection_reason is not None:
+                    rejection_reasons[conflict.rejection_reason] = (
+                        rejection_reasons.get(conflict.rejection_reason, 0) + 1
                     )
                     continue
-                source_anchor = snippet.positions[8 + conflict_index].astype(
-                    np.float64
+                direction_count = sum(
+                    len(directions)
+                    for _crossing_side, directions in conflict.directions_by_side
                 )
-                source_delta = source_anchor - source_current
-                directions_by_side = (
-                    (
-                        -1,
-                        scheduled_crossing_directions(
-                            -normal,
-                            maximum_angle_deg=normalized[
-                                "crossing_angle_max_deg"
-                            ],
-                            angle_step_deg=normalized["blind_reachability"][
-                                "crossing_angle_step_deg"
-                            ],
-                        ),
-                    ),
-                    (
-                        1,
-                        scheduled_crossing_directions(
-                            normal,
-                            maximum_angle_deg=normalized[
-                                "crossing_angle_max_deg"
-                            ],
-                            angle_step_deg=normalized["blind_reachability"][
-                                "crossing_angle_step_deg"
-                            ],
-                        ),
-                    ),
-                )
-                angle_steps = int(
-                    round(
-                        normalized["crossing_angle_max_deg"]
-                        / normalized["blind_reachability"][
-                            "crossing_angle_step_deg"
-                        ]
+                if not descriptor.valid_source_deltas[conflict_offset]:
+                    counters["transform_candidate_count"] += direction_count
+                    counters["transform_rejected_count"] += direction_count
+                    rejection_reasons["invalid_source_anchor"] = (
+                        rejection_reasons.get("invalid_source_anchor", 0)
+                        + direction_count
                     )
-                )
-                angle_offsets = np.arange(-angle_steps, angle_steps + 1) * float(
-                    normalized["blind_reachability"][
-                        "crossing_angle_step_deg"
-                    ]
-                )
-                for crossing_side, directions in directions_by_side:
-                    for angle_offset, direction in zip(angle_offsets, directions):
+                    continue
+                source_anchor = descriptor.source_anchors[conflict_offset]
+                for crossing_side, directions in conflict.directions_by_side:
+                    for angle_offset, direction in zip(
+                        conflict.angle_offsets, directions
+                    ):
                         counters["transform_candidate_count"] += 1
-                        if (
-                            not np.isfinite(source_delta).all()
-                            or float(np.linalg.norm(source_delta)) <= 1e-9
+                        preview_current = _preview_reachability_current_xy(
+                            conflict_point=conflict.conflict_point,
+                            source_current_xy=descriptor.source_current,
+                            source_anchor_xy=source_anchor,
+                            desired_crossing_direction=direction,
+                        )
+                        if not _preview_near_mask(
+                            preview_current,
+                            region.blind_free_mask,
+                            grid,
                         ):
                             counters["transform_rejected_count"] += 1
-                            rejection_reasons["invalid_source_anchor"] = (
-                                rejection_reasons.get("invalid_source_anchor", 0)
+                            rejection_reasons["no_arc_mask_intersection"] = (
+                                rejection_reasons.get(
+                                    "no_arc_mask_intersection", 0
+                                )
                                 + 1
                             )
                             continue
@@ -1836,16 +2188,14 @@ def _generate_v5_events(
                             trajectory_id=trajectory.trajectory_id,
                             source_snippet_id=snippet.snippet_id,
                             source_session_id=snippet.source_session_id,
-                            conflict_index=conflict_index,
-                            conflict_time_s=conflict_time_s,
+                            conflict_index=conflict.conflict_index,
+                            conflict_time_s=conflict.conflict_time_s,
                             crossing_side=crossing_side,
                             angle_offset_deg=float(angle_offset),
                         )
                         candidate = build_reachability_candidate(
-                            conflict_point=trajectory.poses[
-                                conflict_index, :2
-                            ].astype(np.float64),
-                            source_current_xy=source_current,
+                            conflict_point=conflict.conflict_point,
+                            source_current_xy=descriptor.source_current,
                             source_anchor_xy=source_anchor,
                             desired_crossing_direction=direction,
                             identity=identity,
@@ -1860,19 +2210,34 @@ def _generate_v5_events(
                                 + 1
                             )
                             continue
+                        if not candidate_queries_mask(
+                            candidate, region.blind_free_mask, grid
+                        ):
+                            counters["transform_rejected_count"] += 1
+                            rejection_reasons["no_arc_mask_intersection"] = (
+                                rejection_reasons.get(
+                                    "no_arc_mask_intersection", 0
+                                )
+                                + 1
+                            )
+                            continue
                         yaw = float(snippet.headings[7]) + candidate.rotation_rad
+                        canonical_yaw = (
+                            0.0
+                            if hasattr(descriptor.footprint, "radius_m")
+                            else yaw
+                        )
                         mask_key = (
-                            region.region_digest,
-                            footprint_digest,
-                            np.asarray(yaw, dtype=">f8").tobytes(),
+                            descriptor.footprint_digest,
+                            np.asarray(canonical_yaw, dtype=">f8").tobytes(),
                         )
                         center_mask = center_masks.get(mask_key)
                         if center_mask is None:
                             center_mask = build_footprint_center_mask(
                                 region,
-                                footprint_spec=footprint_spec,
-                                footprint_spec_digest=footprint_digest,
-                                yaw_bin_rad=yaw,
+                                footprint_spec=descriptor.footprint_spec,
+                                footprint_spec_digest=descriptor.footprint_digest,
+                                yaw_bin_rad=canonical_yaw,
                             )
                             center_masks[mask_key] = center_mask
                         if not candidate_queries_mask(
@@ -1890,7 +2255,7 @@ def _generate_v5_events(
                             candidate,
                             obstacle_occupancy=region.total_current_occupancy,
                             grid=grid,
-                            footprint_radius_m=_circumscribed_radius(footprint),
+                            footprint_radius_m=descriptor.footprint_radius_m,
                             chord_deviation_bound_m=normalized[
                                 "blind_reachability"
                             ]["chord_deviation_fastpath_m"],
@@ -1902,7 +2267,7 @@ def _generate_v5_events(
                             anchor_key = (
                                 decision.proposal_id,
                                 snippet.snippet_id,
-                                conflict_index,
+                                conflict.conflict_index,
                             )
                             used = unresolved_by_anchor.get(anchor_key, 0)
                             if used >= normalized["blind_reachability"][
@@ -1947,11 +2312,11 @@ def _generate_v5_events(
                                     exact.rejection_reason
                                     or "exact_hidden_pose_rejected"
                                 )
-                            target_footprint = _validate_target_physics(
-                                target,
-                                base_state=base_state,
-                                oracle_context=oracle_context,
-                                base_config=base_config,
+                            target_footprint, _target_poses = (
+                                _validate_target_kinematics(
+                                    target,
+                                    base_config=base_config,
+                                )
                             )
                             placement = validate_environment_occluder_target(
                                 decision.accepted,
@@ -1960,13 +2325,21 @@ def _generate_v5_events(
                                 target_footprint=target_footprint,
                                 grid=grid,
                             )
+                            target_footprint = _validate_target_physics(
+                                target,
+                                base_state=base_state,
+                                oracle_context=oracle_context,
+                                base_config=base_config,
+                            )
                             clearances = trajectory_signed_clearances(
                                 robot_footprint,
                                 trajectory.poses,
                                 target_footprint,
                                 target.future_poses,
                             )
-                            if not bool(clearances[conflict_index] <= 0.0):
+                            if not bool(
+                                clearances[conflict.conflict_index] <= 0.0
+                            ):
                                 raise _EventRejection(
                                     "target_not_same_index_collision_mother"
                                 )
@@ -2014,7 +2387,7 @@ def _generate_v5_events(
                             )
                             continue
                         counters["exact_validation_accepted_count"] += 1
-                        accepted_candidates.append(
+                        accepted_candidates.add(
                             {
                                 "decision": decision,
                                 "region": region,
@@ -2026,25 +2399,29 @@ def _generate_v5_events(
                                 "target_visibility_history": (
                                     target_visibility_history
                                 ),
-                                "conflict_index": conflict_index,
-                                "conflict_time_s": conflict_time_s,
+                                "conflict_index": conflict.conflict_index,
+                                "conflict_time_s": conflict.conflict_time_s,
                                 "proposal_index": parameters.proposal_index,
                                 "attempt_seed": attempt_seed,
-                                "world_occupancy": (
-                                    static_occupancy | placement.mask
-                                ),
                             }
                         )
+                        quota_satisfied = (
+                            counters["exact_validation_accepted_count"]
+                            >= desired_count
+                        )
+                        if quota_satisfied:
+                            break
+                    if quota_satisfied:
+                        break
+                if quota_satisfied:
+                    break
+            if quota_satisfied:
+                break
+        if quota_satisfied:
+            break
 
-    accepted_candidates.sort(
-        key=lambda item: (
-            item["decision"].proposal_id,
-            item["candidate"].candidate_id,
-            item["target"].provenance["transform_id"],
-        )
-    )
     generator_digest = _generator_digest(normalized)
-    selected = accepted_candidates[:desired_count]
+    selected = accepted_candidates.items()
     events = tuple(
         _build_v5_event(
             accepted=item,
@@ -2052,6 +2429,7 @@ def _generate_v5_events(
             base_state=base_state,
             oracle_context=oracle_context,
             trajectory=trajectory,
+            static_occupancy=static_occupancy,
             grid=grid,
             policy=policy,
             generator_digest=generator_digest,
@@ -2067,7 +2445,9 @@ def _generate_v5_events(
         "rejected_count": counters["exact_validation_rejected_count"],
         "unaccepted_event_count": desired_count - len(events),
         "attempt_index_start": attempt_index_start,
-        "attempt_index_stop_exclusive": proposal_budget,
+        "attempt_index_stop_exclusive": (
+            attempt_index_start + counters["obstacle_proposal_count"]
+        ),
         "rejection_reasons": dict(sorted(rejection_reasons.items())),
         **counters,
         "proposal_ids": tuple(proposal_ids),

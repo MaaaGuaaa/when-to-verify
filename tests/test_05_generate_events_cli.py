@@ -112,7 +112,7 @@ def test_cli_executes_once_and_forwards_positive_worker_count(
     assert payload == {
         "allocated_cpu_seconds": 12.5,
         "output_dir": str(tmp_path / "run"),
-        "producer_version": "sop05_generation_run_v5",
+        "producer_version": "sop05_generation_run_v6",
         "publication_semantic_digest": "a" * 64,
         "run_id": "sop05-run-fixture",
         "run_state": "complete",
@@ -192,7 +192,7 @@ def test_cli_returns_four_for_atomically_published_quota_shortfall(
     assert json.loads(capsys.readouterr().out) == {
         "allocated_cpu_seconds": 3.25,
         "output_dir": str(tmp_path / "run"),
-        "producer_version": "sop05_generation_run_v5",
+        "producer_version": "sop05_generation_run_v6",
         "publication_semantic_digest": None,
         "run_id": "sop05-run-fixture",
         "run_state": "quota_unmet",

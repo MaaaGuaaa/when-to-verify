@@ -23,7 +23,7 @@ from src.geometry import (
 )
 from src.utils.seeding import stable_digest
 
-BLIND_REACHABILITY_ALGORITHM_VERSION = "blind_reachability_first_v2"
+BLIND_REACHABILITY_ALGORITHM_VERSION = "blind_reachability_quota_first_v3"
 REACHABLE_ARC_SCHEDULE_VERSION = "reachable_arc_schedule_v1"
 
 _TRIAGE_OUTCOMES = frozenset(("certified_clear", "unresolved"))

@@ -515,8 +515,12 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 - 只接受 `history8_current7_future15_v1`；固定使用
   `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，未来冲突锚点的
   source time 为 `1.4 + conflict_time_s`；
-- SOP05 正式生产算法固定为 `blind_reachability_first_v2`，当前只发布
+- SOP05 正式生产算法固定为 `blind_reachability_quota_first_v3`，当前只发布
   environment collision 母事件；历史 `joint_occluder_first_v4` 产物必须拒绝；
+- producer/report 固定为 `sop05_generation_run_v6` /
+  `sop05_pair_generation_report_v4`，并显式拒绝紧邻旧 v5/v3；pair process pool 的
+  bounded window 同时计算 pending futures 与按 rank 待消费 reports，建议 Slurm
+  `cpus-per-task == --workers`，不得用多个 `ntasks` 重复启动同一 producer；
 - candidate 变换固定为 `reachability_candidate_se2_v2`；`ReachabilityIdentity` /
   candidate 显式绑定 `source_session_id`，并通过 `source_snippet_id` 在可信库中
   间接定位 recording。transform payload 与 generated event/world identity 必须显式同时
@@ -631,7 +635,7 @@ empty_blind_spot: 0.10
 
 若复杂遮挡摆放接受率低：
 
-1. 在不变更 `blind_reachability_first_v2` 物理契约的前提下，限制为单矩形货架/柱子；
+1. 在不变更 `blind_reachability_quota_first_v3` 物理契约的前提下，限制为单矩形货架/柱子；
 2. 优先直线/小弧线候选轨迹和侧向 human target，但仍保留稳定随机化与失败报告；
 3. 复杂静态地图作为单独 stress/OOD 层，不与基础自由空间产物混合计数；
 4. structural/mixed 只能通过未来显式版本升级加入，不得在当前 formal

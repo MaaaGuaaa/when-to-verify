@@ -1020,6 +1020,61 @@ def test_target_occluder_validation_api_requires_complete_motion() -> None:
     )
 
 
+def test_target_occluder_endpoint_collision_skips_continuous_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config()
+    grid = build_grid_spec(config)
+    occluder_footprint = RectangleFootprint(0.5, 0.5)
+    occluder_pose = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    candidate = occluder_sampler.OccluderGeometryCandidate(
+        occluder={
+            "occluder_id": "occluder-endpoint-overlap",
+            "type": "pillar",
+            "pose": [1.0, 0.0, 0.0],
+            "length_m": 0.5,
+            "width_m": 0.5,
+        },
+        footprint=occluder_footprint,
+        pose=occluder_pose,
+        mask=rasterize_footprint_sweep(
+            occluder_footprint,
+            occluder_pose[None, :],
+            grid,
+        ),
+        proposal_index=0,
+    )
+    target_history = np.tile(
+        np.asarray([2.0, 2.0, 0.0], dtype=np.float32),
+        (grid.history_steps, 1),
+    )
+    target_history[0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    target_future = np.tile(
+        np.asarray([2.0, 2.0, 0.0], dtype=np.float32),
+        (grid.future_steps, 1),
+    )
+
+    def unexpected_continuous_sweep(*args, **kwargs):
+        raise AssertionError("endpoint collision must short-circuit the dense sweep")
+
+    monkeypatch.setattr(
+        occluder_sampler,
+        "occluder_collision_sweep_rejection_reason",
+        unexpected_continuous_sweep,
+    )
+
+    with pytest.raises(OccluderSamplingError) as exc_info:
+        occluder_sampler.validate_environment_occluder_target(
+            candidate,
+            target_history_poses=target_history,
+            target_future_poses=target_future,
+            target_footprint=CircleFootprint(0.2),
+            grid=grid,
+        )
+
+    assert exc_info.value.reason == "occluder_target_collision"
+
+
 def test_target_occluder_rejects_collision_between_early_history_frames() -> None:
     config = load_config()
     grid = build_grid_spec(config)

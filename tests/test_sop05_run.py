@@ -167,20 +167,20 @@ def test_sop05_generation_contract_versions_are_exact() -> None:
     selection = importlib.import_module("src.generation.sop05_selection")
     identity = _publication_identity_sut()
 
-    assert module.SOP05_RUN_VERSION == "sop05_generation_run_v5"
+    assert module.SOP05_RUN_VERSION == "sop05_generation_run_v6"
     assert module.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v3"
     assert module.SOP05_GENERATION_SUMMARY_VERSION == (
         "sop05_generation_summary_v3"
     )
     assert module.SOP05_INPUT_LOCK_VERSION == "sop05_input_lock_v2"
     assert selection.SOP05_PAIR_REPORT_VERSION == (
-        "sop05_pair_generation_report_v3"
+        "sop05_pair_generation_report_v4"
     )
     assert selection.SOP05_DIVERSITY_TOTAL_SELECTION_VERSION == (
         "sop05_diversity_total_selection_v1"
     )
     assert module.SOP05_GENERATOR_ALGORITHM_VERSION == (
-        "blind_reachability_first_v2"
+        "blind_reachability_quota_first_v3"
     )
     assert identity.SOP05_PUBLICATION_IDENTITY_VERSION == (
         "sop05_publication_semantic_digest_v2"
@@ -521,7 +521,7 @@ def _generated_event(
         "transform_algorithm_version": "reachability_candidate_se2_v2",
         "transform_id": transform_id,
         "reachability_candidate_id": candidate_id,
-        "reachability_algorithm_version": "blind_reachability_first_v2",
+        "reachability_algorithm_version": "blind_reachability_quota_first_v3",
         "reachable_arc_schedule_version": "reachable_arc_schedule_v1",
         "motion_snippet_layout_version": MOTION_SNIPPET_LAYOUT_VERSION,
         "snippet_id": record.source_snippet_id,
@@ -798,6 +798,193 @@ def _install_thread_pair_pool(monkeypatch, module) -> None:
     monkeypatch.setattr(module, "_make_pair_process_pool", make_pool)
 
 
+class _ControllableFuture:
+    def __init__(self, owner, value: int, *, failure: BaseException | None = None):
+        self._owner = owner
+        self._value = value
+        self.rank = value
+        self._failure = failure
+        self._done = False
+        self.cancel_calls = 0
+
+    def _settle(self) -> None:
+        if not self._done:
+            self._done = True
+            self._owner.outstanding -= 1
+
+    def result(self) -> int:
+        self._settle()
+        if self._failure is not None:
+            raise self._failure
+        return self._value
+
+    def complete(self) -> None:
+        self._settle()
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancel(self) -> bool:
+        self.cancel_calls += 1
+        if self._done:
+            return False
+        self._settle()
+        return True
+
+
+class _ControllableExecutor:
+    def __init__(
+        self,
+        *,
+        failing_rank: int | None = None,
+        completion_order: tuple[int, ...] | None = None,
+    ):
+        self.failing_rank = failing_rank
+        self.completion_order = list(completion_order or ())
+        self.submitted_ranks: list[int] = []
+        self.futures: list[_ControllableFuture] = []
+        self.outstanding = 0
+        self.max_outstanding = 0
+        self.wait_calls = 0
+
+    def submit(self, function, pair):
+        del function
+        self.submitted_ranks.append(pair.rank)
+        self.outstanding += 1
+        self.max_outstanding = max(self.max_outstanding, self.outstanding)
+        failure = (
+            RuntimeError("fixture worker failure")
+            if pair.rank == self.failing_rank
+            else None
+        )
+        future = _ControllableFuture(self, pair.rank, failure=failure)
+        self.futures.append(future)
+        return future
+
+    def wait(self, futures, *, return_when):
+        del return_when
+        self.wait_calls += 1
+        requested = set(futures)
+        if self.completion_order:
+            for index, rank in enumerate(self.completion_order):
+                future = next(
+                    (
+                        item
+                        for item in requested
+                        if item.rank == rank and not item.done()
+                    ),
+                    None,
+                )
+                if future is not None:
+                    self.completion_order.pop(index)
+                    break
+            else:
+                raise AssertionError("no planned future is available")
+        else:
+            future = min(
+                (item for item in requested if not item.done()),
+                key=lambda item: item.rank,
+            )
+        future.complete()
+        return {future}, requested - {future}
+
+
+def test_bounded_pair_scheduler_limits_in_flight_and_preserves_rank_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _sut()
+    schedule = tuple(
+        module.RankedPair(
+            rank=rank,
+            state_id=f"state-{rank}",
+            trajectory_id="trajectory-a",
+            pair_seed=100 + rank,
+        )
+        for rank in range(7)
+    )
+    executor = _ControllableExecutor()
+    monkeypatch.setattr(module, "_restore_pair_report", lambda value: value)
+    monkeypatch.setattr(module, "wait", executor.wait, raising=False)
+
+    completed = list(
+        module._iter_pair_reports_bounded(
+            executor,
+            schedule,
+            max_in_flight=4,
+        )
+    )
+
+    assert completed == list(range(7))
+    assert executor.submitted_ranks == list(range(7))
+    assert executor.max_outstanding == 4
+    assert executor.outstanding == 0
+
+
+def test_bounded_pair_scheduler_cancels_unfinished_futures_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _sut()
+    schedule = tuple(
+        module.RankedPair(
+            rank=rank,
+            state_id=f"state-{rank}",
+            trajectory_id="trajectory-a",
+            pair_seed=100 + rank,
+        )
+        for rank in range(7)
+    )
+    executor = _ControllableExecutor(failing_rank=1)
+    monkeypatch.setattr(module, "_restore_pair_report", lambda value: value)
+    monkeypatch.setattr(module, "wait", executor.wait, raising=False)
+
+    with pytest.raises(RuntimeError, match="fixture worker failure"):
+        list(
+            module._iter_pair_reports_bounded(
+                executor,
+                schedule,
+                max_in_flight=4,
+            )
+        )
+
+    assert executor.submitted_ranks == [0, 1, 2, 3, 4]
+    assert [
+        future.cancel_calls for future in executor.futures
+    ] == [0, 0, 1, 1, 1]
+    assert executor.outstanding == 0
+
+
+def test_bounded_pair_scheduler_replenishes_on_out_of_order_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _sut()
+    schedule = tuple(
+        module.RankedPair(
+            rank=rank,
+            state_id=f"state-{rank}",
+            trajectory_id="trajectory-a",
+            pair_seed=100 + rank,
+        )
+        for rank in range(7)
+    )
+    executor = _ControllableExecutor(
+        completion_order=(1, 2, 3, 0, 4, 5, 6)
+    )
+    monkeypatch.setattr(module, "_restore_pair_report", lambda value: value)
+    monkeypatch.setattr(module, "wait", executor.wait, raising=False)
+
+    completed = module._iter_pair_reports_bounded(
+        executor,
+        schedule,
+        max_in_flight=4,
+    )
+
+    assert next(completed) == 0
+    assert executor.submitted_ranks == list(range(4))
+    assert list(completed) == list(range(1, 7))
+    assert executor.max_outstanding == 4
+    assert executor.wait_calls == 7
+
+
 def test_prepare_is_read_only_and_freezes_ranked_pair_schedule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -951,7 +1138,7 @@ def test_run_identity_binds_only_the_total_selection_contract(
     prepared = module.prepare_sop05_run(_request(module, tmp_path))
 
     identity_payload = {
-        "version": "sop05_generation_run_v5",
+        "version": "sop05_generation_run_v6",
         "selection_version": "sop05_diversity_total_selection_v1",
         "producer_source_identity": prepared.producer_source_identity,
         "split": prepared.request.split,
@@ -1409,7 +1596,7 @@ def test_collection_rejects_old_generator_algorithm_version(
             report,
             summary={
                 **report.summary,
-                "generator_algorithm_version": "joint_occluder_first_v4",
+                "generator_algorithm_version": "blind_reachability_first_v2",
             },
         )
         for seed, report in reports.items()
@@ -1677,10 +1864,24 @@ def test_workers_only_bound_execution_and_never_change_processed_schedule(
     monkeypatch.setattr(
         module, "generate_events", lambda **kwargs: reports[kwargs["seed"]]
     )
+    observed_in_flight_limits: list[int] = []
+
+    def observe_bounded_schedule(executor, schedule, *, max_in_flight):
+        observed_in_flight_limits.append(max_in_flight)
+        for transport in executor.map(module._generate_pair_in_worker, schedule):
+            yield module._restore_pair_report(transport)
+
+    monkeypatch.setattr(
+        module,
+        "_iter_pair_reports_bounded",
+        observe_bounded_schedule,
+        raising=False,
+    )
 
     single = module.collect_sop05_generation(prepared_one)
     parallel = module.collect_sop05_generation(prepared_two)
 
+    assert observed_in_flight_limits == [4]
     assert [item.rank for item in single.pair_reports] == [0, 1]
     assert [item.rank for item in parallel.pair_reports] == [0, 1]
     assert [event.generated_event_id for event in single.selected_events] == [
@@ -1722,7 +1923,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     assert manifest["run_state"] == "complete"
     assert manifest["run_id"] == prepared.run_id
     assert manifest["manifest_version"] == "sop05_run_manifest_v3"
-    assert manifest["producer_version"] == "sop05_generation_run_v5"
+    assert manifest["producer_version"] == "sop05_generation_run_v6"
     assert manifest["runtime"] == {
         "checksum_workers": 2,
         "git_executable": str(prepared.request.git_executable),
@@ -1771,7 +1972,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     ]
     assert [row["rank"] for row in report_rows] == [0, 1]
     assert report_rows[0]["report_version"] == (
-        "sop05_pair_generation_report_v3"
+        "sop05_pair_generation_report_v4"
     )
     assert report_rows[0]["selection_version"] == (
         "sop05_diversity_total_selection_v1"

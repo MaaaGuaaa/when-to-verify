@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -577,8 +578,9 @@ def _generator_config(event_kind: str = "structural") -> dict:
             },
         },
         "blind_reachability": {
-            "algorithm_version": "blind_reachability_first_v2",
+            "algorithm_version": "blind_reachability_quota_first_v3",
             "obstacle_proposals_per_trajectory": 8,
+            "snippet_candidates_per_proposal": 8,
             "interaction_range_m": [1.0, 4.0],
             "bearing_bin_count": 12,
             "yaw_step_deg": 30.0,
@@ -1575,10 +1577,13 @@ def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
         }
         assert config["time_scale_range"] == (1.0, 1.0)
         assert config["blind_reachability"]["algorithm_version"] == (
-            "blind_reachability_first_v2"
+            "blind_reachability_quota_first_v3"
         )
         assert config["blind_reachability"][
             "obstacle_proposals_per_trajectory"
+        ] == 64
+        assert config["blind_reachability"][
+            "snippet_candidates_per_proposal"
         ] == 64
         assert "normal_offset_range_m" not in config["occluders"]
         assert len(config["target_type_policy"].digest) == 32
@@ -1615,7 +1620,7 @@ def test_generator_config_freezes_v5_algorithm_token() -> None:
 
     assert (
         event_sampler_module.SOP05_GENERATOR_ALGORITHM_VERSION
-        == "blind_reachability_first_v2"
+        == "blind_reachability_quota_first_v3"
     )
 
 
@@ -2524,6 +2529,316 @@ def test_v5_summary_reconciles_each_candidate_layer() -> None:
     )
 
 
+def test_v3_quota_first_stops_after_requested_exact_acceptance() -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    proposal_budget = generator_config["blind_reachability"][
+        "obstacle_proposals_per_trajectory"
+    ]
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert len(report.events) == 1
+    assert report.summary["exact_validation_accepted_count"] == 1
+    assert report.summary["obstacle_proposal_count"] < proposal_budget
+    assert report.summary["attempt_index_stop_exclusive"] == (
+        report.summary["attempt_index_start"]
+        + report.summary["obstacle_proposal_count"]
+    )
+
+
+def test_v5_precomputes_trajectory_geometry_once_per_eligible_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, _, _, trajectory, _, generator_config = _v5_mother_inputs()
+    offsets = np.asarray(
+        trajectory.metadata["pose_time_offsets_s"], dtype=np.float64
+    )
+    lower, upper = generator_config["conflict_time_range_s"]
+    eligible_indices = tuple(
+        int(index)
+        for index in np.flatnonzero(
+            (offsets >= lower - 1e-12)
+            & (offsets <= upper + 1e-12)
+            & (np.arange(offsets.size) <= 14)
+        )
+    )
+    calls: list[int] = []
+    real_geometry = event_sampler_module._trajectory_geometry_at_index
+
+    def track_geometry(*args: object, **kwargs: object):
+        calls.append(int(kwargs["index"]))
+        return real_geometry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "_trajectory_geometry_at_index",
+        track_geometry,
+    )
+
+    schedule = event_sampler_module._prepare_v5_conflict_schedule(
+        trajectory=trajectory,
+        offsets=offsets,
+        eligible_indices=eligible_indices,
+        normalized=generator_config,
+        seed=20260716,
+        base_state_id="base-a",
+        trajectory_id=trajectory.trajectory_id,
+    )
+
+    assert sorted(item.conflict_index for item in schedule) == sorted(
+        eligible_indices
+    )
+    assert calls == list(eligible_indices)
+    assert all(item.directions_by_side for item in schedule)
+
+
+def test_v5_circle_center_mask_cache_uses_canonical_yaw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    build_counts: dict[tuple[str, str], int] = {}
+    real_builder = event_sampler_module.build_footprint_center_mask
+
+    def track_build(region, **kwargs: object):
+        key = (region.region_digest, str(kwargs["footprint_spec_digest"]))
+        build_counts[key] = build_counts.get(key, 0) + 1
+        return real_builder(region, **kwargs)
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "build_footprint_center_mask",
+        track_build,
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert report.events
+    assert build_counts
+    assert max(build_counts.values()) == 1
+
+
+def test_bounded_accepted_candidates_matches_full_sort_and_slice() -> None:
+    raw_keys = (
+        ("proposal-c", "candidate-b", "transform-a"),
+        ("proposal-a", "candidate-c", "transform-a"),
+        ("proposal-b", "candidate-a", "transform-c"),
+        ("proposal-a", "candidate-a", "transform-b"),
+        ("proposal-a", "candidate-a", "transform-a"),
+    )
+    candidates = [
+        {
+            "decision": SimpleNamespace(proposal_id=proposal_id),
+            "candidate": SimpleNamespace(candidate_id=candidate_id),
+            "target": SimpleNamespace(
+                provenance={"transform_id": transform_id}
+            ),
+        }
+        for proposal_id, candidate_id, transform_id in raw_keys
+    ]
+    keeper = event_sampler_module._BoundedAcceptedCandidates(limit=3)
+
+    for candidate in candidates:
+        keeper.add(candidate)
+        assert len(keeper) <= 3
+
+    expected = sorted(
+        candidates, key=event_sampler_module._accepted_candidate_key
+    )[:3]
+    assert keeper.items() == tuple(expected)
+
+
+def test_quota_first_snippet_window_rotates_and_wraps_deterministically() -> None:
+    descriptors = tuple(f"snippet-{index}" for index in range(10))
+
+    assert event_sampler_module._proposal_snippet_window(
+        descriptors,
+        proposal_index=0,
+        limit=4,
+    ) == descriptors[0:4]
+    assert event_sampler_module._proposal_snippet_window(
+        descriptors,
+        proposal_index=1,
+        limit=4,
+    ) == descriptors[4:8]
+    assert event_sampler_module._proposal_snippet_window(
+        descriptors,
+        proposal_index=2,
+        limit=4,
+    ) == (descriptors[8], descriptors[9], descriptors[0], descriptors[1])
+    assert event_sampler_module._proposal_snippet_window(
+        descriptors,
+        proposal_index=2,
+        limit=4,
+    ) == event_sampler_module._proposal_snippet_window(
+        descriptors,
+        proposal_index=2,
+        limit=4,
+    )
+
+
+def test_reachability_preview_matches_exact_candidate_current() -> None:
+    snippet = _exact_safe_curve_snippet()
+    source_current = snippet.positions[7].astype(np.float64)
+    source_anchor = snippet.positions[18].astype(np.float64)
+    conflict_point = np.asarray([2.4, -0.7], dtype=np.float64)
+
+    for angle_deg in (-35.0, -5.0, 0.0, 20.0, 35.0):
+        angle_rad = np.deg2rad(angle_deg)
+        direction = np.asarray(
+            [np.cos(angle_rad), np.sin(angle_rad)], dtype=np.float64
+        )
+        candidate = build_reachability_candidate(
+            conflict_point=conflict_point,
+            source_current_xy=source_current,
+            source_anchor_xy=source_anchor,
+            desired_crossing_direction=direction,
+            identity=ReachabilityIdentity(
+                base_state_id="base-preview",
+                trajectory_id="trajectory-preview",
+                source_snippet_id=snippet.snippet_id,
+                source_session_id=snippet.source_session_id,
+                conflict_index=10,
+                conflict_time_s=2.2,
+                crossing_side=1,
+                angle_offset_deg=angle_deg,
+            ),
+        )
+
+        preview = event_sampler_module._preview_reachability_current_xy(
+            conflict_point=conflict_point,
+            source_current_xy=source_current,
+            source_anchor_xy=source_anchor,
+            desired_crossing_direction=direction,
+        )
+
+        np.testing.assert_allclose(
+            preview, candidate.current_xy, rtol=0.0, atol=2e-15
+        )
+
+
+def test_reachability_preview_mask_query_uses_frozen_grid_without_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = build_grid_spec(load_config())
+    mask = np.zeros((grid.height, grid.width), dtype=bool)
+    mask[0, 0] = True
+    mask[80, 80] = True
+    points = (
+        np.asarray([-8.0, -8.0], dtype=np.float64),
+        np.asarray([0.0, 0.0], dtype=np.float64),
+        np.asarray([7.999999, 7.999999], dtype=np.float64),
+        np.asarray([8.0, 0.0], dtype=np.float64),
+        np.asarray([-8.000001, 0.0], dtype=np.float64),
+    )
+    expected = []
+    for point in points:
+        if not bool(event_sampler_module.points_in_grid(point, grid)):
+            expected.append(True)
+            continue
+        row, column = event_sampler_module.world_to_grid(point, grid)
+        expected.append(
+            bool(
+                np.any(
+                    mask[
+                        max(0, int(row) - 1) : min(grid.height, int(row) + 2),
+                        max(0, int(column) - 1) : min(
+                            grid.width, int(column) + 2
+                        ),
+                    ]
+                )
+            )
+        )
+
+    def unexpected_grid_revalidation(*args: object, **kwargs: object):
+        del args, kwargs
+        raise AssertionError("pair-local preview must use the frozen GridSpec")
+
+    monkeypatch.setattr(
+        event_sampler_module, "points_in_grid", unexpected_grid_revalidation
+    )
+    monkeypatch.setattr(
+        event_sampler_module, "world_to_grid", unexpected_grid_revalidation
+    )
+
+    assert [
+        event_sampler_module._preview_near_mask(point, mask, grid)
+        for point in points
+    ] == expected
+
+
+def test_v3_rejects_occluder_collision_before_expensive_world_physics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _v5_mother_inputs()
+    )
+    physics_calls = 0
+
+    def reject_occluder(*args: object, **kwargs: object):
+        del args, kwargs
+        raise event_sampler_module.OccluderSamplingError(
+            "occluder_target_collision",
+            attempts=1,
+            rejection_reasons={"occluder_target_collision": 1},
+        )
+
+    def track_expensive_physics(*args: object, **kwargs: object):
+        del args, kwargs
+        nonlocal physics_calls
+        physics_calls += 1
+        return CircleFootprint(0.3)
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "validate_environment_occluder_target",
+        reject_occluder,
+    )
+    monkeypatch.setattr(
+        event_sampler_module,
+        "_validate_target_physics",
+        track_expensive_physics,
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert report.events == ()
+    assert report.summary["rejection_reasons"][
+        "occluder_target_collision"
+    ] > 0
+    assert physics_calls == 0
+
+
 def test_out_of_grid_mask_query_is_bounded_transform_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2568,9 +2883,12 @@ def test_out_of_grid_mask_query_is_bounded_transform_rejection(
     assert summary["chord_certified_count"] == 0
     assert summary["chord_unresolved_count"] == 0
     assert summary["exact_validation_count"] == 0
-    assert summary["rejection_reasons"]["transform_out_of_bounds"] == summary[
-        "transform_candidate_count"
-    ]
+    assert summary["rejection_reasons"]["transform_out_of_bounds"] > 0
+    assert (
+        summary["rejection_reasons"]["transform_out_of_bounds"]
+        + summary["rejection_reasons"]["no_arc_mask_intersection"]
+        == summary["transform_candidate_count"]
+    )
     assert summary["obstacle_proposal_count"] == (
         summary["obstacle_proposal_rejected_count"]
         + summary["obstacle_proposal_passed_count"]
@@ -2757,7 +3075,7 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
 
     assert len(report.events) == 1
     assert report.summary["generator_algorithm_version"] == (
-        "blind_reachability_first_v2"
+        "blind_reachability_quota_first_v3"
     )
     assert report.summary["obstacle_proposal_count"] == (
         report.summary["obstacle_proposal_rejected_count"]
@@ -2776,7 +3094,7 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
     assert report.summary["exact_validation_accepted_count"] > 0
     event = report.events[0]
     assert event.world.metadata["generator_algorithm_version"] == (
-        "blind_reachability_first_v2"
+        "blind_reachability_quota_first_v3"
     )
     assert event.world.occluders[0]["placement_strategy"] == (
         "causal_free_space_schedule_v1"

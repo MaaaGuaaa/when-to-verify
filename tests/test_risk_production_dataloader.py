@@ -43,6 +43,17 @@ _SHARD_ORDER_DOMAIN = "risk-production-shard-order-v1"
 _ROW_ORDER_DOMAIN = "risk-production-row-order-v1"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_production_subset_plan_cache():
+    cache = getattr(dataloader_module, "_PRODUCTION_SUBSET_PLAN_CACHE", None)
+    if cache is not None:
+        cache.clear()
+    yield
+    cache = getattr(dataloader_module, "_PRODUCTION_SUBSET_PLAN_CACHE", None)
+    if cache is not None:
+        cache.clear()
+
+
 def _publish_and_load(tmp_path: Path) -> tuple[FormalRiskPublication, LoadedRiskDataset]:
     publication = create_formal_risk_publication(tmp_path / "upstream")
     seal_root = publish_risk_dataset_seal(
@@ -558,6 +569,29 @@ def test_runtime_dataset_metadata_must_match_authenticated_manifest(
             select_production_risk_subset(changed, max_samples=4, seed=1)
 
 
+def test_manifest_digest_is_recomputed_before_any_production_shard_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, dataset = _publish_and_load(tmp_path)
+    manifest = dict(dataset.manifest)
+    manifest_grid = dict(dataset.manifest["grid"])
+    manifest_grid["sample_dt_s"] = float(manifest_grid["sample_dt_s"]) + 0.1
+    manifest["grid"] = manifest_grid
+    tampered = replace(dataset, manifest=manifest)
+    load_calls = 0
+
+    def forbidden_shard_load(*args: object, **kwargs: object) -> object:
+        nonlocal load_calls
+        del args, kwargs
+        load_calls += 1
+        raise AssertionError("shard loading must follow manifest authentication")
+
+    monkeypatch.setattr(dataloader_module, "load_risk_shard", forbidden_shard_load)
+    with pytest.raises(RiskDataContractError, match="manifest digest"):
+        select_production_risk_subset(tampered, max_samples=4, seed=1)
+    assert load_calls == 0
+
+
 def test_collator_rejects_empty_duplicate_and_wrong_split_samples(tmp_path: Path) -> None:
     publication, dataset = _publish_and_load(tmp_path)
     loaded = load_risk_shard(
@@ -592,7 +626,9 @@ def test_collator_rejects_empty_duplicate_and_wrong_split_samples(tmp_path: Path
 def test_tampered_shard_fails_before_its_first_batch(tmp_path: Path) -> None:
     publication, dataset = _publish_and_load(tmp_path)
     subset = select_production_risk_subset(dataset, max_samples=1, seed=5)
-    summary = publication.collection_root / "shard-00000" / "summary.json"
+    selected_index = int(subset.sample_ids[0].rsplit("-", 1)[1])
+    selected_shard = dataset.shards[selected_index // 6]
+    summary = publication.collection_root / selected_shard.relative_root / "summary.json"
     summary.write_bytes(summary.read_bytes() + b" ")
 
     stream = iter_production_risk_batches(
@@ -600,6 +636,58 @@ def test_tampered_shard_fails_before_its_first_batch(tmp_path: Path) -> None:
     )
     with pytest.raises(RiskDataContractError, match="shard|summary|formal"):
         next(stream)
+
+
+def test_verified_subset_plan_avoids_all_shard_prepass_on_repeated_epochs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, dataset = _publish_and_load(tmp_path)
+    cache = getattr(dataloader_module, "_PRODUCTION_SUBSET_PLAN_CACHE", None)
+    if cache is not None:
+        cache.clear()
+    subset = select_production_risk_subset(dataset, max_samples=12, seed=23)
+    real_loader = dataloader_module.load_risk_shard
+    load_names: list[str] = []
+
+    def counted_loader(root: Path, **kwargs: object) -> object:
+        load_names.append(Path(root).name)
+        return real_loader(root, **kwargs)
+
+    monkeypatch.setattr(dataloader_module, "load_risk_shard", counted_loader)
+    try:
+        for epoch in (0, 1):
+            for _ in iter_production_risk_batches(
+                dataset,
+                subset=subset,
+                batch_size=4,
+                seed=23,
+                epoch=epoch,
+            ):
+                pass
+        assert len(load_names) == 4
+        assert load_names.count("shard-00000") == 2
+        assert load_names.count("shard-00001") == 2
+
+        load_names.clear()
+        cache = getattr(dataloader_module, "_PRODUCTION_SUBSET_PLAN_CACHE", None)
+        if cache is not None:
+            cache.clear()
+        for epoch in (2, 3):
+            for _ in iter_production_risk_batches(
+                dataset,
+                subset=subset,
+                batch_size=4,
+                seed=23,
+                epoch=epoch,
+            ):
+                pass
+        assert len(load_names) == 6
+        assert load_names.count("shard-00000") == 3
+        assert load_names.count("shard-00001") == 3
+    finally:
+        cache = getattr(dataloader_module, "_PRODUCTION_SUBSET_PLAN_CACHE", None)
+        if cache is not None:
+            cache.clear()
 
 
 def test_stream_retains_at_most_one_formally_loaded_shard_plus_batch(

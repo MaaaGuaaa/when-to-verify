@@ -937,6 +937,28 @@ def _risk_dataset_manifest_digest(manifest: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def validate_risk_dataset_manifest(manifest: Mapping[str, object]) -> str:
+    """Authenticate one complete in-memory ``risk_dataset_v2`` manifest."""
+
+    if not isinstance(manifest, Mapping):
+        raise RiskDataContractError("dataset manifest must be a mapping")
+    if set(manifest) != _DATASET_MANIFEST_KEYS:
+        missing_keys = sorted(_DATASET_MANIFEST_KEYS - set(manifest))
+        extra_keys = sorted(set(manifest) - _DATASET_MANIFEST_KEYS)
+        raise RiskDataContractError(
+            "dataset manifest keys mismatch: "
+            f"missing={missing_keys}, unexpected={extra_keys}"
+        )
+    declared_digest = _require_sha256(
+        manifest.get("risk_dataset_manifest_digest"),
+        field="risk_dataset_manifest_digest",
+    )
+    recomputed_digest = _risk_dataset_manifest_digest(manifest)
+    if recomputed_digest != declared_digest:
+        raise RiskDataContractError("risk dataset manifest digest mismatch")
+    return declared_digest
+
+
 def _write_dataset_seal(staging: Path, manifest: Mapping[str, object]) -> None:
     manifest_path = staging / _DATASET_MANIFEST_NAME
     marker_path = staging / _COMPLETE_MARKER_NAME
@@ -1166,16 +1188,6 @@ def load_risk_dataset_seal(
         manifest.get("dynamic_objects_config_digest"),
         field="dynamic_objects_config_digest",
     )
-    dataset_digest = _require_sha256(
-        manifest.get("risk_dataset_manifest_digest"),
-        field="risk_dataset_manifest_digest",
-    )
-    if expected_manifest_digest is not None:
-        expected_digest = _require_sha256(
-            expected_manifest_digest, field="expected_manifest_digest"
-        )
-        if dataset_digest != expected_digest:
-            raise RiskDataContractError("expected manifest digest does not match seal")
     _validate_channel_spec(manifest.get("channel_spec"))
     grid = _grid_from_manifest(manifest.get("grid"))
     sample_count = _require_positive_int(
@@ -1193,9 +1205,13 @@ def load_risk_dataset_seal(
     )
     if sum(item.sample_count for item in descriptors) != sample_count:
         raise RiskDataContractError("dataset sample_count differs from shard totals")
-    recomputed_dataset_digest = _risk_dataset_manifest_digest(manifest)
-    if recomputed_dataset_digest != dataset_digest:
-        raise RiskDataContractError("risk_dataset_manifest_digest mismatch")
+    dataset_digest = validate_risk_dataset_manifest(manifest)
+    if expected_manifest_digest is not None:
+        expected_digest = _require_sha256(
+            expected_manifest_digest, field="expected_manifest_digest"
+        )
+        if dataset_digest != expected_digest:
+            raise RiskDataContractError("expected manifest digest does not match seal")
 
     handoff_digest = _require_sha256(
         manifest.get("collection_handoff_sha256"),
@@ -1259,4 +1275,5 @@ __all__ = [
     "canonical_dynamic_objects_digest",
     "load_risk_dataset_seal",
     "publish_risk_dataset_seal",
+    "validate_risk_dataset_manifest",
 ]

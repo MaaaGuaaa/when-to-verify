@@ -32,6 +32,7 @@ from src.datasets.risk_dataset_seal import (
     canonical_dynamic_objects_digest,
     load_risk_dataset_seal,
     publish_risk_dataset_seal,
+    validate_risk_dataset_manifest,
 )
 from src.datasets.shard_writer import load_risk_shard
 from src.datasets.sop03_publication import publish_checksum_envelope
@@ -145,6 +146,44 @@ def test_public_contract_is_frozen_and_dynamic_digest_is_canonical() -> None:
     assert canonical_dynamic_objects_digest({"ü": [2, 1], "human": {"radius_m": 0.3}}) == expected
     with pytest.raises((TypeError, ValueError)):
         canonical_dynamic_objects_digest({"bad": float("nan")})
+
+
+def test_public_manifest_validator_authenticates_complete_semantics(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    loaded = load_risk_dataset_seal(
+        _publish(publication, tmp_path / "seal"),
+        collection_root=publication.collection_root,
+        expected_split="train",
+    )
+    assert (
+        validate_risk_dataset_manifest(loaded.manifest)
+        == loaded.risk_dataset_manifest_digest
+    )
+
+    tampered = dict(loaded.manifest)
+    grid = dict(loaded.manifest["grid"])
+    grid["sample_dt_s"] = float(grid["sample_dt_s"]) + 0.1
+    tampered["grid"] = grid
+    with pytest.raises(RiskDataContractError, match="manifest digest"):
+        validate_risk_dataset_manifest(tampered)
+
+    with pytest.raises(RiskDataContractError, match="mapping"):
+        validate_risk_dataset_manifest([])  # type: ignore[arg-type]
+    with pytest.raises(RiskDataContractError, match="keys"):
+        validate_risk_dataset_manifest({**dict(loaded.manifest), "extra": 1})
+    with pytest.raises(RiskDataContractError, match="risk_dataset_manifest_digest"):
+        validate_risk_dataset_manifest(
+            {**dict(loaded.manifest), "risk_dataset_manifest_digest": "A" * 64}
+        )
+
+    nonfinite = dict(loaded.manifest)
+    nonfinite_grid = dict(loaded.manifest["grid"])
+    nonfinite_grid["sample_dt_s"] = float("nan")
+    nonfinite["grid"] = nonfinite_grid
+    with pytest.raises(RiskDataContractError, match="finite canonical JSON"):
+        validate_risk_dataset_manifest(nonfinite)
 
 
 def test_publish_load_round_trip_uses_every_real_shard_and_preserves_temporal_safe(

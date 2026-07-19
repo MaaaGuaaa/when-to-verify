@@ -8,6 +8,7 @@ through to an alternate parser.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
 import json
@@ -131,6 +132,24 @@ class RiskStreamCursor:
     samples_yielded: int
     dataset_manifest_digest: str
     subset_digest_sha256: str
+
+
+@dataclass(frozen=True)
+class _VerifiedProductionSubsetPlan:
+    """Immutable sample-ID-only result of formal membership verification."""
+
+    dataset_manifest_digest: str
+    subset_digest_sha256: str
+    sample_ids: tuple[str, ...]
+    seed: int
+    max_samples: int
+    selected_by_shard: tuple[tuple[int, frozenset[str]], ...]
+
+
+_PRODUCTION_SUBSET_PLAN_CACHE_MAX_ENTRIES = 4
+_PRODUCTION_SUBSET_PLAN_CACHE: OrderedDict[
+    tuple[str, str], _VerifiedProductionSubsetPlan
+] = OrderedDict()
 
 
 def _key_is_forbidden(key: object) -> bool:
@@ -333,7 +352,11 @@ def _validate_production_channel_spec(value: object) -> None:
 
 
 def _validate_loaded_risk_dataset(dataset: object) -> "LoadedRiskDataset":
-    from src.datasets.risk_dataset_seal import LoadedRiskDataset, RiskShardDescriptor
+    from src.datasets.risk_dataset_seal import (
+        LoadedRiskDataset,
+        RiskShardDescriptor,
+        validate_risk_dataset_manifest,
+    )
 
     if not isinstance(dataset, LoadedRiskDataset):
         raise RiskDataContractError(
@@ -345,6 +368,11 @@ def _validate_loaded_risk_dataset(dataset: object) -> "LoadedRiskDataset":
     )
     if not isinstance(dataset.manifest, Mapping):
         raise RiskDataContractError("loaded dataset manifest must be a mapping")
+    validated_manifest_digest = validate_risk_dataset_manifest(dataset.manifest)
+    if validated_manifest_digest != digest:
+        raise RiskDataContractError(
+            "validated manifest digest does not match loaded dataset digest"
+        )
     if dataset.manifest.get("dataset_layout_version") != PRODUCTION_DATASET_LAYOUT_VERSION:
         raise RiskDataContractError(
             f"loaded dataset must use {PRODUCTION_DATASET_LAYOUT_VERSION}"
@@ -747,6 +775,75 @@ def _rank_production_sample_ids(
     )
 
 
+def _production_subset_plan_key(
+    dataset_manifest_digest: str, subset_digest_sha256: str
+) -> tuple[str, str]:
+    return dataset_manifest_digest, subset_digest_sha256
+
+
+def _store_verified_production_subset_plan(
+    subset: ProductionRiskSubset,
+    selected_by_shard: Mapping[int, frozenset[str]],
+) -> None:
+    frozen_mapping = tuple(
+        (shard_index, frozenset(sample_ids))
+        for shard_index, sample_ids in sorted(selected_by_shard.items())
+    )
+    if frozenset(
+        sample_id
+        for _, sample_ids in frozen_mapping
+        for sample_id in sample_ids
+    ) != frozenset(subset.sample_ids):
+        raise RiskDataContractError(
+            "internal verified subset plan does not bind exact sample membership"
+        )
+    plan = _VerifiedProductionSubsetPlan(
+        dataset_manifest_digest=subset.dataset_manifest_digest,
+        subset_digest_sha256=subset.sample_ids_digest_sha256,
+        sample_ids=subset.sample_ids,
+        seed=subset.seed,
+        max_samples=subset.max_samples,
+        selected_by_shard=frozen_mapping,
+    )
+    key = _production_subset_plan_key(
+        subset.dataset_manifest_digest,
+        subset.sample_ids_digest_sha256,
+    )
+    _PRODUCTION_SUBSET_PLAN_CACHE[key] = plan
+    _PRODUCTION_SUBSET_PLAN_CACHE.move_to_end(key)
+    while (
+        len(_PRODUCTION_SUBSET_PLAN_CACHE)
+        > _PRODUCTION_SUBSET_PLAN_CACHE_MAX_ENTRIES
+    ):
+        _PRODUCTION_SUBSET_PLAN_CACHE.popitem(last=False)
+
+
+def _get_verified_production_subset_plan(
+    subset: ProductionRiskSubset,
+) -> dict[int, frozenset[str]] | None:
+    key = _production_subset_plan_key(
+        subset.dataset_manifest_digest,
+        subset.sample_ids_digest_sha256,
+    )
+    plan = _PRODUCTION_SUBSET_PLAN_CACHE.get(key)
+    if plan is None:
+        return None
+    if (
+        plan.dataset_manifest_digest != subset.dataset_manifest_digest
+        or plan.subset_digest_sha256 != subset.sample_ids_digest_sha256
+        or plan.sample_ids != subset.sample_ids
+        or plan.seed != subset.seed
+        or plan.max_samples != subset.max_samples
+    ):
+        _PRODUCTION_SUBSET_PLAN_CACHE.pop(key, None)
+        return None
+    _PRODUCTION_SUBSET_PLAN_CACHE.move_to_end(key)
+    return {
+        shard_index: sample_ids
+        for shard_index, sample_ids in plan.selected_by_shard
+    }
+
+
 def select_production_risk_subset(
     dataset: "LoadedRiskDataset",
     *,
@@ -762,12 +859,12 @@ def select_production_risk_subset(
     loaded_dataset = _validate_loaded_risk_dataset(dataset)
     limit = _require_positive_int(max_samples, "max_samples")
     selection_seed = _require_nonnegative_int(seed, "seed")
-    sample_ids, _, _ = _rank_production_sample_ids(
+    sample_ids, selected_by_shard, _ = _rank_production_sample_ids(
         loaded_dataset,
         max_samples=limit,
         seed=selection_seed,
     )
-    return ProductionRiskSubset(
+    subset = ProductionRiskSubset(
         sample_ids=sample_ids,
         sample_ids_digest_sha256=_subset_digest(
             sample_ids,
@@ -779,6 +876,8 @@ def select_production_risk_subset(
         seed=selection_seed,
         max_samples=limit,
     )
+    _store_verified_production_subset_plan(subset, selected_by_shard)
+    return subset
 
 
 def _validate_production_subset(
@@ -823,6 +922,10 @@ def _validate_production_subset(
     if subset_digest != recomputed_digest:
         raise RiskDataContractError("subset sample_ids_digest_sha256 mismatch")
 
+    cached_plan = _get_verified_production_subset_plan(subset)
+    if cached_plan is not None:
+        return cached_plan
+
     expected_ids, selected_by_shard, all_sample_ids = _rank_production_sample_ids(
         dataset,
         max_samples=max_samples,
@@ -835,6 +938,7 @@ def _validate_production_subset(
         raise RiskDataContractError(
             "subset.sample_ids do not match deterministic production selection"
         )
+    _store_verified_production_subset_plan(subset, selected_by_shard)
     return selected_by_shard
 
 

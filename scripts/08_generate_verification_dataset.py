@@ -11,8 +11,9 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +29,7 @@ from src.generation.scenario_bank import load_scenario_bank_config
 from src.generation.verification_gt import load_verification_gt_config
 from src.generation.verification_pipeline import (
     VERIFICATION_PIPELINE_VERSION,
+    VerificationSourceIneligibleError,
     build_real_verification_input,
     build_verification_toy_input,
     generate_verification_group,
@@ -64,6 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-replan-candidates", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checksum-workers", type=int, default=2)
+    parser.add_argument("--max-source-attempts", type=int, default=100)
     parser.add_argument("--sop03-root", type=Path)
     parser.add_argument("--sop04-root", type=Path)
     parser.add_argument("--sop05-batch-handoff", type=Path)
@@ -86,6 +89,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_replan_candidates must be positive")
     if args.checksum_workers <= 0:
         raise ValueError("checksum_workers must be positive")
+    required_groups = args.sample_count // 6
+    if (
+        args.max_source_attempts < required_groups
+        or args.max_source_attempts > 1000
+    ):
+        raise ValueError(
+            "max_source_attempts must cover every requested group and be at most 1000"
+        )
     if args.posterior_mode == "exact" and args.posterior_temperature is not None:
         raise ValueError("exact posterior does not accept --posterior-temperature")
     if args.mode == "sop05-train":
@@ -111,6 +122,75 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+class _SourceSelection:
+    __slots__ = (
+        "groups",
+        "accepted_event_ids",
+        "attempted_event_count",
+        "rejection_counts",
+        "rejected_event_ids",
+    )
+
+    def __init__(
+        self,
+        *,
+        groups: tuple[object, ...],
+        accepted_event_ids: tuple[str, ...],
+        attempted_event_count: int,
+        rejection_counts: dict[str, int],
+        rejected_event_ids: dict[str, tuple[str, ...]],
+    ) -> None:
+        self.groups = groups
+        self.accepted_event_ids = accepted_event_ids
+        self.attempted_event_count = attempted_event_count
+        self.rejection_counts = rejection_counts
+        self.rejected_event_ids = rejected_event_ids
+
+
+def _generate_exact_eligible_groups(
+    events: Sequence[object],
+    *,
+    required_group_count: int,
+    build_group: Callable[[object], object],
+    event_id: Callable[[object], str],
+) -> _SourceSelection:
+    if required_group_count <= 0:
+        raise ValueError("required_group_count must be positive")
+    groups: list[object] = []
+    accepted_ids: list[str] = []
+    rejection_counts: Counter[str] = Counter()
+    rejected_ids: defaultdict[str, list[str]] = defaultdict(list)
+    attempted = 0
+    for event in events:
+        identifier = event_id(event)
+        attempted += 1
+        try:
+            group = build_group(event)
+        except VerificationSourceIneligibleError as exc:
+            rejection_counts[exc.reason] += 1
+            rejected_ids[exc.reason].append(identifier)
+            continue
+        groups.append(group)
+        accepted_ids.append(identifier)
+        if len(groups) == required_group_count:
+            break
+    if len(groups) != required_group_count:
+        raise RuntimeError(
+            "candidate pool exhausted before enough eligible groups were generated: "
+            f"accepted={len(groups)}, required={required_group_count}, "
+            f"attempted={attempted}, rejections={dict(sorted(rejection_counts.items()))}"
+        )
+    return _SourceSelection(
+        groups=tuple(groups),
+        accepted_event_ids=tuple(accepted_ids),
+        attempted_event_count=attempted,
+        rejection_counts=dict(sorted(rejection_counts.items())),
+        rejected_event_ids={
+            key: tuple(value) for key, value in sorted(rejected_ids.items())
+        },
+    )
 
 
 def _implementation_digest(root: Path, config_paths: Sequence[Path]) -> str:
@@ -347,18 +427,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             sop03_root=args.sop03_root,
             sop04_root=args.sop04_root,
             grid=grid,
-            event_count=group_count,
+            event_count=args.max_source_attempts,
             seed=args.seed,
             checksum_workers=args.checksum_workers,
         )
-        for group_index, event in enumerate(bundle.events):
+        def build_real_group(event):
             source = build_real_verification_input(
                 event,
                 base_config=config,
                 sop05_batch_digest=index.sop05_batch_digest,
                 sop07_collection_digest=index.sop07_collection_digest,
             )
-            result = generate_verification_group(
+            return generate_verification_group(
                 source,
                 base_config=config,
                 action_library=action_library,
@@ -367,11 +447,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 bank_size=args.bank_size,
                 posterior_mode=args.posterior_mode,
                 posterior_temperature=posterior_temperature,
-                seed=derive_seed(args.seed, "real-verification-group", group_index),
+                seed=derive_seed(
+                    args.seed,
+                    "real-verification-group",
+                    event.event.generated_event_id,
+                ),
                 max_replan_candidates=args.max_replan_candidates,
             )
-            groups.append(result.samples)
-            scenario_digests.append(result.scenario_bank_digest)
+
+        selection = _generate_exact_eligible_groups(
+            bundle.events,
+            required_group_count=group_count,
+            build_group=build_real_group,
+            event_id=lambda item: item.event.generated_event_id,
+        )
+        groups.extend(result.samples for result in selection.groups)
+        scenario_digests.extend(
+            result.scenario_bank_digest for result in selection.groups
+        )
         scientific_status = index.scientific_status
         source_summary = {
             "mode": "sop05-train",
@@ -381,9 +474,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "loaded_sop05_publication_digests": list(
                 bundle.loaded_sop05_publication_digests
             ),
-            "selected_event_ids": [
-                item.event.generated_event_id for item in bundle.events
-            ],
+            "candidate_pool_count": len(bundle.events),
+            "attempted_event_count": selection.attempted_event_count,
+            "accepted_group_count": len(selection.groups),
+            "selected_event_ids": list(selection.accepted_event_ids),
+            "rejection_counts": selection.rejection_counts,
+            "rejected_event_ids": {
+                key: list(value)
+                for key, value in selection.rejected_event_ids.items()
+            },
         }
 
     samples = tuple(sample for group in groups for sample in group)

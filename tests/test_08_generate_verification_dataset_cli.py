@@ -7,6 +7,7 @@ import pytest
 from src.contracts import build_grid_spec
 from src.datasets.verification_dataloader import load_verification_shard
 from src.planning.verification_actions import load_verification_actions
+from src.generation.verification_pipeline import VerificationSourceIneligibleError
 from src.utils.config import load_config
 
 
@@ -95,3 +96,63 @@ def test_real_mode_never_falls_back_when_trust_paths_are_missing(tmp_path):
     args[args.index("toy")] = "sop05-train"
     with pytest.raises(ValueError, match="required for sop05-train"):
         module.main(args)
+
+
+def test_real_source_selection_retries_only_typed_ineligibility():
+    module = _module()
+
+    def build(value):
+        if value in {"bad-current", "bad-variant"}:
+            reason = (
+                "scenario_current_static_overlap"
+                if value == "bad-current"
+                else "scenario_variant_static_overlap"
+            )
+            raise VerificationSourceIneligibleError(reason, value)
+        return f"group::{value}"
+
+    selection = module._generate_exact_eligible_groups(
+        ("bad-current", "good-1", "bad-variant", "good-2", "unused"),
+        required_group_count=2,
+        build_group=build,
+        event_id=lambda value: value,
+    )
+
+    assert selection.groups == ("group::good-1", "group::good-2")
+    assert selection.accepted_event_ids == ("good-1", "good-2")
+    assert selection.attempted_event_count == 4
+    assert selection.rejection_counts == {
+        "scenario_current_static_overlap": 1,
+        "scenario_variant_static_overlap": 1,
+    }
+    assert selection.rejected_event_ids == {
+        "scenario_current_static_overlap": ("bad-current",),
+        "scenario_variant_static_overlap": ("bad-variant",),
+    }
+
+
+def test_real_source_selection_fails_closed_when_pool_is_exhausted():
+    module = _module()
+
+    def reject(value):
+        raise VerificationSourceIneligibleError("infeasible_actions", value)
+
+    with pytest.raises(RuntimeError, match="eligible groups"):
+        module._generate_exact_eligible_groups(
+            ("bad-1", "bad-2"),
+            required_group_count=1,
+            build_group=reject,
+            event_id=lambda value: value,
+        )
+
+
+def test_real_source_selection_does_not_swallow_unexpected_errors():
+    module = _module()
+
+    with pytest.raises(KeyError, match="unexpected"):
+        module._generate_exact_eligible_groups(
+            ("event",),
+            required_group_count=1,
+            build_group=lambda _: (_ for _ in ()).throw(KeyError("unexpected")),
+            event_id=lambda value: value,
+        )

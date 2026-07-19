@@ -8,6 +8,7 @@ import pytest
 from src.contracts import OracleWorld
 from src.generation.scenario_bank import (
     SCENARIO_BANK_VERSION,
+    ScenarioBankGeometryError,
     build_scenario_bank,
     load_scenario_bank_config,
     validate_scenario_bank,
@@ -214,3 +215,28 @@ def test_builder_rejects_unsupported_size_and_cross_split_namespace():
                 "source_namespace": "toy/train/source-0",
             },
         )
+
+
+def test_builder_reports_typed_static_geometry_ineligibility():
+    toy, world = _current_inputs()
+    colliding_static = world.static_occupancy.copy()
+    colliding_static[toy.critical_mask] = 1.0
+    colliding_world = replace(world, static_occupancy=colliding_static)
+
+    with pytest.raises(ScenarioBankGeometryError) as captured:
+        build_scenario_bank(
+            current_world=colliding_world,
+            target_object_id="critical_cart",
+            current_dynamic_poses=toy.dynamic_current_poses,
+            current_visible_mask=toy.current_visible_mask,
+            grid=toy.grid,
+            split="train",
+            source_namespace="toy/train/source-0",
+            seed=42,
+            size=8,
+            config=load_scenario_bank_config(CONFIG),
+        )
+
+    assert captured.value.variant_kind == "current"
+    assert captured.value.object_id == "critical_cart"
+    assert captured.value.future_index == 0

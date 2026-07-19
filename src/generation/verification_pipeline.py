@@ -42,6 +42,7 @@ from src.generation.dynamic_object_transplant import footprint_from_spec
 from src.generation.observation_renderer import render_observation
 from src.generation.scenario_bank import (
     ScenarioBankConfig,
+    ScenarioBankGeometryError,
     build_scenario_bank,
 )
 from src.generation.sop06_pipeline import render_sop06_mother_event
@@ -66,6 +67,19 @@ from src.utils.seeding import stable_digest
 
 
 VERIFICATION_PIPELINE_VERSION = "verification_pipeline_v1"
+
+
+class VerificationSourceIneligibleError(ValueError):
+    """An audited source cannot form a complete, physically valid action group."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("source-ineligibility reason must be non-empty")
+        if not isinstance(detail, str) or not detail:
+            raise ValueError("source-ineligibility detail must be non-empty")
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}")
 
 
 @dataclass(frozen=True)
@@ -414,18 +428,26 @@ def generate_verification_group(
     if posterior_mode == "soft" and posterior_temperature is None:
         raise ValueError("soft posterior requires a temperature")
 
-    bank = build_scenario_bank(
-        current_world=source.current_world,
-        target_object_id=source.target_object_id,
-        current_dynamic_poses=source.current_dynamic_poses,
-        current_visible_mask=source.current_visible_mask,
-        grid=source.grid,
-        split=source.split,
-        source_namespace=source.source_namespace,
-        seed=seed,
-        size=bank_count,
-        config=scenario_config,
-    )
+    try:
+        bank = build_scenario_bank(
+            current_world=source.current_world,
+            target_object_id=source.target_object_id,
+            current_dynamic_poses=source.current_dynamic_poses,
+            current_visible_mask=source.current_visible_mask,
+            grid=source.grid,
+            split=source.split,
+            source_namespace=source.source_namespace,
+            seed=seed,
+            size=bank_count,
+            config=scenario_config,
+        )
+    except ScenarioBankGeometryError as exc:
+        reason = (
+            "scenario_current_static_overlap"
+            if exc.variant_kind == "current"
+            else "scenario_variant_static_overlap"
+        )
+        raise VerificationSourceIneligibleError(reason, str(exc)) from exc
     robot_footprint = _robot_footprint(config)
     dynamic_footprints = {
         object_id: footprint_from_spec(spec)
@@ -543,9 +565,9 @@ def generate_verification_group(
             action_cost_config=config["verification_cost"],
         )
     if infeasible:
-        raise ValueError(
-            "infeasible verification actions prevent a complete six-action group: "
-            + ", ".join(infeasible)
+        raise VerificationSourceIneligibleError(
+            "infeasible_actions",
+            "complete six-action group blocked by " + ", ".join(infeasible),
         )
     samples = build_verification_samples(
         VerificationGroupInput(
@@ -576,6 +598,7 @@ __all__ = (
     "VERIFICATION_PIPELINE_VERSION",
     "VerificationGroupResult",
     "VerificationPipelineInput",
+    "VerificationSourceIneligibleError",
     "build_real_verification_input",
     "build_verification_toy_input",
     "generate_verification_group",

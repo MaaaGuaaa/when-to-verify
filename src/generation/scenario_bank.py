@@ -51,6 +51,22 @@ _SCENARIO_KEYS = frozenset(
 )
 
 
+class ScenarioBankGeometryError(ValueError):
+    """A deterministic hypothesis is incompatible with frozen static geometry."""
+
+    def __init__(
+        self, *, variant_kind: str, object_id: str, future_index: int
+    ) -> None:
+        self.variant_kind = variant_kind
+        self.object_id = object_id
+        self.future_index = future_index
+        super().__init__(
+            "scenario dynamic trajectory violates static geometry: "
+            f"variant={variant_kind}, object={object_id}, "
+            f"future_index={future_index}"
+        )
+
+
 def _finite_real(value: Any, *, name: str) -> float:
     if isinstance(value, (bool, np.bool_)) or not isinstance(
         value, (Real, np.integer, np.floating)
@@ -506,12 +522,18 @@ def validate_scenario_bank(bank: ScenarioBank, *, grid: GridSpec) -> None:
             raise ValueError("scenario current visible occupancy differs across worlds")
         for object_id in sorted(ids):
             footprint = footprint_from_spec(hypothesis.world.dynamic_object_specs[object_id])
-            for pose in hypothesis.world.dynamic_object_trajectories[object_id]:
+            for future_index, pose in enumerate(
+                hypothesis.world.dynamic_object_trajectories[object_id]
+            ):
                 if np.any(
                     rasterize_footprint(footprint, pose, grid)
                     & (reference_static != 0.0)
                 ):
-                    raise ValueError("scenario dynamic trajectory violates static geometry")
+                    raise ScenarioBankGeometryError(
+                        variant_kind=hypothesis.variant_kind,
+                        object_id=object_id,
+                        future_index=future_index,
+                    )
     if _bank_digest(bank) != bank.semantic_digest:
         raise ValueError("scenario bank semantic digest mismatch")
 
@@ -702,6 +724,7 @@ __all__ = (
     "SUPPORTED_BANK_SIZES",
     "ScenarioBank",
     "ScenarioBankConfig",
+    "ScenarioBankGeometryError",
     "ScenarioHypothesis",
     "build_scenario_bank",
     "load_scenario_bank_config",

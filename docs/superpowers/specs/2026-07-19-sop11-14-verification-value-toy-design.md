@@ -1,4 +1,4 @@
-# SOP11–14 Verification-Value Toy-First Design
+# SOP11–14 Verification-Value Toy-Exact / Real-Train-Smoke Design
 
 > Status: approved design derived from the authoritative SOP documents. This
 > document does not replace `src/contracts.py`, `configs/base.yaml`,
@@ -7,10 +7,11 @@
 ## Goal
 
 Implement the complete SOP11–14 verification-value path behind stable module
-interfaces, using deterministic toy inputs until schema-compatible SOP06/07
-artifacts are merged. The first milestone must exercise the same geometry,
-posterior, value, dataset, model, and metric code that later consumes real
-artifacts; toy results are labelled smoke evidence and are never reported as
+interfaces. Deterministic toy inputs remain the exact scientific oracle for
+hand-checkable geometry, posterior, and value tests. The audited schema-3
+SOP03/SOP05 train artifacts provide the 10–100-event real-input smoke path.
+Both modes exercise the same geometry, posterior, value, dataset, model, and
+metric code; neither toy results nor train-only smoke results are reported as
 paper-scale evidence.
 
 ## Scope and delivery phases
@@ -25,9 +26,11 @@ The work is one data flow but three independently testable subprojects:
 3. **SOP14 learning:** V0 concat CNN, dual heads, losses, baselines, metrics,
    deterministic training, checkpoint provenance, and toy overfit smoke.
 
-The toy-first milestone does not claim the SOP13 10,000-sample minimum, paper
-model thresholds, real-recording smoke, or G2/G3 completion. Those gates remain
-open until stable SOP06/07 inputs exist.
+The first milestone does not claim the SOP13 10,000-sample minimum, paper model
+thresholds, validation/test performance, cross-split leakage proof, or G2/G3
+completion. A real train smoke is now in scope, but the supplied SOP07 handoff
+contains train only and explicitly marks global cross-split leakage
+`NOT_PROVEN`.
 
 ## Frozen contracts
 
@@ -66,9 +69,35 @@ BaseState + nominal LocalTrajectory + OracleWorld bank
 ```
 
 SOP12 accepts a finite trajectory/world loss callable. The toy adapter uses
-hand-enumerated losses. A future SOP07 adapter will call the merged typed-risk
-implementation. This boundary prevents a second, divergent risk formula from
-being implemented inside the verification module.
+hand-enumerated losses. The real-train adapter uses the merged typed-footprint
+risk implementation through that same callable boundary. This prevents a
+second, divergent risk formula from being implemented inside the verification
+module.
+
+### Audited upstream input boundary
+
+The dependency branch is integrated at
+`263efb5ea6870a9c40a27abcfe93311efdc1f94e`; its prior audit is not repeated.
+The verification adapter performs only downstream trust and join checks:
+
+- SOP05 batch handoff:
+  `outputs/sop05_schema3_405affe1_train_20k_v2/batch_complete_handoff.json`;
+- SOP05 batch semantic digest:
+  `b81cb428495b9275f218ddea9fd34f42675dfecbacccd0c2e771b957053f13e6`;
+- SOP07 train collection handoff:
+  `outputs/sop07_schema3_263efb5_train_from_sop05_20k_v1/collection_complete_handoff.json`;
+- SOP07 collection semantic digest:
+  `e5c7c02aeaba5e0889eff8714c3bdb12ae13b855869162161b66b35588926d51`.
+
+For a deterministic event subset, the adapter reads the trusted per-shard
+publication digest from the SOP05 batch handoff, calls
+`load_complete_sop05_events`, joins each event's `base_state_id` through
+`Sop03SplitInputs.load_pair`, and resolves its `trajectory_id` through the
+strict SOP04 bank loader. Absolute paths are supplied explicitly at the CLI
+boundary; paths embedded in producer runtime metadata are provenance only and
+are never silently trusted. SOP07 risk shards remain an optional distribution
+cross-check and provenance link; their flattened `RiskSample` payload is not
+used to fabricate `OracleWorld`, counterfactual observations, or `G*`.
 
 ## SOP11 design
 
@@ -222,10 +251,12 @@ output directories are never overwritten.
 
 The JSONL manifest includes schema 3.0.0, shard/index, split, group IDs, action
 ID/vector, target object type, footprint kind, source object ID, source mode,
-code/config/input digests, and seed namespace. Production mode requires a G2
-digest. Toy mode instead requires a deterministic toy-fixture digest and stamps
-`scientific_status: smoke_only`, so toy evidence cannot masquerade as a real G2
-artifact.
+code/config/input digests, and seed namespace. A future publication mode
+requires qualifying split/G2 evidence. Toy mode requires a deterministic
+toy-fixture digest and stamps `scientific_status: toy_smoke_only`. The current
+real mode binds both audited handoffs and stamps
+`scientific_status: train_smoke_only`, so train-only evidence cannot masquerade
+as a publication artifact.
 
 The audit checks shape, float32, finite values, action ID/vector consistency,
 group/split isolation, forbidden input tokens, shard checksums, sample counts,
@@ -233,10 +264,13 @@ action/blind/value distributions, and deterministic regeneration. A sampled
 target is recomputed through SOP12 and compared within explicit floating-point
 tolerance.
 
-`scripts/08_generate_verification_dataset.py` requires an explicit
-`--input-mode toy` or `--input-manifest`; it never silently falls back to toy.
-The first smoke artifact contains 10–100 schema-valid samples. Paper-scale
-generation remains disabled until production input provenance passes G2.
+`scripts/08_generate_verification_dataset.py` requires explicit
+`--input-mode toy` or `--input-mode sop05-train`; it never silently falls back
+to toy. Real mode also requires explicit SOP03/SOP04 roots, the external SOP04
+handoff digest, the SOP05 batch handoff, and the SOP07 collection handoff. The
+first artifacts contain 10–100 schema-valid samples per smoke mode. Publication
+generation remains disabled until validation/test inputs and cross-split proof
+exist.
 
 ## SOP14 design
 
@@ -260,7 +294,7 @@ installed. No lockfile is introduced.
 
 The forward result has shape `[B]` for both outputs. No post-action observation
 or target/audit field is accepted by the model API. Risk-encoder reuse is
-outside the toy-first V0 milestone.
+outside the first V0 milestone.
 
 `verification_loss` is Huber regression plus useful BCE and pairwise hinge
 ranking. Ranking pairs are generated only between different actions sharing the
@@ -351,6 +385,11 @@ Required evidence includes:
 - action vector/ID, shape, dtype, finite, checksum, manifest, and distribution
   checks;
 - deterministic 10–100 sample CLI smoke and sampled `G*` recomputation.
+- real-train adapter rejects mismatched SOP03/SOP04/SOP05/SOP07 identities and
+  deterministically selects 10–100 events without loading the 1.2 GB SOP07
+  numeric collection;
+- real-train smoke records both upstream semantic digests and remains marked
+  `train_smoke_only`.
 
 ### SOP14
 
@@ -363,17 +402,23 @@ Required evidence includes:
 - checkpoint manifest acceptance and legacy/mismatched rejection.
 
 Final validation runs unit tests, contract/toy regression tests, the toy dataset
-CLI, a model training smoke, a 10–100-sample artifact audit, shape/dtype/finite
-checks, split/oracle leakage scans, deterministic reruns, and `git diff --check`.
+CLI, a 10–100-event real-train CLI smoke, a model training smoke, artifact
+audits, shape/dtype/finite checks, input/oracle leakage scans, deterministic
+reruns, and `git diff --check`. It does not rerun the upstream 256-shard audit
+or the upstream 215-test suite.
 
 ## Ownership and integration
 
 This branch owns only the SOP11–14 files named by the authoritative Agent SOP,
-new package `__init__.py` files, the approved `pyproject.toml` packaging/dependency
-change, this design, its implementation plan, and corresponding tests. It does
-not edit `src/contracts.py`, `configs/base.yaml`, `DECISIONS.md`, `STATUS.md`,
-SOP05–07 files, raw data, legacy code, or other agents' worktrees.
+new package `__init__.py` files, the approved `pyproject.toml`
+packaging/dependency change, this design, its implementation plan, and
+corresponding tests. The audited SOP05–07 branch is merged as an immutable
+dependency; this task does not edit its files. It also does not edit
+`src/contracts.py`, `configs/base.yaml`, `DECISIONS.md`, `STATUS.md`, raw data,
+legacy code, or other agents' worktrees.
 
-When SOP06/07 merge, integration is performed through explicit adapters and
-production manifests. Any contract conflict stops the workflow and is reported
-instead of supporting two interpretations.
+Integration is performed through explicit adapters and trusted handoffs. Any
+contract conflict stops the workflow and is reported instead of supporting two
+interpretations. The known train-only and temporal-safe limitations are
+propagated into downstream manifests rather than reinterpreted as ordinary safe
+negatives or publication-ready split evidence.

@@ -13,6 +13,7 @@ from src.contracts import GridSpec
 
 from .collision import intersects
 from .footprints import (
+    CircleFootprint,
     Footprint,
     RectangleFootprint,
     _validate_footprint,
@@ -149,6 +150,7 @@ def rasterize_footprint(footprint: Footprint, pose, grid: GridSpec) -> np.ndarra
     """Rasterize every closed grid cell square touched by ``footprint``."""
     _validate_grid(grid)
     bounds = footprint_aabb(footprint, pose)
+    validated_pose = np.asarray(pose, dtype=np.float64)
     centers = grid_cell_centers(grid)
     half_cell = 0.5 * float(grid.resolution_m)
     candidates = (
@@ -158,11 +160,84 @@ def rasterize_footprint(footprint: Footprint, pose, grid: GridSpec) -> np.ndarra
         & (centers[..., 1] <= bounds[3] + half_cell)
     )
     result = np.zeros((grid.height, grid.width), dtype=bool)
-    cell = RectangleFootprint(grid.resolution_m, grid.resolution_m)
-    for row, column in np.argwhere(candidates):
-        center = centers[row, column]
-        cell_pose = np.array([center[0], center[1], 0.0], dtype=np.float64)
-        result[row, column] = intersects(footprint, pose, cell, cell_pose)
+    if not np.any(candidates):
+        return result
+
+    candidate_indices = np.argwhere(candidates)
+    candidate_centers = centers[candidates]
+    delta = candidate_centers - validated_pose[:2]
+    if isinstance(footprint, CircleFootprint):
+        offsets = np.abs(delta) - half_cell
+        outside = np.maximum(offsets, 0.0)
+        outside_distance = np.hypot(outside[:, 0], outside[:, 1])
+        inside_distance = np.minimum(np.max(offsets, axis=1), 0.0)
+        result[candidates] = (
+            outside_distance + inside_distance - footprint.radius_m <= 0.0
+        )
+        return result
+
+    cosine = float(np.cos(validated_pose[2]))
+    sine = float(np.sin(validated_pose[2]))
+    axis_length = np.asarray([cosine, sine], dtype=np.float64)
+    axis_width = np.asarray([-sine, cosine], dtype=np.float64)
+    half_length = 0.5 * footprint.length_m
+    half_width = 0.5 * footprint.width_m
+    projections = np.column_stack(
+        (
+            np.abs(delta @ axis_length),
+            np.abs(delta @ axis_width),
+            np.abs(delta[:, 0]),
+            np.abs(delta[:, 1]),
+        )
+    )
+    supports = np.asarray(
+        [
+            half_length + half_cell * (abs(cosine) + abs(sine)),
+            half_width + half_cell * (abs(sine) + abs(cosine)),
+            half_length * abs(cosine) + half_width * abs(sine) + half_cell,
+            half_length * abs(sine) + half_width * abs(cosine) + half_cell,
+        ],
+        dtype=np.float64,
+    )
+    roundoff = (
+        8.0
+        * np.finfo(np.float64).eps
+        * np.maximum(projections, supports[None, :])
+    )
+    candidate_values = np.all(
+        projections - supports[None, :] <= roundoff,
+        axis=1,
+    )
+    gaps = projections - supports[None, :]
+    coordinate_scale = np.maximum.reduce(
+        (
+            np.ones(candidate_centers.shape[0], dtype=np.float64),
+            np.max(np.abs(candidate_centers), axis=1),
+            np.full(
+                candidate_centers.shape[0],
+                np.max(np.abs(validated_pose[:2])),
+                dtype=np.float64,
+            ),
+        )
+    )
+    uncertain = np.any(
+        np.abs(gaps)
+        <= 64.0
+        * np.finfo(np.float64).eps
+        * coordinate_scale[:, None],
+        axis=1,
+    )
+    if np.any(uncertain):
+        cell = RectangleFootprint(grid.resolution_m, grid.resolution_m)
+        for local_index in np.flatnonzero(uncertain):
+            center = candidate_centers[local_index]
+            candidate_values[local_index] = intersects(
+                footprint,
+                validated_pose,
+                cell,
+                np.asarray([center[0], center[1], 0.0], dtype=np.float64),
+            )
+    result[candidate_indices[:, 0], candidate_indices[:, 1]] = candidate_values
     return result
 
 

@@ -1,0 +1,35 @@
+schema_version: "3.0.0"
+mode: toy
+seed: 42
+
+data:
+  split: train
+  toy_count: 128
+  validation_count: 28
+  calibration_count: 28
+  test_count: 28
+  grid_size: 16
+  history_steps: 8
+  future_steps: 15
+  future_dt_s: 0.2
+
+model:
+  hidden_channels: 16
+  convgru_kernel_size: 3
+  learned_aggregator_hidden_dim: 32
+
+training:
+  occupancy_steps: 300
+  occupancy_learning_rate: 0.005
+  aggregator_steps: 100
+  aggregator_learning_rate: 0.02
+
+aggregation:
+  b2_tau_s: 2.0
+  b2_a_max_s: 5.0
+  sigma_time_s: 2.0
+  occupancy_threshold: 0.5
+
+artifact:
+  checkpoint_layout_version: occupancy_baseline_checkpoint_v2
+  calibration_status: deferred_to_sop10_same_protocol

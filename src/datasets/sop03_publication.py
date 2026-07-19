@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import yaml
 
 from src.contracts import (
     DYNAMIC_OBJECT_TYPES,
@@ -142,6 +143,16 @@ def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
         _require(isinstance(value, dict), f"{label} line must be an object")
         rows.append(value)
     return rows
+
+
+def _load_yaml_mapping(path: str | Path, label: str) -> dict[str, Any]:
+    config_path = Path(path)
+    try:
+        value = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise Sop03PublicationError(f"invalid {label} at {config_path}: {exc}") from exc
+    _require(isinstance(value, dict), f"{label} must contain a mapping")
+    return value
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -484,6 +495,8 @@ def audit_sop03_artifact(
     recording_counts: dict[str, int] = {}
     recording_track_count = 0
     declared_npz: set[Path] = set()
+    recording_split_by_id: dict[str, str] = {}
+    session_splits: dict[str, set[str]] = {}
 
     for split in SPLIT_NAMES:
         recording_root = root_path / "recording_indexes" / split
@@ -512,6 +525,13 @@ def audit_sop03_artifact(
             len(recordings_by_id) == len(recordings),
             "duplicate recording ID within split",
         )
+        for recording in recordings:
+            _require(
+                recording.recording_id not in recording_split_by_id,
+                "recording ID overlaps across splits",
+            )
+            recording_split_by_id[recording.recording_id] = split
+            session_splits.setdefault(recording.session_id, set()).add(split)
         recording_counts[split] = len(recordings)
         recording_track_count += sum(len(item.dynamic_objects) for item in recordings)
 
@@ -667,6 +687,42 @@ def audit_sop03_artifact(
         actual_npz == declared_npz,
         "NPZ payload set does not exactly match scientific manifests",
     )
+    split_rows = _read_jsonl(split_manifest, "split manifest")
+    split_assignments: dict[str, str] = {}
+    for row in split_rows:
+        _require(row.get("schema_version") == SCHEMA_VERSION, "split row schema")
+        recording_id = row.get("recording_id")
+        split = row.get("split")
+        _require(
+            isinstance(recording_id, str) and recording_id,
+            "split recording_id missing",
+        )
+        _require(split in SPLIT_NAMES, "split row assignment is invalid")
+        _require(recording_id not in split_assignments, "duplicate split recording")
+        split_assignments[recording_id] = str(split)
+    _require(
+        split_assignments == recording_split_by_id,
+        "actual recording assignments disagree with the frozen split manifest",
+    )
+    actual_session_overlaps = {
+        session: splits for session, splits in session_splits.items() if len(splits) > 1
+    }
+    session_report = overlap.get("fields", {}).get("session", {})
+    reported_rows = session_report.get("overlaps")
+    _require(isinstance(reported_rows, list), "session overlap rows are missing")
+    reported_session_overlaps = {
+        str(row.get("value")): set(row.get("splits", []))
+        for row in reported_rows
+        if isinstance(row, dict)
+    }
+    _require(
+        actual_session_overlaps == reported_session_overlaps,
+        "session overlap report disagrees with actual recordings",
+    )
+    _require(
+        len(actual_session_overlaps) == overlap.get("allowed_overlap_count"),
+        "allowed session overlap count mismatch",
+    )
     total_base = sum(base_counts.values())
     total_snippets = sum(sum(value.values()) for value in snippet_counts.values())
     total_recordings = sum(recording_counts.values())
@@ -729,6 +785,8 @@ def _finalize_sop03_artifact_locked(
     root: str | Path,
     *,
     base_config_path: str | Path,
+    data_config_path: str | Path,
+    split_config_path: str | Path,
     producer_commit: str,
     finalizer_commit: str,
     workers: int,
@@ -743,6 +801,10 @@ def _finalize_sop03_artifact_locked(
     )
     base_config = load_config(base_config_path)
     base_config_file = Path(base_config_path)
+    data_config_file = Path(data_config_path)
+    split_config_file = Path(split_config_path)
+    data_config = _load_yaml_mapping(data_config_file, "data config")
+    split_config = _load_yaml_mapping(split_config_file, "split config")
     split_summary = _read_json(
         root_path / "splits/split_summary.json", "split summary"
     )
@@ -786,15 +848,66 @@ def _finalize_sop03_artifact_locked(
             "snippet_stride_s": 1.0,
         },
         "producer_protocol": {
-            "base_config_path": str(base_config_file),
-            "base_config_sha256": _sha256_file(base_config_file),
-            "base_config_snapshot": base_config,
-            "scripts": [
-                "scripts/00_freeze_thor_recording_split.py",
-                "scripts/01_index_recordings.py",
-                "scripts/02_build_snippet_library.py",
-                "scripts/03_extract_base_states.py",
-                "scripts/03_finalize_sop03_artifact.py",
+            "config_snapshots": {
+                "base": {
+                    "path": str(base_config_file),
+                    "sha256": _sha256_file(base_config_file),
+                    "value": base_config,
+                },
+                "data": {
+                    "path": str(data_config_file),
+                    "sha256": _sha256_file(data_config_file),
+                    "value": data_config,
+                },
+                "split": {
+                    "path": str(split_config_file),
+                    "sha256": _sha256_file(split_config_file),
+                    "value": split_config,
+                },
+            },
+            "steps": [
+                {
+                    "script": "scripts/00_freeze_thor_recording_split.py",
+                    "arguments": ["--config", str(split_config_file)],
+                },
+                {
+                    "script": "scripts/01_index_recordings.py",
+                    "arguments": [
+                        "--config",
+                        str(data_config_file),
+                        "--base-config",
+                        str(base_config_file),
+                        "--dt-s",
+                        "0.2",
+                        "--max-gap-s",
+                        "0.3",
+                        "--workers",
+                        "8",
+                    ],
+                    "repeat_for_splits": list(SPLIT_NAMES),
+                },
+                {
+                    "script": "scripts/02_build_snippet_library.py",
+                    "arguments": [
+                        "--duration-s",
+                        "4.4",
+                        "--stride-s",
+                        "1.0",
+                        "--workers",
+                        "8",
+                    ],
+                    "repeat_for_splits": list(SPLIT_NAMES),
+                },
+                {
+                    "script": "scripts/03_extract_base_states.py",
+                    "arguments": [
+                        "--all-splits",
+                        "--stride-s",
+                        "0.6",
+                        "--workers",
+                        "8",
+                    ],
+                },
             ],
             "source_data_policy": "read_only",
             "workers": workers,
@@ -848,6 +961,8 @@ def finalize_sop03_artifact(
     root: str | Path,
     *,
     base_config_path: str | Path,
+    data_config_path: str | Path,
+    split_config_path: str | Path,
     producer_commit: str,
     finalizer_commit: str,
     workers: int,
@@ -859,6 +974,8 @@ def finalize_sop03_artifact(
         return _finalize_sop03_artifact_locked(
             root_path,
             base_config_path=base_config_path,
+            data_config_path=data_config_path,
+            split_config_path=split_config_path,
             producer_commit=producer_commit,
             finalizer_commit=finalizer_commit,
             workers=workers,

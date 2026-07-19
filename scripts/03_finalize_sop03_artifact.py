@@ -38,6 +38,14 @@ def main() -> int:
     parser.add_argument(
         "--base-config", type=Path, default=_ROOT / "configs/base.yaml"
     )
+    parser.add_argument(
+        "--data-config", type=Path, default=_ROOT / "configs/data_thor.yaml"
+    )
+    parser.add_argument(
+        "--split-config",
+        type=Path,
+        default=_ROOT / "configs/data_thor_recording_generalization.yaml",
+    )
     parser.add_argument("--producer-commit", required=True)
     parser.add_argument("--finalizer-commit", required=True)
     parser.add_argument("--git-executable", type=Path, required=True)
@@ -65,9 +73,72 @@ def main() -> int:
             raise Sop03PublicationError(
                 "finalizer commit does not match the current checkout"
             )
+        tracked_status = subprocess.run(
+            [
+                str(git_path),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if tracked_status:
+            raise Sop03PublicationError(
+                "finalizer checkout contains tracked modifications"
+            )
+        subprocess.run(
+            [str(git_path), "cat-file", "-e", f"{args.producer_commit}^{{commit}}"],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                str(git_path),
+                "merge-base",
+                "--is-ancestor",
+                args.producer_commit,
+                observed_commit,
+            ],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+        )
+        producer_paths = [
+            "configs/base.yaml",
+            "configs/data_thor.yaml",
+            "configs/data_thor_recording_generalization.yaml",
+            "scripts/00_freeze_thor_recording_split.py",
+            "scripts/01_index_recordings.py",
+            "scripts/02_build_snippet_library.py",
+            "scripts/03_extract_base_states.py",
+            "src/contracts.py",
+            "src/datasets/base_state_index.py",
+            "src/datasets/snippet_library.py",
+            "src/datasets/thor_adapter.py",
+            "src/datasets/thor_split.py",
+        ]
+        subprocess.run(
+            [
+                str(git_path),
+                "diff",
+                "--quiet",
+                f"{args.producer_commit}..{observed_commit}",
+                "--",
+                *producer_paths,
+            ],
+            cwd=_ROOT,
+            check=True,
+            capture_output=True,
+        )
         result = finalize_sop03_artifact(
             args.root,
             base_config_path=args.base_config,
+            data_config_path=args.data_config,
+            split_config_path=args.split_config,
             producer_commit=args.producer_commit,
             finalizer_commit=args.finalizer_commit,
             producer_job_id=args.producer_job_id,

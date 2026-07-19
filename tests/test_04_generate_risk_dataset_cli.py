@@ -588,6 +588,7 @@ def test_main_prints_one_canonical_json_line(
     "option,value",
     [
         ("--seed", "-1"),
+        ("--shard-index", "-1"),
         ("--expected-event-count", "0"),
         ("--expected-sample-count", "0"),
         ("--checksum-workers", "0"),
@@ -608,6 +609,7 @@ def test_parser_rejects_invalid_integer_contracts(
         "--paired-config", "paired.yaml",
         "--seed", "17",
         "--output-dir", "risk",
+        "--shard-index", "7",
         "--expected-event-count", "10",
         "--expected-sample-count", "30",
         "--checksum-workers", "3",

@@ -628,3 +628,118 @@ def test_grid_type_remains_the_existing_contract(tmp_path: Path) -> None:
         expected_split="train",
     )
     assert type(loaded.grid) is GridSpec
+
+
+def test_publisher_recomputes_collection_semantic_digest_after_formal_load(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    handoff["collection_semantic_digest_sha256"] = "0" * 64
+    resigned_handoff_sha256 = rewrite_collection_handoff(publication, handoff)
+
+    with pytest.raises(RiskDataContractError, match="collection semantic digest"):
+        _publish(
+            publication,
+            tmp_path / "seal",
+            expected_handoff_sha256=resigned_handoff_sha256,
+        )
+    assert not (tmp_path / "seal").exists()
+
+
+def test_loaded_dataset_manifest_and_provenance_are_deeply_immutable(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    loaded = load_risk_dataset_seal(
+        _publish(publication, tmp_path / "seal"),
+        collection_root=publication.collection_root,
+        expected_split="train",
+    )
+    scalar_digest = loaded.risk_dataset_manifest_digest
+    provenance_digest = loaded.provenance["risk_dataset_manifest_digest"]
+    manifest_digest = loaded.manifest["risk_dataset_manifest_digest"]
+    assert isinstance(loaded.manifest, dict)
+    assert isinstance(loaded.provenance, dict)
+
+    with pytest.raises(TypeError):
+        loaded.provenance["risk_dataset_manifest_digest"] = "f" * 64
+    grid = loaded.manifest["grid"]
+    assert isinstance(grid, dict)
+    with pytest.raises(TypeError):
+        grid["height"] = 999
+    shards = loaded.manifest["shards"]
+    assert isinstance(shards, tuple)
+    first_shard = shards[0]
+    assert isinstance(first_shard, dict)
+    with pytest.raises(TypeError):
+        first_shard["semantic_digest"] = "f" * 64
+
+    for mutate in (
+        lambda value: value.__delitem__("g1_split_manifest_digest"),
+        lambda value: value.clear(),
+        lambda value: value.pop("g1_split_manifest_digest"),
+        lambda value: value.popitem(),
+        lambda value: value.setdefault("new", "value"),
+        lambda value: value.update({"new": "value"}),
+        lambda value: value.__ior__({"new": "value"}),
+    ):
+        with pytest.raises(TypeError):
+            mutate(loaded.provenance)
+
+    assert loaded.risk_dataset_manifest_digest == scalar_digest
+    assert loaded.provenance["risk_dataset_manifest_digest"] == provenance_digest
+    assert loaded.manifest["risk_dataset_manifest_digest"] == manifest_digest
+
+
+def test_atomic_directory_rename_noreplace_preserves_both_existing_roots(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    destination = tmp_path / "destination"
+    staging.mkdir()
+    destination.mkdir()
+    (staging / "payload").write_text("staged", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        seal_module._atomic_rename_directory_noreplace(staging, destination)
+
+    assert staging.is_dir()
+    assert (staging / "payload").read_text(encoding="utf-8") == "staged"
+    assert destination.is_dir()
+    assert not list(destination.iterdir())
+
+
+def test_relative_external_paths_are_anchored_before_cwd_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    publication = create_formal_risk_publication(workspace / "upstream")
+    monkeypatch.chdir(workspace)
+    published = publish_risk_dataset_seal(
+        "seal",
+        collection_root="upstream/collection",
+        base_config_path="upstream/config/base.yaml",
+        split_provenance_path="upstream/sop03/run_manifest.json",
+        expected_split="train",
+        expected_collection_handoff_sha256=publication.handoff_sha256,
+    )
+    loaded = load_risk_dataset_seal(
+        "seal",
+        collection_root="upstream/collection",
+        expected_split="train",
+    )
+    expected_seal_root = workspace / "seal"
+    expected_collection_root = workspace / "upstream" / "collection"
+
+    monkeypatch.chdir(tmp_path)
+    assert published == expected_seal_root
+    assert published.is_absolute()
+    assert loaded.seal_root == expected_seal_root
+    assert loaded.seal_root.is_absolute()
+    assert loaded.collection_root == expected_collection_root
+    assert loaded.collection_root.is_absolute()
+    for descriptor in loaded.shards:
+        shard_root = loaded.collection_root / descriptor.relative_root
+        assert shard_root.is_dir()
+        assert (shard_root / "summary.json").is_file()

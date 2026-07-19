@@ -8,7 +8,9 @@ levels before returning a dataset descriptor.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import asdict, dataclass
+import errno
 import hashlib
 import json
 import math
@@ -144,6 +146,48 @@ class LoadedRiskDataset:
     provenance: dict[str, str]
 
 
+class _FrozenDict(dict):
+    """Recursively frozen ``dict`` preserving JSON-like downstream behavior."""
+
+    def __init__(self, value: Mapping[object, object]) -> None:
+        dict.__init__(
+            self,
+            ((key, _deep_freeze_json(child)) for key, child in value.items()),
+        )
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("frozen dataset metadata cannot be mutated")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+def _deep_freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _FrozenDict(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_json(child) for child in value)
+    return value
+
+
+def _frozen_string_object_dict(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    return _FrozenDict(value)
+
+
+def _frozen_string_string_dict(value: Mapping[str, str]) -> dict[str, str]:
+    return _FrozenDict(value)
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -249,6 +293,53 @@ def _require_nonnegative_int(value: object, *, field: str) -> int:
 
 def _absolute_without_symlink_resolution(path: Path) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
+
+
+def _atomic_rename_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename a directory while refusing an existing destination."""
+
+    source_path = _absolute_without_symlink_resolution(Path(source))
+    destination_path = _absolute_without_symlink_resolution(Path(destination))
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError as exc:  # pragma: no cover - Linux libc is always loadable
+        raise OSError(errno.ENOSYS, "libc is unavailable for renameat2") from exc
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(
+            errno.ENOSYS,
+            "libc renameat2 is unavailable; refusing overwrite-capable fallback",
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        -100,  # AT_FDCWD
+        os.fsencode(source_path),
+        -100,  # AT_FDCWD
+        os.fsencode(destination_path),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno() or errno.EIO
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_path,
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        destination_path,
+    )
 
 
 def _assert_no_symlink_components(
@@ -798,6 +889,31 @@ def _formally_validate_collection(
         raise RiskDataContractError(
             "collection must contain exactly one consistent target_type_policy_digest"
         )
+    collection_semantics = {
+        "schema_version": SCHEMA_VERSION,
+        "layout_version": RISK_SHARD_LAYOUT_VERSION,
+        "split": expected_split,
+        "sample_count": len(sample_ids),
+        "shards": [
+            {
+                "shard_index": descriptor.shard_index,
+                "relative_root": descriptor.relative_root,
+                "sample_count": descriptor.sample_count,
+                "manifest_digest": descriptor.manifest_digest,
+                "semantic_digest": descriptor.semantic_digest,
+            }
+            for descriptor in descriptors
+        ],
+    }
+    recomputed_collection_digest = _sha256_bytes(
+        _canonical_json(collection_semantics).encode("utf-8")
+    )
+    declared_collection_digest = _require_sha256(
+        handoff.get("collection_semantic_digest_sha256"),
+        field="collection_semantic_digest_sha256",
+    )
+    if recomputed_collection_digest != declared_collection_digest:
+        raise RiskDataContractError("collection semantic digest mismatch")
     return tuple(descriptors), next(iter(target_policy_values))
 
 
@@ -850,10 +966,12 @@ def publish_risk_dataset_seal(
 ) -> Path:
     """Authenticate an accepted SOP07 collection and atomically publish its seal."""
 
-    output_path = Path(output_dir)
-    collection_path = Path(collection_root)
-    config_path = Path(base_config_path)
-    provenance_path = Path(split_provenance_path)
+    output_path = _absolute_without_symlink_resolution(Path(output_dir))
+    collection_path = _absolute_without_symlink_resolution(Path(collection_root))
+    config_path = _absolute_without_symlink_resolution(Path(base_config_path))
+    provenance_path = _absolute_without_symlink_resolution(
+        Path(split_provenance_path)
+    )
     split = _require_nonempty_string(expected_split, field="expected_split")
     _assert_no_symlink_components(
         output_path, label="dataset seal output", allow_missing=True
@@ -946,11 +1064,7 @@ def publish_risk_dataset_seal(
             or reloaded.risk_dataset_manifest_digest != dataset_digest
         ):
             raise RiskDataContractError("formal staging seal reload mismatch")
-        if output_path.exists() or output_path.is_symlink():
-            raise FileExistsError(
-                f"refusing to overwrite immutable risk dataset seal: {output_path}"
-            )
-        os.rename(staging, output_path)
+        _atomic_rename_directory_noreplace(staging, output_path)
     except BaseException:
         if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)
@@ -1027,8 +1141,8 @@ def load_risk_dataset_seal(
 ) -> LoadedRiskDataset:
     """Load only a complete v2 seal whose entire source collection still verifies."""
 
-    seal_path = Path(seal_root)
-    collection_path = Path(collection_root)
+    seal_path = _absolute_without_symlink_resolution(Path(seal_root))
+    collection_path = _absolute_without_symlink_resolution(Path(collection_root))
     split = _require_nonempty_string(expected_split, field="expected_split")
     manifest = _load_seal_manifest(seal_path)
     if manifest.get("dataset_layout_version") != RISK_DATASET_LAYOUT_VERSION:
@@ -1127,13 +1241,13 @@ def load_risk_dataset_seal(
     return LoadedRiskDataset(
         seal_root=seal_path,
         collection_root=collection_path,
-        manifest=dict(manifest),
+        manifest=_frozen_string_object_dict(manifest),
         grid=grid,
         shards=descriptors,
         split=split,
         sample_count=sample_count,
         risk_dataset_manifest_digest=dataset_digest,
-        provenance=provenance,
+        provenance=_frozen_string_string_dict(provenance),
     )
 
 

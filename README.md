@@ -6,16 +6,14 @@ This project studies when a mobile robot should execute a local trajectory, perf
 
 ## Current status
 
-The project is in active development. SOP-00 is complete:
+The project is in active development. The schema-3 data pipeline and
+event/risk-shard generation path through SOP-07 are implemented. Model
+training, calibration, decision-policy, and final evaluation work in SOP-08
+and later is not yet frozen as a cross-server release.
 
-- frozen data contracts and channel ordering
-- deterministic seed and stable-ID utilities
-- strict observed/oracle information separation
-- reproducible base configuration
-- hand-verifiable toy risk and verification-value fixtures
-- 34 passing contract tests
-
-See [`STATUS.md`](./STATUS.md) for the current implementation gate and [`DECISIONS.md`](./DECISIONS.md) for frozen engineering decisions.
+See [`DECISIONS.md`](./DECISIONS.md) for frozen engineering decisions and
+[`docs/environment_reproduction.md`](./docs/environment_reproduction.md) for
+the verified environment boundary and cross-server setup commands.
 
 ## Repository layout
 
@@ -32,15 +30,26 @@ Local datasets, generated runs, environments, previous implementations, and hist
 
 ## Quick start
 
-Python 3.10 or newer is required.
+Python 3.10 is the currently verified interpreter line. For an exact
+cross-server setup, including the provisional GPU-training layer, follow
+[`docs/environment_reproduction.md`](./docs/environment_reproduction.md).
+The minimal CPU data-pipeline setup is:
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install numpy==1.24.4 PyYAML==6.0.1 pytest==8.3.5
+python -m pip install -e . --no-deps
 python -m pytest tests/test_contracts.py tests/test_toy_fixture.py -q
 python scripts/00_validate_contracts.py --config configs/base.yaml
 ```
 
-The validation command checks schema consistency, oracle-leakage guards, deterministic generation, hand-derived toy answers, and NPZ/JSON serialization.
+The validation command checks schema consistency, oracle-leakage guards,
+deterministic generation, hand-derived toy answers, and NPZ/JSON
+serialization. This minimal command does not install PyTorch and is not a
+complete training environment.
+
+The exact core, test, and provisional training dependency versions are also
+recorded in `pyproject.toml`. CUDA 11.8 requires the additional PyTorch wheel
+index documented in the environment guide.
 
 ## Documentation
 

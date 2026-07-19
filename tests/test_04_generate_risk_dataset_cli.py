@@ -468,6 +468,8 @@ def test_pair_rejections_are_reported_but_exact_sample_count_still_gates_publish
         cli_module.run_risk_dataset(request)
 
     assert "collision_mother_invalid" in str(caught.value)
+    assert "expected=6" in str(caught.value)
+    assert "actual=3" in str(caught.value)
     assert calls["writer"] == []
     assert not request.output_dir.exists()
 

@@ -454,6 +454,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
         )
         raise RiskDatasetRunError(
             "expected_sample_count does not match assembled SOP06 variants; "
+            f"expected={request.expected_sample_count}; actual={len(sample_values)}; "
             f"pair rejection reasons={reason_payload}"
         )
     sample_ids = tuple(sample.sample_id for sample in sample_values)

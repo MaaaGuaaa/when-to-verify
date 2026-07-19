@@ -2194,6 +2194,7 @@ python scripts/04_generate_risk_dataset.py \
   --split train \
   --seed 42 \
   --output-dir outputs/event_centered_blind_spot/schema-v3/risk-data/main-seed42-v1/train/shard-00000 \
+  --shard-index <nonnegative-int> \
   --expected-event-count <positive-int> \
   --expected-sample-count <positive-int> \
   --checksum-workers 8

@@ -135,6 +135,7 @@ def _request(module, tmp_path: Path, *, event_count: int, sample_count: int):
         paired_config_path=tmp_path / "paired.yaml",
         seed=17,
         output_dir=tmp_path / "risk-shard",
+        shard_index=7,
         expected_event_count=event_count,
         expected_sample_count=sample_count,
         checksum_workers=3,
@@ -271,8 +272,12 @@ def _install_success_dependencies(
         calls["samples"].extend(built)
         return built
 
-    def fake_write(samples, path, *, grid, expected_sample_count):
-        calls["writer"].append((tuple(samples), path, grid, expected_sample_count))
+    def fake_write(
+        samples, path, *, grid, shard_index, expected_sample_count
+    ):
+        calls["writer"].append(
+            (tuple(samples), path, grid, expected_sample_count, shard_index)
+        )
         path.mkdir(parents=True)
         return {"directory": path}
 
@@ -336,11 +341,13 @@ def test_run_stably_rebuilds_partial_groups_and_writes_verified_shard(
     )
     assert all(call["dataset_seed"] == 17 for call in calls["adapter"])
     assert calls["writer"][0][3] == 6
+    assert calls["writer"][0][4] == 7
     assert report == {
         "schema_version": "3.0.0",
         "producer_version": cli_module.SOP07_RISK_DATASET_CLI_VERSION,
         "split": "train",
         "seed": 17,
+        "shard_index": 7,
         "output_dir": str(request.output_dir),
         "event_count": 2,
         "sample_count": 6,
@@ -553,6 +560,7 @@ def test_main_prints_one_canonical_json_line(
             "--paired-config", str(tmp_path / "paired.yaml"),
             "--seed", "17",
             "--output-dir", str(tmp_path / "risk"),
+            "--shard-index", "7",
             "--expected-event-count", "10",
             "--expected-sample-count", "30",
             "--checksum-workers", "3",

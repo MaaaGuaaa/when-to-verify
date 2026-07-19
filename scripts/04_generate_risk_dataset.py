@@ -65,6 +65,7 @@ class RiskDatasetRunRequest:
     paired_config_path: Path
     seed: int
     output_dir: Path
+    shard_index: int
     expected_event_count: int
     expected_sample_count: int
     checksum_workers: int
@@ -126,6 +127,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=_nonnegative_int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--shard-index", type=_nonnegative_int, required=True)
     parser.add_argument(
         "--expected-event-count", type=_positive_int, required=True
     )
@@ -145,12 +147,13 @@ def _validate_request(request: RiskDatasetRunRequest) -> None:
         raise RiskDatasetRunError(f"unsupported split: {request.split!r}")
     for name in (
         "seed",
+        "shard_index",
         "expected_event_count",
         "expected_sample_count",
         "checksum_workers",
     ):
         value = getattr(request, name)
-        minimum = 0 if name == "seed" else 1
+        minimum = 0 if name in ("seed", "shard_index") else 1
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise RiskDatasetRunError(f"{name} must be an integer >= {minimum}")
     for name in ("sop04_handoff_digest", "sop05_publication_digest"):
@@ -466,6 +469,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
             sample_values,
             request.output_dir,
             grid=grid,
+            shard_index=request.shard_index,
             expected_sample_count=request.expected_sample_count,
         )
         loaded = load_risk_shard(request.output_dir, grid=grid)
@@ -485,6 +489,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
         "producer_version": SOP07_RISK_DATASET_CLI_VERSION,
         "split": request.split,
         "seed": request.seed,
+        "shard_index": request.shard_index,
         "output_dir": str(request.output_dir),
         "event_count": len(events),
         "sample_count": len(sample_values),
@@ -524,6 +529,7 @@ def main() -> int:
         paired_config_path=args.paired_config_path,
         seed=args.seed,
         output_dir=args.output_dir,
+        shard_index=args.shard_index,
         expected_event_count=args.expected_event_count,
         expected_sample_count=args.expected_sample_count,
         checksum_workers=args.checksum_workers,

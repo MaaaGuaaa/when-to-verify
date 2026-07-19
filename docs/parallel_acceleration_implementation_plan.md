@@ -38,9 +38,11 @@ execute / verify / reject 离线闭环
 核心表格、消融、案例图
 ```
 
-Schema v2 迁移期间，主论文目标事件默认使用 `human` snippet；所有
+Schema 3 已冻结 future-endpoint 时间契约；其中继续使用 dynamic-object schema v2
+引入的三类对象语义。主论文目标事件默认使用 `human` snippet；所有
 `carried_object/unknown_dynamic` 仍保留在 observed/oracle world，并参与可见性、
-占据和真实 footprint 风险计算。W2 及之后的任务必须拒绝 v1 artifact，并在每一级
+占据和真实 footprint 风险计算。W2 及之后的任务必须拒绝 schema 2 的
+`q0...q14 / 0.0...2.8 s` artifact，并在每一级
 门禁后重建下游数据、checkpoint、calibration 和结果；非人 target 只作为显式扩展。
 下游只能读取 contract/snippet 冻结的 `object_type` 与 footprint spec，禁止根据原始
 body name、role 或文件名重新分类。W2 的 target-type policy 必须包含白名单和三类
@@ -249,7 +251,14 @@ class VerificationSample:
     metadata: dict
 ```
 
-动态对象 schema v2 冻结为 `human`、`carried_object`、`unknown_dynamic`。数据适配器保留所有有效非机器人 BODY，以 `recording_id::body_name` 作为对象 ID。THÖR split 固定评测未见 recording/已知 recording-day session：recording 和 source object 不跨 split，session 重叠逐项报告，participant identity 标记 unavailable。`human` 使用配置圆 footprint，非人对象优先使用 QTM marker P95 矩形估计并在无有效 marker 时回退配置。snippet 必须按 `snippets/<split>/<object_type>/` 隔离；旧序列化产物全部重建，不做静默兼容。
+全局产物契约为 `schema_version=3.0.0`。其中保留 dynamic-object schema v2
+冻结的 `human`、`carried_object`、`unknown_dynamic` 三类对象语义；这不得被误解
+为仍可发布全局 schema 2 产物。数据适配器保留所有有效非机器人 BODY，以
+`recording_id::body_name` 作为对象 ID。THÖR split 固定评测未见 recording/已知
+recording-day session：recording 和 source object 不跨 split，session 重叠逐项报告，
+participant identity 标记 unavailable。`human` 使用配置圆 footprint，非人对象优先
+使用 QTM marker P95 矩形估计并在无有效 marker 时回退配置。snippet 必须按
+`snippets/<split>/<object_type>/` 隔离；旧序列化产物全部重建，不做静默兼容。
 
 ## 3.2 固定 tensor 约定
 
@@ -291,7 +300,7 @@ outputs/
   recording_indexes/<split>/
   base_state_indexes/<split>/
   snippets/<split>/<object_type>/
-  event_centered_blind_spot/schema-v2/
+  event_centered_blind_spot/schema-v3/
     risk-data/<run-id>/
     risk-model/<run-id>/
     verification-data/<run-id>/
@@ -300,7 +309,7 @@ outputs/
     reports/<run-id>/
 ```
 
-以上运行产物不得提交；每个 schema-v2 run 目录必须原子创建，已有 run ID 直接失败，
+以上运行产物不得提交；每个 schema-v3 run 目录必须原子创建，已有 run ID 直接失败，
 不得静默覆盖。
 
 ## 3.4 Toy fixture
@@ -442,7 +451,8 @@ train / calibration / val / test
 
 ## 6.3 Snippet 过滤
 
-生产片段固定为 4.4 秒、23 个真实采样点；速度阈值按 object type 读取 schema v2 配置：
+生产片段固定为 4.4 秒、23 个真实采样点；速度阈值按 object type 读取
+schema 3 配置中保留的 dynamic-object v2 类型字段：
 
 ```yaml
 motion_snippet_layout_version: history8_current7_future15_v1
@@ -495,20 +505,73 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 ## 7.1 任务
 
 - 接收 `BaseState`、`LocalTrajectory`、typed `MotionSnippet`；
-- 在候选轨迹上选冲突时刻和冲突点；
-- 放置矩形墙体、货架、柱子或结构性 blind sector；
-- 对目标 snippet 做 SE(2) 变换和有限时间缩放；主分布默认 human target；
-- 固定使用 `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，并令
-  `source_anchor_time=1.4+conflict_time_s`；不得直接使用 `conflict_time_s`；
+- `LocalTrajectory` 只接受 `sop04_audited_bank_v2` /
+  `future_endpoints_dt_to_horizon_v1`：15 个 future pose 是 `q1…q15`、时间为
+  `0.2…3.0 s`，冲突零基 index `k` 映射为 `(k+1)*0.2 s`；旧 `0.0…2.8 s`
+  布局不得兼容
+- SOP05 preflight 必须由 CLI 显式接收目录外可信 SOP04 handoff digest，并在
+  `sop05_input_lock_v2` / run identity 中绑定 bank/layout/time/offset、bank semantic
+  digest 和 external handoff digest
+- 只接受 `history8_current7_future15_v1`；固定使用
+  `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，未来冲突锚点的
+  source time 为 `1.4 + conflict_time_s`；
+- SOP05 正式生产算法固定为 `blind_reachability_quota_first_v3`，当前只发布
+  environment collision 母事件；历史 `joint_occluder_first_v4` 产物必须拒绝；
+- producer/report 固定为 `sop05_generation_run_v6` /
+  `sop05_pair_generation_report_v4`，并显式拒绝紧邻旧 v5/v3；pair process pool 的
+  bounded window 同时计算 pending futures 与按 rank 待消费 reports，建议 Slurm
+  `cpus-per-task == --workers`，不得用多个 `ntasks` 重复启动同一 producer；
+- candidate 变换固定为 `reachability_candidate_se2_v2`；`ReachabilityIdentity` /
+  candidate 显式绑定 `source_session_id`，并通过 `source_snippet_id` 在可信库中
+  间接定位 recording。transform payload 与 generated event/world identity 必须显式同时
+  绑定非空 `source_recording_id` 与 `source_session_id`；
+  `blind_reachability_first_v1` / `reachability_candidate_se2_v1` 或缺少 session
+  lineage 的产物必须 fail closed；
+- 运行前对 schedule 内唯一 `trajectory_id` 稳定排序，每条只预热一次机器人
+  canonical future 连续扫掠体；单进程直接复用，多进程通过 `fork` copy-on-write
+  复用父进程已预热的 `robot_sweep_cache_v1`。base-specific history 与 seam
+  仍按 pair 构建一次，不在同一 pair 的遮挡提议内重复构建；
+- 按交互距离、
+  bearing bin、遮挡物类型/尺寸/yaw 生成稳定 causal free-space 候选，先拒绝
+  静态重叠或与机器人/上下文对象扫掠冲突的遮挡物；
+- 用与正式 renderer 一致的栅格、ray casting 和遮挡几何生成 current blind-region
+  mask，并按 footprint/yaw 生成目标中心可放置 mask；
+- 在候选轨迹上枚举对齐的冲突时刻/点，从真实 23 点 snippet 当前位置到冲突点
+  构造 reachability arc；先用 mask 与 chord fast path 筛选，无法证明安全的候选进入
+  每 anchor 有上限的 exact fallback；
+- 对目标 snippet 只做该 reachability candidate 冻结的 SE(2) 变换，正式路径固定
+  `time_scale=1.0`，不外推、不逐帧扭曲；主分布默认 human target；
+- exact 验证必须同时覆盖真实 circle/rectangle footprint、静态和帧间连续净空、
+  当前不可见、未来连续出现以及选定 future endpoint 的 collision；
+- 几何版本栈固定为 `causal_occluder_schedule_v1` /
+  `causal_occluder_proposal_v2` / `blind_region_causal_delta_v2` /
+  `footprint_center_mask_causal_delta_v2` /
+  `occluder_collision_sweep_preparation_v2`。proposal identity 绑定正式
+  interaction region，blind region 必须是 baseline/current renderer 的 causal delta
+  与该 region 精确取交；连续碰撞 preparation v2 对 circle 忽略 yaw-only
+  旋转加密，rectangle 仍保留 yaw 加密；
+- summary 中保存 obstacle proposal、reachability transform/chord 与 exact validation 三层
+  可对账计数和稳定 rejection reasons；
 - 从完整 `target_type_policy` 解析白名单和三类归一化权重，并把稳定 digest 写入事件
   manifest；非人 target 只能由显式扩展配置启用；
 - 直接使用 snippet 冻结的 type/spec；生成的 target ID 必须确定且不与上下文 ID
   冲突，原 `source_object_id` 独立保留用于 provenance；
-- 生成六类配对事件；
+- SOP06 固定 `independent_partial_pairs_v1`：collision 母事件可独立发布，五类
+  negative 分别尝试与保留，一类失败不使其他变体失效；
+- 所有带目标的 SOP06 variant（包括重建的 temporal-safe）必须保持母事件
+  同一 `source_recording_id` + `source_session_id` lineage；禁止只比对 recording
+  或从其他 session 替换 snippet；
+- 每组输出固定六位 coverage mask 和逐位稳定 missing reason；训练不要求额外
+  contrast，完整六位只是 conditional audit 资格；
+- 正式 v5 必须拒绝历史 `joint_environment_pair_v2`，禁止以联合多 LOS 搜索作为
+  训练发布门槛；
 - 渲染历史可见 BEV、不可观测 mask、last-seen 和 age map；
 - 输出完整 `OracleWorld`。
 
 ## 7.2 六类事件
+
+六个名称定义固定的 coverage 位，不定义生产 quota。`collision` 是母事件；其他位
+从同一 base/trajectory/occluder/target lineage 独立构造，失败时保留稳定缺失原因。
 
 ```text
 collision
@@ -519,7 +582,7 @@ irrelevant_hidden
 empty_blind_spot
 ```
 
-推荐训练比例：
+下游对已成功变体做平衡重采样时可参考：
 
 ```yaml
 collision: 0.20
@@ -530,7 +593,8 @@ irrelevant_hidden: 0.15
 empty_blind_spot: 0.10
 ```
 
-校准和测试使用更自然、低碰撞的先验分布。
+该比例不得用作 producer 的缺类失败条件，平衡采样必须另存 manifest，并报告重采样前
+的原始 coverage。校准和测试使用更自然、低碰撞的先验分布。
 
 ## 7.3 关键几何约束
 
@@ -546,30 +610,36 @@ empty_blind_spot: 0.10
 
 ## 7.4 理想结果
 
-- 事件生成成功率 ≥ 80%；
+- 在固定 proposal budget 下，environment collision 母事件生成率稳定，并报告各候选阶段
+  的接受率与拒绝原因；
 - 无效几何比例 < 1%；
-- 六类事件实际比例与目标比例偏差 < 3%；
 - `collision` 样本 100% 真碰撞；
 - `temporal_safe` 空间路径相交但时序不碰撞；
 - `irrelevant_hidden` 中确有隐藏目标动态对象，但与轨迹无关；
 - 同一 pair 的场景几何保持一致；
+- 每类 negative 的 coverage 和 missing-reason 分布可追溯；条件完整组率只作审计，
+  不作为训练数据发布率；
 - 人工可视化 100 个样本无明显穿墙/瞬移。
 
 ## 7.5 最低验收
 
-- 生成成功率 ≥ 50%；
-- 能稳定生成 collision、near_miss、temporal_safe、empty 四类；
+- 在明确的固定 proposal budget 下能稳定发布物理合法的 collision 母事件；
+- 各 negative 独立尝试，所有成功变体都保留，所有缺位都有稳定原因；
 - 5,000 个可用 base events；
 - 主要几何单元测试通过。
+
+上述 5,000 是目标规模，必须由实际发布 manifest 验证；本文的接口更新不代表
+已完成该规模运行。
 
 ## 7.6 降级方案
 
 若复杂遮挡摆放接受率低：
 
-1. 先只做结构性 FOV 盲区；
-2. 再做单矩形货架遮挡；
-3. 取消复杂静态地图约束；
-4. 只保留直线/小弧线轨迹和侧向 human target。
+1. 在不变更 `blind_reachability_quota_first_v3` 物理契约的前提下，限制为单矩形货架/柱子；
+2. 优先直线/小弧线候选轨迹和侧向 human target，但仍保留稳定随机化与失败报告；
+3. 复杂静态地图作为单独 stress/OOD 层，不与基础自由空间产物混合计数；
+4. structural/mixed 只能通过未来显式版本升级加入，不得在当前 formal
+   environment producer 中静默切换。
 
 ---
 
@@ -584,12 +654,32 @@ empty_blind_spot: 0.10
 - 过滤静态碰撞和动力学不合理轨迹；
 - 生成 swept mask、TTA、braking map；
 - 计算 collision、near miss、min clearance、TTC、连续风险严重度；
+- 主标签只统计由调用方显式声明、且经 renderer 验证当前不可见的对象；
+  world 中的可见或未声明对象不得改变 hidden-risk 标签；
 - 从 `dynamic_object_specs` 构造 circle/rectangle footprint，并记录
   `critical_object_id/type`；
 - 启动时把 BEV 物理宽高对角线解析为有限 `no_object_clearance_sentinel_m` 并写入
   manifest；无相关对象的行使用该值且从 clearance 分布聚合排除，但仍计入
   collision/severity 指标；
-- 输出 `RiskSample`。
+- 通过 history-only renderer 构建 `RiskSample` 输入，再在隔离的 label 分支读取
+  `OracleWorld` future；metadata 禁止携带 future/oracle 数组或 hidden-object-ID 集合；
+- 将 `RiskSample` 按 `sample_id` 稳定排序写入 `risk_shard_npz_jsonl_v2`
+  immutable NPZ+JSONL shard；每个目录
+  精确包含 `samples.npz`、`metadata.jsonl`、`summary.json`，固定 expected count 和
+  单 split，完整 loader 重读与 digest/leakage 验证后才原子发布，且不覆盖已有目录；
+  v1 shard 一律 fail closed。
+- 正式 `scripts/04_generate_risk_dataset.py` 对一个 formal
+  `independent_partial_pairs_v1` group 中所有已成功 variants 做原子组装/发布；
+  缺位保留 coverage + stable reason，不要求每个训练 group 凑齐 six-pack。
+  只有 conditional complete audit 路径要求六位齐全；CLI 的 exact sample count
+  是 shard 总边界，不是每组六类 quota。
+- `split_audit_records` 对 base/source recording 跨 split 泄漏执行 fail-closed
+  校验，并完整报告允许的 THÖR session overlap；当前 CLI 只组装本 shard，
+  collection 调用方仍必须传入全部 split 记录完成 global cross-shard audit。
+
+当前已实现 schema 3 hidden-risk GT、`RiskSample` 组装、deterministic immutable
+shard API 与正式数据集 CLI，但只有 unit/toy-fixture 和确定性验证。
+10–100 真实样本 smoke、global cross-shard audit 以及目标规模运行仍待执行。
 
 ## 8.2 候选轨迹
 
@@ -601,6 +691,12 @@ angular_velocities: [-0.8, -0.4, 0.0, 0.4, 0.8]
 horizon_s: 3.0
 dt: 0.2
 ```
+
+正式候选库冻结为 `trajectory_bank_version=sop04_audited_bank_v2`、
+`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，首末 pose 时间分别为
+`0.2 s` 与 `3.0 s`。v2 audit 必须通过 future-endpoint kinematics、query-map、
+shape/dtype/finite 和 serial/parallel exact-match，并以目录外 external handoff digest
+交给 W2/SOP05；v1 或 `poses[0]=q0` 的库立即拒绝。
 
 可加入少量后退 stress test，但不作为主训练分布。
 
@@ -624,6 +720,8 @@ Y_{risk}=\max_{j,\tau}
 
 ## 8.4 理想结果
 
+以下数量是后续实验目标，不是当前完成声明：
+
 - 所有 collision 标签与多边形求交完全一致；
 - 连续严重度随 clearance 减小单调增加；
 - 同 clearance 下，越早发生危险，严重度越高；
@@ -633,6 +731,9 @@ Y_{risk}=\max_{j,\tau}
 - 训练集 collision/near-miss/hard negative 分布可控。
 
 ## 8.5 最低验收
+
+以下 50,000 门槛须以 immutable shard summaries 实际汇总验证；接口/单元测试
+通过不等于达到该规模。
 
 - 风险样本 ≥ 50,000；
 - 二值标签、clearance 和 TTC 单元测试通过；
@@ -1375,6 +1476,12 @@ G* 是否包含验证成本
 
 # 17. 推荐 CLI 与产物
 
+本节的命令是目标编排界面，不是真实数据规模完成声明。截至本次契约对齐，
+schema 3 risk GT、`RiskSample`、单个 immutable shard API 和正式
+`scripts/04_generate_risk_dataset.py` CLI 已实现并有 unit/toy-fixture 验证；
+10–100 真实样本 smoke、global cross-shard audit、shard collection manifest 及
+目标规模运行仍待实现或验证。
+
 ## 17.1 数据
 
 ```bash
@@ -1385,10 +1492,22 @@ python -m scripts.extract_snippets \
   --split train \
   --config configs/thor.yaml
 
-python -m scripts.build_risk_dataset \
+# 正式单 shard CLI；下列 digest 必须来自可信目录外 handoff
+python scripts/04_generate_risk_dataset.py \
+  --sop03-root <schema3-sop03-root> \
+  --sop04-root <schema3-sop04-root> \
+  --sop04-handoff-digest <64-hex> \
+  --sop05-root <schema3-sop05-root> \
+  --sop05-publication-digest <64-hex> \
   --split train \
-  --num-base-states 5000 \
-  --config configs/event_generator.yaml
+  --config configs/base.yaml \
+  --paired-config configs/paired_variants.yaml \
+  --seed 42 \
+  --output-dir outputs/event_centered_blind_spot/schema-v3/risk-data/main-seed42-v1/train/shard-00000 \
+  --shard-index <nonnegative-int> \
+  --expected-event-count <positive-int> \
+  --expected-sample-count <positive-int> \
+  --checksum-workers 8
 ```
 
 预期产物：
@@ -1396,8 +1515,9 @@ python -m scripts.build_risk_dataset \
 ```text
 outputs/splits/split_manifest.parquet
 outputs/snippets/<split>/<object_type>/...
-outputs/event_centered_blind_spot/schema-v2/risk-data/<run-id>/<split>/shard_*.npz
-outputs/event_centered_blind_spot/schema-v2/risk-data/<run-id>/<split>/metadata.jsonl
+outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/samples.npz
+outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/metadata.jsonl
+outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/summary.json
 ```
 
 ## 17.2 风险
@@ -1410,25 +1530,26 @@ python -m training.train_risk \
   --config configs/risk_model.yaml
 
 python -m training.calibrate_risk \
-  --checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt \
+  --checkpoint outputs/event_centered_blind_spot/schema-v3/risk-model/main-seed42-v1/best.pt \
   --split calibration
 ```
 
 预期产物：
 
 ```text
-outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/best.pt
-outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/metrics-val.json
-outputs/event_centered_blind_spot/schema-v2/risk-model/<run-id>/calibration/calibration.json
-outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/reliability-curve.png
-outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/risk-examples/
+outputs/event_centered_blind_spot/schema-v3/risk-model/<run-id>/best.pt
+outputs/event_centered_blind_spot/schema-v3/risk-model/<run-id>/metrics-val.json
+outputs/event_centered_blind_spot/schema-v3/risk-model/<run-id>/calibration/calibration.json
+outputs/event_centered_blind_spot/schema-v3/reports/<run-id>/reliability-curve.png
+outputs/event_centered_blind_spot/schema-v3/reports/<run-id>/risk-examples/
 ```
 
 ## 17.3 验证价值
 
 ```bash
+# planned collection-level interface; exact collection manifest is not frozen yet
 python -m scripts.build_verification_dataset \
-  --risk-manifest outputs/event_centered_blind_spot/schema-v2/risk-data/main-seed42-v1/train/metadata.jsonl \
+  --risk-shard-root outputs/event_centered_blind_spot/schema-v3/risk-data/main-seed42-v1/train/ \
   --scenario-bank-size 16 \
   --config configs/verification_gt.yaml
 
@@ -1439,22 +1560,22 @@ python -m training.train_verify \
 预期产物：
 
 ```text
-outputs/event_centered_blind_spot/schema-v2/verification-data/<run-id>/<split>/shard_*.npz
-outputs/event_centered_blind_spot/schema-v2/verification-model/<run-id>/best.pt
-outputs/event_centered_blind_spot/schema-v2/verification-model/<run-id>/metrics.json
-outputs/event_centered_blind_spot/schema-v2/reports/<run-id>/action-ranking-examples/
+outputs/event_centered_blind_spot/schema-v3/verification-data/<run-id>/<split>/shard_*.npz
+outputs/event_centered_blind_spot/schema-v3/verification-model/<run-id>/best.pt
+outputs/event_centered_blind_spot/schema-v3/verification-model/<run-id>/metrics.json
+outputs/event_centered_blind_spot/schema-v3/reports/<run-id>/action-ranking-examples/
 ```
 
 ## 17.4 闭环
 
 ```bash
 python -m evaluation.eval_closed_loop \
-  --risk-checkpoint outputs/event_centered_blind_spot/schema-v2/risk-model/main-seed42-v1/best.pt \
-  --value-checkpoint outputs/event_centered_blind_spot/schema-v2/verification-model/main-seed42-v1/best.pt \
+  --risk-checkpoint outputs/event_centered_blind_spot/schema-v3/risk-model/main-seed42-v1/best.pt \
+  --value-checkpoint outputs/event_centered_blind_spot/schema-v3/verification-model/main-seed42-v1/best.pt \
   --config configs/closed_loop.yaml
 
 python -m evaluation.plot_pareto \
-  --input outputs/event_centered_blind_spot/schema-v2/closed-loop/main-seed42-v1/all_methods.csv
+  --input outputs/event_centered_blind_spot/schema-v3/closed-loop/main-seed42-v1/all_methods.csv
 ```
 
 ---

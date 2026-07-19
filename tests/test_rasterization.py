@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from src.contracts import GridSpec
+import src.geometry.rasterization as rasterization_module
+from src.geometry.collision import intersects
 from src.geometry.rasterization import (
     grid_bounds,
     grid_cell_centers,
@@ -16,6 +18,7 @@ from src.geometry.rasterization import (
 from src.geometry.footprints import (
     CircleFootprint,
     RectangleFootprint,
+    footprint_aabb,
     inflate_footprint,
 )
 
@@ -183,6 +186,106 @@ def test_rotated_rectangle_rasterization_uses_closed_cell_square_intersection(
     expected[2, 1] = expected[2, 3] = True
 
     np.testing.assert_array_equal(mask, expected)
+
+
+def test_rectangle_rasterization_avoids_scalar_per_cell_collision_queries(
+    square_grid: GridSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    footprint = RectangleFootprint(1.37, 0.63)
+    pose = np.asarray([0.17, -0.23, 0.41], dtype=np.float64)
+    expected = rasterize_footprint(footprint, pose, square_grid)
+
+    def unexpected_scalar_query(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        raise AssertionError("rasterization must batch candidate cell geometry")
+
+    monkeypatch.setattr(
+        rasterization_module,
+        "intersects",
+        unexpected_scalar_query,
+    )
+
+    np.testing.assert_array_equal(
+        rasterize_footprint(footprint, pose, square_grid),
+        expected,
+    )
+
+
+@pytest.mark.parametrize(
+    ("footprint", "pose"),
+    [
+        (CircleFootprint(0.37), np.asarray([0.13, -0.21, 0.7])),
+        (CircleFootprint(0.5), np.asarray([-3.0, 0.0, 0.0])),
+        (RectangleFootprint(1.37, 0.63), np.asarray([0.17, -0.23, 0.41])),
+        (RectangleFootprint(1.0, 1.0), np.asarray([0.0, 0.0, np.pi / 4.0])),
+        (RectangleFootprint(0.7, 1.3), np.asarray([1.11, -1.27, -0.83])),
+    ],
+)
+def test_batched_rasterization_matches_scalar_closed_cell_authority(
+    square_grid: GridSpec,
+    footprint: CircleFootprint | RectangleFootprint,
+    pose: np.ndarray,
+) -> None:
+    centers = grid_cell_centers(square_grid)
+    cell = RectangleFootprint(
+        square_grid.resolution_m,
+        square_grid.resolution_m,
+    )
+    expected = np.zeros((square_grid.height, square_grid.width), dtype=bool)
+    for row in range(square_grid.height):
+        for column in range(square_grid.width):
+            center = centers[row, column]
+            expected[row, column] = intersects(
+                footprint,
+                pose,
+                cell,
+                np.asarray([center[0], center[1], 0.0], dtype=np.float64),
+            )
+
+    np.testing.assert_array_equal(
+        rasterize_footprint(footprint, pose, square_grid),
+        expected,
+    )
+
+
+def test_batched_rectangle_rasterization_defers_numeric_boundary_to_authority() -> None:
+    boundary_grid = GridSpec(
+        height=160,
+        width=160,
+        history_steps=1,
+        future_steps=1,
+        resolution_m=0.125,
+    )
+    footprint = RectangleFootprint(0.5, 0.25)
+    pose = np.asarray([-10.0, 0.0, np.pi / 2.0], dtype=np.float64)
+    centers = grid_cell_centers(boundary_grid)
+    bounds = footprint_aabb(footprint, pose)
+    half_cell = 0.5 * boundary_grid.resolution_m
+    candidates = (
+        (centers[..., 0] >= bounds[0] - half_cell)
+        & (centers[..., 0] <= bounds[1] + half_cell)
+        & (centers[..., 1] >= bounds[2] - half_cell)
+        & (centers[..., 1] <= bounds[3] + half_cell)
+    )
+    cell = RectangleFootprint(
+        boundary_grid.resolution_m,
+        boundary_grid.resolution_m,
+    )
+    expected = np.zeros((boundary_grid.height, boundary_grid.width), dtype=bool)
+    for row, column in np.argwhere(candidates):
+        center = centers[row, column]
+        expected[row, column] = intersects(
+            footprint,
+            pose,
+            cell,
+            np.asarray([center[0], center[1], 0.0], dtype=np.float64),
+        )
+
+    np.testing.assert_array_equal(
+        rasterize_footprint(footprint, pose, boundary_grid),
+        expected,
+    )
 
 
 def test_rasterization_supports_inflation_and_clips_at_grid_bounds(

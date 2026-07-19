@@ -46,7 +46,7 @@ from src.utils.config import ConfigError, load_config  # noqa: E402
 from src.utils.seeding import derive_seed  # noqa: E402
 
 
-SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v2"
+SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v3"
 
 
 class RiskDatasetRunError(ValueError):

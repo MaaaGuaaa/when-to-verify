@@ -142,6 +142,10 @@ def _request(module, tmp_path: Path, *, event_count: int, sample_count: int):
     )
 
 
+def test_cli_version_marks_explicit_shard_index_contract(cli_module) -> None:
+    assert cli_module.SOP07_RISK_DATASET_CLI_VERSION == "sop07_risk_dataset_cli_v3"
+
+
 def _install_success_dependencies(
     module,
     monkeypatch: pytest.MonkeyPatch,

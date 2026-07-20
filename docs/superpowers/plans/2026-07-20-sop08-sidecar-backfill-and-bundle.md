@@ -23,50 +23,32 @@
 - Consumers: SOP08 B3 ConvGRU/B4 aggregation training and the optional SOP09/R3 occupancy auxiliary head use the same `hidden_risk_occupancy` target. Four-split sidecar preparation is mandatory for a complete training bundle; enabling the auxiliary head remains an experimental option.
 - Versioning: this is an external additive schema-3 label publication. It does not alter `RiskSample`, its model-input schema, or the core schema/version.
 
-### Task 1: Add accepted-shard replay verification
+### Task 1: Add accepted-shard replay verification (completed)
 
 **Files:**
-- Create: `scripts/04_backfill_risk_sidecars.py`
-- Create: `tests/test_04_backfill_risk_sidecars.py`
+- Added: `scripts/04_backfill_risk_sidecars.py`
+- Added: `tests/test_04_backfill_risk_sidecars.py`
 
-- [ ] **Step 1: Write failing real-I/O tests**
+**Execution record (2026-07-20):**
 
-Create accepted and replay risk shards with the real `write_risk_shard()` API and a sidecar with the real `write_risk_sidecar_shard()` API. Require exact ordered sample IDs, split/index, manifest digest, semantic digest, sidecar source digest, and pair marker. Add separate failures for changed risk semantics, reordered IDs, wrong basename/index, missing marker, and tampered sidecar.
+- RED Slurm job `36623`: 19 expected collection errors because the runner did not yet
+  exist.
+- Initial GREEN Slurm job `36624`: 19 tests passed after implementing the one-task
+  replay-and-verification runner.
+- Regression Slurm job `36625`: 125 tests passed.
+- Review-gap RED Slurm job `36626`: 2 expected failures exposed missing handoff-identity
+  and single-line-stderr checks; GREEN job `36627`: 128 tests passed after the fixes.
+- Duplicate-key RED Slurm job `36628`: 2 expected failures; final GREEN/regression job
+  `36629`: 130 tests passed in 15 seconds after recursive duplicate-key rejection was
+  added.
+- The exact Task 1 files were committed as `550044c446327ec76a2b558a82ea3e1caca27db6`
+  (`feat(occupancy): backfill accepted risk sidecars`).
 
-- [ ] **Step 2: Run RED through Slurm**
-
-```bash
-sbatch --wait -p gpu --cpus-per-task=4 --mem=20G --time=00:10:00 \
-  --output="$ROOT/.tmp/agent/logs/%x-%j.log" \
-  --wrap="cd $WT && $PY -m pytest -q tests/test_04_backfill_risk_sidecars.py"
-```
-
-Expected: import failure because `scripts/04_backfill_risk_sidecars.py` does not exist.
-
-- [ ] **Step 3: Implement one Slurm-array-task runner**
-
-The CLI must resolve one task from the accepted batch report and SOP05 batch handoff, invoke the existing formal SOP07 CLI with both temporary replay-risk and final sidecar roots, formally reload accepted risk/replay risk/sidecar/marker, and return one canonical JSON report. It must fail closed before returning success unless all identities and digests match. Existing complete outputs may be resumed only after the same full reload.
-
-- [ ] **Step 4: Run GREEN and regressions through Slurm**
-
-```bash
-sbatch --wait -p gpu --cpus-per-task=8 --mem=48G --time=00:20:00 \
-  --output="$ROOT/.tmp/agent/logs/%x-%j.log" \
-  --wrap="cd $WT && $PY -m pytest -q \
-    tests/test_04_backfill_risk_sidecars.py tests/test_risk_sidecars.py \
-    tests/test_sidecar_writer.py tests/test_04_generate_risk_dataset_cli.py \
-    tests/test_risk_dataset_seal.py tests/test_occupancy_production_training.py"
-```
-
-Expected: zero failures.
-
-- [ ] **Step 5: Commit exact Task 1 files**
-
-```bash
-$GIT add scripts/04_backfill_risk_sidecars.py \
-  tests/test_04_backfill_risk_sidecars.py
-$GIT commit -m "feat(occupancy): backfill accepted risk sidecars"
-```
+The completed runner resolves exactly one Slurm-array task from the accepted batch
+report and SOP05 batch handoff, invokes the formal SOP07 CLI with temporary replay-risk
+and final sidecar roots, reloads accepted risk/replay risk/sidecar/marker, and succeeds
+only when all ordered identities and digests match. Existing outputs resume only after
+the same full reload.
 
 ### Task 2: Synchronize the authoritative SOP text
 

@@ -1717,6 +1717,12 @@ cross-attention → concatenate + CNN
 全量 verification → 只对边界风险轨迹生成
 ```
 
+其中降低 occupancy 分辨率只能作为新的、显式版本化的实验分支，不能就地重采样或
+静默偏离当前冻结的 `float32 [N,15,160,160]` 监督契约。若确需使用
+`96×96` 或 `128×128`，必须定义新的 sidecar schema、独立配置和发布版本，重新生成并
+核验 train/calibration/val/test 四个 split，同时显式更新所有消费者的兼容性；当前
+`hidden_risk_occupancy` 发布仍固定为 `160×160`。
+
 ---
 
 # 20. 最终优先级

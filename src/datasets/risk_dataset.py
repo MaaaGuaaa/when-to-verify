@@ -83,6 +83,7 @@ from src.geometry import (
     trajectory_signed_clearances,
     wrap_angle,
 )
+from src.utils.config import config_digest
 from src.utils.seeding import stable_digest
 
 
@@ -418,20 +419,6 @@ class RiskBuildInput:
     hidden_object_ids: tuple[str, ...]
     sensor_config: StructuralBlindSpot | None
     provenance: Mapping[str, object]
-
-
-def _canonical_config_digest(config: Mapping[str, object]) -> str:
-    try:
-        payload = json.dumps(
-            dict(config),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("base_config must be finite canonical JSON") from exc
-    return stable_digest(payload, size=16)
 
 
 def _canonical_paired_config(value: PairedVariantConfig) -> PairedVariantConfig:
@@ -850,8 +837,8 @@ def _build_formal_source(
     target_footprint_kind = _require_nonempty_string(
         target_footprint.get("kind"), name="target_footprint_kind"
     )
-    base_config_digest = _canonical_config_digest(base_config)
-    risk_config_digest = _canonical_config_digest(risk_config)
+    base_config_digest = config_digest(base_config)
+    risk_config_digest = config_digest(risk_config)
     snippet_motion_digest = stable_digest(
         source_snippet.snippet_id,
         source_snippet.start_timestamp,

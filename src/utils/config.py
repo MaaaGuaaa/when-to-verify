@@ -7,6 +7,7 @@ partial config file remains valid while silent drift is impossible.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import hashlib
 import json
@@ -162,7 +163,19 @@ def load_config(path: str | Path | None = None) -> dict:
     return merged
 
 
-def config_digest(cfg: dict, size: int = 16) -> str:
-    """Return a stable digest of a config dict (order-independent)."""
-    payload = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def config_digest(cfg: Mapping[str, Any], size: int = 16) -> str:
+    """Return the canonical finite-JSON BLAKE2b digest for a config mapping."""
+
+    if not isinstance(cfg, Mapping):
+        raise TypeError("config must be a mapping")
+    try:
+        payload = json.dumps(
+            dict(cfg),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("config must be finite canonical JSON") from exc
     return hashlib.blake2b(payload, digest_size=size).hexdigest()

@@ -1230,6 +1230,11 @@ random seed
 - `RiskSample` 的 history/state channels 由 history-only renderer 构建；候选轨迹的
   四个 query maps 按冻结顺序拼接。`OracleWorld` future 只在独立标签分支内读取，
   不得写入模型输入或 provenance metadata。
+- `base_config_digest` 是 SOP07 sample provenance、occupancy seal 与 production
+  evaluation provenance 共用的同一配置身份：由
+  `src.utils.config.config_digest` 对有限 canonical JSON（键排序、紧凑分隔、UTF-8、
+  禁止 NaN/Inf）计算 BLAKE2b-128，固定为 32 位小写十六进制。三处必须逐值 join；
+  不得另算 SHA-256 后当作同一字段，也不得用 family/collection 顶层摘要替代。
 - 每个 `risk_shard_npz_jsonl_v2` immutable shard 目录精确包含 `samples.npz`、`metadata.jsonl` 和
   `summary.json`。样本按 `sample_id` 稳定排序，固定 expected count 与单 split；
   写入 staging 后必须用正式 loader 重读并校验 schema/layout、shape/dtype/finite、

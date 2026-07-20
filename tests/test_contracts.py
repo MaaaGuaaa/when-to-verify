@@ -537,3 +537,23 @@ def test_config_digest_is_stable_and_sensitive():
     mutated = load_config(_ROOT / "configs" / "base.yaml")
     mutated["seed"] = 999
     assert config_digest(cfg) != config_digest(mutated)
+
+
+def test_config_digest_matches_frozen_blake2b128_canonical_json():
+    cfg = {"说明": "机器人", "seed": 42}
+    canonical = json.dumps(
+        cfg,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    assert config_digest(cfg) == seeding.stable_digest(canonical, size=16)
+    assert len(config_digest(cfg)) == 32
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_config_digest_rejects_nonfinite_values(nonfinite):
+    with pytest.raises(ValueError, match="finite canonical JSON"):
+        config_digest({"value": nonfinite})

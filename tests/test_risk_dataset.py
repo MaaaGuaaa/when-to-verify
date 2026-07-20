@@ -64,6 +64,7 @@ from src.geometry import (
     rasterize_footprint,
     trajectory_signed_clearances,
 )
+from src.utils.config import config_digest
 from src.utils.seeding import stable_digest
 
 
@@ -901,10 +902,12 @@ def test_formal_group_triple_api_aligns_evaluation_records_without_sample_leakag
     assert records[1]["critical_object_id"] is None
     assert records[1]["target_footprint_spec"] is None
     assert records[1]["footprint_kind"] == "none"
+    expected_base_config_digest = config_digest(triple_inputs["base_config"])
     assert all(
-        len(record["robot_footprint_provenance"]["base_config_digest_sha256"])
-        == 64
-        for record in records
+        sample.metadata["provenance"]["base_config_digest"]
+        == record["robot_footprint_provenance"]["base_config_digest"]
+        == expected_base_config_digest
+        for sample, record in zip(samples, records, strict=True)
     )
     forbidden_eval_fields = {
         "critical_area_fraction",

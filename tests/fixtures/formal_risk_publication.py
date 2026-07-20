@@ -46,8 +46,7 @@ from src.geometry import (
 from src.generation.observation_renderer import RENDERER_LAYOUT_VERSION
 from src.generation.risk_gt import RISK_GT_VERSION
 from src.planning.differential_drive import rollout_constant_control
-from src.utils.config import DEFAULT_CONFIG, load_config
-from src.utils.seeding import stable_digest
+from src.utils.config import DEFAULT_CONFIG, config_digest, load_config
 
 
 G1_SPLIT_MANIFEST_DIGEST = "1" * 32
@@ -228,8 +227,7 @@ def _base_config(*, history_steps: int = 2, future_steps: int = 3) -> dict[str, 
 
 
 def _base_config_digest(config: Mapping[str, object]) -> str:
-    payload = canonical_json(dict(config))
-    return stable_digest(payload, size=16)
+    return config_digest(config)
 
 
 def write_formal_collection_handoff(

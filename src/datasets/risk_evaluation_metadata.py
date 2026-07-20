@@ -7,7 +7,6 @@ outputs are authenticated analysis metadata and must never be attached to a
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from collections.abc import Mapping
@@ -32,6 +31,7 @@ from src.geometry import (
     RectangleFootprint,
     inflate_footprint,
 )
+from src.utils.config import config_digest
 
 if TYPE_CHECKING:
     from src.datasets.risk_dataset import RiskBuildInput
@@ -107,7 +107,7 @@ _ROBOT_PROVENANCE_KEYS = frozenset(
         "base_footprint_spec",
         "inflation_m",
         "effective_footprint_spec",
-        "base_config_digest_sha256",
+        "base_config_digest",
     }
 )
 _OOD_EVIDENCE_KEYS = frozenset({"rule_version", "source", "reason"})
@@ -153,6 +153,17 @@ def _require_nonempty_string(value: object, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+def _require_lower_hex_digest(
+    value: object, *, name: str, length: int
+) -> str:
+    text = _require_nonempty_string(value, name=name)
+    if len(text) != length or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(f"{name} must be {length} lowercase hex")
+    return text
 
 
 def _finite_float(value: object, *, name: str) -> float:
@@ -256,17 +267,17 @@ def _validate_robot_footprint_provenance(
         footprint_to_canonical_spec(expected_effective) != effective
     ):
         raise ValueError("effective footprint differs from robot_footprint")
-    digest = value.get("base_config_digest_sha256")
-    if not isinstance(digest, str) or len(digest) != 64 or any(
-        character not in "0123456789abcdef" for character in digest
-    ):
-        raise ValueError("base_config_digest_sha256 must be 64 lowercase hex")
+    digest = _require_lower_hex_digest(
+        value.get("base_config_digest"),
+        name="base_config_digest",
+        length=32,
+    )
     return {
         "rule_version": ROBOT_FOOTPRINT_PROVENANCE_RULE_VERSION,
         "base_footprint_spec": base,
         "inflation_m": inflation,
         "effective_footprint_spec": effective,
-        "base_config_digest_sha256": digest,
+        "base_config_digest": digest,
     }
 
 
@@ -293,16 +304,6 @@ def derive_robot_footprint_provenance(
     inflation = _finite_float(robot.get("inflation_m"), name="inflation_m")
     if inflation < 0.0:
         raise ValueError("inflation_m must be non-negative")
-    try:
-        canonical_config = json.dumps(
-            base_config,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("base_config must be finite canonical JSON") from exc
     provenance = {
         "rule_version": ROBOT_FOOTPRINT_PROVENANCE_RULE_VERSION,
         "base_footprint_spec": base_spec,
@@ -310,9 +311,7 @@ def derive_robot_footprint_provenance(
         "effective_footprint_spec": footprint_to_canonical_spec(
             effective_footprint
         ),
-        "base_config_digest_sha256": hashlib.sha256(
-            canonical_config.encode("utf-8")
-        ).hexdigest(),
+        "base_config_digest": config_digest(base_config),
     }
     normalized = _validate_robot_footprint_provenance(
         provenance, expected_effective=effective_footprint
@@ -508,6 +507,18 @@ def _joined_identity(
         if source_value != sample_value:
             raise ValueError(f"sample/source {field} join failed")
         identity[field] = source_value
+    source_config_digest = _require_lower_hex_digest(
+        source_provenance.get("base_config_digest"),
+        name="source provenance base_config_digest",
+        length=32,
+    )
+    sample_config_digest = _require_lower_hex_digest(
+        sample_provenance.get("base_config_digest"),
+        name="sample provenance base_config_digest",
+        length=32,
+    )
+    if source_config_digest != sample_config_digest:
+        raise ValueError("sample/source base_config_digest join failed")
     if identity["base_recording_id"] != source.base_state.recording_id:
         raise ValueError("base_recording_id differs from BaseState")
     if identity["base_session_id"] != source.base_state.metadata.get(
@@ -632,6 +643,10 @@ def derive_production_evaluation_record(
     provenance = _validate_robot_footprint_provenance(
         robot_footprint_provenance, expected_effective=robot_footprint
     )
+    if provenance["base_config_digest"] != source.provenance.get(
+        "base_config_digest"
+    ):
+        raise ValueError("robot/source base_config_digest join failed")
     tag, evidence = _validate_ood(ood_tag, ood_evidence)
     record: dict[str, object] = {
         "risk_evaluation_record_layout_version": (

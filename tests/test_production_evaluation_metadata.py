@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import hashlib
-import json
 
 import numpy as np
 import pytest
@@ -35,6 +33,7 @@ from src.datasets.risk_evaluation_metadata import (
 )
 from src.generation.observation_renderer import RenderedObservation
 from src.geometry import RectangleFootprint
+from src.utils.config import config_digest
 
 
 TARGET_ID = "generated::human::critical"
@@ -116,6 +115,7 @@ def _boundary_fixture() -> tuple[RiskSample, RiskBuildInput, RenderedObservation
         "source_snippet_id": "snippet-evaluation",
         "seed_namespace": "sop07/test/seed-19/event-evaluation",
         "blind_spot_type": "environment",
+        "base_config_digest": "a" * 32,
     }
     source = RiskBuildInput(
         sample_id="test-evaluation-record",
@@ -209,7 +209,7 @@ def _robot_provenance() -> dict[str, object]:
             "length_m": 0.7,
             "width_m": 0.5,
         },
-        "base_config_digest_sha256": "a" * 64,
+        "base_config_digest": "a" * 32,
     }
 
 
@@ -342,15 +342,7 @@ def test_robot_footprint_provenance_is_recomputed_from_base_config() -> None:
         "bev": {"size": 2, "resolution_m": 0.5},
         "robot": {"length_m": 0.5, "width_m": 0.3, "inflation_m": 0.1},
     }
-    expected_digest = hashlib.sha256(
-        json.dumps(
-            base_config,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    expected_digest = config_digest(base_config)
 
     provenance = derive_robot_footprint_provenance(
         base_config=base_config,
@@ -370,7 +362,7 @@ def test_robot_footprint_provenance_is_recomputed_from_base_config() -> None:
             "length_m": 0.7,
             "width_m": 0.5,
         },
-        "base_config_digest_sha256": expected_digest,
+        "base_config_digest": expected_digest,
     }
     with pytest.raises(TypeError, match="frozen"):
         provenance["inflation_m"] = 0.0
@@ -378,6 +370,64 @@ def test_robot_footprint_provenance_is_recomputed_from_base_config() -> None:
         derive_robot_footprint_provenance(
             base_config=base_config,
             effective_footprint=RectangleFootprint(0.71, 0.5),
+        )
+
+
+def test_evaluation_record_rejects_robot_config_digest_join_mismatch() -> None:
+    sample, source, rendered = _boundary_fixture()
+    provenance = _robot_provenance()
+    provenance["base_config_digest"] = "b" * 32
+
+    with pytest.raises(ValueError, match="base_config_digest join failed"):
+        derive_production_evaluation_record(
+            sample=sample,
+            source=source,
+            rendered=rendered,
+            ground_truth=_ground_truth(),
+            robot_footprint=RectangleFootprint(0.7, 0.5),
+            age_max_s=5.0,
+            pair_eligible=True,
+            ood_tag="in_distribution",
+            robot_footprint_provenance=provenance,
+            ood_evidence={
+                "rule_version": OOD_ROUTING_RULE_VERSION,
+                "source": "default_in_distribution",
+                "reason": "no explicit OOD provenance was published",
+            },
+        )
+
+
+def test_evaluation_record_rejects_sample_config_digest_join_mismatch() -> None:
+    sample, source, rendered = _boundary_fixture()
+    sample = replace(
+        sample,
+        metadata={
+            **sample.metadata,
+            "provenance": {
+                **sample.metadata["provenance"],
+                "base_config_digest": "b" * 32,
+            },
+        },
+    )
+
+    with pytest.raises(
+        ValueError, match="sample/source base_config_digest join failed"
+    ):
+        derive_production_evaluation_record(
+            sample=sample,
+            source=source,
+            rendered=rendered,
+            ground_truth=_ground_truth(),
+            robot_footprint=RectangleFootprint(0.7, 0.5),
+            age_max_s=5.0,
+            pair_eligible=True,
+            ood_tag="in_distribution",
+            robot_footprint_provenance=_robot_provenance(),
+            ood_evidence={
+                "rule_version": OOD_ROUTING_RULE_VERSION,
+                "source": "default_in_distribution",
+                "reason": "no explicit OOD provenance was published",
+            },
         )
 
 

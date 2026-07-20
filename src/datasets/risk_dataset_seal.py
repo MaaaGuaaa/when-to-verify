@@ -42,9 +42,8 @@ from src.datasets.sidecar_writer import (
     load_risk_sidecar_shard,
     risk_sidecar_pair_completion_marker_path,
 )
-from src.utils.config import ConfigError, load_config
+from src.utils.config import ConfigError, config_digest, load_config
 from src.utils.atomic_publish import atomic_rename_noreplace
-from src.utils.seeding import stable_digest
 
 
 RISK_DATASET_LAYOUT_VERSION = "risk_dataset_v2"
@@ -1090,16 +1089,6 @@ def _descriptor_from_mapping(
     )
 
 
-def _base_config_digest(config: Mapping[str, object]) -> str:
-    """Match SOP07's frozen ``stable_digest(canonical_config, size=16)``."""
-
-    try:
-        payload = _canonical_json(dict(config))
-    except (TypeError, ValueError) as exc:
-        raise RiskDataContractError("base config must be finite canonical JSON") from exc
-    return stable_digest(payload, size=16)
-
-
 def _query_geometry_from_config(
     config: Mapping[str, object], *, base_config_digest: str, grid: GridSpec
 ) -> dict[str, object]:
@@ -1831,7 +1820,7 @@ def publish_risk_dataset_seal(
     sidecar_path: Path | None = None
     if sidecar_root is not None:
         sidecar_path = _absolute_without_symlink_resolution(Path(sidecar_root))
-        base_config_digest = _base_config_digest(config)
+        base_config_digest = config_digest(config)
         query_geometry = _query_geometry_from_config(
             config,
             base_config_digest=base_config_digest,

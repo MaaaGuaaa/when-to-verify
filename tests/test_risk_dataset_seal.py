@@ -37,6 +37,7 @@ from src.datasets.risk_dataset_seal import (
 )
 from src.datasets.shard_writer import load_risk_shard
 from src.datasets.sop03_publication import publish_checksum_envelope
+from src.utils.config import config_digest, load_config
 from tests.fixtures.formal_risk_publication import (
     FormalRiskPublication,
     canonical_json,
@@ -1017,6 +1018,15 @@ def test_cli_can_seal_an_authenticated_occupancy_sidecar_collection(
     assert payload["occupancy_sidecar_collection_digest_sha256"] == (
         manifest["occupancy_sidecars"]["collection_digest_sha256"]
     )
+    expected_base_config_digest = config_digest(
+        load_config(publication.base_config_path)
+    )
+    assert manifest["occupancy_sidecars"]["base_config_digest"] == (
+        expected_base_config_digest
+    )
+    assert manifest["occupancy_sidecars"]["query_geometry"][
+        "base_config_digest"
+    ] == expected_base_config_digest
 
 
 def test_sidecar_seal_rejects_missing_extra_and_reordered_evidence(

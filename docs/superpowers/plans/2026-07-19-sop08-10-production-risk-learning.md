@@ -27,6 +27,15 @@
   evaluation-collection publisher, which must join each record to an
   authenticated risk shard and verify its sample ID and labels.  This status
   is not added to `RiskSample` inputs or metadata.
+- `base_config_digest` is one shared cross-publication identity, not a
+  per-module choice: finite canonical JSON (`sort_keys=True`, compact
+  separators, UTF-8, no NaN/Inf) followed by BLAKE2b-128.  SOP07 sample
+  provenance, occupancy seals, and evaluation robot-footprint provenance must
+  use `src.utils.config.config_digest` and compare the same 32-hex field.
+  A SHA-256 variant must not substitute for this join identity.  Because no
+  evaluation-record collection has yet been formally published, the earlier
+  SHA-shaped draft record is invalidated before first publication rather than
+  supported through a dual-algorithm compatibility path.
 
 ---
 

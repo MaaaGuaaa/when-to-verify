@@ -8,9 +8,7 @@ levels before returning a dataset descriptor.
 
 from __future__ import annotations
 
-import ctypes
 from dataclasses import asdict, dataclass
-import errno
 import hashlib
 import json
 import math
@@ -45,6 +43,7 @@ from src.datasets.sidecar_writer import (
     risk_sidecar_pair_completion_marker_path,
 )
 from src.utils.config import ConfigError, load_config
+from src.utils.atomic_publish import atomic_rename_noreplace
 from src.utils.seeding import stable_digest
 
 
@@ -368,50 +367,9 @@ def _absolute_without_symlink_resolution(path: Path) -> Path:
 
 
 def _atomic_rename_directory_noreplace(source: Path, destination: Path) -> None:
-    """Atomically rename a directory while refusing an existing destination."""
+    """Publish through the repository's portable immutable-path primitive."""
 
-    source_path = _absolute_without_symlink_resolution(Path(source))
-    destination_path = _absolute_without_symlink_resolution(Path(destination))
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-    except OSError as exc:  # pragma: no cover - Linux libc is always loadable
-        raise OSError(errno.ENOSYS, "libc is unavailable for renameat2") from exc
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(
-            errno.ENOSYS,
-            "libc renameat2 is unavailable; refusing overwrite-capable fallback",
-        )
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        -100,  # AT_FDCWD
-        os.fsencode(source_path),
-        -100,  # AT_FDCWD
-        os.fsencode(destination_path),
-        1,  # RENAME_NOREPLACE
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno() or errno.EIO
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(
-            error_number,
-            os.strerror(error_number),
-            destination_path,
-        )
-    raise OSError(
-        error_number,
-        os.strerror(error_number),
-        destination_path,
-    )
+    atomic_rename_noreplace(source, destination)
 
 
 def _assert_no_symlink_components(

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-import ctypes
 from dataclasses import asdict, dataclass
-import errno
 import hashlib
 import io
 import json
@@ -41,6 +39,7 @@ from src.models.risk_model import (
     load_risk_checkpoint,
     save_risk_checkpoint,
 )
+from src.utils.atomic_publish import atomic_rename_noreplace
 
 
 PRODUCTION_RISK_TRAINING_LAYOUT_VERSION = "sop09_production_training_v1"
@@ -558,36 +557,7 @@ def _absolute(path: str | Path) -> Path:
 
 
 def _atomic_rename_directory_noreplace(source: Path, destination: Path) -> None:
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = libc.renameat2
-    except (OSError, AttributeError) as exc:
-        raise OSError(
-            errno.ENOSYS,
-            "renameat2 is unavailable; refusing overwrite-capable fallback",
-        ) from exc
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        -100,
-        os.fsencode(source),
-        -100,
-        os.fsencode(destination),
-        1,
-    )
-    if result == 0:
-        return
-    code = ctypes.get_errno()
-    if code == errno.EEXIST:
-        raise FileExistsError(f"refusing to overwrite existing output: {destination}")
-    raise OSError(code, os.strerror(code), os.fspath(destination))
+    atomic_rename_noreplace(source, destination)
 
 
 def _move_batch(batch: RiskBatch, device: torch.device) -> RiskBatch:

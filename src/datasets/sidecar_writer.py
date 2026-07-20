@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -22,6 +21,7 @@ import numpy as np
 from src.contracts import SCHEMA_VERSION, GridSpec
 from src.datasets.split_manager import SPLIT_NAMES
 from src.generation.risk_sidecars import RiskLabelSidecar
+from src.utils.atomic_publish import atomic_rename_noreplace
 
 
 RISK_SIDECAR_SHARD_LAYOUT_VERSION = "risk_label_sidecar_shard_v1"
@@ -446,46 +446,9 @@ def _semantic_digest(
 
 
 def _atomic_rename_directory_noreplace(source: Path, destination: Path) -> None:
-    """Use Linux ``renameat2(RENAME_NOREPLACE)``; never fall back to clobber."""
+    """Publish through the repository's portable immutable-path primitive."""
 
-    source_path = Path(os.path.abspath(os.fspath(source)))
-    destination_path = Path(os.path.abspath(os.fspath(destination)))
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-    except OSError as exc:  # pragma: no cover - Linux libc is always available
-        raise OSError(errno.ENOSYS, "libc unavailable for renameat2") from exc
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(
-            errno.ENOSYS,
-            "renameat2 unavailable; refusing overwrite-capable fallback",
-        )
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        -100,
-        os.fsencode(source_path),
-        -100,
-        os.fsencode(destination_path),
-        1,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno() or errno.EIO
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(
-            error_number,
-            os.strerror(error_number),
-            destination_path,
-        )
-    raise OSError(error_number, os.strerror(error_number), destination_path)
+    atomic_rename_noreplace(source, destination)
 
 
 def _capture_owned_path(

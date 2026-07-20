@@ -184,6 +184,8 @@ def build_real_verification_input(
     base_config: Mapping[str, Any],
     sop05_batch_digest: str,
     sop07_collection_digest: str,
+    scientific_status: str,
+    cross_split_status: str,
 ) -> VerificationPipelineInput:
     """Render deployment history and retain oracle state only in label fields."""
 
@@ -212,11 +214,20 @@ def build_real_verification_input(
         source.event.world, grid
     )
     event_id = source.event.generated_event_id
-    namespace = f"sop05/train/{event_id}"
+    split = source.base_state.split
+    if split not in {"train", "calibration", "val", "test"}:
+        raise ValueError("real verification source split is unsupported")
+    expected_status = f"{split}_smoke_only"
+    if scientific_status != expected_status:
+        raise ValueError("real verification scientific status differs from split")
+    if cross_split_status not in {"NOT_PROVEN", "PROVEN"}:
+        raise ValueError("real verification cross-split status is invalid")
+    source_mode = "sop05-train" if split == "train" else "sop05-heldout"
+    namespace = f"sop05/{split}/{event_id}"
     provenance = {
-        "source_mode": "sop05-train",
-        "scientific_status": "train_smoke_only",
-        "cross_split_status": "NOT_PROVEN",
+        "source_mode": source_mode,
+        "scientific_status": scientific_status,
+        "cross_split_status": cross_split_status,
         "source_event_id": event_id,
         "source_snippet_id": source.source_snippet.snippet_id,
         "source_trajectory_id": source.nominal_trajectory.trajectory_id,
@@ -230,7 +241,7 @@ def build_real_verification_input(
         ),
     }
     return VerificationPipelineInput(
-        split="train",
+        split=split,
         base_state_id=source.base_state.state_id,
         source_namespace=namespace,
         grid=grid,

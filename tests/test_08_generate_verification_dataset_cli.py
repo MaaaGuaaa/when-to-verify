@@ -98,6 +98,27 @@ def test_real_mode_never_falls_back_when_trust_paths_are_missing(tmp_path):
         module.main(args)
 
 
+def test_heldout_mode_requires_explicit_split_and_never_falls_back(tmp_path):
+    module = _module()
+    args = _toy_args(tmp_path / "heldout")
+    args[args.index("toy")] = "sop05-heldout"
+    with pytest.raises(ValueError, match="--split"):
+        module.main(args)
+
+    args.extend(["--split", "val"])
+    with pytest.raises(ValueError, match="required for sop05-heldout"):
+        module.main(args)
+
+
+def test_heldout_mode_rejects_per_split_soft_posterior_fitting(tmp_path):
+    module = _module()
+    args = _toy_args(tmp_path / "heldout-soft")
+    args[args.index("toy")] = "sop05-heldout"
+    args.extend(["--split", "test", "--posterior-mode", "soft"])
+    with pytest.raises(ValueError, match="frozen train normalizer"):
+        module.main(args)
+
+
 def test_real_source_selection_retries_only_typed_ineligibility():
     module = _module()
 

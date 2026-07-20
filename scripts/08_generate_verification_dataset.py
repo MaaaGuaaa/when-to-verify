@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate bounded SOP13 toy or audited-train verification smoke data."""
+"""Generate bounded SOP13 toy or audited four-split verification smoke data."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from src.utils.config import load_config
 from src.utils.seeding import derive_seed
 
 
-GENERATION_VERSION = "verification_dataset_cli_v1"
+GENERATION_VERSION = "verification_dataset_cli_v2"
 _REAL_REQUIRED_ARGS = (
     "sop03_root",
     "sop04_root",
@@ -52,7 +52,10 @@ _REAL_REQUIRED_ARGS = (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("toy", "sop05-train"), required=True)
+    parser.add_argument(
+        "--mode", choices=("toy", "sop05-train", "sop05-heldout"), required=True
+    )
+    parser.add_argument("--split", choices=("train", "calibration", "val", "test"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sample-count", type=int, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -99,12 +102,37 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.posterior_mode == "exact" and args.posterior_temperature is not None:
         raise ValueError("exact posterior does not accept --posterior-temperature")
-    if args.mode == "sop05-train":
+    if args.mode == "toy" and args.split is not None:
+        raise ValueError("toy mode does not accept --split")
+    if args.mode == "sop05-train" and args.split not in (None, "train"):
+        raise ValueError("sop05-train requires --split train when split is explicit")
+    if args.mode == "sop05-heldout" and args.split not in {
+        "calibration",
+        "val",
+        "test",
+    }:
+        raise ValueError(
+            "sop05-heldout requires explicit --split calibration, val, or test"
+        )
+    if args.mode == "sop05-heldout" and args.posterior_mode == "soft":
+        raise ValueError(
+            "held-out soft posterior requires a frozen train normalizer; "
+            "per-split fitting is forbidden"
+        )
+    if args.mode != "toy":
         missing = [name for name in _REAL_REQUIRED_ARGS if getattr(args, name) is None]
         if missing:
             raise ValueError(
-                "required for sop05-train: " + ", ".join(name.replace("_", "-") for name in missing)
+                f"required for {args.mode}: "
+                + ", ".join(name.replace("_", "-") for name in missing)
             )
+
+
+def _resolved_split(args: argparse.Namespace) -> str:
+    if args.mode in {"toy", "sop05-train"}:
+        return "train"
+    assert args.split in {"calibration", "val", "test"}
+    return str(args.split)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -200,9 +228,10 @@ def _implementation_digest(root: Path, config_paths: Sequence[Path]) -> str:
         Path("src/generation/verification_gt.py"),
         Path("src/datasets/verification_dataset.py"),
         Path("src/datasets/verification_dataloader.py"),
+        Path("src/datasets/verification_sources.py"),
     )
     digest = hashlib.sha256()
-    digest.update(b"verification-smoke-implementation-v1\0")
+    digest.update(b"verification-smoke-implementation-v2\0")
     for path in (*[root / value for value in relative_files], *config_paths):
         payload = path.read_bytes()
         label = str(path.name).encode("utf-8")
@@ -216,6 +245,7 @@ def _implementation_digest(root: Path, config_paths: Sequence[Path]) -> str:
 def _collection_digest(
     *,
     mode: str,
+    split: str,
     scientific_status: str,
     sample_count: int,
     group_count: int,
@@ -231,6 +261,7 @@ def _collection_digest(
         "generation_version": GENERATION_VERSION,
         "pipeline_version": VERIFICATION_PIPELINE_VERSION,
         "mode": mode,
+        "split": split,
         "scientific_status": scientific_status,
         "sample_count": sample_count,
         "group_count": group_count,
@@ -242,7 +273,7 @@ def _collection_digest(
         "implementation_digest_sha256": implementation_digest,
     }
     digest = hashlib.sha256()
-    digest.update(b"verification-collection-semantic-v1\0")
+    digest.update(b"verification-collection-semantic-v2\0")
     digest.update(_canonical_bytes(semantic))
     return digest.hexdigest()
 
@@ -254,11 +285,15 @@ def _write_collection(
     grid,
     library,
     scientific_status: str,
+    split: str,
     source_summary: dict[str, object],
     scenario_bank_digests: Sequence[str],
     posterior_temperature: float | None,
     elapsed_seconds: float,
 ) -> dict[str, object]:
+    observed_splits = {sample.split for sample in samples}
+    if observed_splits != {split}:
+        raise ValueError("generated samples differ from the declared collection split")
     output = args.output_dir
     if output.exists():
         raise FileExistsError(f"refusing to overwrite immutable output: {output}")
@@ -283,6 +318,7 @@ def _write_collection(
         )
         collection_digest = _collection_digest(
             mode=args.mode,
+            split=split,
             scientific_status=scientific_status,
             sample_count=args.sample_count,
             group_count=args.sample_count // 6,
@@ -293,21 +329,28 @@ def _write_collection(
             posterior_mode=args.posterior_mode,
             implementation_digest=implementation_digest,
         )
-        limitations = [
-            (
-                "toy data are not paper-scale evidence"
-                if args.mode == "toy"
-                else "train-only smoke data are not paper-scale evidence"
-            ),
-            "validation/test performance and cross-split leakage are not proven",
-        ]
+        if args.mode == "toy":
+            limitations = [
+                "toy data are not paper-scale evidence",
+                "validation/test performance and cross-split leakage are not proven",
+            ]
+        elif split == "train":
+            limitations = [
+                "train-only smoke data are not paper-scale evidence",
+                "validation/test performance and cross-split leakage are not proven",
+            ]
+        else:
+            limitations = [
+                "held-out smoke data are not paper-scale evidence",
+                "cross-split leakage is not proven by this per-split output",
+            ]
         report: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "generation_version": GENERATION_VERSION,
             "pipeline_version": VERIFICATION_PIPELINE_VERSION,
             "mode": args.mode,
             "scientific_status": scientific_status,
-            "split": "train",
+            "split": split,
             "sample_count": args.sample_count,
             "group_count": args.sample_count // 6,
             "bank_size": args.bank_size,
@@ -337,7 +380,7 @@ def _write_collection(
             "handoff_version": "verification_collection_handoff_v1",
             "collection_state": "complete",
             "scientific_status": scientific_status,
-            "split": "train",
+            "split": split,
             "sample_count": args.sample_count,
             "group_count": args.sample_count // 6,
             "collection_semantic_digest": collection_digest,
@@ -366,6 +409,7 @@ def _write_collection(
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     _validate_args(args)
+    split = _resolved_split(args)
     if args.output_dir.exists():
         raise FileExistsError(
             f"refusing to overwrite immutable output: {args.output_dir}"
@@ -420,6 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.sop07_collection_handoff,
             expected_sop05_batch_digest=args.expected_sop05_batch_digest,
             expected_sop07_collection_digest=args.expected_sop07_collection_digest,
+            expected_split=split,
         )
         grid = build_grid_spec(config)
         bundle = load_joined_source_events(
@@ -437,6 +482,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_config=config,
                 sop05_batch_digest=index.sop05_batch_digest,
                 sop07_collection_digest=index.sop07_collection_digest,
+                scientific_status=index.scientific_status,
+                cross_split_status=index.global_cross_split_leakage,
             )
             return generate_verification_group(
                 source,
@@ -467,7 +514,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         scientific_status = index.scientific_status
         source_summary = {
-            "mode": "sop05-train",
+            "mode": args.mode,
+            "split": split,
             "sop05_batch_digest": index.sop05_batch_digest,
             "sop07_collection_digest": index.sop07_collection_digest,
             "cross_split_status": index.global_cross_split_leakage,
@@ -494,6 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         grid=grid,
         library=action_library,
         scientific_status=scientific_status,
+        split=split,
         source_summary=source_summary,
         scenario_bank_digests=scenario_digests,
         posterior_temperature=posterior_temperature,

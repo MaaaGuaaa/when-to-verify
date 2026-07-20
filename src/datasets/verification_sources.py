@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -23,9 +24,31 @@ from src.generation.sop05_output_loader import load_complete_sop05_events
 from src.utils.seeding import stable_digest
 
 
-VERIFICATION_SOURCE_INDEX_VERSION = "verification_source_index_v1"
-_BATCH_HANDOFF_VERSION = "sop05_batch_index_handoff_v1"
-_COLLECTION_HANDOFF_VERSION = "sop07_collection_complete_handoff_v1"
+VERIFICATION_SOURCE_INDEX_VERSION = "verification_source_index_v2"
+_SPLITS = ("train", "calibration", "val", "test")
+_SCIENTIFIC_STATUS = {
+    split: f"{split}_smoke_only" for split in _SPLITS
+}
+_BATCH_CONTRACTS = {
+    "train": (
+        "sop05_batch_index_handoff_v1",
+        "sop05_train_batch_complete_index",
+    ),
+    "heldout": (
+        "sop05_heldout_batch_complete_handoff_v1",
+        "sop05_heldout_batch_complete_index",
+    ),
+}
+_COLLECTION_CONTRACTS = {
+    "train": (
+        "sop07_collection_complete_handoff_v1",
+        "sop07_train_collection_complete_handoff",
+    ),
+    "heldout": (
+        "sop07_heldout_collection_complete_handoff_v1",
+        "sop07_heldout_collection_complete_handoff",
+    ),
+}
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
@@ -139,6 +162,69 @@ def _safe_relative_root(value: object, *, name: str) -> str:
     return text
 
 
+def _safe_launch_manifest(value: object) -> str:
+    text = _string(value, name="SOP07 launch manifest relative_path")
+    path = PurePosixPath(text)
+    if (
+        path.is_absolute()
+        or len(path.parts) != 1
+        or text != "batch_launch_manifest.json"
+    ):
+        raise ValueError("SOP07 launch manifest must use its canonical relative path")
+    return text
+
+
+def _sha256_file(path: Path, *, label: str) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a real file")
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError(f"cannot read {label}") from exc
+    return digest.hexdigest()
+
+
+def _source_batch_binding(
+    collection: Mapping[str, object],
+    *,
+    collection_path: Path,
+    split: str,
+    collection_commit: str,
+) -> Mapping[str, object]:
+    launch_evidence = _mapping(
+        collection.get("launch_evidence"), name="SOP07 launch evidence"
+    )
+    if split == "train":
+        return _mapping(
+            launch_evidence.get("source_sop05_batch"),
+            name="SOP07 source SOP05 batch",
+        )
+
+    relative = _safe_launch_manifest(launch_evidence.get("relative_path"))
+    expected_digest = _digest(
+        launch_evidence.get("sha256"), name="SOP07 launch manifest digest"
+    )
+    launch_path = collection_path.parent / relative
+    observed_digest = _sha256_file(launch_path, label="SOP07 launch manifest")
+    if observed_digest != expected_digest:
+        raise ValueError("SOP07 launch manifest digest mismatch")
+    launch = _strict_json(launch_path, label="SOP07 launch manifest")
+    if launch.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("SOP07 launch manifest schema mismatch")
+    if launch.get("split") != split:
+        raise ValueError("SOP07 launch manifest split mismatch")
+    if launch.get("code_commit") != collection_commit:
+        raise ValueError("SOP07 launch manifest code commit mismatch")
+    if launch.get("artifact_role") != f"sop07_{split}_batch_launch_manifest":
+        raise ValueError("SOP07 launch manifest artifact role mismatch")
+    return _mapping(
+        launch.get("source_sop05_batch"), name="SOP07 source SOP05 batch"
+    )
+
+
 def _validate_sop03_lock(value: object) -> Mapping[str, object]:
     lock = _mapping(value, name="SOP03 input lock")
     required = {
@@ -205,6 +291,7 @@ def load_verification_source_index(
     *,
     expected_sop05_batch_digest: str,
     expected_sop07_collection_digest: str,
+    expected_split: str = "train",
 ) -> VerificationSourceIndex:
     """Bind two retained handoffs to caller-supplied external trust anchors."""
 
@@ -218,6 +305,12 @@ def load_verification_source_index(
         name="SOP07 collection",
         anchor=True,
     )
+    split = _string(expected_split, name="expected split")
+    if split not in _SPLITS:
+        raise ValueError(f"expected split must be one of {_SPLITS}")
+    contract_kind = "train" if split == "train" else "heldout"
+    batch_version, batch_role = _BATCH_CONTRACTS[contract_kind]
+    collection_version, collection_role = _COLLECTION_CONTRACTS[contract_kind]
     batch_path = Path(sop05_batch_handoff)
     collection_path = Path(sop07_collection_handoff)
     batch = _strict_json(batch_path, label="SOP05 batch handoff")
@@ -225,12 +318,14 @@ def load_verification_source_index(
 
     if batch.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("SOP05 batch schema version mismatch")
-    if batch.get("handoff_version") != _BATCH_HANDOFF_VERSION:
+    if batch.get("handoff_version") != batch_version:
         raise ValueError("unsupported SOP05 batch handoff version")
-    if batch.get("artifact_role") != "sop05_train_batch_complete_index":
+    if batch.get("artifact_role") != batch_role:
         raise ValueError("SOP05 batch artifact role mismatch")
     if batch.get("batch_state") != "complete":
         raise ValueError("SOP05 batch is not complete")
+    if batch.get("split") != split:
+        raise ValueError(f"SOP05 batch split differs from expected split {split}")
     observed_batch = _digest(
         batch.get("batch_semantic_digest_sha256"), name="SOP05 batch digest"
     )
@@ -241,16 +336,19 @@ def load_verification_source_index(
     input_lock = _mapping(common.get("input_lock"), name="SOP05 input lock")
     if input_lock.get("version") != "sop05_input_lock_v2":
         raise ValueError("unsupported SOP05 input lock version")
-    if input_lock.get("split") != "train":
-        raise ValueError("SOP05 input lock split must be train")
+    if input_lock.get("split") != split:
+        raise ValueError(f"SOP05 input lock split differs from expected split {split}")
     if "sop03" not in input_lock or "sop04" not in input_lock:
         raise ValueError("SOP05 input lock must contain SOP03 and SOP04")
     sop03_lock = _validate_sop03_lock(input_lock["sop03"])
     sop04_lock = _validate_sop04_lock(input_lock["sop04"])
     counts = _mapping(batch.get("counts"), name="SOP05 counts")
     event_count = _integer(counts.get("events"), name="SOP05 event count", minimum=1)
-    if counts.get("planned_events") != event_count:
+    if split == "train" and counts.get("planned_events") != event_count:
         raise ValueError("SOP05 planned/event count mismatch")
+    if split != "train" and "planned_events" in counts:
+        if counts.get("planned_events") != event_count:
+            raise ValueError("SOP05 held-out planned/event count mismatch")
     shard_count = _integer(counts.get("shards"), name="SOP05 shard count", minimum=1)
     raw_shards = batch.get("shards")
     if not isinstance(raw_shards, list) or len(raw_shards) != shard_count:
@@ -287,14 +385,14 @@ def load_verification_source_index(
 
     if collection.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("SOP07 collection schema version mismatch")
-    if collection.get("handoff_version") != _COLLECTION_HANDOFF_VERSION:
+    if collection.get("handoff_version") != collection_version:
         raise ValueError("unsupported SOP07 collection handoff version")
-    if collection.get("artifact_role") != "sop07_train_collection_complete_handoff":
+    if collection.get("artifact_role") != collection_role:
         raise ValueError("SOP07 collection artifact role mismatch")
     if collection.get("collection_state") != "complete":
         raise ValueError("SOP07 collection is not complete")
-    if collection.get("split") != "train":
-        raise ValueError("SOP07 handoff must remain train-only")
+    if collection.get("split") != split:
+        raise ValueError(f"SOP07 handoff split differs from expected split {split}")
     observed_collection = _digest(
         collection.get("collection_semantic_digest_sha256"),
         name="SOP07 collection digest",
@@ -311,13 +409,14 @@ def load_verification_source_index(
         raise ValueError("SOP07 generation evidence join is not proven")
     if downstream.get("global_sample_id_uniqueness") != "PROVEN":
         raise ValueError("SOP07 global sample ID uniqueness is not proven")
-    if downstream.get("global_cross_split_leakage") != "NOT_PROVEN":
-        raise ValueError("train-only SOP07 cross-split status must remain NOT_PROVEN")
-    source_batch = _mapping(
-        _mapping(
-            collection.get("launch_evidence"), name="SOP07 launch evidence"
-        ).get("source_sop05_batch"),
-        name="SOP07 source SOP05 batch",
+    cross_split_status = downstream.get("global_cross_split_leakage")
+    if cross_split_status != "NOT_PROVEN":
+        raise ValueError("per-split SOP07 cross-split status must remain NOT_PROVEN")
+    source_batch = _source_batch_binding(
+        collection,
+        collection_path=collection_path,
+        split=split,
+        collection_commit=collection_commit,
     )
     if (
         source_batch.get("batch_semantic_digest_sha256") != observed_batch
@@ -348,9 +447,9 @@ def load_verification_source_index(
     return VerificationSourceIndex(
         version=VERIFICATION_SOURCE_INDEX_VERSION,
         schema_version=SCHEMA_VERSION,
-        split="train",
-        scientific_status="train_smoke_only",
-        global_cross_split_leakage="NOT_PROVEN",
+        split=split,
+        scientific_status=_SCIENTIFIC_STATUS[split],
+        global_cross_split_leakage=str(cross_split_status),
         sop05_batch_root=batch_path.parent,
         sop05_batch_digest=observed_batch,
         sop05_code_commit=batch_commit,

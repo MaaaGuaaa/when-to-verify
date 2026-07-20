@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 import json
 
 import numpy as np
@@ -55,6 +56,7 @@ def _batch_handoff():
         "counts": {"events": 2, "planned_events": 2, "shards": 2},
         "handoff_version": "sop05_batch_index_handoff_v1",
         "schema_version": "3.0.0",
+        "split": "train",
         "shards": [
             {
                 "event_count": 1,
@@ -114,7 +116,46 @@ def _collection_handoff():
     }
 
 
-def _write_handoffs(tmp_path, *, batch=None, collection=None):
+def _heldout_handoffs(split):
+    batch = deepcopy(_batch_handoff())
+    batch.update(
+        {
+            "artifact_role": "sop05_heldout_batch_complete_index",
+            "handoff_version": "sop05_heldout_batch_complete_handoff_v1",
+            "split": split,
+        }
+    )
+    batch["common_contracts"]["input_lock"]["split"] = split
+    del batch["counts"]["planned_events"]
+    launch = {
+        "artifact_role": f"sop07_{split}_batch_launch_manifest",
+        "code_commit": "f" * 40,
+        "schema_version": "3.0.0",
+        "source_sop05_batch": {
+            "batch_semantic_digest_sha256": BATCH_DIGEST,
+            "event_count": 2,
+            "shard_count": 2,
+        },
+        "split": split,
+    }
+    launch_bytes = json.dumps(launch).encode("utf-8")
+    collection = deepcopy(_collection_handoff())
+    collection.update(
+        {
+            "artifact_role": "sop07_heldout_collection_complete_handoff",
+            "handoff_version": "sop07_heldout_collection_complete_handoff_v1",
+            "launch_evidence": {
+                "absolute_source_paths_omitted": True,
+                "relative_path": "batch_launch_manifest.json",
+                "sha256": hashlib.sha256(launch_bytes).hexdigest(),
+            },
+            "split": split,
+        }
+    )
+    return batch, collection, launch_bytes
+
+
+def _write_handoffs(tmp_path, *, batch=None, collection=None, launch_bytes=None):
     batch_path = tmp_path / "sop05" / "batch_complete_handoff.json"
     collection_path = tmp_path / "sop07" / "collection_complete_handoff.json"
     batch_path.parent.mkdir(parents=True)
@@ -123,6 +164,10 @@ def _write_handoffs(tmp_path, *, batch=None, collection=None):
     collection_path.write_text(
         json.dumps(collection or _collection_handoff()), encoding="utf-8"
     )
+    if launch_bytes is not None:
+        (collection_path.parent / "batch_launch_manifest.json").write_bytes(
+            launch_bytes
+        )
     return batch_path, collection_path
 
 
@@ -148,6 +193,63 @@ def test_loads_train_only_index_and_deterministic_shard_selection(tmp_path):
     assert first == repeated
     assert len(first) == 1
     assert first[0].root == batch_path.parent / first[0].relative_root
+
+
+@pytest.mark.parametrize("split", ["calibration", "val", "test"])
+def test_loads_strict_heldout_index_with_hashed_launch_binding(tmp_path, split):
+    batch, collection, launch_bytes = _heldout_handoffs(split)
+    batch_path, collection_path = _write_handoffs(
+        tmp_path,
+        batch=batch,
+        collection=collection,
+        launch_bytes=launch_bytes,
+    )
+
+    index = load_verification_source_index(
+        batch_path,
+        collection_path,
+        expected_sop05_batch_digest=BATCH_DIGEST,
+        expected_sop07_collection_digest=COLLECTION_DIGEST,
+        expected_split=split,
+    )
+
+    assert index.split == split
+    assert index.scientific_status == f"{split}_smoke_only"
+    assert index.global_cross_split_leakage == "NOT_PROVEN"
+    assert index.event_count == 2
+
+
+def test_heldout_index_rejects_launch_tampering_and_explicit_split_mismatch(tmp_path):
+    batch, collection, launch_bytes = _heldout_handoffs("val")
+    batch_path, collection_path = _write_handoffs(
+        tmp_path / "tampered",
+        batch=batch,
+        collection=collection,
+        launch_bytes=launch_bytes + b"\n",
+    )
+    with pytest.raises(ValueError, match="launch manifest digest"):
+        load_verification_source_index(
+            batch_path,
+            collection_path,
+            expected_sop05_batch_digest=BATCH_DIGEST,
+            expected_sop07_collection_digest=COLLECTION_DIGEST,
+            expected_split="val",
+        )
+
+    batch_path, collection_path = _write_handoffs(
+        tmp_path / "split",
+        batch=batch,
+        collection=collection,
+        launch_bytes=launch_bytes,
+    )
+    with pytest.raises(ValueError, match="expected split"):
+        load_verification_source_index(
+            batch_path,
+            collection_path,
+            expected_sop05_batch_digest=BATCH_DIGEST,
+            expected_sop07_collection_digest=COLLECTION_DIGEST,
+            expected_split="test",
+        )
 
 
 @pytest.mark.parametrize(

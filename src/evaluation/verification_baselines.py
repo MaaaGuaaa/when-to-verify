@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 
-from src.contracts import ARRAY_DTYPE, STATE_CHANNELS, TRAJECTORY_CHANNELS
+from src.contracts import (
+    ARRAY_DTYPE,
+    STATE_CHANNELS,
+    TRAJECTORY_CHANNELS,
+    VerificationSample,
+)
+from src.evaluation.verification_metrics import evaluate_verification_predictions
 
 
 def _legal_arrays(
@@ -130,8 +138,62 @@ def occupancy_entropy_reduction_score(
     return float(np.sum(entropy[_newly_visible(state, fov)], dtype=np.float64))
 
 
+def evaluate_verification_baselines(
+    samples: Sequence[VerificationSample], *, huber_delta: float
+) -> dict[str, object]:
+    """Evaluate all legal deployment-side baselines on complete sample groups."""
+
+    rows = tuple(samples)
+    if not rows or any(not isinstance(sample, VerificationSample) for sample in rows):
+        raise ValueError("baseline evaluation requires VerificationSample values")
+    score_functions = {
+        "visible_area": lambda sample: visible_area_score(
+            state_channels=sample.state_channels,
+            verification_fov_mask=sample.verification_fov_mask,
+        ),
+        "critical_swept_coverage": lambda sample: critical_swept_coverage_score(
+            state_channels=sample.state_channels,
+            trajectory_channels=sample.trajectory_channels,
+            verification_fov_mask=sample.verification_fov_mask,
+        ),
+        "occupancy_entropy": lambda sample: occupancy_entropy_reduction_score(
+            state_channels=sample.state_channels,
+            verification_fov_mask=sample.verification_fov_mask,
+        ),
+    }
+    values = np.asarray([sample.value_target for sample in rows], dtype=np.float64)
+    useful = np.asarray([sample.useful_target for sample in rows], dtype=np.int64)
+    groups = tuple(str(sample.metadata["ranking_group_id"]) for sample in rows)
+    actions = tuple(sample.verification_action_id for sample in rows)
+    result: dict[str, object] = {}
+    for name, function in score_functions.items():
+        scores = np.asarray([function(sample) for sample in rows], dtype=np.float64)
+        report = evaluate_verification_predictions(
+            value_prediction=scores,
+            useful_probability=np.full(scores.shape, 0.5, dtype=np.float64),
+            value_target=values,
+            useful_target=useful,
+            group_ids=groups,
+            action_ids=actions,
+            huber_delta=huber_delta,
+        )
+        result[name] = {
+            key: report[key]
+            for key in (
+                "pairwise_accuracy",
+                "pair_count",
+                "top1_regret_mean",
+                "top_two_selection_rate",
+                "selected_action_counts",
+                "selected_action_proportions",
+            )
+        }
+    return result
+
+
 __all__ = (
     "critical_swept_coverage_score",
+    "evaluate_verification_baselines",
     "occupancy_entropy_reduction_score",
     "visible_area_score",
 )

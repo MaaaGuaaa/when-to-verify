@@ -66,8 +66,20 @@ class VerificationTrainingResult:
     device: str
 
 
+@dataclass(frozen=True)
+class VerificationEvaluationResult:
+    split: str
+    sample_count: int
+    group_count: int
+    losses: dict[str, float | int]
+    metrics: dict[str, object]
+    value_prediction: np.ndarray
+    useful_probability: np.ndarray
+    device: str
+
+
 def _validated_samples(
-    samples: Sequence[VerificationSample], *, grid: GridSpec
+    samples: Sequence[VerificationSample], *, grid: GridSpec, expected_split: str
 ) -> tuple[VerificationSample, ...]:
     if isinstance(samples, (str, bytes)) or not isinstance(samples, Sequence):
         raise TypeError("samples must be a sequence")
@@ -80,8 +92,12 @@ def _validated_samples(
         if not isinstance(sample, VerificationSample):
             raise TypeError("samples must contain VerificationSample values")
         validate_verification_sample(sample, grid)
-        if sample.split != "train":
-            raise ValueError("verification model fitting accepts train split only")
+        if sample.split != expected_split:
+            if expected_split == "train":
+                raise ValueError("verification model fitting accepts train split only")
+            raise ValueError(
+                "verification model evaluation requires one declared held-out split"
+            )
         verification_model_inputs(sample)
     audit_verification_groups(list(ordered), require_complete=True)
     return ordered
@@ -216,7 +232,7 @@ def train_verification_samples(
 
     if not isinstance(config, VerifyModelConfig):
         raise TypeError("config must be a VerifyModelConfig")
-    ordered = _validated_samples(samples, grid=grid)
+    ordered = _validated_samples(samples, grid=grid, expected_split="train")
     grouped = _groups(ordered)
     group_size = len(CANONICAL_ACTION_IDS)
     if config.training.batch_size % group_size != 0:
@@ -311,6 +327,69 @@ def train_verification_samples(
         loss_history=tuple(history),
         initial_loss=float(history[0]),
         final_loss=float(final_loss.total.item()),
+        metrics=metrics,
+        value_prediction=values,
+        useful_probability=probabilities,
+        device=str(device),
+    )
+
+
+def evaluate_verification_samples(
+    samples: Sequence[VerificationSample],
+    *,
+    grid: GridSpec,
+    config: VerifyModelConfig,
+    checkpoint: LoadedVerificationTrainingCheckpoint,
+    split: str,
+) -> VerificationEvaluationResult:
+    """Run deterministic CPU-only forward evaluation without optimizer updates."""
+
+    if split not in {"calibration", "val", "test"}:
+        raise ValueError("verification checkpoint evaluation is held-out only")
+    if not isinstance(config, VerifyModelConfig):
+        raise TypeError("config must be a VerifyModelConfig")
+    if not isinstance(checkpoint, LoadedVerificationTrainingCheckpoint):
+        raise TypeError("checkpoint must be a LoadedVerificationTrainingCheckpoint")
+    ordered = _validated_samples(samples, grid=grid, expected_split=split)
+    grouped = _groups(ordered)
+    device = torch.device("cpu")
+    model = VerificationValueModel(
+        grid=grid,
+        config=config.model,
+        initialization_seed=config.training.seed,
+    ).to(device)
+    try:
+        model.load_state_dict(checkpoint.model_state_dict, strict=True)
+    except RuntimeError as exc:
+        raise ValueError("checkpoint model state is incompatible with config") from exc
+    model.eval()
+    prediction, loss = _predict_and_loss(
+        model, ordered, config=config, device=device, gradients=False
+    )
+    values = prediction.g_pred.detach().cpu().numpy().astype(np.float64)
+    probabilities = prediction.p_useful.detach().cpu().numpy().astype(np.float64)
+    losses: dict[str, float | int] = {
+        "total": float(loss.total.item()),
+        "value_regression": float(loss.value_regression.item()),
+        "useful_classification": float(loss.useful_classification.item()),
+        "pairwise_ranking": float(loss.pairwise_ranking.item()),
+        "pair_count": int(loss.pair_count),
+    }
+    if not np.isfinite(
+        [value for key, value in losses.items() if key != "pair_count"]
+    ).all():
+        raise ValueError("verification evaluation losses must be finite")
+    metrics = _metric_report(
+        ordered,
+        value_prediction=values,
+        useful_probability=probabilities,
+        huber_delta=config.loss.huber_delta,
+    )
+    return VerificationEvaluationResult(
+        split=split,
+        sample_count=len(ordered),
+        group_count=len(grouped),
+        losses=losses,
         metrics=metrics,
         value_prediction=values,
         useful_probability=probabilities,
@@ -425,7 +504,9 @@ def load_verification_training_checkpoint(
 __all__ = (
     "LoadedVerificationTrainingCheckpoint",
     "VERIFICATION_TRAINING_CHECKPOINT_VERSION",
+    "VerificationEvaluationResult",
     "VerificationTrainingResult",
+    "evaluate_verification_samples",
     "load_verification_training_checkpoint",
     "train_verification_samples",
     "write_verification_training_checkpoint",

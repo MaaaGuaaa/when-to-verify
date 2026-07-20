@@ -328,4 +328,3 @@ SOP03–07 loaders, optional PyTorch 2.x, pytest, compressed NPZ + JSONL.
 For the real smoke and model smoke, run the same Python executable inside a
 CPU-only Slurm allocation (`-p gpu --cpus-per-task=2`, no GPU request), save
 outputs under `outputs/`, and do not stage them.
-

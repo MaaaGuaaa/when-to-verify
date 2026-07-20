@@ -341,6 +341,7 @@ def _sample(
     split: str,
     target_type_policy_digest: str,
     base_config_digest: str,
+    identity_prefixes: Mapping[str, str],
 ) -> RiskSample:
     event_types = (
         "collision",
@@ -356,13 +357,17 @@ def _sample(
     # published labels remain collision=0 and near_miss=1.
     near_miss = event_type in {"near_miss", "temporal_safe"}
     value = float(index + 1) / 20.0
-    sample_id = f"{split}-formal-{index:03d}"
-    base_state_id = f"base-state-{index:03d}"
+    identities = {
+        field: f"{prefix}-{index:03d}"
+        for field, prefix in identity_prefixes.items()
+    }
+    sample_id = identities["sample_id"]
+    base_state_id = f"{split}-base-state-{index:03d}"
     return RiskSample(
         sample_id=sample_id,
         split=split,
         base_state_id=base_state_id,
-        pair_group_id=f"pair-group-{index:03d}",
+        pair_group_id=identities["pair_group_id"],
         event_type=event_type,
         bev_history=np.full(
             (
@@ -400,12 +405,12 @@ def _sample(
             },
             "trajectory_id": f"trajectory-{index % 3}",
             "provenance": {
-                "base_recording_id": f"base-recording-{index:03d}",
+                "base_recording_id": identities["base_recording_id"],
                 "base_session_id": "formal-base-session",
-                "source_recording_id": f"source-recording-{index:03d}",
+                "source_recording_id": identities["source_recording_id"],
                 "source_session_id": "formal-source-session",
-                "source_snippet_id": f"source-snippet-{index:03d}",
-                "seed_namespace": f"sop07/{split}/formal-{index:03d}",
+                "source_snippet_id": identities["source_snippet_id"],
+                "seed_namespace": identities["seed_namespace"],
                 "target_type_policy_digest": target_type_policy_digest,
                 "base_config_digest": base_config_digest,
                 "trajectory_primitive": {
@@ -435,6 +440,8 @@ def create_formal_risk_publication(
     history_steps: int = 2,
     future_steps: int = 3,
     handoff_dialect: str = "legacy",
+    identity_prefixes: Mapping[str, str] | None = None,
+    dynamic_human_radius_m: float | None = None,
 ) -> FormalRiskPublication:
     """Publish one compact formal SOP03 provenance root and SOP07 collection."""
 
@@ -446,6 +453,12 @@ def create_formal_risk_publication(
         history_steps=history_steps,
         future_steps=future_steps,
     )
+    if dynamic_human_radius_m is not None:
+        dynamic_objects = raw_base_config["dynamic_objects"]
+        assert isinstance(dynamic_objects, dict)
+        human = dynamic_objects["human"]
+        assert isinstance(human, dict)
+        human["radius_m"] = dynamic_human_radius_m
     base_config_path.write_text(
         yaml.safe_dump(raw_base_config, sort_keys=True), encoding="utf-8"
     )
@@ -485,6 +498,22 @@ def create_formal_risk_publication(
 
     collection_root = root / "collection"
     collection_root.mkdir()
+    prefixes = {
+        "sample_id": f"{split}-formal",
+        "base_recording_id": f"{split}-base-recording",
+        "source_recording_id": f"{split}-source-recording",
+        "source_snippet_id": f"{split}-source-snippet",
+        "pair_group_id": f"{split}-pair-group",
+        "seed_namespace": f"sop07/{split}/formal",
+    }
+    if identity_prefixes is not None:
+        unexpected = set(identity_prefixes) - set(prefixes)
+        if unexpected:
+            raise ValueError(
+                "unsupported formal identity prefix fields: "
+                + ", ".join(sorted(unexpected))
+            )
+        prefixes.update(identity_prefixes)
     samples = tuple(
         _sample(
             index,
@@ -492,6 +521,7 @@ def create_formal_risk_publication(
             split=split,
             target_type_policy_digest=target_type_policy_digest,
             base_config_digest=base_config_digest,
+            identity_prefixes=prefixes,
         )
         for index in range(12)
     )

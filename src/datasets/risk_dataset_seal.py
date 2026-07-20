@@ -85,7 +85,20 @@ _FAMILY_MANIFEST_KEYS = frozenset(
         "members",
         "common_contract",
         "cross_split_audit",
+        "production_evaluation_metadata",
         "risk_dataset_family_digest",
+    }
+)
+_PRODUCTION_EVALUATION_METADATA_KEYS = frozenset(
+    {
+        "layout_version",
+        "training_split",
+        "selection_split",
+        "calibration_fit_split",
+        "evaluation_split",
+        "test_used_for_training_or_selection",
+        "test_used_for_calibration",
+        "calibration_statistics_scope",
     }
 )
 _FAMILY_MEMBER_KEYS = frozenset(
@@ -93,6 +106,7 @@ _FAMILY_MEMBER_KEYS = frozenset(
         "split",
         "risk_dataset_manifest_digest",
         "sample_count",
+        "sample_ids_digest_sha256",
         "shard_count",
     }
 )
@@ -264,6 +278,15 @@ class LoadedRiskDataset:
 
 
 @dataclass(frozen=True)
+class RiskDatasetFamilyMemberSource:
+    """Explicit paths and pinned digest for authenticated family assembly."""
+
+    seal_root: Path
+    collection_root: Path
+    expected_manifest_digest: str
+
+
+@dataclass(frozen=True)
 class LoadedRiskDatasetFamily:
     """A complete immutable four-split risk-dataset family publication."""
 
@@ -271,6 +294,7 @@ class LoadedRiskDatasetFamily:
     manifest: dict[str, object]
     members: dict[str, dict[str, object]]
     cross_split_audit: dict[str, object]
+    production_evaluation_metadata: dict[str, object]
     risk_dataset_family_digest: str
 
 
@@ -2147,760 +2171,6 @@ def _canonical_mapping_copy(
     return _strict_json_loads(_canonical_json(value), label=label)
 
 
-def _family_split_pairs() -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (left, right)
-        for left_index, left in enumerate(_FAMILY_MEMBER_ORDER)
-        for right in _FAMILY_MEMBER_ORDER[left_index + 1 :]
-    )
-
-
-def _family_common_contract(dataset: LoadedRiskDataset) -> dict[str, object]:
-    return {
-        "schema_version": dataset.manifest["schema_version"],
-        "grid": _canonical_mapping_copy(
-            dataset.manifest["grid"], label="family member grid"
-        ),
-        "channel_spec": _canonical_mapping_copy(
-            dataset.manifest["channel_spec"],
-            label="family member channel_spec",
-        ),
-        "g1_split_manifest_digest": dataset.provenance[
-            "g1_split_manifest_digest"
-        ],
-        "dynamic_objects_config_digest": dataset.provenance[
-            "dynamic_objects_config_digest"
-        ],
-        "target_type_policy_digest": dataset.provenance[
-            "target_type_policy_digest"
-        ],
-    }
-
-
-def _family_identity_sets(
-    rows: tuple[dict[str, object], ...],
-    *,
-    split: str,
-) -> dict[str, set[str]]:
-    result = {
-        field: set()
-        for field in (
-            "sample_id",
-            "base_recording_id",
-            "source_recording_id",
-            "source_snippet_id",
-            "pair_group_id",
-            "seed_namespace",
-            "base_session_id",
-            "source_session_id",
-        )
-    }
-    for row in rows:
-        if row.get("split") != split:
-            raise RiskDataContractError(
-                f"family authenticated metadata row split mismatch for {split}"
-            )
-        for field in result:
-            result[field].add(
-                _require_nonempty_string(
-                    row.get(field), field=f"family metadata {split}.{field}"
-                )
-            )
-    if len(result["sample_id"]) != len(rows):
-        raise RiskDataContractError(
-            f"duplicate sample_id within authenticated family member {split}"
-        )
-    return result
-
-
-def _family_pair_overlap_values(
-    identities: Mapping[str, Mapping[str, set[str]]],
-    *,
-    field: str,
-    left: str,
-    right: str,
-) -> list[str]:
-    if field == "base_source_cross_role_recording_id":
-        values = (
-            identities[left]["base_recording_id"]
-            & identities[right]["source_recording_id"]
-        ) | (
-            identities[left]["source_recording_id"]
-            & identities[right]["base_recording_id"]
-        )
-    elif field == "base_source_cross_role_session_id":
-        values = (
-            identities[left]["base_session_id"]
-            & identities[right]["source_session_id"]
-        ) | (
-            identities[left]["source_session_id"]
-            & identities[right]["base_session_id"]
-        )
-    else:
-        values = identities[left][field] & identities[right][field]
-    return sorted(values)
-
-
-def _family_overlap_entry(
-    identities: Mapping[str, Mapping[str, set[str]]],
-    *,
-    field: str,
-) -> dict[str, object]:
-    pair_entries: list[dict[str, object]] = []
-    all_values: set[str] = set()
-    for left, right in _family_split_pairs():
-        values = _family_pair_overlap_values(
-            identities,
-            field=field,
-            left=left,
-            right=right,
-        )
-        all_values.update(values)
-        pair_entries.append(
-            {
-                "left_split": left,
-                "right_split": right,
-                "overlap_count": len(values),
-                "overlap_values": values,
-            }
-        )
-    ordered_values = sorted(all_values)
-    return {
-        "overlap_count": len(ordered_values),
-        "overlap_values": ordered_values,
-        "split_pair_overlaps": pair_entries,
-    }
-
-
-def _build_family_cross_split_audit(
-    identities: Mapping[str, Mapping[str, set[str]]],
-    *,
-    row_counts: Mapping[str, int],
-) -> dict[str, object]:
-    forbidden = {
-        field: _family_overlap_entry(identities, field=field)
-        for field in _FAMILY_FORBIDDEN_IDENTITY_FIELDS
-    }
-    for field in _FAMILY_FORBIDDEN_IDENTITY_FIELDS:
-        entry = forbidden[field]
-        if entry["overlap_count"]:
-            values = entry["overlap_values"]
-            assert isinstance(values, list)
-            preview = ", ".join(values[:3])
-            raise RiskDataContractError(
-                f"forbidden cross-split {field} overlap: {preview}"
-            )
-    allowed = {
-        field: _family_overlap_entry(identities, field=field)
-        for field in _FAMILY_ALLOWED_IDENTITY_FIELDS
-    }
-    return {
-        "policy_version": _FAMILY_AUDIT_POLICY_VERSION,
-        "member_order": list(_FAMILY_MEMBER_ORDER),
-        "authenticated_metadata_row_counts": {
-            split: row_counts[split] for split in _FAMILY_MEMBER_ORDER
-        },
-        "forbidden_overlaps": forbidden,
-        "allowed_overlaps": allowed,
-        "evidence_completeness": "PROVEN",
-        "global_sample_id_uniqueness": "PROVEN",
-        "global_cross_split_leakage": "PROVEN",
-    }
-
-
-def _risk_dataset_family_digest(manifest: Mapping[str, object]) -> str:
-    projection = {
-        key: value
-        for key, value in manifest.items()
-        if key != "risk_dataset_family_digest"
-    }
-    try:
-        payload = _canonical_json(projection).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise RiskDataContractError(
-            "dataset family manifest must be finite canonical JSON"
-        ) from exc
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _validate_family_member_descriptor(
-    value: object,
-    *,
-    split: str,
-) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _FAMILY_MEMBER_KEYS:
-        raise RiskDataContractError(
-            f"dataset family member descriptor keys mismatch for {split}"
-        )
-    if value.get("split") != split:
-        raise RiskDataContractError(
-            f"dataset family member descriptor split mismatch for {split}"
-        )
-    digest = _require_sha256(
-        value.get("risk_dataset_manifest_digest"),
-        field=f"members.{split}.risk_dataset_manifest_digest",
-    )
-    sample_count = _require_positive_int(
-        value.get("sample_count"), field=f"members.{split}.sample_count"
-    )
-    shard_count = _require_positive_int(
-        value.get("shard_count"), field=f"members.{split}.shard_count"
-    )
-    return {
-        "split": split,
-        "risk_dataset_manifest_digest": digest,
-        "sample_count": sample_count,
-        "shard_count": shard_count,
-    }
-
-
-def _validate_family_common_contract(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _FAMILY_COMMON_CONTRACT_KEYS:
-        raise RiskDataContractError("dataset family common_contract keys mismatch")
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise RiskDataContractError("dataset family common schema_version mismatch")
-    grid_value = _canonical_mapping_copy(
-        value.get("grid"), label="dataset family common grid"
-    )
-    _grid_from_manifest(grid_value)
-    channel_spec = _canonical_mapping_copy(
-        value.get("channel_spec"),
-        label="dataset family common channel_spec",
-    )
-    _validate_channel_spec(channel_spec)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "grid": grid_value,
-        "channel_spec": channel_spec,
-        "g1_split_manifest_digest": _require_blake2b128(
-            value.get("g1_split_manifest_digest"),
-            field="common_contract.g1_split_manifest_digest",
-        ),
-        "dynamic_objects_config_digest": _require_sha256(
-            value.get("dynamic_objects_config_digest"),
-            field="common_contract.dynamic_objects_config_digest",
-        ),
-        "target_type_policy_digest": _require_blake2b128(
-            value.get("target_type_policy_digest"),
-            field="common_contract.target_type_policy_digest",
-        ),
-    }
-
-
-def _validate_family_overlap_entry(
-    value: object,
-    *,
-    field: str,
-) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _FAMILY_OVERLAP_ENTRY_KEYS:
-        raise RiskDataContractError(
-            f"dataset family overlap audit keys mismatch for {field}"
-        )
-    overlap_count = _require_nonnegative_int(
-        value.get("overlap_count"), field=f"{field}.overlap_count"
-    )
-    overlap_values = value.get("overlap_values")
-    if (
-        not isinstance(overlap_values, list)
-        or any(not isinstance(item, str) or not item for item in overlap_values)
-        or overlap_values != sorted(set(overlap_values))
-        or len(overlap_values) != overlap_count
-    ):
-        raise RiskDataContractError(
-            f"dataset family overlap values are non-canonical for {field}"
-        )
-    raw_pairs = value.get("split_pair_overlaps")
-    expected_pairs = _family_split_pairs()
-    if not isinstance(raw_pairs, list) or len(raw_pairs) != len(expected_pairs):
-        raise RiskDataContractError(
-            f"dataset family split-pair audit coverage mismatch for {field}"
-        )
-    normalized_pairs: list[dict[str, object]] = []
-    union: set[str] = set()
-    for raw, (expected_left, expected_right) in zip(raw_pairs, expected_pairs):
-        if (
-            not isinstance(raw, Mapping)
-            or set(raw) != _FAMILY_SPLIT_PAIR_OVERLAP_KEYS
-            or raw.get("left_split") != expected_left
-            or raw.get("right_split") != expected_right
-        ):
-            raise RiskDataContractError(
-                f"dataset family split-pair audit order mismatch for {field}"
-            )
-        pair_count = _require_nonnegative_int(
-            raw.get("overlap_count"),
-            field=f"{field}.{expected_left}.{expected_right}.overlap_count",
-        )
-        pair_values = raw.get("overlap_values")
-        if (
-            not isinstance(pair_values, list)
-            or any(not isinstance(item, str) or not item for item in pair_values)
-            or pair_values != sorted(set(pair_values))
-            or len(pair_values) != pair_count
-        ):
-            raise RiskDataContractError(
-                f"dataset family split-pair values are non-canonical for {field}"
-            )
-        union.update(pair_values)
-        normalized_pairs.append(
-            {
-                "left_split": expected_left,
-                "right_split": expected_right,
-                "overlap_count": pair_count,
-                "overlap_values": list(pair_values),
-            }
-        )
-    if sorted(union) != list(overlap_values):
-        raise RiskDataContractError(
-            f"dataset family aggregate overlap values mismatch for {field}"
-        )
-    return {
-        "overlap_count": overlap_count,
-        "overlap_values": list(overlap_values),
-        "split_pair_overlaps": normalized_pairs,
-    }
-
-
-def _validate_family_cross_split_audit(
-    value: object,
-    *,
-    members: Mapping[str, Mapping[str, object]],
-) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _FAMILY_AUDIT_KEYS:
-        raise RiskDataContractError("dataset family cross_split_audit keys mismatch")
-    if value.get("policy_version") != _FAMILY_AUDIT_POLICY_VERSION:
-        raise RiskDataContractError("dataset family audit policy_version mismatch")
-    member_order = value.get("member_order")
-    if not isinstance(member_order, list) or tuple(member_order) != _FAMILY_MEMBER_ORDER:
-        raise RiskDataContractError("dataset family audit member_order mismatch")
-    raw_counts = value.get("authenticated_metadata_row_counts")
-    if not isinstance(raw_counts, Mapping) or set(raw_counts) != set(
-        _FAMILY_MEMBER_ORDER
-    ):
-        raise RiskDataContractError(
-            "dataset family authenticated metadata row-count coverage mismatch"
-        )
-    row_counts: dict[str, int] = {}
-    for split in _FAMILY_MEMBER_ORDER:
-        count = _require_positive_int(
-            raw_counts.get(split),
-            field=f"authenticated_metadata_row_counts.{split}",
-        )
-        if count != members[split]["sample_count"]:
-            raise RiskDataContractError(
-                f"dataset family authenticated row count differs for {split}"
-            )
-        row_counts[split] = count
-
-    raw_forbidden = value.get("forbidden_overlaps")
-    if not isinstance(raw_forbidden, Mapping) or set(raw_forbidden) != set(
-        _FAMILY_FORBIDDEN_IDENTITY_FIELDS
-    ):
-        raise RiskDataContractError("dataset family forbidden overlap coverage mismatch")
-    forbidden = {
-        field: _validate_family_overlap_entry(raw_forbidden[field], field=field)
-        for field in _FAMILY_FORBIDDEN_IDENTITY_FIELDS
-    }
-    for field, entry in forbidden.items():
-        if entry["overlap_count"] != 0:
-            raise RiskDataContractError(
-                f"dataset family forbidden overlap is nonzero for {field}"
-            )
-
-    raw_allowed = value.get("allowed_overlaps")
-    if not isinstance(raw_allowed, Mapping) or set(raw_allowed) != set(
-        _FAMILY_ALLOWED_IDENTITY_FIELDS
-    ):
-        raise RiskDataContractError("dataset family allowed overlap coverage mismatch")
-    allowed = {
-        field: _validate_family_overlap_entry(raw_allowed[field], field=field)
-        for field in _FAMILY_ALLOWED_IDENTITY_FIELDS
-    }
-    if value.get("evidence_completeness") != "PROVEN":
-        raise RiskDataContractError(
-            "dataset family cross-split evidence is not complete"
-        )
-    if value.get("global_sample_id_uniqueness") != "PROVEN":
-        raise RiskDataContractError(
-            "dataset family global sample_id uniqueness is not proven"
-        )
-    if value.get("global_cross_split_leakage") != "PROVEN":
-        raise RiskDataContractError(
-            "dataset family global cross-split leakage is not proven"
-        )
-    return {
-        "policy_version": _FAMILY_AUDIT_POLICY_VERSION,
-        "member_order": list(_FAMILY_MEMBER_ORDER),
-        "authenticated_metadata_row_counts": row_counts,
-        "forbidden_overlaps": forbidden,
-        "allowed_overlaps": allowed,
-        "evidence_completeness": "PROVEN",
-        "global_sample_id_uniqueness": "PROVEN",
-        "global_cross_split_leakage": "PROVEN",
-    }
-
-
-def _validate_risk_dataset_family_manifest(
-    manifest: Mapping[str, object],
-) -> tuple[
-    dict[str, dict[str, object]],
-    dict[str, object],
-    str,
-]:
-    if not isinstance(manifest, Mapping) or set(manifest) != _FAMILY_MANIFEST_KEYS:
-        raise RiskDataContractError("dataset family manifest keys mismatch")
-    if manifest.get("dataset_family_layout_version") != (
-        RISK_DATASET_FAMILY_LAYOUT_VERSION
-    ):
-        raise RiskDataContractError(
-            f"unsupported dataset family layout; require {RISK_DATASET_FAMILY_LAYOUT_VERSION}"
-        )
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise RiskDataContractError("dataset family schema_version mismatch")
-    member_order = manifest.get("member_order")
-    if not isinstance(member_order, list) or tuple(member_order) != _FAMILY_MEMBER_ORDER:
-        raise RiskDataContractError("dataset family member_order mismatch")
-    raw_members = manifest.get("members")
-    if not isinstance(raw_members, Mapping) or set(raw_members) != set(
-        _FAMILY_MEMBER_ORDER
-    ):
-        raise RiskDataContractError(
-            "dataset family members must be exactly train, calibration, val, test"
-        )
-    members = {
-        split: _validate_family_member_descriptor(raw_members[split], split=split)
-        for split in _FAMILY_MEMBER_ORDER
-    }
-    common_contract = _validate_family_common_contract(
-        manifest.get("common_contract")
-    )
-    if common_contract["schema_version"] != manifest["schema_version"]:
-        raise RiskDataContractError(
-            "dataset family top-level/common schema_version mismatch"
-        )
-    cross_split_audit = _validate_family_cross_split_audit(
-        manifest.get("cross_split_audit"), members=members
-    )
-    declared_digest = _require_sha256(
-        manifest.get("risk_dataset_family_digest"),
-        field="risk_dataset_family_digest",
-    )
-    if _risk_dataset_family_digest(manifest) != declared_digest:
-        raise RiskDataContractError("risk dataset family digest mismatch")
-    return members, cross_split_audit, declared_digest
-
-
-def _write_family_seal(staging: Path, manifest: Mapping[str, object]) -> None:
-    manifest_path = staging / _FAMILY_MANIFEST_NAME
-    marker_path = staging / _COMPLETE_MARKER_NAME
-    checksums_path = staging / _CHECKSUMS_NAME
-    manifest_path.write_bytes(
-        (_canonical_json(dict(manifest)) + "\n").encode("utf-8")
-    )
-    marker_path.write_bytes(b"")
-    entries = {
-        _COMPLETE_MARKER_NAME: _sha256_file(marker_path),
-        _FAMILY_MANIFEST_NAME: _sha256_file(manifest_path),
-    }
-    checksums_path.write_text(
-        "".join(
-            f"{entries[relative]}  {relative}\n" for relative in sorted(entries)
-        ),
-        encoding="utf-8",
-    )
-
-
-def _snapshot_family_files(root: Path) -> dict[str, bytes]:
-    """Read each exact family member once below one pinned directory FD."""
-
-    _require_directory(root, label="risk dataset family root")
-    try:
-        root_fd = os.open(
-            root,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
-        )
-    except OSError as exc:
-        raise RiskDataContractError(
-            "risk dataset family root must be a direct non-symlink directory"
-        ) from exc
-    try:
-        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
-            raise RiskDataContractError(
-                "risk dataset family root must be a directory"
-            )
-        try:
-            actual_names = set(os.listdir(root_fd))
-        except OSError as exc:
-            raise RiskDataContractError(
-                "failed to enumerate pinned risk dataset family"
-            ) from exc
-        missing = _REQUIRED_FAMILY_FILES - actual_names
-        unexpected = actual_names - _REQUIRED_FAMILY_FILES
-        if missing:
-            raise RiskDataContractError(
-                "incomplete risk dataset family: missing "
-                + ", ".join(sorted(missing))
-            )
-        if unexpected:
-            raise RiskDataContractError(
-                "unexpected risk dataset family files: "
-                + ", ".join(sorted(unexpected))
-            )
-        snapshots: dict[str, bytes] = {}
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-        for name in sorted(_REQUIRED_FAMILY_FILES):
-            try:
-                descriptor = os.open(name, flags, dir_fd=root_fd)
-            except OSError as exc:
-                raise RiskDataContractError(
-                    "risk dataset family entry is missing or a forbidden "
-                    f"symlink: {name}"
-                ) from exc
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise RiskDataContractError(
-                        "risk dataset family entry must be a regular file: "
-                        f"{name}"
-                    )
-                chunks: list[bytes] = []
-                while True:
-                    chunk = os.read(descriptor, 1 << 20)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                snapshots[name] = b"".join(chunks)
-            finally:
-                os.close(descriptor)
-        return snapshots
-    finally:
-        os.close(root_fd)
-
-
-def _load_family_manifest(root: Path) -> dict[str, object]:
-    snapshots = _snapshot_family_files(root)
-    marker = snapshots[_COMPLETE_MARKER_NAME]
-    if marker != b"":
-        raise RiskDataContractError(
-            "risk dataset family completion marker must be empty"
-        )
-    checksum_entries = _parse_checksum_manifest_bytes(
-        snapshots[_CHECKSUMS_NAME],
-        label="risk dataset family checksum manifest",
-    )
-    expected_checksum_entries = {_COMPLETE_MARKER_NAME, _FAMILY_MANIFEST_NAME}
-    if set(checksum_entries) != expected_checksum_entries:
-        raise RiskDataContractError(
-            "risk dataset family checksum coverage is not exact"
-        )
-    for relative in sorted(expected_checksum_entries):
-        if checksum_entries[relative] != _sha256_bytes(snapshots[relative]):
-            raise RiskDataContractError(
-                f"risk dataset family checksum mismatch for {relative}"
-            )
-    raw = snapshots[_FAMILY_MANIFEST_NAME]
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeError as exc:
-        raise RiskDataContractError("failed to read dataset family manifest") from exc
-    manifest = _strict_json_loads(text, label="dataset family manifest")
-    if raw != (_canonical_json(manifest) + "\n").encode("utf-8"):
-        raise RiskDataContractError(
-            "dataset family manifest is not canonical compact JSON"
-        )
-    return manifest
-
-
-def _publish_risk_dataset_family_from_references(
-    output_dir: str | Path,
-    *,
-    member_references: Mapping[str, tuple[str | Path, str | Path, str]],
-) -> Path:
-    """Reauthenticate referenced members once and publish their family seal."""
-
-    output_path = _absolute_without_symlink_resolution(Path(output_dir))
-    _assert_no_symlink_components(
-        output_path, label="risk dataset family output", allow_missing=True
-    )
-    if output_path.exists() or output_path.is_symlink():
-        raise FileExistsError(
-            f"refusing to overwrite immutable risk dataset family: {output_path}"
-        )
-    if not isinstance(member_references, Mapping) or set(
-        member_references
-    ) != set(
-        _FAMILY_MEMBER_ORDER
-    ):
-        raise RiskDataContractError(
-            "risk dataset family members must be exactly train, calibration, val, test"
-        )
-
-    reloaded_members: dict[str, LoadedRiskDataset] = {}
-    member_descriptors: dict[str, dict[str, object]] = {}
-    identities: dict[str, dict[str, set[str]]] = {}
-    row_counts: dict[str, int] = {}
-    common_contract: dict[str, object] | None = None
-    for split in _FAMILY_MEMBER_ORDER:
-        reference = member_references[split]
-        if not isinstance(reference, tuple) or len(reference) != 3:
-            raise RiskDataContractError(
-                f"family member reference {split} must contain seal root, "
-                "collection root, and dataset digest"
-            )
-        seal_root, collection_root, expected_digest = reference
-        reloaded, rows = _load_risk_dataset_seal_with_authenticated_rows(
-            seal_root,
-            collection_root=collection_root,
-            expected_split=split,
-            expected_manifest_digest=expected_digest,
-            retain_authenticated_metadata_rows=True,
-        )
-        observed_contract = _family_common_contract(reloaded)
-        if common_contract is None:
-            common_contract = observed_contract
-        elif observed_contract != common_contract:
-            differing = next(
-                key
-                for key in _FAMILY_COMMON_CONTRACT_KEYS
-                if observed_contract[key] != common_contract[key]
-            )
-            raise RiskDataContractError(
-                f"risk dataset family common contract mismatch: {differing}"
-            )
-        reloaded_members[split] = reloaded
-        row_counts[split] = len(rows)
-        identities[split] = _family_identity_sets(rows, split=split)
-        member_descriptors[split] = {
-            "split": split,
-            "risk_dataset_manifest_digest": (
-                reloaded.risk_dataset_manifest_digest
-            ),
-            "sample_count": len(rows),
-            "shard_count": len(reloaded.shards),
-        }
-    assert common_contract is not None
-    audit = _build_family_cross_split_audit(identities, row_counts=row_counts)
-    manifest: dict[str, object] = {
-        "dataset_family_layout_version": RISK_DATASET_FAMILY_LAYOUT_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        "member_order": list(_FAMILY_MEMBER_ORDER),
-        "members": member_descriptors,
-        "common_contract": common_contract,
-        "cross_split_audit": audit,
-    }
-    family_digest = _risk_dataset_family_digest(manifest)
-    manifest["risk_dataset_family_digest"] = family_digest
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _assert_no_symlink_components(
-        output_path.parent, label="risk dataset family output parent"
-    )
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=f".{output_path.name}.staging-",
-            dir=output_path.parent,
-        )
-    )
-    try:
-        _write_family_seal(staging, manifest)
-        expected_digests = {
-            split: reloaded_members[split].risk_dataset_manifest_digest
-            for split in _FAMILY_MEMBER_ORDER
-        }
-        reloaded_family = load_risk_dataset_family(
-            staging,
-            expected_member_digests=expected_digests,
-        )
-        if reloaded_family.risk_dataset_family_digest != family_digest:
-            raise RiskDataContractError("formal staging family reload mismatch")
-        _atomic_rename_directory_noreplace(staging, output_path)
-    except BaseException:
-        if staging.exists() and not staging.is_symlink():
-            shutil.rmtree(staging)
-        raise
-    return output_path
-
-
-def publish_risk_dataset_family(
-    output_dir: str | Path,
-    *,
-    members: Mapping[str, LoadedRiskDataset],
-) -> Path:
-    """Reauthenticate and atomically publish exactly four split dataset seals."""
-
-    if not isinstance(members, Mapping) or set(members) != set(
-        _FAMILY_MEMBER_ORDER
-    ):
-        raise RiskDataContractError(
-            "risk dataset family members must be exactly train, calibration, val, test"
-        )
-    references: dict[str, tuple[str | Path, str | Path, str]] = {}
-    for split in _FAMILY_MEMBER_ORDER:
-        member = members[split]
-        if not isinstance(member, LoadedRiskDataset):
-            raise RiskDataContractError(
-                f"family member {split} must be a LoadedRiskDataset"
-            )
-        references[split] = (
-            member.seal_root,
-            member.collection_root,
-            member.risk_dataset_manifest_digest,
-        )
-    return _publish_risk_dataset_family_from_references(
-        output_dir,
-        member_references=references,
-    )
-
-
-def load_risk_dataset_family(
-    root: str | Path,
-    *,
-    expected_member_digests: Mapping[str, str] | None = None,
-) -> LoadedRiskDatasetFamily:
-    """Load one self-contained family seal without guessing collection roots."""
-
-    root_path = _absolute_without_symlink_resolution(Path(root))
-    manifest = _load_family_manifest(root_path)
-    members, cross_split_audit, family_digest = (
-        _validate_risk_dataset_family_manifest(manifest)
-    )
-    if expected_member_digests is not None:
-        if not isinstance(expected_member_digests, Mapping) or set(
-            expected_member_digests
-        ) != set(_FAMILY_MEMBER_ORDER):
-            raise RiskDataContractError(
-                "expected_member_digests must exactly cover train, calibration, val, test"
-            )
-        for split in _FAMILY_MEMBER_ORDER:
-            expected = _require_sha256(
-                expected_member_digests[split],
-                field=f"expected_member_digests.{split}",
-            )
-            if expected != members[split]["risk_dataset_manifest_digest"]:
-                raise RiskDataContractError(
-                    f"expected member digest mismatch for {split}"
-                )
-    ordered_members = {
-        split: members[split] for split in _FAMILY_MEMBER_ORDER
-    }
-    return LoadedRiskDatasetFamily(
-        root=root_path,
-        manifest=_frozen_string_object_dict(manifest),
-        members=_FrozenDict(ordered_members),
-        cross_split_audit=_frozen_string_object_dict(cross_split_audit),
-        risk_dataset_family_digest=family_digest,
-    )
-
-
-def _canonical_mapping_copy(
-    value: object,
-    *,
-    label: str,
-) -> dict[str, object]:
-    if not isinstance(value, Mapping):
-        raise RiskDataContractError(f"{label} must be a mapping")
-    return _strict_json_loads(_canonical_json(value), label=label)
-
-
 def risk_dataset_family_sample_ids_digest(
     sample_ids: Sequence[str],
 ) -> str:
@@ -2953,182 +2223,6 @@ def _family_common_contract(dataset: LoadedRiskDataset) -> dict[str, object]:
             "target_type_policy_digest"
         ],
     }
-
-
-def _authenticate_family_member_seal(
-    member: LoadedRiskDataset | RiskDatasetFamilyMemberSource,
-    *,
-    split: str,
-) -> LoadedRiskDataset:
-    """Authenticate the immutable seal without reopening numeric shard payloads."""
-
-    if isinstance(member, LoadedRiskDataset):
-        seal_root = member.seal_root
-        collection_root = member.collection_root
-        pinned_digest = member.risk_dataset_manifest_digest
-    elif isinstance(member, RiskDatasetFamilyMemberSource):
-        seal_root = member.seal_root
-        collection_root = member.collection_root
-        pinned_digest = member.expected_manifest_digest
-    else:
-        raise RiskDataContractError(
-            f"family member {split} must be a loaded dataset or explicit source"
-        )
-    seal_path = _absolute_without_symlink_resolution(Path(seal_root))
-    collection_path = _absolute_without_symlink_resolution(Path(collection_root))
-    _require_directory(collection_path, label=f"family {split} collection root")
-    manifest = _load_seal_manifest(seal_path)
-    if manifest.get("dataset_layout_version") != RISK_DATASET_LAYOUT_VERSION:
-        raise RiskDataContractError("family member dataset layout mismatch")
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise RiskDataContractError("family member schema_version mismatch")
-    if manifest.get("split") != split:
-        raise RiskDataContractError(f"family member split mismatch for {split}")
-    expected_handoff_version = (
-        _COLLECTION_HANDOFF_VERSION
-        if split == "train"
-        else _HELDOUT_COLLECTION_HANDOFF_VERSION
-    )
-    if manifest.get("collection_handoff_version") != expected_handoff_version:
-        raise RiskDataContractError(
-            f"family member handoff version mismatch for {split}"
-        )
-
-    g1_digest = _require_blake2b128(
-        manifest.get("g1_split_manifest_digest"),
-        field=f"family {split} g1_split_manifest_digest",
-    )
-    target_digest = _require_blake2b128(
-        manifest.get("target_type_policy_digest"),
-        field=f"family {split} target_type_policy_digest",
-    )
-    dynamic_digest = _require_sha256(
-        manifest.get("dynamic_objects_config_digest"),
-        field=f"family {split} dynamic_objects_config_digest",
-    )
-    _validate_channel_spec(manifest.get("channel_spec"))
-    grid = _grid_from_manifest(manifest.get("grid"))
-    sample_count = _require_positive_int(
-        manifest.get("sample_count"), field=f"family {split} sample_count"
-    )
-    shard_count = _require_positive_int(
-        manifest.get("shard_count"), field=f"family {split} shard_count"
-    )
-    raw_descriptors = manifest.get("shards")
-    if not isinstance(raw_descriptors, list) or len(raw_descriptors) != shard_count:
-        raise RiskDataContractError(
-            f"family {split} shard_count differs from descriptors"
-        )
-    descriptors = tuple(
-        _descriptor_from_mapping(value, position=index, exact_keys=True)
-        for index, value in enumerate(raw_descriptors)
-    )
-    if sum(item.sample_count for item in descriptors) != sample_count:
-        raise RiskDataContractError(
-            f"family {split} sample_count differs from shard totals"
-        )
-    dataset_digest = validate_risk_dataset_manifest(manifest)
-    expected_digest = _require_sha256(
-        pinned_digest,
-        field=f"family {split} expected manifest digest",
-    )
-    if dataset_digest != expected_digest:
-        raise RiskDataContractError(
-            f"family member manifest digest mismatch for {split}"
-        )
-    return LoadedRiskDataset(
-        seal_root=seal_path,
-        collection_root=collection_path,
-        manifest=_frozen_string_object_dict(manifest),
-        grid=grid,
-        shards=descriptors,
-        split=split,
-        sample_count=sample_count,
-        risk_dataset_manifest_digest=dataset_digest,
-        provenance=_frozen_string_string_dict(
-            {
-                "g1_split_manifest_digest": g1_digest,
-                "risk_dataset_manifest_digest": dataset_digest,
-                "dynamic_objects_config_digest": dynamic_digest,
-                "target_type_policy_digest": target_digest,
-            }
-        ),
-    )
-
-
-def _load_family_member_metadata_rows(
-    dataset: LoadedRiskDataset,
-) -> tuple[dict[str, object], ...]:
-    """Read only seal-authenticated JSONL metadata needed for leakage checks."""
-
-    rows: list[dict[str, object]] = []
-    for descriptor in dataset.shards:
-        shard_root = dataset.collection_root / descriptor.relative_root
-        _require_directory(
-            shard_root,
-            label=f"family {dataset.split}/{descriptor.relative_root} shard",
-        )
-        metadata_path = shard_root / "metadata.jsonl"
-        _require_regular_file(
-            metadata_path,
-            label=f"family {dataset.split}/{descriptor.relative_root} metadata",
-        )
-        if _sha256_file(metadata_path) != descriptor.metadata_sha256:
-            raise RiskDataContractError(
-                "family member metadata SHA-256 differs from authenticated seal: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        try:
-            raw = metadata_path.read_bytes()
-            text = raw.decode("utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise RiskDataContractError(
-                "family metadata read failed for "
-                f"{dataset.split}/{descriptor.relative_root}: {exc}"
-            ) from exc
-        if not raw or not raw.endswith(b"\n"):
-            raise RiskDataContractError(
-                "family metadata must be non-empty newline-terminated JSONL: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        shard_rows = tuple(
-            _strict_json_loads(
-                line,
-                label=(
-                    f"family {dataset.split}/{descriptor.relative_root} "
-                    f"metadata row {row_index}"
-                ),
-            )
-            for row_index, line in enumerate(text.splitlines())
-        )
-        canonical = (
-            "\n".join(_canonical_json(row) for row in shard_rows) + "\n"
-        ).encode("utf-8")
-        if canonical != raw:
-            raise RiskDataContractError(
-                "family metadata is not canonical compact JSONL: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        digest = hashlib.sha256()
-        digest.update(b"risk-shard-manifest-v2\0")
-        digest.update(len(raw).to_bytes(8, "big"))
-        digest.update(raw)
-        if digest.hexdigest() != descriptor.manifest_digest:
-            raise RiskDataContractError(
-                "family metadata manifest digest differs from authenticated seal: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        if len(shard_rows) != descriptor.sample_count:
-            raise RiskDataContractError(
-                "family metadata row count differs from authenticated seal: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        rows.extend(shard_rows)
-    if len(rows) != dataset.sample_count:
-        raise RiskDataContractError(
-            f"family authenticated metadata row count mismatch for {dataset.split}"
-        )
-    return tuple(rows)
 
 
 def _family_identity_sets(
@@ -3614,40 +2708,81 @@ def _write_family_seal(staging: Path, manifest: Mapping[str, object]) -> None:
     )
 
 
-def _load_family_manifest(root: Path) -> dict[str, object]:
+def _snapshot_family_files(root: Path) -> dict[str, bytes]:
+    """Read each exact family member once below one pinned directory FD."""
+
     _require_directory(root, label="risk dataset family root")
     try:
-        entries = list(os.scandir(root))
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
     except OSError as exc:
-        raise RiskDataContractError("failed to enumerate risk dataset family") from exc
-    actual_names = {entry.name for entry in entries}
-    missing = _REQUIRED_FAMILY_FILES - actual_names
-    unexpected = actual_names - _REQUIRED_FAMILY_FILES
-    if missing:
         raise RiskDataContractError(
-            "incomplete risk dataset family: missing " + ", ".join(sorted(missing))
-        )
-    if unexpected:
-        raise RiskDataContractError(
-            "unexpected risk dataset family files: "
-            + ", ".join(sorted(unexpected))
-        )
-    for entry in entries:
-        if entry.is_symlink():
+            "risk dataset family root must be a direct non-symlink directory"
+        ) from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
             raise RiskDataContractError(
-                f"risk dataset family contains a forbidden symlink: {entry.name}"
+                "risk dataset family root must be a directory"
             )
-        if not entry.is_file(follow_symlinks=False):
+        try:
+            actual_names = set(os.listdir(root_fd))
+        except OSError as exc:
             raise RiskDataContractError(
-                f"risk dataset family entry must be a regular file: {entry.name}"
+                "failed to enumerate pinned risk dataset family"
+            ) from exc
+        missing = _REQUIRED_FAMILY_FILES - actual_names
+        unexpected = actual_names - _REQUIRED_FAMILY_FILES
+        if missing:
+            raise RiskDataContractError(
+                "incomplete risk dataset family: missing "
+                + ", ".join(sorted(missing))
             )
-    marker = root / _COMPLETE_MARKER_NAME
-    if marker.read_bytes() != b"":
+        if unexpected:
+            raise RiskDataContractError(
+                "unexpected risk dataset family files: "
+                + ", ".join(sorted(unexpected))
+            )
+        snapshots: dict[str, bytes] = {}
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        for name in sorted(_REQUIRED_FAMILY_FILES):
+            try:
+                descriptor = os.open(name, flags, dir_fd=root_fd)
+            except OSError as exc:
+                raise RiskDataContractError(
+                    "risk dataset family entry is missing or a forbidden "
+                    f"symlink: {name}"
+                ) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RiskDataContractError(
+                        "risk dataset family entry must be a regular file: "
+                        f"{name}"
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                snapshots[name] = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        return snapshots
+    finally:
+        os.close(root_fd)
+
+
+def _load_family_manifest(root: Path) -> dict[str, object]:
+    snapshots = _snapshot_family_files(root)
+    marker = snapshots[_COMPLETE_MARKER_NAME]
+    if marker != b"":
         raise RiskDataContractError(
             "risk dataset family completion marker must be empty"
         )
-    checksum_entries = _parse_checksum_manifest(
-        root / _CHECKSUMS_NAME,
+    checksum_entries = _parse_checksum_manifest_bytes(
+        snapshots[_CHECKSUMS_NAME],
         label="risk dataset family checksum manifest",
     )
     expected_checksum_entries = {_COMPLETE_MARKER_NAME, _FAMILY_MANIFEST_NAME}
@@ -3656,15 +2791,14 @@ def _load_family_manifest(root: Path) -> dict[str, object]:
             "risk dataset family checksum coverage is not exact"
         )
     for relative in sorted(expected_checksum_entries):
-        if checksum_entries[relative] != _sha256_file(root / relative):
+        if checksum_entries[relative] != _sha256_bytes(snapshots[relative]):
             raise RiskDataContractError(
                 f"risk dataset family checksum mismatch for {relative}"
             )
-    manifest_path = root / _FAMILY_MANIFEST_NAME
+    raw = snapshots[_FAMILY_MANIFEST_NAME]
     try:
-        raw = manifest_path.read_bytes()
         text = raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
+    except UnicodeError as exc:
         raise RiskDataContractError("failed to read dataset family manifest") from exc
     manifest = _strict_json_loads(text, label="dataset family manifest")
     if raw != (_canonical_json(manifest) + "\n").encode("utf-8"):
@@ -3674,15 +2808,12 @@ def _load_family_manifest(root: Path) -> dict[str, object]:
     return manifest
 
 
-def publish_risk_dataset_family(
+def _publish_risk_dataset_family_from_references(
     output_dir: str | Path,
     *,
-    members: Mapping[
-        str,
-        LoadedRiskDataset | RiskDatasetFamilyMemberSource,
-    ],
+    member_references: Mapping[str, tuple[str | Path, str | Path, str]],
 ) -> Path:
-    """Reauthenticate and atomically publish exactly four split dataset seals."""
+    """Reauthenticate referenced members once and publish their family seal."""
 
     output_path = _absolute_without_symlink_resolution(Path(output_dir))
     _assert_no_symlink_components(
@@ -3692,7 +2823,9 @@ def publish_risk_dataset_family(
         raise FileExistsError(
             f"refusing to overwrite immutable risk dataset family: {output_path}"
         )
-    if not isinstance(members, Mapping) or set(members) != set(
+    if not isinstance(member_references, Mapping) or set(
+        member_references
+    ) != set(
         _FAMILY_MEMBER_ORDER
     ):
         raise RiskDataContractError(
@@ -3705,12 +2838,20 @@ def publish_risk_dataset_family(
     row_counts: dict[str, int] = {}
     common_contract: dict[str, object] | None = None
     for split in _FAMILY_MEMBER_ORDER:
-        member = members[split]
-        reloaded = _authenticate_family_member_seal(
-            member,
-            split=split,
+        reference = member_references[split]
+        if not isinstance(reference, tuple) or len(reference) != 3:
+            raise RiskDataContractError(
+                f"family member reference {split} must contain seal root, "
+                "collection root, and dataset digest"
+            )
+        seal_root, collection_root, expected_digest = reference
+        reloaded, rows = _load_risk_dataset_seal_with_authenticated_rows(
+            seal_root,
+            collection_root=collection_root,
+            expected_split=split,
+            expected_manifest_digest=expected_digest,
+            retain_authenticated_metadata_rows=True,
         )
-        rows = _load_family_member_metadata_rows(reloaded)
         observed_contract = _family_common_contract(reloaded)
         if common_contract is None:
             common_contract = observed_contract
@@ -3783,6 +2924,47 @@ def publish_risk_dataset_family(
     return output_path
 
 
+def publish_risk_dataset_family(
+    output_dir: str | Path,
+    *,
+    members: Mapping[
+        str,
+        LoadedRiskDataset | RiskDatasetFamilyMemberSource,
+    ],
+) -> Path:
+    """Reauthenticate and atomically publish exactly four split dataset seals."""
+
+    if not isinstance(members, Mapping) or set(members) != set(
+        _FAMILY_MEMBER_ORDER
+    ):
+        raise RiskDataContractError(
+            "risk dataset family members must be exactly train, calibration, val, test"
+        )
+    references: dict[str, tuple[str | Path, str | Path, str]] = {}
+    for split in _FAMILY_MEMBER_ORDER:
+        member = members[split]
+        if isinstance(member, LoadedRiskDataset):
+            references[split] = (
+                member.seal_root,
+                member.collection_root,
+                member.risk_dataset_manifest_digest,
+            )
+        elif isinstance(member, RiskDatasetFamilyMemberSource):
+            references[split] = (
+                member.seal_root,
+                member.collection_root,
+                member.expected_manifest_digest,
+            )
+        else:
+            raise RiskDataContractError(
+                f"family member {split} must be a loaded dataset or explicit source"
+            )
+    return _publish_risk_dataset_family_from_references(
+        output_dir,
+        member_references=references,
+    )
+
+
 def load_risk_dataset_family(
     root: str | Path,
     *,
@@ -3797,9 +2979,7 @@ def load_risk_dataset_family(
         cross_split_audit,
         production_evaluation_metadata,
         family_digest,
-    ) = (
-        _validate_risk_dataset_family_manifest(manifest)
-    )
+    ) = _validate_risk_dataset_family_manifest(manifest)
     if expected_member_digests is not None:
         if not isinstance(expected_member_digests, Mapping) or set(
             expected_member_digests

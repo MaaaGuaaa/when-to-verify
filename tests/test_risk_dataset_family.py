@@ -24,6 +24,7 @@ from src.datasets.risk_dataset_seal import (
     load_risk_dataset_seal,
     publish_risk_dataset_family,
     publish_risk_dataset_seal,
+    risk_dataset_family_sample_ids_digest,
 )
 from tests.fixtures.formal_risk_publication import (
     FormalRiskPublication,
@@ -127,6 +128,7 @@ def test_family_public_contract_round_trip_and_deep_immutability(
         "manifest",
         "members",
         "cross_split_audit",
+        "production_evaluation_metadata",
         "risk_dataset_family_digest",
     ]
     members, _ = _publish_members(tmp_path / "source")
@@ -146,6 +148,7 @@ def test_family_public_contract_round_trip_and_deep_immutability(
         "members",
         "common_contract",
         "cross_split_audit",
+        "production_evaluation_metadata",
         "risk_dataset_family_digest",
     }
     assert tuple(loaded.members) == MEMBER_ORDER
@@ -155,6 +158,16 @@ def test_family_public_contract_round_trip_and_deep_immutability(
         ".producer-complete",
     }
     assert len(loaded.risk_dataset_family_digest) == 64
+    assert loaded.production_evaluation_metadata == {
+        "layout_version": "production_risk_evaluation_metadata_v1",
+        "training_split": "train",
+        "selection_split": "val",
+        "calibration_fit_split": "calibration",
+        "evaluation_split": "test",
+        "test_used_for_training_or_selection": False,
+        "test_used_for_calibration": False,
+        "calibration_statistics_scope": "calibration_only",
+    }
     for split in MEMBER_ORDER:
         descriptor = loaded.members[split]
         assert descriptor == {
@@ -163,6 +176,9 @@ def test_family_public_contract_round_trip_and_deep_immutability(
                 members[split].risk_dataset_manifest_digest
             ),
             "sample_count": 12,
+            "sample_ids_digest_sha256": risk_dataset_family_sample_ids_digest(
+                [f"{split}-formal-{index:03d}" for index in range(12)]
+            ),
             "shard_count": 2,
         }
 
@@ -553,6 +569,33 @@ def test_publisher_reauthenticates_members_and_formally_reloads_metadata_rows(
         )
     ]
     assert family.members["train"]["sample_count"] == 12
+
+
+def test_family_publisher_accepts_explicit_authenticated_sources(
+    tmp_path: Path,
+) -> None:
+    members, _ = _publish_members(tmp_path / "source")
+    source_type = seal_module.RiskDatasetFamilyMemberSource
+    sources = {
+        split: source_type(
+            seal_root=members[split].seal_root,
+            collection_root=members[split].collection_root,
+            expected_manifest_digest=(
+                members[split].risk_dataset_manifest_digest
+            ),
+        )
+        for split in MEMBER_ORDER
+    }
+
+    root = publish_risk_dataset_family(
+        tmp_path / "family",
+        members=sources,
+    )
+    loaded = load_risk_dataset_family(root)
+
+    assert loaded.members["test"]["risk_dataset_manifest_digest"] == (
+        members["test"].risk_dataset_manifest_digest
+    )
 
 
 def test_family_publish_cli_formally_decodes_each_member_shard_once(

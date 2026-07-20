@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 
 import pytest
 
+import src.datasets.risk_dataset as risk_dataset_module
 from src.generation.paired_variants import PairGenerationError
 
 
@@ -143,7 +146,7 @@ def _request(module, tmp_path: Path, *, event_count: int, sample_count: int):
 
 
 def test_cli_version_marks_explicit_shard_index_contract(cli_module) -> None:
-    assert cli_module.SOP07_RISK_DATASET_CLI_VERSION == "sop07_risk_dataset_cli_v3"
+    assert cli_module.SOP07_RISK_DATASET_CLI_VERSION == "sop07_risk_dataset_cli_v4"
 
 
 def _install_success_dependencies(
@@ -247,6 +250,10 @@ def _install_success_dependencies(
         "adapter": [],
         "samples": [],
         "writer": [],
+        "risk_load": [],
+        "pinned_risk_open": [],
+        "pinned_risk_verify": [],
+        "pinned_risk_close": [],
     }
 
     def fake_generate(**kwargs):
@@ -286,11 +293,34 @@ def _install_success_dependencies(
         return {"directory": path}
 
     def fake_load(path, *, grid):
+        calls["risk_load"].append((path, grid))
         return SimpleNamespace(
             samples=tuple(calls["samples"]),
             semantic_digest="8" * 64,
             manifest_digest="9" * 64,
+            summary={"split": "train", "shard_index": 7},
         )
+
+    class FakePinnedRiskShard:
+        def __init__(self, path, *, grid):
+            self.path = path
+            self.grid = grid
+            self.loaded_shard = None
+
+        def __enter__(self):
+            calls["pinned_risk_open"].append((self.path, self.grid))
+            self.loaded_shard = fake_load(self.path, grid=self.grid)
+            return self
+
+        def verify_unchanged(self):
+            calls["pinned_risk_verify"].append(self.path)
+
+        def __exit__(self, exc_type, exc, traceback):
+            calls["pinned_risk_close"].append(self.path)
+            return False
+
+    def fake_pin(path, *, grid):
+        return FakePinnedRiskShard(path, grid=grid)
 
     monkeypatch.setattr(module, "generate_paired_variants", fake_generate)
     monkeypatch.setattr(
@@ -298,6 +328,9 @@ def _install_success_dependencies(
     )
     monkeypatch.setattr(module, "write_risk_shard", fake_write)
     monkeypatch.setattr(module, "load_risk_shard", fake_load)
+    monkeypatch.setattr(
+        module, "pin_risk_shard_snapshot", fake_pin
+    )
     monkeypatch.setattr(
         module,
         "summarize_paired_groups",
@@ -311,6 +344,104 @@ def _install_success_dependencies(
         },
     )
     return calls, loaded_sop05, sop03, sop04
+
+
+def _install_success_sidecar_dependencies(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    calls: dict[str, list],
+):
+    sidecar_write_calls: list[tuple[object, ...]] = []
+    sidecar_load_calls: list[tuple[object, ...]] = []
+
+    def fake_combined_adapter(**kwargs):
+        samples = module.build_risk_samples_from_sop06_group(**kwargs)
+        sidecars = tuple(
+            SimpleNamespace(sample_id=sample.sample_id) for sample in samples
+        )
+        return samples, sidecars
+
+    def fake_sidecar_write(
+        sidecars,
+        path,
+        *,
+        grid,
+        split,
+        shard_index,
+        source_risk_shard_semantic_digest,
+    ):
+        sidecar_write_calls.append(
+            (
+                tuple(sidecars),
+                path,
+                grid,
+                split,
+                shard_index,
+                source_risk_shard_semantic_digest,
+            )
+        )
+        path.mkdir(parents=True)
+        return {"directory": path}
+
+    def fake_sidecar_load(
+        path,
+        *,
+        grid,
+        expected_sample_ids,
+        expected_source_risk_shard_semantic_digest,
+    ):
+        sidecar_load_calls.append(
+            (
+                path,
+                grid,
+                tuple(expected_sample_ids),
+                expected_source_risk_shard_semantic_digest,
+            )
+        )
+        assert tuple(expected_sample_ids) == tuple(
+            sample.sample_id for sample in calls["samples"]
+        )
+        assert expected_source_risk_shard_semantic_digest == "8" * 64
+        return SimpleNamespace(
+            sample_ids=tuple(expected_sample_ids),
+            semantic_digest="a" * 64,
+            split="train",
+            shard_index=7,
+        )
+
+    monkeypatch.setattr(
+        module,
+        "build_risk_samples_and_sidecars_from_sop06_group",
+        fake_combined_adapter,
+    )
+    monkeypatch.setattr(module, "write_risk_sidecar_shard", fake_sidecar_write)
+    monkeypatch.setattr(module, "load_risk_sidecar_shard", fake_sidecar_load)
+    return sidecar_write_calls, sidecar_load_calls
+
+
+def _pair_marker_path(module, request) -> Path:
+    assert request.sidecar_output_dir is not None
+    return module.risk_sidecar_pair_completion_marker_path(
+        request.sidecar_output_dir
+    )
+
+
+def _assert_pair_staging_clean(request) -> None:
+    assert request.sidecar_output_dir is not None
+    for parent in {
+        request.output_dir.parent,
+        request.sidecar_output_dir.parent,
+    }:
+        if parent.exists():
+            assert not tuple(parent.glob(".*.pair-staging-*"))
+
+
+def _assert_no_published_pair(module, request) -> None:
+    assert request.sidecar_output_dir is not None
+    assert not request.output_dir.exists()
+    assert not request.sidecar_output_dir.exists()
+    assert not _pair_marker_path(module, request).exists()
+    _assert_pair_staging_clean(request)
 
 
 def test_run_stably_rebuilds_partial_groups_and_writes_verified_shard(
@@ -385,6 +516,701 @@ def test_run_stably_rebuilds_partial_groups_and_writes_verified_shard(
         "manifest_digest": "9" * 64,
         "semantic_digest": "8" * 64,
     }
+
+
+def test_optional_sidecar_root_publishes_separate_id_bound_shard(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        output_dir=tmp_path / "risk-parent" / "risk-shard",
+        sidecar_output_dir=tmp_path / "sidecar-parent" / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    sidecar_calls, sidecar_load_calls = _install_success_sidecar_dependencies(
+        cli_module,
+        monkeypatch,
+        calls,
+    )
+
+    report = cli_module.run_risk_dataset(request)
+
+    assert len(sidecar_calls) == 1
+    assert len(calls["risk_load"]) == 3
+    assert len(sidecar_load_calls) == 3
+    risk_staging_root = calls["writer"][0][1]
+    sidecar_staging_root = sidecar_calls[0][1]
+    assert risk_staging_root != request.output_dir
+    assert sidecar_staging_root != request.sidecar_output_dir
+    assert risk_staging_root.parent.parent == request.output_dir.parent
+    assert sidecar_staging_root.parent.parent == request.sidecar_output_dir.parent
+    assert calls["risk_load"][0][0] == risk_staging_root
+    assert calls["risk_load"][1][0] == request.output_dir
+    assert sidecar_load_calls[0][0] == sidecar_staging_root
+    assert sidecar_load_calls[1][0] == request.sidecar_output_dir
+    assert sidecar_calls[0][3:] == ("train", 7, "8" * 64)
+    assert report["publication_status"] == "complete"
+    assert report["sidecar_output_dir"] == str(request.sidecar_output_dir)
+    assert report["risk_shard_semantic_digest"] == "8" * 64
+    assert report["sidecar_shard_semantic_digest"] == "a" * 64
+    marker_path = _pair_marker_path(cli_module, request)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker_path.parent == request.sidecar_output_dir.parent
+    assert marker["risk_root_basename"] == request.output_dir.name
+    assert marker["sidecar_root_basename"] == request.sidecar_output_dir.name
+    assert marker["split"] == "train"
+    assert marker["shard_index"] == 7
+    assert marker["risk_shard_semantic_digest"] == "8" * 64
+    assert marker["sidecar_shard_semantic_digest"] == "a" * 64
+    assert len(marker["ordered_sample_ids_digest_sha256"]) == 64
+    assert report["pair_completion_marker_path"] == str(marker_path)
+    assert report["pair_completion_marker_digest"] == marker[
+        "marker_digest_sha256"
+    ]
+    _assert_pair_staging_clean(request)
+
+
+def test_complete_pair_uses_pinned_risk_snapshot_guard(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _install_success_sidecar_dependencies(cli_module, monkeypatch, calls)
+
+    report = cli_module.run_risk_dataset(request)
+
+    assert report["publication_status"] == "complete"
+    assert len(calls["pinned_risk_open"]) == 1
+    assert calls["pinned_risk_open"][0][0] == request.output_dir
+    assert calls["pinned_risk_verify"] == [request.output_dir]
+    assert calls["pinned_risk_close"] == [request.output_dir]
+    assert all(
+        not str(path).startswith("/proc/self/fd/")
+        for path, _ in calls["risk_load"]
+    )
+
+
+@pytest.mark.parametrize("mutation_stage", ("sidecar", "marker"))
+@pytest.mark.parametrize(
+    ("mutation_kind", "error_pattern"),
+    (
+        ("same-inode-content", "content changed"),
+        ("replace-member", "identity changed"),
+        ("add-member", "membership changed"),
+        ("delete-member", "membership changed"),
+    ),
+)
+def test_complete_pair_pins_risk_members_through_downstream_gate(
+    cli_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation_stage: str,
+    mutation_kind: str,
+    error_pattern: str,
+) -> None:
+    risk_root = tmp_path / "risk-shard"
+    sidecar_root = tmp_path / "sidecar-shard"
+    risk_root.mkdir()
+    sidecar_root.mkdir()
+    original_members = {
+        "samples.npz": b"payload-original",
+        "metadata.jsonl": b"manifest-original\n",
+        "summary.json": b"summary-original\n",
+    }
+    for name, payload in original_members.items():
+        (risk_root / name).write_bytes(payload)
+    marker_path = cli_module.risk_sidecar_pair_completion_marker_path(
+        sidecar_root
+    )
+    marker_path.write_bytes(b"marker-original\n")
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=1),
+        output_dir=risk_root,
+        sidecar_output_dir=sidecar_root,
+    )
+    risk_identity = cli_module._capture_owned_path(
+        risk_root, expected_file_type=cli_module.stat.S_IFDIR
+    )
+    sidecar_identity = cli_module._capture_owned_path(
+        sidecar_root, expected_file_type=cli_module.stat.S_IFDIR
+    )
+    marker_identity = cli_module._capture_owned_path(
+        marker_path, expected_file_type=cli_module.stat.S_IFREG
+    )
+    root_inode = os.lstat(risk_root).st_ino
+    risk_shard = SimpleNamespace(
+        samples=(SimpleNamespace(sample_id="sample-a"),),
+        semantic_digest="8" * 64,
+        summary={"split": "train", "shard_index": 7},
+    )
+    mutation_count = 0
+
+    def mutate_risk_root() -> None:
+        nonlocal mutation_count
+        mutation_count += 1
+        if mutation_kind == "same-inode-content":
+            member = risk_root / "summary.json"
+            inode = os.lstat(member).st_ino
+            with member.open("r+b") as handle:
+                handle.seek(0)
+                handle.write(b"BORK")
+                handle.flush()
+                os.fsync(handle.fileno())
+            assert os.lstat(member).st_ino == inode
+        elif mutation_kind == "replace-member":
+            member = risk_root / "metadata.jsonl"
+            member.rename(tmp_path / "displaced-metadata.jsonl")
+            member.write_bytes(b"replacement-manifest\n")
+        elif mutation_kind == "add-member":
+            (risk_root / "unexpected-member").write_bytes(b"unexpected\n")
+        else:
+            assert mutation_kind == "delete-member"
+            (risk_root / "samples.npz").unlink()
+        assert os.lstat(risk_root).st_ino == root_inode
+
+    def fake_risk_load(path, *, grid):
+        return risk_shard
+
+    def fake_sidecar_load(path, **kwargs):
+        if mutation_stage == "sidecar":
+            mutate_risk_root()
+        return SimpleNamespace(
+            sample_ids=("sample-a",),
+            semantic_digest="a" * 64,
+            split="train",
+            shard_index=7,
+        )
+
+    def fake_marker_load(path, **kwargs):
+        if mutation_stage == "marker":
+            mutate_risk_root()
+        return SimpleNamespace(marker_digest_sha256="b" * 64)
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "_load_risk_shard_from_snapshot_directory",
+        fake_risk_load,
+    )
+    monkeypatch.setattr(
+        cli_module, "load_risk_sidecar_shard", fake_sidecar_load
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_risk_sidecar_pair_completion_marker",
+        fake_marker_load,
+    )
+
+    with pytest.raises(ValueError, match=error_pattern):
+        cli_module._load_complete_risk_sidecar_pair(
+            request=request,
+            grid=SimpleNamespace(name="grid"),
+            risk_identity=risk_identity,
+            sidecar_identity=sidecar_identity,
+            marker_identity=marker_identity,
+        )
+
+    assert mutation_count == 1
+    assert os.lstat(risk_root).st_ino == root_inode
+
+
+@pytest.mark.parametrize("nested_direction", ["sidecar-inside-risk", "risk-inside-sidecar"])
+def test_nested_risk_and_sidecar_roots_are_rejected_before_any_write(
+    cli_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    nested_direction: str,
+) -> None:
+    request = _request(cli_module, tmp_path, event_count=1, sample_count=3)
+    if nested_direction == "sidecar-inside-risk":
+        request = replace(
+            request,
+            sidecar_output_dir=request.output_dir / "sidecars",
+        )
+    else:
+        parent = tmp_path / "combined-root"
+        request = replace(
+            request,
+            output_dir=parent / "risk-shard",
+            sidecar_output_dir=parent,
+        )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_inputs",
+        lambda value: pytest.fail("nested roots must fail before loading inputs"),
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="must not be nested"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert not request.output_dir.exists()
+    assert request.sidecar_output_dir is not None
+    assert not request.sidecar_output_dir.exists()
+
+
+def test_sidecar_write_failure_cleans_transaction_and_is_retryable(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    successful_write = cli_module.write_risk_sidecar_shard
+    fail_once = True
+
+    def flaky_sidecar_write(*args, **kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise ValueError("forced sidecar write failure")
+        return successful_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_module, "write_risk_sidecar_shard", flaky_sidecar_write
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    _assert_no_published_pair(cli_module, request)
+    calls["samples"].clear()
+
+    report = cli_module.run_risk_dataset(request)
+
+    assert report["publication_status"] == "complete"
+    assert request.output_dir.is_dir()
+    assert request.sidecar_output_dir is not None
+    assert request.sidecar_output_dir.is_dir()
+    assert _pair_marker_path(cli_module, request).is_file()
+
+
+def test_sidecar_staging_reload_failure_cleans_transaction_and_is_retryable(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    successful_load = cli_module.load_risk_sidecar_shard
+    fail_once = True
+
+    def flaky_sidecar_load(*args, **kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise ValueError("forced sidecar staging reload failure")
+        return successful_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_module, "load_risk_sidecar_shard", flaky_sidecar_load
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    _assert_no_published_pair(cli_module, request)
+    calls["samples"].clear()
+
+    report = cli_module.run_risk_dataset(request)
+
+    assert report["publication_status"] == "complete"
+
+
+def test_final_reload_failure_removes_only_this_invocations_pair(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    successful_load = cli_module.load_risk_shard
+    load_count = 0
+
+    def fail_final_risk_reload(*args, **kwargs):
+        nonlocal load_count
+        load_count += 1
+        if load_count == 2:
+            raise ValueError("forced final risk reload failure")
+        return successful_load(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "load_risk_shard", fail_final_risk_reload)
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert load_count == 2
+    _assert_no_published_pair(cli_module, request)
+
+
+def test_second_directory_commit_race_preserves_competitor_and_rolls_back_first(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    real_commit = cli_module._atomic_pair_commit_noreplace
+    commit_count = 0
+    competitor_inode: int | None = None
+
+    def race_second_commit(source: Path, destination: Path) -> None:
+        nonlocal commit_count, competitor_inode
+        commit_count += 1
+        if commit_count == 2:
+            destination.mkdir()
+            competitor_inode = os.lstat(destination).st_ino
+        real_commit(source, destination)
+
+    monkeypatch.setattr(
+        cli_module, "_atomic_pair_commit_noreplace", race_second_commit
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert commit_count == 2
+    assert not request.output_dir.exists()
+    assert request.sidecar_output_dir is not None
+    assert request.sidecar_output_dir.is_dir()
+    assert os.lstat(request.sidecar_output_dir).st_ino == competitor_inode
+    assert not tuple(request.sidecar_output_dir.iterdir())
+    assert not _pair_marker_path(cli_module, request).exists()
+    _assert_pair_staging_clean(request)
+
+
+def test_marker_commit_race_preserves_competitor_and_removes_owned_pair(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    real_commit = cli_module._atomic_pair_commit_noreplace
+    commit_count = 0
+    competitor_inode: int | None = None
+
+    def race_marker_commit(source: Path, destination: Path) -> None:
+        nonlocal commit_count, competitor_inode
+        commit_count += 1
+        if commit_count == 3:
+            destination.write_text("competitor\n", encoding="utf-8")
+            competitor_inode = os.lstat(destination).st_ino
+        real_commit(source, destination)
+
+    monkeypatch.setattr(
+        cli_module, "_atomic_pair_commit_noreplace", race_marker_commit
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    marker_path = _pair_marker_path(cli_module, request)
+    assert commit_count == 3
+    assert not request.output_dir.exists()
+    assert request.sidecar_output_dir is not None
+    assert not request.sidecar_output_dir.exists()
+    assert marker_path.read_text(encoding="utf-8") == "competitor\n"
+    assert os.lstat(marker_path).st_ino == competitor_inode
+    _assert_pair_staging_clean(request)
+
+
+def test_final_marker_reload_failure_removes_owned_marker_and_pair(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _, _ = _install_success_sidecar_dependencies(
+        cli_module, monkeypatch, calls
+    )
+    successful_load = cli_module.load_risk_sidecar_pair_completion_marker
+    load_count = 0
+
+    def fail_final_marker_reload(*args, **kwargs):
+        nonlocal load_count
+        load_count += 1
+        if load_count == 2:
+            raise ValueError("forced final marker reload failure")
+        return successful_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_risk_sidecar_pair_completion_marker",
+        fail_final_marker_reload,
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="publication failed"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert load_count == 2
+    _assert_no_published_pair(cli_module, request)
+
+
+def test_cleanup_claim_restores_competitor_when_owned_path_is_replaced(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owned_path = tmp_path / "owned-directory"
+    displaced_owned = tmp_path / "displaced-owned-directory"
+    owned_path.mkdir()
+    owned = cli_module._capture_owned_path(
+        owned_path, expected_file_type=cli_module.stat.S_IFDIR
+    )
+    competitor_inode: int | None = None
+    real_claim = cli_module._atomic_pair_cleanup_claim_noreplace
+
+    def swap_before_claim(source: Path, destination: Path) -> None:
+        nonlocal competitor_inode
+        source.rename(displaced_owned)
+        source.mkdir()
+        competitor_inode = os.lstat(source).st_ino
+        real_claim(source, destination)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_atomic_pair_cleanup_claim_noreplace",
+        swap_before_claim,
+    )
+
+    assert cli_module._remove_owned_path(owned) is False
+
+    assert displaced_owned.is_dir()
+    assert owned_path.is_dir()
+    assert os.lstat(owned_path).st_ino == competitor_inode
+    assert not tuple(tmp_path.glob(".*.cleanup-quarantine-*"))
+
+
+def test_final_root_replacement_before_marker_commit_prevents_complete_report(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _install_success_sidecar_dependencies(cli_module, monkeypatch, calls)
+    real_commit = cli_module._atomic_pair_commit_noreplace
+    displaced_risk = tmp_path / "displaced-owned-risk"
+    competitor_inode: int | None = None
+    commit_count = 0
+
+    def replace_risk_before_marker(source: Path, destination: Path) -> None:
+        nonlocal commit_count, competitor_inode
+        commit_count += 1
+        if commit_count == 3:
+            request.output_dir.rename(displaced_risk)
+            request.output_dir.mkdir()
+            competitor_inode = os.lstat(request.output_dir).st_ino
+        real_commit(source, destination)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_atomic_pair_commit_noreplace",
+        replace_risk_before_marker,
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="cleanup incomplete"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert commit_count == 3
+    assert displaced_risk.is_dir()
+    assert request.output_dir.is_dir()
+    assert os.lstat(request.output_dir).st_ino == competitor_inode
+    assert request.sidecar_output_dir is not None
+    assert not request.sidecar_output_dir.exists()
+    assert not _pair_marker_path(cli_module, request).exists()
+    _assert_pair_staging_clean(request)
+
+
+def test_final_root_replacement_after_marker_commit_prevents_complete_report(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _install_success_sidecar_dependencies(cli_module, monkeypatch, calls)
+    real_complete_load = cli_module._load_complete_risk_sidecar_pair
+    displaced_sidecar = tmp_path / "displaced-owned-sidecar"
+    competitor_inode: int | None = None
+
+    def replace_sidecar_then_load(*args, **kwargs):
+        nonlocal competitor_inode
+        assert request.sidecar_output_dir is not None
+        request.sidecar_output_dir.rename(displaced_sidecar)
+        request.sidecar_output_dir.mkdir()
+        competitor_inode = os.lstat(request.sidecar_output_dir).st_ino
+        return real_complete_load(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_module,
+        "_load_complete_risk_sidecar_pair",
+        replace_sidecar_then_load,
+    )
+
+    with pytest.raises(
+        cli_module.RiskDatasetRunError, match="cleanup incomplete"
+    ):
+        cli_module.run_risk_dataset(request)
+
+    assert displaced_sidecar.is_dir()
+    assert request.sidecar_output_dir is not None
+    assert request.sidecar_output_dir.is_dir()
+    assert os.lstat(request.sidecar_output_dir).st_ino == competitor_inode
+    assert not request.output_dir.exists()
+    assert not _pair_marker_path(cli_module, request).exists()
+    _assert_pair_staging_clean(request)
+
+
+def test_base_exception_still_cleans_all_pair_staging(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (
+        _event("event-a", state_id="base-a", trajectory_id="trajectory-a"),
+    )
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        sidecar_output_dir=tmp_path / "sidecar-shard",
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _install_success_sidecar_dependencies(cli_module, monkeypatch, calls)
+
+    def interrupt_sidecar_write(*args, **kwargs):
+        raise KeyboardInterrupt("forced interrupt")
+
+    monkeypatch.setattr(
+        cli_module, "write_risk_sidecar_shard", interrupt_sidecar_write
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="forced interrupt"):
+        cli_module.run_risk_dataset(request)
+
+    _assert_no_published_pair(cli_module, request)
 
 
 def test_run_rejects_sop05_input_lock_that_differs_from_reloaded_sop03(

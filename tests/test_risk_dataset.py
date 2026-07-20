@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 import math
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,6 +29,7 @@ from src.datasets.risk_dataset import (
     validate_risk_sample_for_publication,
 )
 from src.datasets.snippet_library import MotionSnippet
+from src.datasets.shard_writer import load_risk_shard, write_risk_shard
 from src.generation.dynamic_object_transplant import (
     TransplantedDynamicObject,
     footprint_from_spec,
@@ -814,6 +817,229 @@ def test_formal_group_adapter_is_atomic_and_keeps_valid_partial_variants(
     assert samples[1].risk_severity == 0.0
     assert samples[0].pair_group_id == samples[1].pair_group_id
     assert render_calls == [samples[0].pair_group_id]
+
+
+def test_formal_group_sidecar_api_preserves_risk_samples_and_keeps_labels_separate() -> None:
+    combined_inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+    legacy_inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+
+    samples, sidecars = (
+        risk_dataset_module.build_risk_samples_and_sidecars_from_sop06_group(
+            **combined_inputs
+        )
+    )
+    legacy_samples = _build_formal_group_samples(legacy_inputs)
+
+    assert tuple(sidecar.sample_id for sidecar in sidecars) == tuple(
+        sample.sample_id for sample in samples
+    )
+    assert len(samples) == len(legacy_samples) == len(sidecars)
+    for sample, legacy in zip(samples, legacy_samples, strict=True):
+        for field in fields(RiskSample):
+            actual = getattr(sample, field.name)
+            expected = getattr(legacy, field.name)
+            if isinstance(actual, np.ndarray):
+                np.testing.assert_array_equal(actual, expected)
+            else:
+                assert actual == expected
+        assert "hidden_risk_occupancy" not in sample.metadata
+        assert "robot_future_footprints" not in sample.metadata
+    by_kind = {
+        sample.event_type: sidecar
+        for sample, sidecar in zip(samples, sidecars, strict=True)
+    }
+    assert np.any(by_kind["collision"].hidden_risk_occupancy)
+    assert not np.any(by_kind["empty_blind_spot"].hidden_risk_occupancy)
+    assert all(not sidecar.hidden_risk_occupancy.flags.writeable for sidecar in sidecars)
+
+
+def test_risk_only_group_adapter_never_builds_oracle_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+
+    def forbidden_sidecar_builder(**kwargs):
+        raise AssertionError("risk-only assembly must not rasterize sidecars")
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "build_risk_label_sidecar",
+        forbidden_sidecar_builder,
+    )
+
+    samples = risk_dataset_module.build_risk_samples_from_sop06_group(**inputs)
+
+    assert tuple(sample.event_type for sample in samples) == (
+        "collision",
+        "empty_blind_spot",
+    )
+
+
+def test_combined_group_adapter_builds_one_sidecar_per_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+    real_builder = risk_dataset_module.build_risk_label_sidecar
+    built_ids: list[str] = []
+
+    def counted_sidecar_builder(**kwargs):
+        built_ids.append(kwargs["sample_id"])
+        return real_builder(**kwargs)
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "build_risk_label_sidecar",
+        counted_sidecar_builder,
+    )
+
+    samples, sidecars = (
+        risk_dataset_module.build_risk_samples_and_sidecars_from_sop06_group(
+            **inputs
+        )
+    )
+
+    assert built_ids == [sample.sample_id for sample in samples]
+    assert tuple(built_ids) == tuple(sidecar.sample_id for sidecar in sidecars)
+
+
+def test_formal_group_risk_shard_matches_pre_task4_semantic_golden(
+    tmp_path,
+) -> None:
+    inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+    samples = risk_dataset_module.build_risk_samples_from_sop06_group(**inputs)
+    grid = build_grid_spec(inputs["base_config"])
+    root = tmp_path / "risk-shard-golden"
+
+    write_risk_shard(
+        samples,
+        root,
+        grid=grid,
+        shard_index=7,
+        expected_sample_count=2,
+    )
+    loaded = load_risk_shard(root, grid=grid)
+
+    assert tuple(sample.sample_id for sample in loaded.samples) == (
+        "train-269373dcdaab245d19563b96",
+        "train-ede80befc273c7aa98c3b3a8",
+    )
+    assert loaded.manifest_digest == (
+        "7e00c65a7e1e3ecbfd043470879dbdbfcb057f95b66bf8a07f798b2280637ae7"
+    )
+    assert loaded.semantic_digest == (
+        "bc4f2ed6a1029a29635f5c46edd4fbc0079a8816a4ce4539432c44c8380f50e4"
+    )
+
+
+def _write_formal_risk_shard_for_hardened_load(
+    tmp_path: Path,
+) -> tuple[Path, object]:
+    inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+    samples = risk_dataset_module.build_risk_samples_from_sop06_group(**inputs)
+    grid = build_grid_spec(inputs["base_config"])
+    root = tmp_path / "risk-shard-hardened"
+    write_risk_shard(
+        samples,
+        root,
+        grid=grid,
+        shard_index=7,
+        expected_sample_count=2,
+    )
+    return root, grid
+
+
+@pytest.mark.parametrize(
+    "member_name", ("summary.json", "metadata.jsonl", "samples.npz")
+)
+def test_hardened_risk_loader_rejects_member_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_name: str,
+) -> None:
+    root, grid = _write_formal_risk_shard_for_hardened_load(tmp_path)
+    root_inode = os.lstat(root).st_ino
+    member = root / member_name
+    displaced = root / f"{member_name}.displaced"
+    real_open = risk_dataset_module._open_risk_snapshot_member_nofollow
+    swapped = False
+
+    def swap_member_then_open(root_fd: int, name: str):
+        nonlocal swapped
+        if name == member_name and not swapped:
+            member.rename(displaced)
+            member.symlink_to(displaced.name)
+            swapped = True
+        return real_open(root_fd, name)
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "_open_risk_snapshot_member_nofollow",
+        swap_member_then_open,
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        risk_dataset_module.load_hardened_risk_shard_snapshot(
+            root, grid=grid
+        )
+
+    assert swapped
+    assert os.lstat(root).st_ino == root_inode
+    assert member.is_symlink()
+    assert displaced.is_file()
+
+
+@pytest.mark.parametrize(
+    "member_name", ("summary.json", "metadata.jsonl", "samples.npz")
+)
+def test_hardened_risk_loader_detects_same_inode_member_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_name: str,
+) -> None:
+    root, grid = _write_formal_risk_shard_for_hardened_load(tmp_path)
+    root_inode = os.lstat(root).st_ino
+    member = root / member_name
+    member_inode = os.lstat(member).st_ino
+    real_load = risk_dataset_module._load_risk_shard_from_snapshot_directory
+    mutated = False
+
+    def mutate_original_then_load(snapshot_root: Path, *, grid):
+        nonlocal mutated
+        with member.open("r+b") as mutable:
+            mutable.seek(0)
+            mutable.write(b"BORK")
+            mutable.flush()
+            os.fsync(mutable.fileno())
+        assert os.lstat(member).st_ino == member_inode
+        mutated = True
+        return real_load(snapshot_root, grid=grid)
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "_load_risk_shard_from_snapshot_directory",
+        mutate_original_then_load,
+    )
+
+    with pytest.raises(ValueError, match="content changed"):
+        risk_dataset_module.load_hardened_risk_shard_snapshot(
+            root, grid=grid
+        )
+
+    assert mutated
+    assert os.lstat(root).st_ino == root_inode
+    assert os.lstat(member).st_ino == member_inode
 
 
 def test_formal_group_adapter_replaces_the_single_variant_bypass() -> None:

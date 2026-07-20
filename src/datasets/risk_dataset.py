@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
+import errno
 import json
 import math
 from numbers import Integral, Real
+import os
+from pathlib import Path
+import stat
+import tempfile
 from typing import Any, Mapping
 
 import numpy as np
@@ -58,6 +63,10 @@ from src.generation.risk_gt import (
     compute_hidden_risk_gt,
     resolve_no_object_clearance_sentinel,
 )
+from src.generation.risk_sidecars import (
+    RiskLabelSidecar,
+    build_risk_label_sidecar,
+)
 from src.generation.sop06_pipeline import render_sop06_partial_pair_group
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
@@ -104,6 +113,285 @@ _FORBIDDEN_METADATA_KEY_TOKENS = (
     "hidden_object_ids",
 )
 _RISK_INPUT_ADAPTER_VERSION = "sop06_group_to_risk_samples_v2"
+_RISK_SHARD_SNAPSHOT_MEMBERS = (
+    "samples.npz",
+    "metadata.jsonl",
+    "summary.json",
+)
+
+
+@dataclass(frozen=True)
+class _RiskSnapshotIdentity:
+    device: int
+    inode: int
+    file_type: int
+
+
+def _risk_snapshot_identity(descriptor: int) -> _RiskSnapshotIdentity:
+    metadata = os.fstat(descriptor)
+    return _RiskSnapshotIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        file_type=stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _same_risk_snapshot_identity(
+    first: _RiskSnapshotIdentity, second: _RiskSnapshotIdentity
+) -> bool:
+    return (
+        first.device == second.device
+        and first.inode == second.inode
+        and first.file_type == second.file_type
+    )
+
+
+def _open_risk_snapshot_root_nofollow(
+    root: Path,
+) -> tuple[int, _RiskSnapshotIdentity]:
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(
+                f"risk shard root must not be a symlink: {root}"
+            ) from exc
+        if exc.errno == errno.ENOENT:
+            raise ValueError(f"risk shard root not found: {root}") from exc
+        raise ValueError(f"failed to open risk shard root: {root}") from exc
+    try:
+        identity = _risk_snapshot_identity(descriptor)
+        if identity.file_type != stat.S_IFDIR:
+            raise ValueError(f"risk shard root must be a directory: {root}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identity
+
+
+def _open_risk_snapshot_member_nofollow(
+    root_fd: int, name: str
+) -> tuple[int, _RiskSnapshotIdentity]:
+    if name not in _RISK_SHARD_SNAPSHOT_MEMBERS:
+        raise ValueError(f"unexpected risk shard member name: {name}")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(
+                f"risk shard member must not be a symlink: {name}"
+            ) from exc
+        if exc.errno == errno.ENOENT:
+            raise ValueError(f"risk shard member not found: {name}") from exc
+        raise ValueError(f"failed to open risk shard member: {name}") from exc
+    try:
+        identity = _risk_snapshot_identity(descriptor)
+        if identity.file_type != stat.S_IFREG:
+            raise ValueError(
+                f"risk shard member must be a direct regular file: {name}"
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identity
+
+
+def _read_risk_snapshot_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1 << 20)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def _load_risk_shard_from_snapshot_directory(
+    snapshot_root: Path, *, grid: GridSpec
+) -> Any:
+    from src.datasets.shard_writer import load_risk_shard
+
+    return load_risk_shard(snapshot_root, grid=grid)
+
+
+class PinnedRiskShardSnapshot:
+    """Hold a verified risk root and every formal member through a gate."""
+
+    def __init__(self, output_dir: str | Path, *, grid: GridSpec) -> None:
+        self._root = Path(output_dir)
+        self._grid = grid
+        self._root_fd: int | None = None
+        self._root_identity: _RiskSnapshotIdentity | None = None
+        self._member_fds: dict[str, int] = {}
+        self._member_identities: dict[str, _RiskSnapshotIdentity] = {}
+        self._snapshots: dict[str, bytes] = {}
+        self._loaded_shard: Any | None = None
+
+    @property
+    def loaded_shard(self) -> Any:
+        if self._loaded_shard is None:
+            raise RuntimeError("pinned risk shard has not been entered")
+        return self._loaded_shard
+
+    def __enter__(self) -> PinnedRiskShardSnapshot:
+        if self._root_fd is not None:
+            raise RuntimeError("pinned risk shard cannot be entered twice")
+        root_fd, root_identity = _open_risk_snapshot_root_nofollow(
+            self._root
+        )
+        self._root_fd = root_fd
+        self._root_identity = root_identity
+        try:
+            actual_files = set(os.listdir(root_fd))
+            required_files = set(_RISK_SHARD_SNAPSHOT_MEMBERS)
+            missing = required_files - actual_files
+            if missing:
+                raise ValueError(
+                    "incomplete risk shard: missing "
+                    + ", ".join(sorted(missing))
+                )
+            unexpected = actual_files - required_files
+            if unexpected:
+                raise ValueError(
+                    "unexpected risk shard files: "
+                    + ", ".join(sorted(unexpected))
+                )
+
+            for name in _RISK_SHARD_SNAPSHOT_MEMBERS:
+                descriptor, identity = _open_risk_snapshot_member_nofollow(
+                    root_fd, name
+                )
+                self._member_fds[name] = descriptor
+                self._member_identities[name] = identity
+                self._snapshots[name] = _read_risk_snapshot_descriptor(
+                    descriptor
+                )
+
+            with tempfile.TemporaryDirectory(
+                prefix="risk-shard-immutable-snapshot-"
+            ) as temporary:
+                snapshot_root = Path(temporary) / "risk-shard"
+                snapshot_root.mkdir(mode=0o700)
+                for name in _RISK_SHARD_SNAPSHOT_MEMBERS:
+                    snapshot_path = snapshot_root / name
+                    with snapshot_path.open("xb") as handle:
+                        handle.write(self._snapshots[name])
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                self._loaded_shard = (
+                    _load_risk_shard_from_snapshot_directory(
+                        snapshot_root, grid=self._grid
+                    )
+                )
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def verify_unchanged(self) -> None:
+        """Fail unless pinned bytes, membership, and identities still match."""
+
+        root_fd = self._root_fd
+        root_identity = self._root_identity
+        if (
+            root_fd is None
+            or root_identity is None
+            or self._loaded_shard is None
+        ):
+            raise RuntimeError("pinned risk shard is not open")
+
+        for name in _RISK_SHARD_SNAPSHOT_MEMBERS:
+            if (
+                _read_risk_snapshot_descriptor(self._member_fds[name])
+                != self._snapshots[name]
+            ):
+                raise ValueError(
+                    "risk shard member content changed during complete load: "
+                    f"{name}"
+                )
+
+        actual_files = set(os.listdir(root_fd))
+        required_files = set(_RISK_SHARD_SNAPSHOT_MEMBERS)
+        if actual_files != required_files:
+            missing = sorted(required_files - actual_files)
+            unexpected = sorted(actual_files - required_files)
+            details: list[str] = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if unexpected:
+                details.append("unexpected " + ", ".join(unexpected))
+            raise ValueError(
+                "risk shard membership changed during complete load: "
+                + "; ".join(details)
+            )
+
+        for name in _RISK_SHARD_SNAPSHOT_MEMBERS:
+            descriptor, identity = _open_risk_snapshot_member_nofollow(
+                root_fd, name
+            )
+            os.close(descriptor)
+            if not _same_risk_snapshot_identity(
+                self._member_identities[name], identity
+            ):
+                raise ValueError(
+                    "risk shard member identity changed during complete load: "
+                    f"{name}"
+                )
+
+        verification_fd, verification_identity = (
+            _open_risk_snapshot_root_nofollow(self._root)
+        )
+        os.close(verification_fd)
+        if not _same_risk_snapshot_identity(
+            root_identity, verification_identity
+        ):
+            raise ValueError(
+                "risk shard root identity changed during complete load"
+            )
+
+    def close(self) -> None:
+        for descriptor in self._member_fds.values():
+            os.close(descriptor)
+        self._member_fds.clear()
+        self._member_identities.clear()
+        self._snapshots.clear()
+        if self._root_fd is not None:
+            os.close(self._root_fd)
+            self._root_fd = None
+        self._root_identity = None
+        self._loaded_shard = None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self.close()
+        return False
+
+
+def pin_risk_shard_snapshot(
+    output_dir: str | Path, *, grid: GridSpec
+) -> PinnedRiskShardSnapshot:
+    """Create a guard whose fixed FDs remain open until context exit."""
+
+    return PinnedRiskShardSnapshot(output_dir, grid=grid)
+
+
+def load_hardened_risk_shard_snapshot(
+    output_dir: str | Path, *, grid: GridSpec
+) -> Any:
+    """Load and immediately verify one pinned formal risk shard."""
+
+    with pin_risk_shard_snapshot(output_dir, grid=grid) as pinned:
+        loaded = pinned.loaded_shard
+        pinned.verify_unchanged()
+        return loaded
 
 
 @dataclass(frozen=True)
@@ -1376,7 +1664,7 @@ def _validate_variant_semantics(
             raise ValueError(f"{kind} transform metadata mismatch")
 
 
-def _build_risk_sample_from_rendered(
+def _build_risk_sample_and_optional_sidecar_from_rendered(
     source: RiskBuildInput,
     rendered: RenderedObservation,
     *,
@@ -1387,7 +1675,8 @@ def _build_risk_sample_from_rendered(
     mother_event: GeneratedEvent | None = None,
     source_snippet: MotionSnippet | None = None,
     oracle_context: OracleContext | None = None,
-) -> RiskSample:
+    include_sidecar: bool = False,
+) -> tuple[RiskSample, RiskLabelSidecar | None]:
     grid = build_grid_spec(dict(base_config))
     if not np.array_equal(
         source.observed_static_occupancy,
@@ -1414,6 +1703,19 @@ def _build_risk_sample_from_rendered(
         sigma_distance_m=normalized_risk["sigma_distance_m"],
         sigma_time_s=normalized_risk["sigma_time_s"],
         near_miss_distance_m=normalized_risk["near_miss_distance_m"],
+    )
+    sidecar = (
+        build_risk_label_sidecar(
+            sample_id=source.sample_id,
+            trajectory=source.trajectory,
+            world=source.oracle_world,
+            hidden_object_ids=source.hidden_object_ids,
+            robot_footprint=robot_footprint,
+            grid=grid,
+            future_dt_s=bev_config.get("future_dt_s"),
+        )
+        if include_sidecar
+        else None
     )
     if formal_variant is not None:
         if any(
@@ -1485,7 +1787,7 @@ def _build_risk_sample_from_rendered(
         metadata=metadata,
     )
     validate_risk_sample_for_publication(sample, grid)
-    return sample
+    return sample, sidecar
 
 
 def build_risk_sample(
@@ -1513,15 +1815,16 @@ def build_risk_sample(
         sensor_config=source.sensor_config,
         config=base_config_dict,
     )
-    return _build_risk_sample_from_rendered(
+    sample, _ = _build_risk_sample_and_optional_sidecar_from_rendered(
         source,
         rendered,
         base_config=base_config_dict,
         normalized_risk=normalized_risk,
     )
+    return sample
 
 
-def build_risk_samples_from_sop06_group(
+def _build_risk_samples_from_sop06_group_impl(
     *,
     group: PairedEventGroup,
     mother_event: GeneratedEvent,
@@ -1533,8 +1836,9 @@ def build_risk_samples_from_sop06_group(
     paired_config: PairedVariantConfig,
     risk_config: Mapping[str, object],
     dataset_seed: int,
-) -> tuple[RiskSample, ...]:
-    """Atomically validate, render once, and assemble one formal SOP06 group."""
+    include_sidecars: bool,
+) -> tuple[tuple[RiskSample, ...], tuple[RiskLabelSidecar, ...]]:
+    """Atomically assemble one formal group with optional oracle sidecars."""
 
     if not isinstance(base_config, Mapping):
         raise TypeError("base_config must be a mapping")
@@ -1606,6 +1910,7 @@ def build_risk_samples_from_sop06_group(
         raise RuntimeError("formal SOP06 renderer returned misaligned observations")
 
     samples: list[RiskSample] = []
+    sidecars: list[RiskLabelSidecar] = []
     for variant, rendered in zip(
         group.variants, rendered_group.observations, strict=True
     ):
@@ -1625,17 +1930,84 @@ def build_risk_samples_from_sop06_group(
             paired_seed=paired_seed,
         )
         _validate_source_join(source)
-        samples.append(
-            _build_risk_sample_from_rendered(
-                source,
-                rendered,
-                base_config=base_config_dict,
-                normalized_risk=normalized_risk,
-                formal_variant=variant,
-                paired_config=paired_config,
-                mother_event=mother_event,
-                source_snippet=source_snippet,
-                oracle_context=oracle_context,
-            )
+        sample, sidecar = _build_risk_sample_and_optional_sidecar_from_rendered(
+            source,
+            rendered,
+            base_config=base_config_dict,
+            normalized_risk=normalized_risk,
+            formal_variant=variant,
+            paired_config=paired_config,
+            mother_event=mother_event,
+            source_snippet=source_snippet,
+            oracle_context=oracle_context,
+            include_sidecar=include_sidecars,
         )
-    return tuple(samples)
+        samples.append(sample)
+        if include_sidecars:
+            if sidecar is None:  # pragma: no cover - private call invariant
+                raise RuntimeError(
+                    "formal sidecar construction unexpectedly returned None"
+                )
+            sidecars.append(sidecar)
+    return tuple(samples), tuple(sidecars)
+
+
+def build_risk_samples_and_sidecars_from_sop06_group(
+    *,
+    group: PairedEventGroup,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    paired_config: PairedVariantConfig,
+    risk_config: Mapping[str, object],
+    dataset_seed: int,
+) -> tuple[tuple[RiskSample, ...], tuple[RiskLabelSidecar, ...]]:
+    """Atomically assemble model samples and separate oracle-only sidecars."""
+
+    return _build_risk_samples_from_sop06_group_impl(
+        group=group,
+        mother_event=mother_event,
+        source_snippet=source_snippet,
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        paired_config=paired_config,
+        risk_config=risk_config,
+        dataset_seed=dataset_seed,
+        include_sidecars=True,
+    )
+
+
+def build_risk_samples_from_sop06_group(
+    *,
+    group: PairedEventGroup,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    paired_config: PairedVariantConfig,
+    risk_config: Mapping[str, object],
+    dataset_seed: int,
+) -> tuple[RiskSample, ...]:
+    """Compatibility wrapper that exposes only deployment-safe samples."""
+
+    samples, _ = _build_risk_samples_from_sop06_group_impl(
+        group=group,
+        mother_event=mother_event,
+        source_snippet=source_snippet,
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        paired_config=paired_config,
+        risk_config=risk_config,
+        dataset_seed=dataset_seed,
+        include_sidecars=False,
+    )
+    return samples

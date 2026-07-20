@@ -7,9 +7,14 @@ import argparse
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+import errno
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import sys
+import tempfile
 
 import yaml
 
@@ -20,7 +25,19 @@ if str(_ROOT) not in sys.path:
 
 from src.contracts import ContractError, SCHEMA_VERSION, build_grid_spec  # noqa: E402
 from src.datasets.risk_dataset import (  # noqa: E402
+    build_risk_samples_and_sidecars_from_sop06_group,
     build_risk_samples_from_sop06_group,
+    pin_risk_shard_snapshot,
+)
+from src.datasets.sidecar_writer import (  # noqa: E402
+    _atomic_rename_directory_noreplace as _atomic_pair_cleanup_claim_noreplace,
+    _atomic_rename_directory_noreplace as _atomic_pair_commit_noreplace,
+    _atomic_rename_directory_noreplace as _atomic_pair_restore_noreplace,
+    load_risk_sidecar_pair_completion_marker,
+    load_risk_sidecar_shard,
+    risk_sidecar_pair_completion_marker_path,
+    write_risk_sidecar_pair_completion_marker,
+    write_risk_sidecar_shard,
 )
 from src.datasets.shard_writer import (  # noqa: E402
     load_risk_shard,
@@ -46,7 +63,7 @@ from src.utils.config import ConfigError, load_config  # noqa: E402
 from src.utils.seeding import derive_seed  # noqa: E402
 
 
-SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v3"
+SOP07_RISK_DATASET_CLI_VERSION = "sop07_risk_dataset_cli_v4"
 
 
 class RiskDatasetRunError(ValueError):
@@ -69,6 +86,22 @@ class RiskDatasetRunRequest:
     expected_event_count: int
     expected_sample_count: int
     checksum_workers: int
+    sidecar_output_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class _OwnedFilesystemPath:
+    path: Path
+    device: int
+    inode: int
+    file_type: int
+
+
+@dataclass(frozen=True)
+class _CompleteRiskSidecarPair:
+    risk_shard: object
+    sidecar_shard: object
+    completion_marker: object
 
 
 def _positive_int(text: str) -> int:
@@ -127,6 +160,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=_nonnegative_int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--sidecar-output-dir",
+        type=Path,
+        help=(
+            "optional separate immutable root for oracle-only SOP08 labels"
+        ),
+    )
     parser.add_argument("--shard-index", type=_nonnegative_int, required=True)
     parser.add_argument(
         "--expected-event-count", type=_positive_int, required=True
@@ -164,10 +204,474 @@ def _validate_request(request: RiskDatasetRunRequest) -> None:
             or any(character not in "0123456789abcdef" for character in value)
         ):
             raise RiskDatasetRunError(f"{name} must be a lowercase SHA-256")
-    if request.output_dir.exists():
+    if os.path.lexists(request.output_dir):
         raise FileExistsError(
             f"refusing to overwrite immutable shard: {request.output_dir}"
         )
+    if request.sidecar_output_dir is not None:
+        if not isinstance(request.sidecar_output_dir, Path):
+            raise TypeError("sidecar_output_dir must be a Path or None")
+        risk_root = request.output_dir.resolve(strict=False)
+        sidecar_root = request.sidecar_output_dir.resolve(strict=False)
+        if (
+            risk_root == sidecar_root
+            or risk_root in sidecar_root.parents
+            or sidecar_root in risk_root.parents
+        ):
+            raise RiskDatasetRunError(
+                "risk and sidecar output directories must not be nested"
+            )
+        if os.path.lexists(request.sidecar_output_dir):
+            raise FileExistsError(
+                "refusing to overwrite immutable sidecar shard: "
+                f"{request.sidecar_output_dir}"
+            )
+        marker_path = risk_sidecar_pair_completion_marker_path(
+            request.sidecar_output_dir
+        )
+        if os.path.lexists(marker_path):
+            raise FileExistsError(
+                "refusing to overwrite immutable risk/sidecar pair marker: "
+                f"{marker_path}"
+            )
+
+
+def _capture_owned_path(
+    path: Path, *, expected_file_type: int
+) -> _OwnedFilesystemPath:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if expected_file_type == stat.S_IFDIR:
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        file_type = stat.S_IFMT(metadata.st_mode)
+        if file_type != expected_file_type:
+            raise RiskDatasetRunError(
+                f"transaction path has unexpected file type: {path}"
+            )
+        return _OwnedFilesystemPath(
+            path=path,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            file_type=file_type,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _same_owned_path(value: _OwnedFilesystemPath) -> bool:
+    try:
+        actual = _capture_owned_path(
+            value.path, expected_file_type=value.file_type
+        )
+    except (FileNotFoundError, OSError, RiskDatasetRunError):
+        return False
+    return (
+        actual.device == value.device
+        and actual.inode == value.inode
+        and actual.file_type == value.file_type
+    )
+
+
+def _remove_owned_path(value: _OwnedFilesystemPath) -> bool:
+    """Atomically claim and remove only this invocation's inode."""
+
+    quarantine = Path(
+        tempfile.mkdtemp(
+            prefix=f".{value.path.name}.cleanup-quarantine-",
+            dir=value.path.parent,
+        )
+    )
+    quarantine_identity = _capture_owned_path(
+        quarantine, expected_file_type=stat.S_IFDIR
+    )
+    claimed = quarantine / "claimed"
+    try:
+        try:
+            _atomic_pair_cleanup_claim_noreplace(value.path, claimed)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                if not _same_owned_path(quarantine_identity):
+                    raise RiskDatasetRunError(
+                        "cleanup incomplete: quarantine identity changed"
+                    )
+                os.rmdir(quarantine)
+                return True
+            raise
+        metadata = claimed.lstat()
+        claimed_identity = _OwnedFilesystemPath(
+            path=claimed,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            file_type=stat.S_IFMT(metadata.st_mode),
+        )
+        if (
+            claimed_identity.device != value.device
+            or claimed_identity.inode != value.inode
+            or claimed_identity.file_type != value.file_type
+        ):
+            try:
+                _atomic_pair_restore_noreplace(claimed, value.path)
+            except OSError as restore_exc:
+                raise RiskDatasetRunError(
+                    "cleanup incomplete: competitor could not be restored; "
+                    f"preserved at {claimed}"
+                ) from restore_exc
+            if not _same_owned_path(quarantine_identity):
+                raise RiskDatasetRunError(
+                    "cleanup incomplete: quarantine identity changed"
+                )
+            os.rmdir(quarantine)
+            return False
+        if value.file_type == stat.S_IFDIR:
+            shutil.rmtree(claimed)
+        elif value.file_type == stat.S_IFREG:
+            claimed.unlink()
+        else:  # pragma: no cover - capture limits transaction path types
+            raise RiskDatasetRunError(
+                "cleanup incomplete: unsupported transaction path type"
+            )
+        if not _same_owned_path(quarantine_identity):
+            raise RiskDatasetRunError(
+                "cleanup incomplete: quarantine identity changed"
+            )
+        os.rmdir(quarantine)
+        return True
+    except BaseException:
+        if quarantine.exists() and not any(quarantine.iterdir()):
+            try:
+                if _same_owned_path(quarantine_identity):
+                    os.rmdir(quarantine)
+            except OSError:
+                pass
+        raise
+
+
+def _make_pair_staging_target(final_path: Path) -> tuple[_OwnedFilesystemPath, Path]:
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    container = Path(
+        tempfile.mkdtemp(
+            prefix=f".{final_path.name}.pair-staging-",
+            dir=final_path.parent,
+        )
+    )
+    owned_container = _capture_owned_path(
+        container, expected_file_type=stat.S_IFDIR
+    )
+    return owned_container, container / final_path.name
+
+
+def _commit_staged_path(
+    source: Path,
+    destination: Path,
+    *,
+    expected_file_type: int,
+) -> _OwnedFilesystemPath:
+    source_identity = _capture_owned_path(
+        source, expected_file_type=expected_file_type
+    )
+    _atomic_pair_commit_noreplace(source, destination)
+    try:
+        destination_identity = _capture_owned_path(
+            destination, expected_file_type=expected_file_type
+        )
+    except BaseException:
+        try:
+            _atomic_pair_restore_noreplace(destination, source)
+        except OSError as restore_exc:
+            raise RiskDatasetRunError(
+                "publication cleanup incomplete: committed path could not be restored"
+            ) from restore_exc
+        raise
+    if (
+        destination_identity.device != source_identity.device
+        or destination_identity.inode != source_identity.inode
+        or destination_identity.file_type != source_identity.file_type
+    ):
+        try:
+            _atomic_pair_restore_noreplace(destination, source)
+        except OSError as restore_exc:
+            raise RiskDatasetRunError(
+                "publication cleanup incomplete: raced path could not be restored"
+            ) from restore_exc
+        raise RiskDatasetRunError(
+            "staging identity changed during no-replace publication"
+        )
+    return _OwnedFilesystemPath(
+        path=destination,
+        device=source_identity.device,
+        inode=source_identity.inode,
+        file_type=source_identity.file_type,
+    )
+
+
+def _load_complete_risk_sidecar_pair(
+    *,
+    request: RiskDatasetRunRequest,
+    grid: object,
+    risk_identity: _OwnedFilesystemPath,
+    sidecar_identity: _OwnedFilesystemPath,
+    marker_identity: _OwnedFilesystemPath,
+) -> _CompleteRiskSidecarPair:
+    """Reload and bind one final marker plus both exact final-root inodes."""
+
+    if request.sidecar_output_dir is None:  # pragma: no cover - private contract
+        raise RuntimeError("complete pair load requires sidecar_output_dir")
+    for owned, name in (
+        (risk_identity, "risk root"),
+        (sidecar_identity, "sidecar root"),
+        (marker_identity, "pair marker"),
+    ):
+        if not _same_owned_path(owned):
+            raise ValueError(f"final {name} identity changed before complete load")
+
+    with pin_risk_shard_snapshot(
+        request.output_dir, grid=grid
+    ) as pinned_risk:
+        risk_shard = pinned_risk.loaded_shard
+        sample_ids = tuple(sample.sample_id for sample in risk_shard.samples)
+        if len(sample_ids) != request.expected_sample_count:
+            raise ValueError("complete pair risk sample count mismatch")
+        risk_summary = getattr(risk_shard, "summary", None)
+        if not isinstance(risk_summary, Mapping):
+            raise ValueError("complete pair risk summary is unavailable")
+        if (
+            risk_summary.get("split") != request.split
+            or risk_summary.get("shard_index") != request.shard_index
+        ):
+            raise ValueError("complete pair risk split/index mismatch")
+
+        sidecar_shard = load_risk_sidecar_shard(
+            request.sidecar_output_dir,
+            grid=grid,
+            expected_sample_ids=sample_ids,
+            expected_source_risk_shard_semantic_digest=(
+                risk_shard.semantic_digest
+            ),
+        )
+        if (
+            sidecar_shard.sample_ids != sample_ids
+            or sidecar_shard.split != request.split
+            or sidecar_shard.shard_index != request.shard_index
+        ):
+            raise ValueError("complete pair sidecar identity mismatch")
+
+        marker_path = risk_sidecar_pair_completion_marker_path(
+            request.sidecar_output_dir
+        )
+        marker = load_risk_sidecar_pair_completion_marker(
+            marker_path,
+            expected_risk_root=request.output_dir,
+            expected_sidecar_root=request.sidecar_output_dir,
+            expected_split=request.split,
+            expected_shard_index=request.shard_index,
+            expected_sample_ids=sample_ids,
+            expected_risk_shard_semantic_digest=(
+                risk_shard.semantic_digest
+            ),
+            expected_sidecar_shard_semantic_digest=(
+                sidecar_shard.semantic_digest
+            ),
+        )
+        for owned, name in (
+            (risk_identity, "risk root"),
+            (sidecar_identity, "sidecar root"),
+            (marker_identity, "pair marker"),
+        ):
+            if not _same_owned_path(owned):
+                raise ValueError(
+                    f"final {name} identity changed during complete load"
+                )
+        complete_pair = _CompleteRiskSidecarPair(
+            risk_shard=risk_shard,
+            sidecar_shard=sidecar_shard,
+            completion_marker=marker,
+        )
+        pinned_risk.verify_unchanged()
+        return complete_pair
+
+
+def _publish_risk_sidecar_pair(
+    *,
+    request: RiskDatasetRunRequest,
+    sample_values: tuple[object, ...],
+    sidecars: tuple[object, ...],
+    grid: object,
+):
+    """Publish both immutable roots and their external marker as one protocol."""
+
+    if request.sidecar_output_dir is None:  # pragma: no cover - private contract
+        raise RuntimeError("paired publication requires sidecar_output_dir")
+    marker_final = risk_sidecar_pair_completion_marker_path(
+        request.sidecar_output_dir
+    )
+    staging_containers: list[_OwnedFilesystemPath] = []
+    published_paths: list[_OwnedFilesystemPath] = []
+    try:
+        risk_container, risk_staging = _make_pair_staging_target(
+            request.output_dir
+        )
+        staging_containers.append(risk_container)
+        sidecar_container, sidecar_staging = _make_pair_staging_target(
+            request.sidecar_output_dir
+        )
+        staging_containers.append(sidecar_container)
+
+        write_risk_shard(
+            sample_values,
+            risk_staging,
+            grid=grid,
+            shard_index=request.shard_index,
+            expected_sample_count=request.expected_sample_count,
+        )
+        staged_risk = load_risk_shard(risk_staging, grid=grid)
+        if len(staged_risk.samples) != request.expected_sample_count:
+            raise ValueError("formal risk staging reload count mismatch")
+        staged_ids = tuple(
+            sample.sample_id for sample in staged_risk.samples
+        )
+
+        write_risk_sidecar_shard(
+            sidecars,
+            sidecar_staging,
+            grid=grid,
+            split=request.split,
+            shard_index=request.shard_index,
+            source_risk_shard_semantic_digest=staged_risk.semantic_digest,
+        )
+        staged_sidecars = load_risk_sidecar_shard(
+            sidecar_staging,
+            grid=grid,
+            expected_sample_ids=staged_ids,
+            expected_source_risk_shard_semantic_digest=(
+                staged_risk.semantic_digest
+            ),
+        )
+        if staged_sidecars.sample_ids != staged_ids:
+            raise ValueError("formal sidecar staging reload sample IDs mismatch")
+
+        risk_published = _commit_staged_path(
+            risk_staging,
+            request.output_dir,
+            expected_file_type=stat.S_IFDIR,
+        )
+        published_paths.append(risk_published)
+        sidecar_published = _commit_staged_path(
+            sidecar_staging,
+            request.sidecar_output_dir,
+            expected_file_type=stat.S_IFDIR,
+        )
+        published_paths.append(sidecar_published)
+
+        final_risk = load_risk_shard(request.output_dir, grid=grid)
+        final_ids = tuple(sample.sample_id for sample in final_risk.samples)
+        if (
+            final_risk.manifest_digest != staged_risk.manifest_digest
+            or final_risk.semantic_digest != staged_risk.semantic_digest
+            or final_ids != staged_ids
+        ):
+            raise ValueError("final risk shard differs from verified staging")
+        final_sidecars = load_risk_sidecar_shard(
+            request.sidecar_output_dir,
+            grid=grid,
+            expected_sample_ids=final_ids,
+            expected_source_risk_shard_semantic_digest=(
+                final_risk.semantic_digest
+            ),
+        )
+        if final_sidecars.semantic_digest != staged_sidecars.semantic_digest:
+            raise ValueError("final sidecar shard differs from verified staging")
+
+        marker_container, marker_staging = _make_pair_staging_target(
+            marker_final
+        )
+        staging_containers.append(marker_container)
+        marker_kwargs = {
+            "expected_risk_root": request.output_dir,
+            "expected_sidecar_root": request.sidecar_output_dir,
+            "expected_split": request.split,
+            "expected_shard_index": request.shard_index,
+            "expected_sample_ids": final_ids,
+            "expected_risk_shard_semantic_digest": (
+                final_risk.semantic_digest
+            ),
+            "expected_sidecar_shard_semantic_digest": (
+                final_sidecars.semantic_digest
+            ),
+        }
+        write_risk_sidecar_pair_completion_marker(
+            marker_staging,
+            risk_root=request.output_dir,
+            sidecar_root=request.sidecar_output_dir,
+            split=request.split,
+            shard_index=request.shard_index,
+            sample_ids=final_ids,
+            risk_shard_semantic_digest=final_risk.semantic_digest,
+            sidecar_shard_semantic_digest=final_sidecars.semantic_digest,
+        )
+        staged_marker = load_risk_sidecar_pair_completion_marker(
+            marker_staging,
+            **marker_kwargs,
+        )
+        marker_published = _commit_staged_path(
+            marker_staging,
+            marker_final,
+            expected_file_type=stat.S_IFREG,
+        )
+        published_paths.append(marker_published)
+        complete_pair = _load_complete_risk_sidecar_pair(
+            request=request,
+            grid=grid,
+            risk_identity=risk_published,
+            sidecar_identity=sidecar_published,
+            marker_identity=marker_published,
+        )
+        if (
+            complete_pair.completion_marker.marker_digest_sha256
+            != staged_marker.marker_digest_sha256
+        ):
+            raise ValueError("final pair marker differs from verified staging")
+
+        for container in reversed(staging_containers):
+            if not _remove_owned_path(container):
+                raise RiskDatasetRunError(
+                    "transaction staging cleanup incomplete: identity changed"
+                )
+        return (
+            complete_pair.risk_shard,
+            complete_pair.sidecar_shard,
+            complete_pair.completion_marker,
+            marker_final,
+        )
+    except BaseException as exc:
+        cleanup_errors: list[str] = []
+        for owned in reversed(published_paths):
+            try:
+                if not _remove_owned_path(owned):
+                    cleanup_errors.append(
+                        f"{owned.path}: identity changed before cleanup"
+                    )
+            except (OSError, RiskDatasetRunError) as cleanup_exc:
+                cleanup_errors.append(f"{owned.path}: {cleanup_exc}")
+        for container in reversed(staging_containers):
+            try:
+                if not _remove_owned_path(container):
+                    cleanup_errors.append(
+                        f"{container.path}: identity changed before cleanup"
+                    )
+            except (OSError, RiskDatasetRunError) as cleanup_exc:
+                cleanup_errors.append(f"{container.path}: {cleanup_exc}")
+        if not isinstance(exc, Exception):
+            if cleanup_errors:
+                exc.add_note(
+                    "cleanup incomplete: " + "; ".join(cleanup_errors)
+                )
+            raise
+        detail = f"paired risk/sidecar publication failed: {exc}"
+        if cleanup_errors:
+            detail += "; cleanup incomplete: " + "; ".join(cleanup_errors)
+        raise RiskDatasetRunError(detail) from exc
 
 
 def _producer_evidence_payload(evidence: object) -> dict[str, object]:
@@ -396,6 +900,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
 
     snippet_index = _snippet_index(sop03)
     samples: list[object] = []
+    sidecars: list[object] = []
     groups: list[object] = []
     accepted_sources: list[tuple[object, object]] = []
     rejection_reasons: Counter[str] = Counter()
@@ -428,24 +933,36 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
         groups.append(group)
         accepted_sources.append((event, snippet))
         try:
-            group_samples = build_risk_samples_from_sop06_group(
-                group=group,
-                mother_event=event,
-                source_snippet=snippet,
-                base_state=base_state,
-                trajectory=trajectory,
-                oracle_context=oracle_context,
-                base_config=base_config,
-                paired_config=paired_config,
-                risk_config=base_config["risk_gt"],
-                dataset_seed=request.seed,
-            )
+            adapter_kwargs = {
+                "group": group,
+                "mother_event": event,
+                "source_snippet": snippet,
+                "base_state": base_state,
+                "trajectory": trajectory,
+                "oracle_context": oracle_context,
+                "base_config": base_config,
+                "paired_config": paired_config,
+                "risk_config": base_config["risk_gt"],
+                "dataset_seed": request.seed,
+            }
+            if request.sidecar_output_dir is None:
+                group_samples = build_risk_samples_from_sop06_group(
+                    **adapter_kwargs
+                )
+                group_sidecars: tuple[object, ...] = ()
+            else:
+                group_samples, group_sidecars = (
+                    build_risk_samples_and_sidecars_from_sop06_group(
+                        **adapter_kwargs
+                    )
+                )
         except (TypeError, ValueError) as exc:
             raise RiskDatasetRunError(
                 "failed to atomically assemble risk samples for "
                 f"{event.generated_event_id}: {exc}"
             ) from exc
         samples.extend(group_samples)
+        sidecars.extend(group_sidecars)
 
     sample_values = tuple(samples)
     if len(sample_values) != request.expected_sample_count:
@@ -463,20 +980,46 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
     sample_ids = tuple(sample.sample_id for sample in sample_values)
     if len(sample_ids) != len(set(sample_ids)):
         raise RiskDatasetRunError("assembled RiskSample IDs are not unique")
+    if request.sidecar_output_dir is not None:
+        sidecar_ids = tuple(sidecar.sample_id for sidecar in sidecars)
+        if sidecar_ids != sample_ids:
+            raise RiskDatasetRunError(
+                "assembled sidecars do not align with RiskSample IDs"
+            )
 
-    try:
-        write_risk_shard(
-            sample_values,
-            request.output_dir,
+    loaded_sidecars = None
+    loaded_pair_marker = None
+    pair_marker_path = None
+    if request.sidecar_output_dir is None:
+        try:
+            write_risk_shard(
+                sample_values,
+                request.output_dir,
+                grid=grid,
+                shard_index=request.shard_index,
+                expected_sample_count=request.expected_sample_count,
+            )
+            loaded = load_risk_shard(request.output_dir, grid=grid)
+        except (FileExistsError, TypeError, ValueError) as exc:
+            raise RiskDatasetRunError(
+                f"risk shard publication failed: {exc}"
+            ) from exc
+        if len(loaded.samples) != request.expected_sample_count:
+            raise RiskDatasetRunError(
+                "formal risk shard reload count mismatch"
+            )
+    else:
+        (
+            loaded,
+            loaded_sidecars,
+            loaded_pair_marker,
+            pair_marker_path,
+        ) = _publish_risk_sidecar_pair(
+            request=request,
+            sample_values=sample_values,
+            sidecars=tuple(sidecars),
             grid=grid,
-            shard_index=request.shard_index,
-            expected_sample_count=request.expected_sample_count,
         )
-        loaded = load_risk_shard(request.output_dir, grid=grid)
-    except (FileExistsError, TypeError, ValueError) as exc:
-        raise RiskDatasetRunError(f"risk shard publication failed: {exc}") from exc
-    if len(loaded.samples) != request.expected_sample_count:
-        raise RiskDatasetRunError("formal risk shard reload count mismatch")
 
     rejection_report = {
         "attempted_event_count": len(events),
@@ -500,6 +1043,23 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
         "manifest_digest": loaded.manifest_digest,
         "semantic_digest": loaded.semantic_digest,
     }
+    if loaded_sidecars is not None:
+        if loaded_pair_marker is None or pair_marker_path is None:
+            raise RuntimeError("complete paired publication lacks its marker")
+        report.update(
+            {
+                "publication_status": "complete",
+                "sidecar_output_dir": str(request.sidecar_output_dir),
+                "risk_shard_semantic_digest": loaded.semantic_digest,
+                "sidecar_shard_semantic_digest": (
+                    loaded_sidecars.semantic_digest
+                ),
+                "pair_completion_marker_path": str(pair_marker_path),
+                "pair_completion_marker_digest": (
+                    loaded_pair_marker.marker_digest_sha256
+                ),
+            }
+        )
     json.dumps(report, sort_keys=True, allow_nan=False)
     return report
 
@@ -533,6 +1093,7 @@ def main() -> int:
         expected_event_count=args.expected_event_count,
         expected_sample_count=args.expected_sample_count,
         checksum_workers=args.checksum_workers,
+        sidecar_output_dir=args.sidecar_output_dir,
     )
     try:
         report = run_risk_dataset(request)

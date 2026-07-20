@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""Train and publish deterministic toy SOP08 occupancy risk baselines.
-
-Production mode intentionally fails closed until a dataset-level v2 manifest
-and label-only occupancy/query sidecars are published by SOP07.
-"""
+"""Train and publish deterministic toy or authenticated production SOP08 baselines."""
 
 from __future__ import annotations
 
@@ -39,6 +35,10 @@ from src.datasets.toy_risk_learning import (  # noqa: E402
     frozen_channel_spec,
     make_toy_risk_dataset,
 )
+from src.datasets.risk_dataloader import (  # noqa: E402
+    select_production_risk_subset,
+)
+from src.datasets.risk_dataset_seal import load_risk_dataset_seal  # noqa: E402
 from src.evaluation.risk_baselines import (  # noqa: E402
     BASELINE_SPECS,
     OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
@@ -57,6 +57,10 @@ from src.models.occupancy_baseline import (  # noqa: E402
     ConvGRUOccupancyPredictor,
     LastObservationHold,
     LearnedOccupancyRiskAggregator,
+)
+from src.training.occupancy_trainer import (  # noqa: E402
+    ProductionOccupancyTrainingConfig,
+    train_production_occupancy_baselines,
 )
 
 
@@ -97,6 +101,30 @@ _CONFIG_SCHEMA: dict[str, Any] = {
         "calibration_status": None,
     },
 }
+_PRODUCTION_CONFIG_KEYS = frozenset(
+    {
+        "mode",
+        "stage",
+        "seed",
+        "device",
+        "hidden_channels",
+        "convgru_kernel_size",
+        "learned_aggregator_hidden_dim",
+        "max_samples",
+        "batch_size",
+        "occupancy_epochs",
+        "aggregator_epochs",
+        "gradient_accumulation_steps",
+        "occupancy_learning_rate",
+        "aggregator_learning_rate",
+        "weight_decay",
+        "checkpoint_interval_steps",
+        "b2_tau_s",
+        "b2_a_max_s",
+        "sigma_time_s",
+        "optimizer",
+    }
+)
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -197,6 +225,92 @@ def _load_config(path: Path) -> dict[str, Any]:
     if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
         raise ValueError("aggregation.occupancy_threshold must be in [0,1]")
     return value
+
+
+def _load_production_config(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        value = yaml.safe_load(handle)
+    if not isinstance(value, dict):
+        raise ValueError("production config must be a mapping")
+    missing = sorted(_PRODUCTION_CONFIG_KEYS.difference(value))
+    unknown = sorted(set(value).difference(_PRODUCTION_CONFIG_KEYS))
+    if missing:
+        raise ValueError(f"production config missing keys: {missing}")
+    if unknown:
+        raise ValueError(f"production config has unknown keys: {unknown}")
+    if value["mode"] != "production":
+        raise ValueError("production config mode must be production")
+    if value["optimizer"] != "AdamW":
+        raise ValueError("production optimizer must be AdamW")
+    _positive_int(value["max_samples"], "max_samples")
+    ProductionOccupancyTrainingConfig(
+        **{
+            key: value[key]
+            for key in _PRODUCTION_CONFIG_KEYS
+            if key not in {"mode", "max_samples", "optimizer"}
+        }
+    )
+    return dict(value)
+
+
+def _run_production(args: argparse.Namespace) -> dict[str, object]:
+    for field, option in (
+        ("dataset_seal_root", "--dataset-seal-root"),
+        ("risk_collection_root", "--risk-collection-root"),
+        ("sidecar_collection_root", "--sidecar-collection-root"),
+    ):
+        if getattr(args, field) is None:
+            raise ValueError(f"{option} is required in production mode")
+    config = _load_production_config(args.config)
+    if args.stage is not None:
+        config["stage"] = args.stage
+    if args.seed is not None:
+        config["seed"] = _nonnegative_int(args.seed, "--seed")
+    if args.max_samples is not None:
+        config["max_samples"] = _positive_int(args.max_samples, "--max-samples")
+    if args.batch_size is not None:
+        config["batch_size"] = _positive_int(args.batch_size, "--batch-size")
+    if args.device is not None:
+        config["device"] = args.device
+    training_config = ProductionOccupancyTrainingConfig(
+        **{
+            key: config[key]
+            for key in _PRODUCTION_CONFIG_KEYS
+            if key not in {"mode", "max_samples", "optimizer"}
+        }
+    )
+    dataset = load_risk_dataset_seal(
+        args.dataset_seal_root,
+        collection_root=args.risk_collection_root,
+        expected_split="train",
+        sidecar_root=args.sidecar_collection_root,
+    )
+    subset = select_production_risk_subset(
+        dataset,
+        max_samples=int(config["max_samples"]),
+        seed=training_config.seed,
+    )
+    result = train_production_occupancy_baselines(
+        train_dataset=dataset,
+        train_subset=subset,
+        sidecar_root=args.sidecar_collection_root,
+        config=training_config,
+        output_dir=args.output_dir,
+        code_commit=args.code_commit,
+        resume_from=args.resume_from,
+        resume_expected_publication_instance_digest_sha256=(
+            args.resume_publication_instance_digest
+        ),
+    )
+    return {
+        "artifact": str(result.output_dir),
+        "semantic_digest_sha256": result.semantic_digest_sha256,
+        "publication_instance_digest_sha256": (
+            result.publication_instance_digest_sha256
+        ),
+        "risk_dataset_manifest_digest": dataset.risk_dataset_manifest_digest,
+        "scientific_gate": "engineering_only_without_validation_family",
+    }
 
 
 def _risk_metrics(probability: np.ndarray, target: np.ndarray) -> dict[str, float]:
@@ -678,12 +792,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--b2-a-max-s", type=float)
     parser.add_argument("--convgru-kernel-size", type=int)
     parser.add_argument("--code-commit", default="unversioned")
+    parser.add_argument("--dataset-seal-root", type=Path)
+    parser.add_argument("--risk-collection-root", type=Path)
+    parser.add_argument("--sidecar-collection-root", type=Path)
+    parser.add_argument(
+        "--stage",
+        choices=("one_shard_smoke", "real_1k_overfit", "formal_50k"),
+    )
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--device")
+    parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--resume-publication-instance-digest")
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     try:
+        if args.mode == "production":
+            report = _run_production(args)
+            print(f"artifact={report['artifact']}")
+            print(f"semantic_digest_sha256={report['semantic_digest_sha256']}")
+            print(
+                "publication_instance_digest_sha256="
+                f"{report['publication_instance_digest_sha256']}"
+            )
+            print(
+                "risk_dataset_manifest_digest="
+                f"{report['risk_dataset_manifest_digest']}"
+            )
+            print(f"scientific_gate={report['scientific_gate']}")
+            return 0
         config = _load_config(args.config)
         if args.mode is not None:
             config["mode"] = args.mode
@@ -734,17 +874,18 @@ def main() -> int:
                 "--convgru-kernel-size",
             )
         if config["mode"] == "production":
-            validate_occupancy_dataset_manifest(
-                {},
-                mode="production",
-                expected_manifest_digest="unavailable",
-            )
+            raise ValueError("production mode must be selected with --mode production")
         manifest = _publish_toy_artifact(
             config=config,
             output_dir=args.output_dir,
             code_commit=args.code_commit,
         )
-    except (ValueError, FileExistsError, ProductionOccupancyContractUnavailable) as error:
+    except (
+        ValueError,
+        FileExistsError,
+        OSError,
+        ProductionOccupancyContractUnavailable,
+    ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(f"artifact={args.output_dir}")

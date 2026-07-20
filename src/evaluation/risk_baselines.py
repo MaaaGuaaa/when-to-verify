@@ -16,6 +16,7 @@ from torch import nn
 
 from src.contracts import INPUT_CHANNELS, SCHEMA_VERSION
 from src.datasets.risk_dataloader import (
+    MODEL_INPUT_KEYS,
     collate_risk_samples,
     validate_toy_dataset_manifest,
 )
@@ -33,6 +34,12 @@ from src.models.occupancy_aggregation import (
     future_endpoint_times,
     probabilistic_union_risk,
     weighted_swept_volume_risk,
+)
+from src.models.occupancy_baseline import (
+    AgeDecay,
+    ConvGRUOccupancyPredictor,
+    LastObservationHold,
+    LearnedOccupancyRiskAggregator,
 )
 
 
@@ -95,7 +102,7 @@ BASELINE_SPECS: dict[str, str] = {
 
 
 class ProductionOccupancyContractUnavailable(RuntimeError):
-    """Raised because the production v2 occupancy-label contract is unpublished."""
+    """Raised when a toy-only API is incorrectly used for production data."""
 
 
 def occupancy_checkpoint_semantic_digest(checkpoint: Mapping[str, Any]) -> str:
@@ -147,11 +154,11 @@ def validate_occupancy_dataset_manifest(
     mode: str,
     expected_manifest_digest: str,
 ) -> dict[str, Any]:
-    """Validate the supported toy manifest or fail closed for production."""
+    """Validate toy mappings; production uses the authenticated v2 loader."""
     if mode == "production":
         raise ProductionOccupancyContractUnavailable(
-            "production occupancy training requires a dataset-level v2 manifest "
-            "with label-only future occupancy and robot-footprint sidecars"
+            "production occupancy validation requires an authenticated "
+            "LoadedRiskDataset and sidecar collection, not a raw manifest mapping"
         )
     if mode != "toy":
         raise ValueError("mode must be 'toy' or 'production'")
@@ -266,7 +273,8 @@ def validate_occupancy_checkpoint_provenance(
     """Validate checkpoint-v2 identity without accepting legacy or cross-mode data."""
     if mode == "production":
         raise ProductionOccupancyContractUnavailable(
-            "production occupancy checkpoints require the unpublished dataset-level v2 manifest"
+            "production checkpoints use load_production_occupancy_checkpoint; "
+            "the toy checkpoint validator cannot authenticate production state"
         )
     if mode != "toy":
         raise ValueError("mode must be 'toy' or 'production'")
@@ -408,6 +416,87 @@ def hand_trajectory_risk_scores(
             robot_future_footprints,
         ),
     }
+
+
+def score_production_occupancy_baseline(
+    *,
+    method: str,
+    model_inputs: Mapping[str, torch.Tensor],
+    query_inputs: Mapping[str, torch.Tensor],
+    occupancy_model: ConvGRUOccupancyPredictor,
+    learned_aggregator: LearnedOccupancyRiskAggregator,
+    b2_tau_s: float,
+    b2_a_max_s: float,
+    sigma_time_s: float,
+) -> torch.Tensor:
+    """Score one production batch without accepting any oracle namespace.
+
+    B1/B2 use deployment-time observations, B3 uses the learned occupancy
+    predictor, and B4 applies the learned risk head to the same B3 prediction.
+    The API deliberately cannot receive risk or occupancy targets.
+    """
+    if method not in BASELINE_SPECS:
+        raise ValueError(f"method must be one of {sorted(BASELINE_SPECS)}")
+    if not isinstance(model_inputs, Mapping) or tuple(model_inputs) != MODEL_INPUT_KEYS:
+        raise ValueError("model_inputs must contain the exact production input keys")
+    if not isinstance(query_inputs, Mapping) or tuple(query_inputs) != (
+        "robot_endpoint_footprints",
+        "endpoint_times_s",
+    ):
+        raise ValueError("query_inputs must contain exact robot geometry and endpoints")
+    history = model_inputs["bev_history"]
+    state = model_inputs["state_channels"]
+    footprints = query_inputs["robot_endpoint_footprints"]
+    endpoint_times = query_inputs["endpoint_times_s"]
+    if not all(
+        torch.is_tensor(value)
+        for value in (history, state, footprints, endpoint_times)
+    ):
+        raise TypeError("production baseline inputs must be torch tensors")
+    if endpoint_times.dtype != torch.float32 or endpoint_times.shape != (15,):
+        raise ValueError("endpoint_times_s must be float32 [15]")
+    expected_endpoints = (
+        torch.arange(1, 16, device=endpoint_times.device, dtype=torch.float32) * 0.2
+    )
+    if not torch.equal(endpoint_times, expected_endpoints):
+        raise ValueError("endpoint_times_s must equal 0.2 .. 3.0")
+
+    model_was_training = occupancy_model.training
+    aggregator_was_training = learned_aggregator.training
+    occupancy_model.eval()
+    learned_aggregator.eval()
+    try:
+        with torch.no_grad():
+            if method == "B1":
+                probability = LastObservationHold(future_steps=15)(history)
+            elif method == "B2":
+                probability = AgeDecay(
+                    future_steps=15,
+                    dt_s=0.2,
+                    tau_s=b2_tau_s,
+                    a_max_s=b2_a_max_s,
+                )(state)
+            else:
+                probability = occupancy_model(history)
+            if method == "B4":
+                score = learned_aggregator(probability, footprints)
+            else:
+                score = weighted_swept_volume_risk(
+                    probability,
+                    footprints,
+                    dt_s=0.2,
+                    sigma_time_s=sigma_time_s,
+                )
+    finally:
+        occupancy_model.train(model_was_training)
+        learned_aggregator.train(aggregator_was_training)
+    if score.dtype != torch.float32 or score.ndim != 1:
+        raise ValueError("production baseline score must be float32 [B]")
+    if not bool(torch.isfinite(score).all()) or bool(
+        ((score < 0.0) | (score > 1.0)).any()
+    ):
+        raise ValueError("production baseline score must be finite and in [0,1]")
+    return score
 
 
 def fit_toy_occupancy_model(
@@ -641,6 +730,7 @@ __all__ = [
     "occupancy_binary_metrics",
     "occupancy_checkpoint_semantic_digest",
     "save_occupancy_checkpoint",
+    "score_production_occupancy_baseline",
     "validate_occupancy_checkpoint_provenance",
     "validate_occupancy_dataset_manifest",
 ]

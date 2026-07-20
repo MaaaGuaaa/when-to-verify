@@ -244,10 +244,10 @@ def test_occupancy_collation_rejects_tampered_manifest_row_content() -> None:
         risk_baselines_module.collate_occupancy_toy_dataset(tampered)
 
 
-def test_production_manifest_is_rejected_until_v2_sidecars_are_published() -> None:
+def test_legacy_mapping_validator_rejects_production_without_authenticated_loader() -> None:
     with pytest.raises(
         ProductionOccupancyContractUnavailable,
-        match="dataset-level v2 manifest",
+        match="authenticated LoadedRiskDataset",
     ):
         validate_occupancy_dataset_manifest(
             {"mode": "production", "schema_version": SCHEMA_VERSION},

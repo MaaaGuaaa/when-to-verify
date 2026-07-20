@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,11 @@ from src.evaluation.risk_baselines import (
 from src.models.occupancy_baseline import (
     ConvGRUOccupancyPredictor,
     LearnedOccupancyRiskAggregator,
+)
+from src.datasets.risk_dataset_seal import publish_risk_dataset_seal
+from tests.fixtures.formal_risk_publication import (
+    create_formal_risk_publication,
+    create_formal_risk_sidecar_publication,
 )
 
 
@@ -145,14 +151,88 @@ def _mutated_config(tmp_path: Path, name: str, mutate) -> Path:
     return path
 
 
-def test_training_cli_rejects_production_until_v2_sidecars_exist(tmp_path) -> None:
+def test_training_cli_requires_authenticated_production_paths(tmp_path) -> None:
     output_dir = tmp_path / "production"
 
     result = _run_training_cli(output_dir, mode="production")
 
     assert result.returncode == 2
-    assert "dataset-level v2 manifest" in result.stderr
+    assert "dataset-seal-root" in result.stderr
     assert not output_dir.exists()
+
+
+def test_production_cli_uses_distinct_trainer_and_never_calls_toy_publisher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        history_steps=8,
+        future_steps=15,
+    )
+    sidecars = create_formal_risk_sidecar_publication(
+        publication,
+        tmp_path / "sidecars",
+    )
+    seal_root = publish_risk_dataset_seal(
+        tmp_path / "seal",
+        collection_root=publication.collection_root,
+        base_config_path=publication.base_config_path,
+        split_provenance_path=publication.split_provenance_path,
+        expected_split="train",
+        expected_collection_handoff_sha256=publication.handoff_sha256,
+        sidecar_root=sidecars.sidecar_root,
+    )
+    script = root / "scripts/05_train_occupancy_baseline.py"
+    spec = importlib.util.spec_from_file_location("occupancy_cli_under_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        module,
+        "_publish_toy_artifact",
+        lambda **_: (_ for _ in ()).throw(AssertionError("toy publisher called")),
+    )
+    output_dir = tmp_path / "production-output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "--config",
+            str(root / "configs/occupancy_baseline_production.yaml"),
+            "--mode",
+            "production",
+            "--dataset-seal-root",
+            str(seal_root),
+            "--risk-collection-root",
+            str(publication.collection_root),
+            "--sidecar-collection-root",
+            str(sidecars.sidecar_root),
+            "--output-dir",
+            str(output_dir),
+            "--stage",
+            "one_shard_smoke",
+            "--max-samples",
+            "12",
+            "--batch-size",
+            "5",
+            "--device",
+            "cpu",
+            "--code-commit",
+            "e" * 40,
+        ],
+    )
+
+    assert module.main() == 0
+    manifest = json.loads(
+        (output_dir / "training_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["mode"] == "production"
+    assert manifest["stage"] == "one_shard_smoke"
+    assert manifest["provenance"]["code_commit"] == "e" * 40
+    assert not (output_dir / "occupancy_predictions.npz").exists()
 
 
 def test_training_cli_rejects_nontrain_config_split(tmp_path: Path) -> None:

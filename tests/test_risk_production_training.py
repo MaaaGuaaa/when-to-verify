@@ -54,6 +54,7 @@ from tests.fixtures.formal_risk_publication import (
     sha256_bytes,
     sha256_file,
     write_canonical_json,
+    write_formal_collection_handoff,
 )
 
 
@@ -102,7 +103,12 @@ def _model_compatible_publication(
 ) -> FormalRiskPublication:
     """Upgrade the compact real-writer fixture to SOP09's frozen K=8 history."""
 
-    publication = create_formal_risk_publication(root, split=split)
+    handoff_dialect = "legacy" if split == "train" else "heldout"
+    publication = create_formal_risk_publication(
+        root,
+        split=split,
+        handoff_dialect=handoff_dialect,
+    )
     handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
     old_samples = tuple(
         sample
@@ -211,11 +217,14 @@ def _model_compatible_publication(
             }
         ).encode("utf-8")
     )
-    payload = canonical_json(handoff).encode("utf-8")
-    publication.handoff_path.write_bytes(payload)
+    handoff_sha256 = write_formal_collection_handoff(
+        publication.collection_root,
+        handoff,
+        handoff_dialect=handoff_dialect,
+    )
     return replace(
         publication,
-        handoff_sha256=sha256_bytes(payload),
+        handoff_sha256=handoff_sha256,
         grid=grid,
     )
 

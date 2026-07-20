@@ -108,6 +108,61 @@ def _republish_sop03_envelope(publication: FormalRiskPublication) -> None:
     publish_checksum_envelope(root, workers=1)
 
 
+def _rewrite_as_heldout_collection(
+    publication: FormalRiskPublication,
+    *,
+    report_updates: dict[str, object] | None = None,
+    evidence_updates: dict[str, object] | None = None,
+    handoff_updates: dict[str, object] | None = None,
+) -> str:
+    """Rewrite the compact fixture using the accepted heldout handoff dialect."""
+
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    report: dict[str, object] = {
+        "artifact_role": "sop07_heldout_batch_generation_report",
+        "batch_generation_instance_digest_sha256": "5" * 64,
+        "batch_generation_semantic_digest_sha256": "6" * 64,
+        "code_commit": handoff["code_commit"],
+        "conservation": {"status": "PROVEN"},
+        "event_count": 12,
+        "generation_state": "complete",
+        "layout_version": handoff["layout_version"],
+        "producer_version": "sop07_risk_dataset_cli_v3",
+        "report_version": "sop07_heldout_batch_generation_report_v1",
+        "sample_count": handoff["sample_count"],
+        "schema_version": handoff["schema_version"],
+        "shard_count": handoff["shard_count"],
+        "split": handoff["split"],
+    }
+    report.update(report_updates or {})
+    report_path = publication.collection_root / "batch_generation_report.json"
+    write_canonical_json(report_path, report)
+
+    evidence: dict[str, object] = {
+        "conservation_status": "PROVEN",
+        "event_count": 12,
+        "instance_digest_sha256": "5" * 64,
+        "relative_path": "batch_generation_report.json",
+        "sample_count": handoff["sample_count"],
+        "semantic_digest_sha256": "6" * 64,
+        "sha256": sha256_file(report_path),
+        "shard_count": handoff["shard_count"],
+    }
+    evidence.update(evidence_updates or {})
+    handoff.update(
+        {
+            "artifact_role": "sop07_heldout_collection_complete_handoff",
+            "generation_report_evidence": evidence,
+            "handoff_version": (
+                "sop07_heldout_collection_complete_handoff_v1"
+            ),
+        }
+    )
+    handoff.pop("producer_version", None)
+    handoff.update(handoff_updates or {})
+    return rewrite_collection_handoff(publication, handoff)
+
+
 def test_public_contract_is_frozen_and_dynamic_digest_is_canonical() -> None:
     assert RISK_DATASET_LAYOUT_VERSION == "risk_dataset_v2"
     assert RISK_DATASET_FAMILY_LAYOUT_VERSION == "risk_dataset_family_v1"
@@ -297,6 +352,209 @@ def test_publisher_authenticates_handoff_before_parsing_collection(
 
     with pytest.raises(RiskDataContractError, match="handoff SHA-256"):
         _publish(publication, tmp_path / "seal")
+    assert not (tmp_path / "seal").exists()
+
+
+@pytest.mark.parametrize("split", ["calibration", "val", "test"])
+def test_heldout_publisher_authenticates_report_and_normalizes_producer(
+    tmp_path: Path,
+    split: str,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split=split,
+    )
+    handoff_sha256 = _rewrite_as_heldout_collection(publication)
+
+    seal_root = _publish(
+        publication,
+        tmp_path / "seal",
+        expected_split=split,
+        expected_handoff_sha256=handoff_sha256,
+    )
+    manifest = _manifest(seal_root)
+    assert manifest["collection_handoff_version"] == (
+        "sop07_heldout_collection_complete_handoff_v1"
+    )
+    assert manifest["collection_artifact_role"] == (
+        "sop07_heldout_collection_complete_handoff"
+    )
+    assert manifest["collection_producer_version"] == "sop07_risk_dataset_cli_v3"
+    loaded = load_risk_dataset_seal(
+        seal_root,
+        collection_root=publication.collection_root,
+        expected_split=split,
+    )
+    assert loaded.manifest["collection_producer_version"] == (
+        "sop07_risk_dataset_cli_v3"
+    )
+
+
+def test_collection_handoff_dialects_are_split_specific(tmp_path: Path) -> None:
+    legacy_val = create_formal_risk_publication(
+        tmp_path / "legacy-val",
+        split="val",
+    )
+    with pytest.raises(RiskDataContractError, match="handoff dialect"):
+        _publish(
+            legacy_val,
+            tmp_path / "legacy-val-seal",
+            expected_split="val",
+        )
+
+    heldout_train = create_formal_risk_publication(tmp_path / "heldout-train")
+    heldout_sha256 = _rewrite_as_heldout_collection(heldout_train)
+    with pytest.raises(RiskDataContractError, match="handoff dialect"):
+        _publish(
+            heldout_train,
+            tmp_path / "heldout-train-seal",
+            expected_handoff_sha256=heldout_sha256,
+        )
+
+
+@pytest.mark.parametrize("failure", ["missing", "tampered", "unsafe_path"])
+def test_heldout_generation_report_publication_fails_closed(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split="val",
+    )
+    evidence_updates = (
+        {"relative_path": "nested/batch_generation_report.json"}
+        if failure == "unsafe_path"
+        else None
+    )
+    handoff_sha256 = _rewrite_as_heldout_collection(
+        publication,
+        evidence_updates=evidence_updates,
+    )
+    report_path = publication.collection_root / "batch_generation_report.json"
+    if failure == "missing":
+        report_path.unlink()
+    elif failure == "tampered":
+        report_path.write_bytes(report_path.read_bytes() + b" ")
+
+    with pytest.raises(RiskDataContractError, match="heldout generation report"):
+        _publish(
+            publication,
+            tmp_path / "seal",
+            expected_split="val",
+            expected_handoff_sha256=handoff_sha256,
+        )
+    assert not (tmp_path / "seal").exists()
+
+
+@pytest.mark.parametrize(
+    ("report_updates", "evidence_updates"),
+    [
+        ({"generation_state": "partial"}, None),
+        ({"schema_version": "2.0.0"}, None),
+        ({"layout_version": "risk_shard_npz_jsonl_v1"}, None),
+        ({"split": "test"}, None),
+        ({"code_commit": "4" * 40}, None),
+        ({"sample_count": 13}, None),
+        ({"shard_count": 3}, None),
+        ({"event_count": 13}, None),
+        ({"batch_generation_semantic_digest_sha256": "7" * 64}, None),
+        ({"batch_generation_instance_digest_sha256": "8" * 64}, None),
+        ({"conservation": {"status": "FAILED"}}, None),
+        (None, {"sample_count": 13}),
+    ],
+)
+def test_heldout_generation_report_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    report_updates: dict[str, object] | None,
+    evidence_updates: dict[str, object] | None,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split="calibration",
+    )
+    handoff_sha256 = _rewrite_as_heldout_collection(
+        publication,
+        report_updates=report_updates,
+        evidence_updates=evidence_updates,
+    )
+    with pytest.raises(
+        RiskDataContractError,
+        match="heldout generation report",
+    ):
+        _publish(
+            publication,
+            tmp_path / "seal",
+            expected_split="calibration",
+            expected_handoff_sha256=handoff_sha256,
+        )
+    assert not (tmp_path / "seal").exists()
+
+
+@pytest.mark.parametrize(
+    ("document", "old", "new"),
+    [
+        (
+            "handoff",
+            b'"global_sample_id_uniqueness":"PROVEN"',
+            (
+                b'"global_sample_id_uniqueness":"PROVEN",'
+                b'"global_sample_id_uniqueness":"PROVEN"'
+            ),
+        ),
+        (
+            "handoff",
+            b'"sample_count":12,"schema_version"',
+            b'"sample_count":1e400,"schema_version"',
+        ),
+        (
+            "report",
+            b'"conservation":{"status":"PROVEN"}',
+            (
+                b'"conservation":{"status":"PROVEN",'
+                b'"status":"PROVEN"}'
+            ),
+        ),
+        ("report", b'"event_count":12', b'"event_count":1e400'),
+    ],
+)
+def test_handoff_and_report_reject_recursive_duplicates_and_overflow_numbers(
+    tmp_path: Path,
+    document: str,
+    old: bytes,
+    new: bytes,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split="test",
+    )
+    handoff_sha256 = _rewrite_as_heldout_collection(publication)
+    if document == "handoff":
+        raw = publication.handoff_path.read_bytes()
+        assert raw.count(old) == 1
+        mutated = raw.replace(old, new, 1)
+        publication.handoff_path.write_bytes(mutated)
+        handoff_sha256 = hashlib.sha256(mutated).hexdigest()
+    else:
+        report_path = publication.collection_root / "batch_generation_report.json"
+        raw = report_path.read_bytes()
+        assert raw.count(old) == 1
+        mutated = raw.replace(old, new, 1)
+        report_path.write_bytes(mutated)
+        handoff = json.loads(
+            publication.handoff_path.read_text(encoding="utf-8")
+        )
+        handoff["generation_report_evidence"]["sha256"] = hashlib.sha256(
+            mutated
+        ).hexdigest()
+        handoff_sha256 = rewrite_collection_handoff(publication, handoff)
+
+    with pytest.raises(RiskDataContractError, match="strict finite JSON"):
+        _publish(
+            publication,
+            tmp_path / "seal",
+            expected_split="test",
+            expected_handoff_sha256=handoff_sha256,
+        )
     assert not (tmp_path / "seal").exists()
 
 

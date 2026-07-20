@@ -146,6 +146,101 @@ def _base_config_digest(config: Mapping[str, object]) -> str:
     return stable_digest(payload, size=16)
 
 
+def write_formal_collection_handoff(
+    collection_root: Path,
+    handoff: Mapping[str, object],
+    *,
+    handoff_dialect: str,
+) -> str:
+    """Write one compact train/heldout handoff using its real identity join."""
+
+    value = deepcopy(dict(handoff))
+    split = value.get("split")
+    if handoff_dialect == "legacy":
+        value["artifact_role"] = f"sop07_{split}_collection_complete_handoff"
+        value["handoff_version"] = "sop07_collection_complete_handoff_v1"
+        value["producer_version"] = "sop07_risk_dataset_cli_v3"
+    elif handoff_dialect == "heldout":
+        if split not in {"calibration", "val", "test"}:
+            raise ValueError("heldout handoff dialect requires a heldout split")
+        report_semantics = {
+            "code_commit": value["code_commit"],
+            "event_count": value["sample_count"],
+            "layout_version": value["layout_version"],
+            "sample_count": value["sample_count"],
+            "schema_version": value["schema_version"],
+            "shard_count": value["shard_count"],
+            "shards": [
+                {
+                    key: descriptor[key]
+                    for key in (
+                        "shard_index",
+                        "relative_root",
+                        "sample_count",
+                        "manifest_digest",
+                        "semantic_digest",
+                    )
+                }
+                for descriptor in value["shards"]
+            ],
+            "split": split,
+        }
+        semantic_digest = sha256_bytes(
+            canonical_json(report_semantics).encode("utf-8")
+        )
+        instance_digest = sha256_bytes(
+            canonical_json(
+                {
+                    "runtime": value.get("runtime_metadata", {}),
+                    "semantics": report_semantics,
+                }
+            ).encode("utf-8")
+        )
+        report = {
+            "artifact_role": "sop07_heldout_batch_generation_report",
+            "batch_generation_instance_digest_sha256": instance_digest,
+            "batch_generation_semantic_digest_sha256": semantic_digest,
+            "code_commit": value["code_commit"],
+            "conservation": {"status": "PROVEN"},
+            "event_count": value["sample_count"],
+            "generation_state": "complete",
+            "layout_version": value["layout_version"],
+            "producer_version": "sop07_risk_dataset_cli_v3",
+            "report_version": "sop07_heldout_batch_generation_report_v1",
+            "sample_count": value["sample_count"],
+            "schema_version": value["schema_version"],
+            "shard_count": value["shard_count"],
+            "shards": report_semantics["shards"],
+            "split": split,
+        }
+        report_path = collection_root / "batch_generation_report.json"
+        write_canonical_json(report_path, report)
+        downstream = dict(value["downstream_contract"])
+        downstream["generation_evidence_join"] = "PROVEN"
+        value["artifact_role"] = "sop07_heldout_collection_complete_handoff"
+        value["downstream_contract"] = downstream
+        value["generation_report_evidence"] = {
+            "conservation_status": "PROVEN",
+            "event_count": value["sample_count"],
+            "instance_digest_sha256": instance_digest,
+            "relative_path": "batch_generation_report.json",
+            "sample_count": value["sample_count"],
+            "semantic_digest_sha256": semantic_digest,
+            "sha256": sha256_file(report_path),
+            "shard_count": value["shard_count"],
+        }
+        value["handoff_version"] = (
+            "sop07_heldout_collection_complete_handoff_v1"
+        )
+        value.pop("producer_version", None)
+    else:
+        raise ValueError("handoff_dialect must be 'legacy' or 'heldout'")
+
+    payload = canonical_json(value).encode("utf-8")
+    (collection_root / "collection_complete_handoff.json").write_bytes(payload)
+    return sha256_bytes(payload)
+
+
 def _sample(
     index: int,
     *,
@@ -246,6 +341,7 @@ def create_formal_risk_publication(
     runtime_metadata: Mapping[str, object] | None = None,
     history_steps: int = 2,
     future_steps: int = 3,
+    handoff_dialect: str = "legacy",
 ) -> FormalRiskPublication:
     """Publish one compact formal SOP03 provenance root and SOP07 collection."""
 
@@ -386,15 +482,18 @@ def create_formal_risk_publication(
         "split": split,
     }
     handoff_path = collection_root / "collection_complete_handoff.json"
-    handoff_payload = canonical_json(handoff).encode("utf-8")
-    handoff_path.write_bytes(handoff_payload)
+    handoff_sha256 = write_formal_collection_handoff(
+        collection_root,
+        handoff,
+        handoff_dialect=handoff_dialect,
+    )
     return FormalRiskPublication(
         root=root,
         collection_root=collection_root,
         base_config_path=base_config_path,
         split_provenance_path=split_provenance_path,
         handoff_path=handoff_path,
-        handoff_sha256=sha256_bytes(handoff_payload),
+        handoff_sha256=handoff_sha256,
         grid=grid,
         g1_split_manifest_digest=g1_split_manifest_digest,
         target_type_policy_digest=target_type_policy_digest,
@@ -494,5 +593,6 @@ __all__ = [
     "resign_dataset_seal",
     "rewrite_collection_handoff",
     "sha256_file",
+    "write_formal_collection_handoff",
     "write_canonical_json",
 ]

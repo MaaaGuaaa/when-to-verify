@@ -52,6 +52,14 @@ RISK_DATASET_FAMILY_LAYOUT_VERSION = "risk_dataset_family_v1"
 RISK_SIDECAR_COLLECTION_LAYOUT_VERSION = "risk_label_sidecar_collection_v1"
 
 _COLLECTION_HANDOFF_VERSION = "sop07_collection_complete_handoff_v1"
+_HELDOUT_COLLECTION_HANDOFF_VERSION = (
+    "sop07_heldout_collection_complete_handoff_v1"
+)
+_HELDOUT_COLLECTION_HANDOFF_ROLE = "sop07_heldout_collection_complete_handoff"
+_HELDOUT_GENERATION_REPORT_NAME = "batch_generation_report.json"
+_HELDOUT_GENERATION_REPORT_VERSION = "sop07_heldout_batch_generation_report_v1"
+_HELDOUT_GENERATION_REPORT_ROLE = "sop07_heldout_batch_generation_report"
+_HELDOUT_SPLITS = frozenset({"calibration", "val", "test"})
 _COLLECTION_HANDOFF_NAME = "collection_complete_handoff.json"
 _DATASET_MANIFEST_NAME = "dataset_manifest.json"
 _CHECKSUMS_NAME = "checksums.sha256"
@@ -276,9 +284,32 @@ def _reject_json_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
+def _reject_duplicate_json_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key is forbidden: {key}")
+        result[key] = value
+    return result
+
+
 def _strict_json_loads(payload: str, *, label: str) -> dict[str, object]:
     try:
-        value = json.loads(payload, parse_constant=_reject_json_constant)
+        value = json.loads(
+            payload,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
     except (json.JSONDecodeError, ValueError) as exc:
         raise RiskDataContractError(f"{label} is not strict finite JSON") from exc
     if not isinstance(value, dict):
@@ -637,6 +668,119 @@ def _load_authenticated_sop03_manifest(
     return g1_digest, dynamic_digest, code_commit, finalizer_commit
 
 
+def _load_authenticated_heldout_generation_report(
+    collection_root: Path,
+    *,
+    handoff: Mapping[str, object],
+) -> str:
+    evidence = handoff.get("generation_report_evidence")
+    if not isinstance(evidence, Mapping):
+        raise RiskDataContractError(
+            "heldout generation report evidence is missing"
+        )
+    if evidence.get("relative_path") != _HELDOUT_GENERATION_REPORT_NAME:
+        raise RiskDataContractError(
+            "heldout generation report must use the safe batch_generation_report.json "
+            "basename"
+        )
+    report_path = collection_root / _HELDOUT_GENERATION_REPORT_NAME
+    _require_regular_file(report_path, label="heldout generation report")
+    expected_sha256 = _require_sha256(
+        evidence.get("sha256"),
+        field="heldout generation report sha256",
+    )
+    try:
+        raw = report_path.read_bytes()
+    except OSError as exc:
+        raise RiskDataContractError(
+            "failed to read heldout generation report"
+        ) from exc
+    if _sha256_bytes(raw) != expected_sha256:
+        raise RiskDataContractError("heldout generation report SHA-256 mismatch")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise RiskDataContractError(
+            "heldout generation report must be UTF-8"
+        ) from exc
+    report = _strict_json_loads(text, label="heldout generation report")
+    if (
+        report.get("report_version") != _HELDOUT_GENERATION_REPORT_VERSION
+        or report.get("artifact_role") != _HELDOUT_GENERATION_REPORT_ROLE
+    ):
+        raise RiskDataContractError("heldout generation report dialect mismatch")
+    if report.get("generation_state") != "complete":
+        raise RiskDataContractError("heldout generation report is not complete")
+    for field in ("schema_version", "layout_version", "split", "code_commit"):
+        if report.get(field) != handoff.get(field):
+            raise RiskDataContractError(
+                f"heldout generation report {field} mismatch"
+            )
+    _require_commit(report.get("code_commit"), field="heldout report code_commit")
+
+    report_sample_count = _require_positive_int(
+        report.get("sample_count"), field="heldout report sample_count"
+    )
+    report_shard_count = _require_positive_int(
+        report.get("shard_count"), field="heldout report shard_count"
+    )
+    report_event_count = _require_positive_int(
+        report.get("event_count"), field="heldout report event_count"
+    )
+    evidence_sample_count = _require_positive_int(
+        evidence.get("sample_count"), field="heldout report evidence sample_count"
+    )
+    evidence_shard_count = _require_positive_int(
+        evidence.get("shard_count"), field="heldout report evidence shard_count"
+    )
+    evidence_event_count = _require_positive_int(
+        evidence.get("event_count"), field="heldout report evidence event_count"
+    )
+    if (
+        report_sample_count != handoff.get("sample_count")
+        or report_sample_count != evidence_sample_count
+        or report_shard_count != handoff.get("shard_count")
+        or report_shard_count != evidence_shard_count
+        or report_event_count != evidence_event_count
+    ):
+        raise RiskDataContractError("heldout generation report count mismatch")
+
+    report_semantic_digest = _require_sha256(
+        report.get("batch_generation_semantic_digest_sha256"),
+        field="heldout report semantic digest",
+    )
+    report_instance_digest = _require_sha256(
+        report.get("batch_generation_instance_digest_sha256"),
+        field="heldout report instance digest",
+    )
+    evidence_semantic_digest = _require_sha256(
+        evidence.get("semantic_digest_sha256"),
+        field="heldout report evidence semantic digest",
+    )
+    evidence_instance_digest = _require_sha256(
+        evidence.get("instance_digest_sha256"),
+        field="heldout report evidence instance digest",
+    )
+    if (
+        report_semantic_digest != evidence_semantic_digest
+        or report_instance_digest != evidence_instance_digest
+    ):
+        raise RiskDataContractError("heldout generation report digest mismatch")
+    conservation = report.get("conservation")
+    if (
+        evidence.get("conservation_status") != "PROVEN"
+        or not isinstance(conservation, Mapping)
+        or conservation.get("status") != "PROVEN"
+    ):
+        raise RiskDataContractError(
+            "heldout generation report conservation is not proven"
+        )
+    return _require_nonempty_string(
+        report.get("producer_version"),
+        field="heldout generation report producer_version",
+    )
+
+
 def _load_authenticated_handoff(
     collection_root: Path,
     *,
@@ -660,8 +804,23 @@ def _load_authenticated_handoff(
     except UnicodeError as exc:
         raise RiskDataContractError("SOP07 collection handoff must be UTF-8") from exc
     handoff = _strict_json_loads(text, label="SOP07 collection handoff")
-    if handoff.get("handoff_version") != _COLLECTION_HANDOFF_VERSION:
-        raise RiskDataContractError("unsupported SOP07 collection handoff version")
+    if expected_split == "train":
+        expected_version = _COLLECTION_HANDOFF_VERSION
+        expected_role = "sop07_train_collection_complete_handoff"
+        is_heldout = False
+    elif expected_split in _HELDOUT_SPLITS:
+        expected_version = _HELDOUT_COLLECTION_HANDOFF_VERSION
+        expected_role = _HELDOUT_COLLECTION_HANDOFF_ROLE
+        is_heldout = True
+    else:
+        raise RiskDataContractError(
+            "unsupported SOP07 collection split/handoff dialect"
+        )
+    if (
+        handoff.get("handoff_version") != expected_version
+        or handoff.get("artifact_role") != expected_role
+    ):
+        raise RiskDataContractError("SOP07 collection handoff dialect mismatch")
     if handoff.get("collection_state") != "complete":
         raise RiskDataContractError("SOP07 collection handoff is not complete")
     if handoff.get("schema_version") != SCHEMA_VERSION:
@@ -670,9 +829,6 @@ def _load_authenticated_handoff(
         raise RiskDataContractError("SOP07 collection uses an unsupported shard layout")
     if handoff.get("split") != expected_split:
         raise RiskDataContractError("SOP07 collection split mismatch")
-    expected_role = f"sop07_{expected_split}_collection_complete_handoff"
-    if handoff.get("artifact_role") != expected_role:
-        raise RiskDataContractError("SOP07 collection source artifact role mismatch")
     _require_positive_int(handoff.get("sample_count"), field="collection sample_count")
     _require_positive_int(handoff.get("shard_count"), field="collection shard_count")
     _require_sha256(
@@ -684,9 +840,28 @@ def _load_authenticated_handoff(
         field="collection_semantic_digest_sha256",
     )
     _require_commit(handoff.get("code_commit"), field="SOP07 code_commit")
-    _require_nonempty_string(
-        handoff.get("producer_version"), field="SOP07 producer_version"
-    )
+    if is_heldout:
+        producer_version = _load_authenticated_heldout_generation_report(
+            collection_root,
+            handoff=handoff,
+        )
+        declared_producer = handoff.get("producer_version")
+        if declared_producer is not None and (
+            _require_nonempty_string(
+                declared_producer,
+                field="SOP07 heldout producer_version",
+            )
+            != producer_version
+        ):
+            raise RiskDataContractError(
+                "heldout generation report producer_version mismatch"
+            )
+        handoff = dict(handoff)
+        handoff["producer_version"] = producer_version
+    else:
+        _require_nonempty_string(
+            handoff.get("producer_version"), field="SOP07 producer_version"
+        )
     downstream = handoff.get("downstream_contract")
     if not isinstance(downstream, Mapping) or (
         downstream.get("global_sample_id_uniqueness") != "PROVEN"
@@ -1461,7 +1636,7 @@ def publish_risk_dataset_seal(
         "dataset_layout_version": RISK_DATASET_LAYOUT_VERSION,
         "schema_version": SCHEMA_VERSION,
         "split": split,
-        "collection_handoff_version": _COLLECTION_HANDOFF_VERSION,
+        "collection_handoff_version": handoff["handoff_version"],
         "collection_handoff_sha256": handoff_digest,
         "collection_artifact_role": handoff["artifact_role"],
         "collection_instance_digest_sha256": handoff[
@@ -1642,7 +1817,15 @@ def load_risk_dataset_seal(
         raise RiskDataContractError("dataset manifest schema_version mismatch")
     if manifest.get("split") != split:
         raise RiskDataContractError("dataset manifest split mismatch")
-    if manifest.get("collection_handoff_version") != _COLLECTION_HANDOFF_VERSION:
+    if split == "train":
+        expected_handoff_version = _COLLECTION_HANDOFF_VERSION
+    elif split in _HELDOUT_SPLITS:
+        expected_handoff_version = _HELDOUT_COLLECTION_HANDOFF_VERSION
+    else:
+        raise RiskDataContractError(
+            "unsupported SOP07 collection split/handoff dialect"
+        )
+    if manifest.get("collection_handoff_version") != expected_handoff_version:
         raise RiskDataContractError("dataset collection handoff version mismatch")
     g1_digest = _require_blake2b128(
         manifest.get("g1_split_manifest_digest"), field="g1_split_manifest_digest"

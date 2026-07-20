@@ -19,6 +19,7 @@ from src.datasets.risk_dataset_seal import (  # noqa: E402
     _publish_risk_dataset_family_from_references,
     load_risk_dataset_family,
     load_risk_dataset_seal,
+    publish_risk_dataset_family,
     publish_risk_dataset_seal,
 )
 

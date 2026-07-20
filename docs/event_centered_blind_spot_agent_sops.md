@@ -1131,6 +1131,9 @@ cross-shard audit 和 50k/240k 运行仍待完成。
 - [ ] 先在 1,000 risk samples 上过拟合
 - [ ] 再运行 50k 首轮训练，保存 best checkpoint、config、channel spec、metrics
 - [ ] 比较 R0/R1 后再决定是否开发 cross-attention
+- [x] `formal_50k` 入口必须加载认证后的 `risk_dataset_family_v1`，并核对实际
+      train/val seal 与 family member digest/count；拒绝调用方自行提供的 raw
+      cross-split audit JSON。smoke/1k 阶段继续 fail closed，不接受 family 的正式规模声明
 
 ### 验收
 
@@ -1184,6 +1187,13 @@ cross-shard audit 和 50k/240k 运行仍待完成。
 - [ ] 对主模型和 occupancy baseline 使用相同校准协议
 - [ ] calibration artifact 绑定 v2 checkpoint、split digest、`dynamic_objects` config
       digest 和 `target_type_policy_digest`，拒绝 v1 calibration
+- [x] 所有生产校准/评测必须继承 family 中冻结的 split role，并在 checkpoint provenance
+      中绑定 `risk_dataset_family_digest`；训练完成后生成的 calibration artifact 与 test
+      metrics 仍须分别记录 checkpoint/family digest，不能由 family 元数据替代
+- [x] `scripts/07_calibrate_risk.py` 与 `scripts/10_eval_offline.py` 的 production 模式
+      强制加载 typed family，分别核对完整 calibration/test sample-ID membership、member
+      digest、checkpoint、cohort 和 calibration provenance；跨 family、错 split 或 raw
+      family claim 一律 fail closed
 
 ### 验收
 

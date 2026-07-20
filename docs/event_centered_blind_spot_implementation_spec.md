@@ -1251,6 +1251,18 @@ random seed
   未提供额外 `split_audit_records`，审计上下文只包含本 shard 自动生成的 manifest
   rows。全局跨 shard audit 必须由 collection 调用方提供全部 split 记录后执行，
   不得用单 shard 通过代替 recording 隔离证明或 session overlap 报告。
+- 正式四划分边界为 `risk_dataset_family_v1`：成员必须精确为
+  train/calibration/val/test，分别绑定 immutable `risk_dataset_v2` manifest digest、
+  sample count、完整 sample-ID membership digest 和 shard count；family 同时绑定共同 schema/grid/channel spec、G1 split
+  manifest、dynamic-object config 与 target-type policy，并以 seal 已认证的 canonical
+  metadata 生成 fail-closed 跨 split 泄漏证明。未认证的 raw audit JSON 不能替代 family。
+- family 中的 `production_risk_evaluation_metadata_v1` 固定 train=训练、val=模型选择、
+  calibration=校准统计、test=最终评测，且 test 不得参与训练或选择。该数据角色契约必须
+  由 SOP09 checkpoint provenance 绑定 `risk_dataset_family_digest`；训练后的 calibration
+  artifact 和 test metrics 仍需另外绑定 checkpoint/family digest，不能由 family 冒充。
+- production calibration/evaluation CLI 必须加载 typed family，并分别核对 calibration/test
+  的完整 sample-ID membership、member digest、checkpoint、cohort 和 artifact provenance；
+  raw family/audit mapping、跨 family 或部分 test 表不能进入正式结果。
 
 ### 13.1 schema 3 外置隐藏占据 sidecar
 

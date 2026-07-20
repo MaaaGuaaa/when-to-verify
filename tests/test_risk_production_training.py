@@ -22,7 +22,10 @@ from src.datasets.risk_dataloader import (
 )
 from src.datasets.risk_dataset_seal import (
     LoadedRiskDataset,
+    LoadedRiskDatasetFamily,
+    load_risk_dataset_family,
     load_risk_dataset_seal,
+    publish_risk_dataset_family,
     publish_risk_dataset_seal,
 )
 from src.datasets.shard_writer import (
@@ -96,6 +99,26 @@ def _publish_and_load(
         collection_root=publication.collection_root,
         expected_split=split,
     )
+
+
+def _publish_family(
+    root: Path,
+    *,
+    train: LoadedRiskDataset,
+    validation: LoadedRiskDataset,
+) -> LoadedRiskDatasetFamily:
+    _, calibration = _publish_and_load(root / "calibration", split="calibration")
+    _, test = _publish_and_load(root / "test", split="test")
+    family_root = publish_risk_dataset_family(
+        root / "family",
+        members={
+            "train": train,
+            "calibration": calibration,
+            "val": validation,
+            "test": test,
+        },
+    )
+    return load_risk_dataset_family(family_root)
 
 
 def _model_compatible_publication(
@@ -895,6 +918,11 @@ def test_stage_gates_checkpoint_provenance_and_atomic_no_clobber(
 ) -> None:
     _, train = _publish_and_load(tmp_path / "train")
     _, validation = _publish_and_load(tmp_path / "validation", split="val")
+    family = _publish_family(
+        tmp_path / "dataset-family",
+        train=train,
+        validation=validation,
+    )
     full = select_production_risk_subset(train, max_samples=1000, seed=42)
     partial = select_production_risk_subset(train, max_samples=11, seed=42)
 
@@ -948,9 +976,7 @@ def test_stage_gates_checkpoint_provenance_and_atomic_no_clobber(
             output_dir=tmp_path / "unexpected-validation",
             validation_dataset=validation,
         )
-    with pytest.raises(
-        RiskDataContractError, match="authenticated risk_dataset_family_v1 loader"
-    ):
+    with pytest.raises(RiskDataContractError, match="validation"):
         train_production_risk_model(
             train_dataset=train,
             train_subset=full,
@@ -976,11 +1002,22 @@ def test_stage_gates_checkpoint_provenance_and_atomic_no_clobber(
             config=_config(stage="formal_50k"),
             output_dir=tmp_path / "formal-forged-audit",
             validation_dataset=validation,
-            cross_split_audit={
+            dataset_family={  # type: ignore[arg-type]
                 "global_cross_split_leakage": "PROVEN",
                 "risk_dataset_family_digest": "f" * 64,
             },
         )
+    assert trainer_module._validate_stage_gates(
+        train_dataset=train,
+        train_subset=full,
+        config=_config(stage="formal_50k", epochs=1),
+        validation_dataset=validation,
+        dataset_family=family,
+    ) == (
+        validation.risk_dataset_manifest_digest,
+        family.risk_dataset_family_digest,
+        "PROVEN",
+    )
 
     output = tmp_path / "atomic"
     result = train_production_risk_model(

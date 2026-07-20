@@ -32,6 +32,7 @@ from src.datasets.risk_dataloader import (  # noqa: E402
     load_production_risk_dataset,
     select_production_risk_subset,
 )
+from src.datasets.risk_dataset_seal import load_risk_dataset_family  # noqa: E402
 from src.datasets.toy_risk_learning import (  # noqa: E402
     assert_toy_split_isolation,
     frozen_channel_spec,
@@ -285,27 +286,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--resume-publication-instance-digest")
-    parser.add_argument("--cross-split-audit", type=Path)
+    parser.add_argument("--dataset-family-root", type=Path)
     return parser
-
-
-def _load_cross_split_audit(path: Path | None) -> Mapping[str, object] | None:
-    if path is None:
-        return None
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"),
-            parse_constant=lambda token: (_ for _ in ()).throw(
-                ValueError(f"non-finite constant: {token}")
-            ),
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-        raise RiskDataContractError(
-            f"unable to load finite cross-split audit JSON: {error}"
-        ) from error
-    if not isinstance(value, dict):
-        raise RiskDataContractError("cross-split audit must be a JSON mapping")
-    return value
 
 
 def main() -> int:
@@ -377,7 +359,11 @@ def main() -> int:
                 resume_expected_publication_instance_digest_sha256=(
                     args.resume_publication_instance_digest
                 ),
-                cross_split_audit=_load_cross_split_audit(args.cross_split_audit),
+                dataset_family=(
+                    None
+                    if args.dataset_family_root is None
+                    else load_risk_dataset_family(args.dataset_family_root)
+                ),
             )
             print(
                 json.dumps(

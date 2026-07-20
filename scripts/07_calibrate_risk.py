@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a toy split-conformal artifact from a validated prediction table."""
+"""Fit a split-conformal artifact from a validated prediction table."""
 
 from __future__ import annotations
 
@@ -26,6 +26,11 @@ from src.calibration.split_conformal import (  # noqa: E402
     fit_calibration_artifact,
     validate_calibration_artifact,
     validate_prediction_table,
+)
+from src.datasets.risk_dataset_seal import (  # noqa: E402
+    RISK_DATASET_FAMILY_LAYOUT_VERSION,
+    LoadedRiskDatasetFamily,
+    load_risk_dataset_family,
 )
 
 
@@ -78,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("toy", "production"), required=True)
     parser.add_argument("--prediction-table", type=Path, required=True)
+    parser.add_argument("--dataset-family-root", type=Path)
     parser.add_argument("--split", default="calibration")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--alpha", type=float, default=0.1)
@@ -88,22 +94,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.mode == "production":
+    dataset_family: LoadedRiskDatasetFamily | None = None
+    if args.mode == "production" and args.dataset_family_root is None:
         raise SystemExit(
-            "production mode is fail-closed until the risk dataset v2 manifest "
-            "and required provenance are published"
+            "production risk_dataset_v2 calibration is fail-closed without "
+            "--dataset-family-root"
         )
+    if args.mode == "toy" and args.dataset_family_root is not None:
+        raise SystemExit("toy calibration must not use --dataset-family-root")
+    if args.mode == "production":
+        dataset_family = load_risk_dataset_family(args.dataset_family_root)
     if args.split != "calibration":
         raise SystemExit("calibration fitting requires --split calibration")
     table = validate_prediction_table(
         _read_json(args.prediction_table),
-        expected_mode="toy",
+        expected_mode=args.mode,
         expected_split="calibration",
+        dataset_family=dataset_family,
     )
     artifact = fit_calibration_artifact(
         table,
         alpha=args.alpha,
         prediction_key=args.prediction_key,
+        dataset_family=dataset_family,
     )
     artifact["grouped"] = fit_grouped_calibration(
         table["rows"],
@@ -113,7 +126,11 @@ def main() -> int:
         min_group_size=args.min_group_size,
     )
     artifact["semantic_digest"] = calibration_artifact_semantic_digest(artifact)
-    validate_calibration_artifact(artifact, expected_mode="toy")
+    validate_calibration_artifact(
+        artifact,
+        expected_mode=args.mode,
+        dataset_family=dataset_family,
+    )
 
     # The manifest is semantic metadata; calibration.json has a separate full-file
     # checksum because formatting bytes are deliberately outside semantic digest.
@@ -128,12 +145,18 @@ def main() -> int:
         + "\n"
     ).encode("utf-8")
     manifest = {
-        "artifact_kind": "sop10_toy_calibration",
-        "mode": "toy",
+        "artifact_kind": (
+            "sop10_production_calibration"
+            if args.mode == "production"
+            else "sop10_toy_calibration"
+        ),
+        "mode": args.mode,
         "schema_version": "3.0.0",
         "fit_split": "calibration",
         "method_id": table["method_id"],
-        "toy_dataset_manifest_digest": table["toy_dataset_manifest_digest"],
+        "checkpoint_layout_version": table["checkpoint_layout_version"],
+        "checkpoint_digest": table["checkpoint_digest"],
+        "checkpoint_digest_kind": table["checkpoint_digest_kind"],
         "seed": table["seed"],
         "channel_spec": table["channel_spec"],
         "config_digest_sha256": table["config_digest_sha256"],
@@ -142,8 +165,40 @@ def main() -> int:
         "calibration_semantic_digest": artifact["semantic_digest"],
         "calibration_file_sha256": hashlib.sha256(calibration_bytes).hexdigest(),
         "calibration_count": len(table["rows"]),
-        "scientific_gate_status": "not_evaluated_real_data",
+        "scientific_gate_status": (
+            "production_calibration_published"
+            if args.mode == "production"
+            else "not_evaluated_real_data"
+        ),
     }
+    if dataset_family is None:
+        manifest["toy_dataset_manifest_digest"] = table[
+            "toy_dataset_manifest_digest"
+        ]
+    else:
+        manifest.update(
+            {
+                "risk_dataset_family_layout_version": (
+                    RISK_DATASET_FAMILY_LAYOUT_VERSION
+                ),
+                "risk_dataset_family_digest": (
+                    dataset_family.risk_dataset_family_digest
+                ),
+                "calibration_risk_dataset_manifest_digest": (
+                    dataset_family.members["calibration"][
+                        "risk_dataset_manifest_digest"
+                    ]
+                ),
+                "calibration_sample_ids_digest_sha256": (
+                    dataset_family.members["calibration"][
+                        "sample_ids_digest_sha256"
+                    ]
+                ),
+                "production_evaluation_metadata": dict(
+                    dataset_family.production_evaluation_metadata
+                ),
+            }
+        )
     _publish(
         args.output_dir,
         {"calibration.json": artifact, "manifest.json": manifest},

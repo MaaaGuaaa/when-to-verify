@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a calibrated toy risk prediction table without test-time fitting."""
+"""Evaluate a calibrated risk prediction table without test-time fitting."""
 
 from __future__ import annotations
 
@@ -37,6 +37,11 @@ from src.evaluation.risk_metrics import (  # noqa: E402
     evaluate_risk_rows,
     quantile_coverage,
     upper_bound_tightness,
+)
+from src.datasets.risk_dataset_seal import (  # noqa: E402
+    RISK_DATASET_FAMILY_LAYOUT_VERSION,
+    LoadedRiskDatasetFamily,
+    load_risk_dataset_family,
 )
 
 
@@ -169,9 +174,13 @@ def _assert_same_calibration_protocol(
         "fit_split",
         "fitted_identities",
         "toy_dataset_manifest_digest",
+        "risk_dataset_family_layout_version",
+        "risk_dataset_family_digest",
+        "risk_dataset_manifest_digest",
         "calibration_cohort_digest_sha256",
         "seed",
         "channel_spec",
+        "config_digest_sha256",
     ):
         if main_artifact.get(field) != baseline_artifact.get(field):
             raise ValueError(
@@ -211,6 +220,13 @@ def _expected_artifact_provenance(table: dict[str, Any]) -> dict[str, Any]:
     }
     if table["checkpoint_layout_version"] == OCCUPANCY_CHECKPOINT_LAYOUT_VERSION:
         expected["prediction_semantics"] = table["prediction_semantics"]
+    if table["mode"] == "production":
+        expected["risk_dataset_family_layout_version"] = table[
+            "risk_dataset_family_layout_version"
+        ]
+        expected["risk_dataset_family_digest"] = table[
+            "risk_dataset_family_digest"
+        ]
     return expected
 
 
@@ -220,6 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=("risk",), default="risk")
     parser.add_argument("--prediction-table", type=Path, required=True)
     parser.add_argument("--calibration-artifact", type=Path, required=True)
+    parser.add_argument("--dataset-family-root", type=Path)
     parser.add_argument("--baseline-prediction-table", type=Path)
     parser.add_argument("--baseline-calibration-artifact", type=Path)
     parser.add_argument("--split", default="test")
@@ -229,11 +246,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.mode == "production":
+    dataset_family: LoadedRiskDatasetFamily | None = None
+    if args.mode == "production" and args.dataset_family_root is None:
         raise SystemExit(
-            "production mode is fail-closed until the risk dataset v2 manifest "
-            "and required provenance are published"
+            "production risk_dataset_v2 evaluation is fail-closed without "
+            "--dataset-family-root"
         )
+    if args.mode == "toy" and args.dataset_family_root is not None:
+        raise SystemExit("toy evaluation must not use --dataset-family-root")
+    if args.mode == "production":
+        dataset_family = load_risk_dataset_family(args.dataset_family_root)
     if args.split != "test":
         raise SystemExit("offline evaluation requires --split test")
     if (args.baseline_prediction_table is None) != (
@@ -245,8 +267,9 @@ def main() -> int:
         )
     table = validate_prediction_table(
         _read_json(args.prediction_table),
-        expected_mode="toy",
+        expected_mode=args.mode,
         expected_split="test",
+        dataset_family=dataset_family,
     )
     if (
         args.baseline_prediction_table is not None
@@ -258,26 +281,34 @@ def main() -> int:
         )
     artifact = validate_calibration_artifact(
         _read_json(args.calibration_artifact),
-        expected_mode="toy",
+        expected_mode=args.mode,
         expected_provenance=_expected_artifact_provenance(table),
+        dataset_family=dataset_family,
     )
     isolation = assert_calibration_artifact_test_isolation(
-        artifact, table["rows"]
+        artifact,
+        table["rows"],
+        dataset_family=dataset_family,
     )
     rows = _calibrated_rows(table, artifact)
     metrics = evaluate_risk_rows(rows)
     metrics["calibration_application"] = _calibration_application_report(
         table, artifact
     )
-    metrics["mode"] = "toy"
+    metrics["mode"] = args.mode
     metrics["method_id"] = table["method_id"]
-    metrics["scientific_gate_status"] = "not_evaluated_real_data"
+    metrics["scientific_gate_status"] = (
+        "production_evaluation_published"
+        if args.mode == "production"
+        else "not_evaluated_real_data"
+    )
     baseline_manifest_fields: dict[str, Any] = {}
     if args.baseline_prediction_table is not None:
         baseline_table = validate_prediction_table(
             _read_json(args.baseline_prediction_table),
-            expected_mode="toy",
+            expected_mode=args.mode,
             expected_split="test",
+            dataset_family=dataset_family,
         )
         if baseline_table["checkpoint_layout_version"] != (
             OCCUPANCY_CHECKPOINT_LAYOUT_VERSION
@@ -288,14 +319,23 @@ def main() -> int:
             )
         baseline_artifact = validate_calibration_artifact(
             _read_json(args.baseline_calibration_artifact),
-            expected_mode="toy",
+            expected_mode=args.mode,
             expected_provenance=_expected_artifact_provenance(baseline_table),
+            dataset_family=dataset_family,
         )
-        if baseline_table["toy_dataset_manifest_digest"] != table[
-            "toy_dataset_manifest_digest"
+        if args.mode == "toy":
+            if baseline_table["toy_dataset_manifest_digest"] != table[
+                "toy_dataset_manifest_digest"
+            ]:
+                raise ValueError(
+                    "main and occupancy baseline must use the same toy dataset "
+                    "manifest"
+                )
+        elif baseline_table["risk_dataset_family_digest"] != table[
+            "risk_dataset_family_digest"
         ]:
             raise ValueError(
-                "main and occupancy baseline must use the same toy dataset manifest"
+                "main and occupancy baseline risk_dataset_family_digest mismatch"
             )
         if baseline_table["cohort_digest_sha256"] != table[
             "cohort_digest_sha256"
@@ -305,7 +345,9 @@ def main() -> int:
             )
         _assert_same_calibration_protocol(artifact, baseline_artifact)
         baseline_isolation = assert_calibration_artifact_test_isolation(
-            baseline_artifact, baseline_table["rows"]
+            baseline_artifact,
+            baseline_table["rows"],
+            dataset_family=dataset_family,
         )
         baseline_rows = _calibrated_rows(baseline_table, baseline_artifact)
         metrics["occupancy_baseline"] = evaluate_risk_rows(baseline_rows)
@@ -316,6 +358,15 @@ def main() -> int:
         metrics["same_calibration_protocol"] = True
         baseline_manifest_fields = {
             "baseline_method_id": baseline_table["method_id"],
+            "baseline_checkpoint_layout_version": baseline_table[
+                "checkpoint_layout_version"
+            ],
+            "baseline_checkpoint_digest": baseline_table[
+                "checkpoint_digest"
+            ],
+            "baseline_checkpoint_digest_kind": baseline_table[
+                "checkpoint_digest_kind"
+            ],
             "baseline_prediction_table_semantic_digest": baseline_table[
                 "semantic_digest"
             ],
@@ -332,17 +383,18 @@ def main() -> int:
         metrics["same_calibration_protocol"] = "not_compared"
     metrics["semantic_digest"] = calibration_artifact_semantic_digest(metrics)
     manifest = {
-        "artifact_kind": "sop10_toy_offline_evaluation",
-        "mode": "toy",
+        "artifact_kind": (
+            "sop10_production_offline_evaluation"
+            if args.mode == "production"
+            else "sop10_toy_offline_evaluation"
+        ),
+        "mode": args.mode,
         "schema_version": "3.0.0",
         "evaluated_split": "test",
         "method_id": table["method_id"],
-        "test_toy_dataset_manifest_digest": table[
-            "toy_dataset_manifest_digest"
-        ],
-        "calibration_toy_dataset_manifest_digest": artifact[
-            "toy_dataset_manifest_digest"
-        ],
+        "checkpoint_layout_version": table["checkpoint_layout_version"],
+        "checkpoint_digest": table["checkpoint_digest"],
+        "checkpoint_digest_kind": table["checkpoint_digest_kind"],
         "prediction_table_semantic_digest": table["semantic_digest"],
         "test_cohort_digest_sha256": table["cohort_digest_sha256"],
         "calibration_cohort_digest_sha256": artifact[
@@ -356,7 +408,11 @@ def main() -> int:
         "metrics_file_sha256": _json_sha256(metrics),
         "sample_count": len(rows),
         "calibration_test_identity_overlap": isolation,
-        "scientific_gate_status": "not_evaluated_real_data",
+        "scientific_gate_status": (
+            "production_evaluation_published"
+            if args.mode == "production"
+            else "not_evaluated_real_data"
+        ),
         "primary_calibration_scope": "global_split_conformal",
         "grouped_calibration_scope": "one_dimension_at_a_time_diagnostic",
         "false_safe_scope": "raw_collision_head_probability_not_conformal",
@@ -365,11 +421,60 @@ def main() -> int:
             "improvement claim"
         ),
         "production_thor_session_policy": (
-            "not_applied_in_toy; future production evaluation must explicitly "
-            "allow-and-report the frozen THOR recording-generalization policy"
+            "bound_by_risk_dataset_family_cross_split_audit"
+            if args.mode == "production"
+            else (
+                "not_applied_in_toy; future production evaluation must explicitly "
+                "allow-and-report the frozen THOR recording-generalization policy"
+            )
         ),
         **baseline_manifest_fields,
     }
+    if dataset_family is None:
+        manifest.update(
+            {
+                "test_toy_dataset_manifest_digest": table[
+                    "toy_dataset_manifest_digest"
+                ],
+                "calibration_toy_dataset_manifest_digest": artifact[
+                    "toy_dataset_manifest_digest"
+                ],
+            }
+        )
+    else:
+        manifest.update(
+            {
+                "risk_dataset_family_layout_version": (
+                    RISK_DATASET_FAMILY_LAYOUT_VERSION
+                ),
+                "risk_dataset_family_digest": (
+                    dataset_family.risk_dataset_family_digest
+                ),
+                "calibration_risk_dataset_manifest_digest": (
+                    dataset_family.members["calibration"][
+                        "risk_dataset_manifest_digest"
+                    ]
+                ),
+                "calibration_sample_ids_digest_sha256": (
+                    dataset_family.members["calibration"][
+                        "sample_ids_digest_sha256"
+                    ]
+                ),
+                "test_risk_dataset_manifest_digest": (
+                    dataset_family.members["test"][
+                        "risk_dataset_manifest_digest"
+                    ]
+                ),
+                "test_sample_ids_digest_sha256": (
+                    dataset_family.members["test"][
+                        "sample_ids_digest_sha256"
+                    ]
+                ),
+                "production_evaluation_metadata": dict(
+                    dataset_family.production_evaluation_metadata
+                ),
+            }
+        )
     _publish(args.output_dir, {"metrics.json": metrics, "manifest.json": manifest})
     return 0
 

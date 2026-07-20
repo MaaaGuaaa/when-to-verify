@@ -31,7 +31,11 @@ from src.datasets.risk_dataloader import (
     iter_production_risk_batches,
     select_production_risk_subset,
 )
-from src.datasets.risk_dataset_seal import LoadedRiskDataset
+from src.datasets.risk_dataset_seal import (
+    LoadedRiskDataset,
+    LoadedRiskDatasetFamily,
+    load_risk_dataset_family,
+)
 from src.datasets.toy_risk_learning import frozen_channel_spec
 from src.models.risk_model import (
     RiskModel,
@@ -615,7 +619,7 @@ def _validate_stage_gates(
     train_subset: ProductionRiskSubset,
     config: ProductionRiskTrainingConfig,
     validation_dataset: LoadedRiskDataset | None,
-    cross_split_audit: Mapping[str, object] | None,
+    dataset_family: LoadedRiskDatasetFamily | None,
 ) -> tuple[str | None, str | None, str]:
     _dataset_provenance(train_dataset)
     if train_dataset.split != "train":
@@ -643,15 +647,66 @@ def _validate_stage_gates(
             raise RiskDataContractError(
                 "one_shard_smoke/real_1k_overfit rejects validation data"
             )
-        if cross_split_audit is not None:
+        if dataset_family is not None:
             raise RiskDataContractError(
-                "one_shard_smoke/real_1k_overfit rejects cross-split audit claims"
+                "one_shard_smoke/real_1k_overfit rejects dataset family claims"
             )
         return None, None, "NOT_PROVEN"
-    raise RiskDataContractError(
-        "formal_50k requires the authenticated risk_dataset_family_v1 loader; "
-        "that strong typed boundary is not available yet, so raw audit mappings "
-        "and JSON claims are rejected"
+    if validation_dataset is None:
+        raise RiskDataContractError(
+            "formal_50k requires the authenticated validation (val) dataset"
+        )
+    _dataset_provenance(validation_dataset)
+    if validation_dataset.split != "val":
+        raise RiskDataContractError(
+            "formal_50k validation dataset must be the val split"
+        )
+    if not isinstance(dataset_family, LoadedRiskDatasetFamily):
+        raise RiskDataContractError(
+            "formal_50k requires the authenticated risk_dataset_family_v1 loader"
+        )
+    authenticated_family = load_risk_dataset_family(dataset_family.root)
+    if (
+        dataset_family.risk_dataset_family_digest
+        != authenticated_family.risk_dataset_family_digest
+    ):
+        raise RiskDataContractError(
+            "dataset family object differs from its authenticated publication"
+        )
+    for split, dataset in (
+        ("train", train_dataset),
+        ("val", validation_dataset),
+    ):
+        member = authenticated_family.members[split]
+        if (
+            member["risk_dataset_manifest_digest"]
+            != dataset.risk_dataset_manifest_digest
+            or member["sample_count"] != dataset.sample_count
+            or member["shard_count"] != len(dataset.shards)
+        ):
+            raise RiskDataContractError(
+                f"dataset family member differs from authenticated {split} dataset"
+            )
+    train_provenance = _dataset_provenance(train_dataset)
+    validation_provenance = _dataset_provenance(validation_dataset)
+    for field in (
+        "g1_split_manifest_digest",
+        "dynamic_objects_config_digest",
+        "target_type_policy_digest",
+    ):
+        if train_provenance[field] != validation_provenance[field]:
+            raise RiskDataContractError(
+                f"train/val common contract mismatch: {field}"
+            )
+    leakage_status = authenticated_family.cross_split_audit[
+        "global_cross_split_leakage"
+    ]
+    if leakage_status != "PROVEN":  # pragma: no cover - family loader rejects it
+        raise RiskDataContractError("dataset family leakage proof is not PROVEN")
+    return (
+        validation_dataset.risk_dataset_manifest_digest,
+        authenticated_family.risk_dataset_family_digest,
+        str(leakage_status),
     )
 
 
@@ -1335,7 +1390,7 @@ def train_production_risk_model(
     validation_dataset: LoadedRiskDataset | None = None,
     resume_from: str | Path | None = None,
     resume_expected_publication_instance_digest_sha256: str | None = None,
-    cross_split_audit: Mapping[str, object] | None = None,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> ProductionRiskTrainingResult:
     """Train R0/R1 while preserving split gates, stream cursors, and provenance."""
 
@@ -1365,7 +1420,7 @@ def train_production_risk_model(
         train_subset=train_subset,
         config=config,
         validation_dataset=validation_dataset,
-        cross_split_audit=cross_split_audit,
+        dataset_family=dataset_family,
     )
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():

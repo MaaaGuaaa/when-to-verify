@@ -3,7 +3,7 @@
 Only rows from the calibration split may be used to fit a correction.  The
 module is intentionally NumPy-only and keeps toy and production provenance
 separate: toy artifacts bind a toy dataset digest, while production artifacts
-must bind the future dataset-v2 provenance set.
+bind an authenticated four-split risk-dataset family.
 """
 
 from __future__ import annotations
@@ -17,6 +17,13 @@ from typing import Any
 
 import numpy as np
 
+from src.datasets.risk_dataloader import RiskDataContractError
+from src.datasets.risk_dataset_seal import (
+    RISK_DATASET_FAMILY_LAYOUT_VERSION,
+    LoadedRiskDatasetFamily,
+    load_risk_dataset_family,
+    risk_dataset_family_sample_ids_digest,
+)
 from src.datasets.toy_risk_learning import (
     TOY_MANIFEST_ROW_KEYS,
     frozen_channel_spec,
@@ -187,6 +194,111 @@ def _validate_channel_spec(value: Any) -> dict[str, list[str]]:
     return copy.deepcopy(expected)
 
 
+def _reauthenticate_dataset_family(
+    dataset_family: LoadedRiskDatasetFamily | None,
+    *,
+    mode: str,
+) -> LoadedRiskDatasetFamily | None:
+    """Reload a production family from its sealed root and reject substitutes."""
+
+    if mode == "toy":
+        if dataset_family is not None:
+            raise CalibrationContractError(
+                "toy mode must not receive a production dataset family"
+            )
+        return None
+    if type(dataset_family) is not LoadedRiskDatasetFamily:
+        raise CalibrationContractError(
+            "production mode is fail-closed without an authenticated "
+            "LoadedRiskDatasetFamily"
+        )
+    try:
+        authenticated = load_risk_dataset_family(dataset_family.root)
+    except (OSError, RiskDataContractError, TypeError, ValueError) as exc:
+        raise CalibrationContractError(
+            "production dataset family reauthentication failed"
+        ) from exc
+    if authenticated != dataset_family:
+        raise CalibrationContractError(
+            "production dataset family reauthentication rejected a forged or "
+            "stale object"
+        )
+    return authenticated
+
+
+def _validate_production_family_binding(
+    payload: Mapping[str, Any],
+    *,
+    dataset_family: LoadedRiskDatasetFamily,
+    split: str,
+    label: str,
+) -> None:
+    """Bind one production payload to the family and its corresponding member."""
+
+    if payload.get("risk_dataset_family_layout_version") != (
+        RISK_DATASET_FAMILY_LAYOUT_VERSION
+    ):
+        raise CalibrationContractError(
+            f"{label} risk_dataset_family_layout_version mismatch"
+        )
+    family_digest = _hex_digest(
+        payload.get("risk_dataset_family_digest"),
+        "risk_dataset_family_digest",
+        length=64,
+    )
+    if family_digest != dataset_family.risk_dataset_family_digest:
+        raise CalibrationContractError(f"{label} family digest mismatch")
+    member = dataset_family.members.get(split)
+    if not isinstance(member, Mapping):
+        raise CalibrationContractError(
+            f"{label} split {split!r} is not a risk dataset family member"
+        )
+    member_digest = _hex_digest(
+        payload.get("risk_dataset_manifest_digest"),
+        "risk_dataset_manifest_digest",
+        length=64,
+    )
+    if member_digest != member.get("risk_dataset_manifest_digest"):
+        raise CalibrationContractError(
+            f"{label} member digest mismatch for split {split}"
+        )
+    common = dataset_family.manifest.get("common_contract")
+    if not isinstance(common, Mapping):
+        raise CalibrationContractError(
+            "authenticated dataset family common contract is unavailable"
+        )
+    provenance_lengths = {
+        "g1_split_manifest_digest": 32,
+        "dynamic_objects_config_digest": 64,
+        "target_type_policy_digest": 32,
+    }
+    for field, length in provenance_lengths.items():
+        value = _hex_digest(payload.get(field), field, length=length)
+        if value != common.get(field):
+            raise CalibrationContractError(
+                f"{label} family common contract mismatch for {field}"
+            )
+    if payload.get("schema_version") != common.get("schema_version"):
+        raise CalibrationContractError(
+            f"{label} family common contract mismatch for schema_version"
+        )
+    common_channels = common.get("channel_spec")
+    if not isinstance(common_channels, Mapping):
+        raise CalibrationContractError(
+            "authenticated dataset family channel contract is unavailable"
+        )
+    family_input_channels = _semantic_projection(
+        {
+            key: common_channels.get(key)
+            for key in ("history", "state", "trajectory", "flat")
+        }
+    )
+    if payload.get("channel_spec") != family_input_channels:
+        raise CalibrationContractError(
+            f"{label} family common contract mismatch for channel_spec"
+        )
+
+
 def prediction_table_cohort_digest(table: Mapping[str, Any]) -> str:
     """Hash the method-independent ordered labels, groups, and source identities."""
 
@@ -301,12 +413,9 @@ def validate_prediction_table(
     *,
     expected_mode: str | None = None,
     expected_split: str | None = None,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> dict[str, Any]:
-    """Validate and defensively copy a prediction table.
-
-    The public API is intentionally toy-only until the risk-dataset-v2
-    publication exists; production payloads fail closed here as well as in CLIs.
-    """
+    """Validate and defensively copy a prediction table."""
 
     if not isinstance(table, Mapping):
         raise CalibrationContractError("prediction table must be a mapping")
@@ -324,11 +433,10 @@ def validate_prediction_table(
         raise CalibrationContractError(
             f"prediction table mode mismatch: expected {expected_mode!r}, got {mode!r}"
         )
-    if mode == "production":
-        raise CalibrationContractError(
-            "production prediction table mode is fail-closed until the "
-            "risk dataset v2 publication contract is available"
-        )
+    authenticated_family = _reauthenticate_dataset_family(
+        dataset_family,
+        mode=mode,
+    )
     if result.get("schema_version") != "3.0.0":
         raise CalibrationContractError("prediction table schema_version must be '3.0.0'")
     split = result.get("split")
@@ -380,6 +488,8 @@ def validate_prediction_table(
             )
 
     production_fields = (
+        "risk_dataset_family_layout_version",
+        "risk_dataset_family_digest",
         "g1_split_manifest_digest",
         "risk_dataset_manifest_digest",
         "dynamic_objects_config_digest",
@@ -401,8 +511,13 @@ def validate_prediction_table(
             raise CalibrationContractError(
                 "production prediction table must not contain toy provenance"
             )
-        for field in production_fields:
-            _hex_digest(result.get(field), field, length=64)
+        assert authenticated_family is not None
+        _validate_production_family_binding(
+            result,
+            dataset_family=authenticated_family,
+            split=split,
+            label="prediction table",
+        )
 
     rows = result.get("rows")
     if not isinstance(rows, list) or not rows:
@@ -418,6 +533,21 @@ def validate_prediction_table(
                 f"prediction table has duplicate sample_id {sample_id!r}"
             )
         seen_ids.add(sample_id)
+    if authenticated_family is not None:
+        member = authenticated_family.members[split]
+        if len(rows) != member["sample_count"]:
+            raise CalibrationContractError(
+                "production prediction table sample count differs from its "
+                f"family member for split {split}"
+            )
+        observed_membership = risk_dataset_family_sample_ids_digest(
+            [str(row["sample_id"]) for row in rows]
+        )
+        if observed_membership != member["sample_ids_digest_sha256"]:
+            raise CalibrationContractError(
+                "production prediction table sample ID membership differs "
+                f"from its family member for split {split}"
+            )
 
     declared_cohort_digest = _hex_digest(
         result.get("cohort_digest_sha256"), "cohort_digest_sha256", length=64
@@ -502,10 +632,14 @@ def fit_calibration_artifact(
     *,
     alpha: float,
     prediction_key: str,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> dict[str, Any]:
     """Fit a global correction from a validated calibration prediction table."""
 
-    table = validate_prediction_table(prediction_table)
+    table = validate_prediction_table(
+        prediction_table,
+        dataset_family=dataset_family,
+    )
     if table["split"] != "calibration":
         raise CalibrationContractError(
             "conformal fitting requires the calibration split, "
@@ -553,6 +687,8 @@ def fit_calibration_artifact(
         ]
     else:
         for field in (
+            "risk_dataset_family_layout_version",
+            "risk_dataset_family_digest",
             "g1_split_manifest_digest",
             "risk_dataset_manifest_digest",
             "dynamic_objects_config_digest",
@@ -568,6 +704,7 @@ def validate_calibration_artifact(
     *,
     expected_mode: str | None = None,
     expected_provenance: Mapping[str, Any] | None = None,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> dict[str, Any]:
     """Validate artifact layout, provenance, fitted identities, and digest."""
 
@@ -587,11 +724,10 @@ def validate_calibration_artifact(
         raise CalibrationContractError(
             f"calibration artifact mode mismatch: expected {expected_mode!r}, got {mode!r}"
         )
-    if mode == "production":
-        raise CalibrationContractError(
-            "production calibration artifact mode is fail-closed until the "
-            "risk dataset v2 publication contract is available"
-        )
+    authenticated_family = _reauthenticate_dataset_family(
+        dataset_family,
+        mode=mode,
+    )
     if result.get("schema_version") != "3.0.0":
         raise CalibrationContractError("calibration artifact schema_version must be '3.0.0'")
     if result.get("fit_split") != "calibration":
@@ -656,6 +792,8 @@ def validate_calibration_artifact(
         if any(
             field in result
             for field in (
+                "risk_dataset_family_layout_version",
+                "risk_dataset_family_digest",
                 "g1_split_manifest_digest",
                 "risk_dataset_manifest_digest",
                 "dynamic_objects_config_digest",
@@ -670,13 +808,13 @@ def validate_calibration_artifact(
             raise CalibrationContractError(
                 "production calibration artifact contains toy provenance"
             )
-        for field in (
-            "g1_split_manifest_digest",
-            "risk_dataset_manifest_digest",
-            "dynamic_objects_config_digest",
-            "target_type_policy_digest",
-        ):
-            _hex_digest(result.get(field), field, length=64)
+        assert authenticated_family is not None
+        _validate_production_family_binding(
+            result,
+            dataset_family=authenticated_family,
+            split="calibration",
+            label="calibration artifact",
+        )
     global_fit = result.get("global")
     if not isinstance(global_fit, Mapping):
         raise CalibrationContractError("artifact global fit must be a mapping")
@@ -795,10 +933,15 @@ def assert_calibration_test_isolation(
 def assert_calibration_artifact_test_isolation(
     artifact: Mapping[str, Any],
     test_rows: Sequence[Mapping[str, Any]],
+    *,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> dict[str, int]:
     """Check test identities against the fitted identity sets in an artifact."""
 
-    validated = validate_calibration_artifact(artifact)
+    validated = validate_calibration_artifact(
+        artifact,
+        dataset_family=dataset_family,
+    )
     identities = validated["fitted_identities"]
     result: dict[str, int] = {}
     for index, row in enumerate(test_rows):

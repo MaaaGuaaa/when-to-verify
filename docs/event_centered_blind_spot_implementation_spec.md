@@ -1252,6 +1252,47 @@ random seed
   rows。全局跨 shard audit 必须由 collection 调用方提供全部 split 记录后执行，
   不得用单 shard 通过代替 recording 隔离证明或 session overlap 报告。
 
+### 13.1 schema 3 外置隐藏占据 sidecar
+
+SOP08 将占据监督发布为 additive label-only sidecar，不向上述
+`RiskSample` 增加字段，不改变 model-input schema，因此 core
+`schema_version=3.0.0` 与通道顺序均不升版。冻结契约为：
+
+- `hidden_risk_occupancy`：逻辑/正式 loader 输出为
+  `float32 [N,15,160,160]`；磁盘中是 binary `uint8` 压缩 NPZ。
+- `robot_future_footprints`：同 shape 的 query-only companion；
+  `future_endpoint_times_s` 为 `float32 [15]`，精确对应
+  `0.2, 0.4, ..., 3.0 s`，不含 `t=0`。
+- 两个 mask 共用已冻结的 robot-centric `160×160`、`0.1 m/cell`
+  grid 和现有 footprint rasterizer，禁止单独重实现栅格化语义。
+- 占据标签对参与 SOP07 hidden-risk target 的、由调用方显式声明的
+  隐藏动态对象 footprint 逐端点做 OR；不含 static obstacle，不含
+  undeclared/context actor，且不按对象的未来可见性裁剪。
+  `empty_blind_spot` 或无 hidden target 时整个
+  `hidden_risk_occupancy` 必须全零。
+- risk/sidecar 只能在有序 `sample_id`、source risk shard semantic digest、
+  risk/sidecar pair completion marker 和 split-level collection seal 全部一致时严格
+  join；缺失、重复、额外或任一 digest 不匹配均 fail closed，禁止宽松按位置配对。
+- sidecar 只能用于 supervision 和 offline metrics，不得出现在
+  `model_inputs`。同一 `hidden_risk_occupancy` 是 SOP08 B3 ConvGRU/B4
+  aggregation 训练标签，也是 SOP09/R3 可选 occupancy auxiliary head 的标签。
+  四 split sidecar 数据准备是完整训练包的必做步骤，是否启用 auxiliary
+  head 仍是实验选项。
+
+### 13.2 四 split 发布与打包门禁
+
+- [ ] `train` / `calibration` / `val` / `test` 的每个已接受 risk shard 都有
+      唯一 sidecar shard 和 pair completion marker，且无 missing/extra/duplicate
+      `sample_id`。
+- [ ] 四个 split 均由正式 loader 重读，通过 shape/dtype/finite/binary、
+      `0.2...3.0 s`、source risk semantic digest 和全零边界检查。
+- [ ] 四个 split 各自发布绑定 risk collection、sidecar collection 和全部
+      pair markers 的 authenticated dataset seal，并在打包前完整重载。
+- [ ] 新版本完整训练包同时包含四 split immutable risk shards、sidecars/
+      markers、四个 seals、manifest 和逐文件 checksum；不覆盖旧 bundle。
+- [ ] 解包后拒绝 symlink/不安全路径，校验 archive 与成员 checksum、
+      四 split/shard/sample 边界、全量严格 join 及确定性 collection digest。
+
 这些模块、CLI 和分片契约目前只有 unit/toy-fixture 及确定性验证，
 不等于整条真实数据集生成任务已完成。10–100 真实样本 smoke、
 全局跨 shard recording 隔离/session overlap 审计与 50k/240k 目标规模运行仍待执行；未验证前
@@ -1290,6 +1331,9 @@ future occupancy + swept volume → 手写概率聚合 → trajectory risk
 - Trajectron++/Social-STGCNN 预测行人轨迹后栅格化；
 - 轻量 ConvGRU occupancy baseline。
 
+B3 ConvGRU predictor 和 B4 learned aggregator 必须读取第 13.1 节的同一
+`hidden_risk_occupancy` 监督，不得从 model-input 通道反推或替换该标签。
+
 ### 14.3 可选辅助任务
 
 主模型使用共享 encoder：
@@ -1301,6 +1345,8 @@ BEV encoder
 ```
 
 推理时风险 head 不应强制经过 occupancy 输出。
+完整数据包始终准备占据 sidecar；是否在 SOP09/R3 启用该 auxiliary
+head/loss 由消融配置决定，不得借关闭 auxiliary head 跳过 sidecar 数据准备。
 
 ---
 
@@ -2267,6 +2313,12 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - visible actor 不计入 hidden-risk 主标签。
 - circle-circle、circle-rectangle、rectangle-rectangle 和多对象最小 clearance
   与手算一致。
+- `hidden_risk_occupancy` 只 OR 已声明 SOP07 hidden targets，不含
+  static/undeclared/context actors，且不按未来可见性裁剪；
+- `empty_blind_spot`/无 hidden target 全零，并与重用 rasterizer 生成的
+  `robot_future_footprints` 在 `0.2...3.0 s` 端点严格对齐；
+- sidecar 磁盘 binary `uint8` 与 loader `float32` 契约、risk semantic digest/
+  marker/seal 严格 join 和 `model_inputs` 隔离测试通过。
 
 ### 31.5 验证价值测试
 
@@ -2288,6 +2340,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 ✓ 能独立发布 collision 母事件，并对各 paired negative 报告 coverage/缺失原因
 ✓ 能渲染 K 帧不完整 BEV 和完整 oracle
 ✓ 能计算 collision/risk GT
+✓ 四 split hidden-occupancy sidecars、pair markers 和 authenticated seals 完整打包并可严格重载
 ✓ 能训练过拟合 1000 个 risk samples
 ✓ 能生成至少两个验证动作价值不同的样本
 ✓ 能训练 verification model 过拟合小数据

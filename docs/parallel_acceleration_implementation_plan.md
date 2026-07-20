@@ -282,6 +282,29 @@ future:
   steps: 15
 ```
 
+### 3.2.1 Additive hidden-occupancy sidecar
+
+SOP08 占据监督是 schema 3 外置的 additive label-only 发布：它不修改
+`RiskSample`、model-input 通道或 core `schema_version=3.0.0`。冻结数组为：
+
+```text
+hidden_risk_occupancy     float32 [N,15,160,160]  # 逻辑/loader
+robot_future_footprints   float32 [N,15,160,160]  # query companion
+future_endpoint_times_s   float32 [15]            # 0.2,...,3.0，不含 t=0
+```
+
+两个 binary mask 在压缩 NPZ 中均以 `uint8` 存储，loader 才转为
+`float32`。它们共用已冻结的 robot-centric `160×160`、`0.1 m/cell`
+grid 和现有 footprint rasterizer。`hidden_risk_occupancy` 只对调用方声明且
+参与 SOP07 hidden-risk target 的隐藏动态对象逐端点 OR；排除
+static obstacle 和 undeclared/context actor，不按未来可见性裁剪。
+`empty_blind_spot` 或无 hidden target 时必须全零。
+
+sidecar 只用于 supervision/offline metrics，禁止进入 `model_inputs`。加载时
+必须同时校验有序 `sample_id`、source risk shard semantic digest、每 shard
+pair completion marker 与 split-level collection seal；任一缺失/不匹配即
+fail closed，不做宽松位置 join。
+
 ## 3.3 样本存储
 
 推荐：
@@ -302,6 +325,8 @@ outputs/
   snippets/<split>/<object_type>/
   event_centered_blind_spot/schema-v3/
     risk-data/<run-id>/
+    risk-sidecars/<run-id>/
+    risk-dataset-seals/<run-id>/
     risk-model/<run-id>/
     verification-data/<run-id>/
     verification-model/<run-id>/
@@ -676,6 +701,12 @@ empty_blind_spot: 0.10
 - `split_audit_records` 对 base/source recording 跨 split 泄漏执行 fail-closed
   校验，并完整报告允许的 THÖR session overlap；当前 CLI 只组装本 shard，
   collection 调用方仍必须传入全部 split 记录完成 global cross-shard audit。
+- 对每个已接受 SOP07 risk shard 发布独立 immutable sidecar shard 和 pair
+  completion marker；使用第 3.2.1 节冻结的隐藏占据/机器人 query 标签，
+  不得反向改写已接受 risk shard。
+- `train` / `calibration` / `val` / `test` 四 split 中的全部 risk/sidecar/marker
+  必须严格 join，每 split 发布 authenticated dataset seal；完整训练包中
+  sidecar 数据准备是必做项。
 
 当前已实现 schema 3 hidden-risk GT、`RiskSample` 组装、deterministic immutable
 shard API 与正式数据集 CLI，但只有 unit/toy-fixture 和确定性验证。
@@ -779,6 +810,10 @@ trajectory risk
 past BEV occupancy → future occupancy probability
 ```
 
+B3 ConvGRU predictor 和 B4 learned aggregation 统一使用第 3.2.1 节的
+`hidden_risk_occupancy` 进行训练，使用同时间轴/同栅格的
+`robot_future_footprints` 进行 trajectory query 聚合。该 sidecar 不是历史输入通道。
+
 ### 可选复用
 
 - Social-STGCNN；
@@ -833,6 +868,11 @@ R1: temporal CNN / ConvGRU + trajectory channels
 R2: trajectory-query cross-attention
 R3: R2 + occupancy auxiliary head（可选）
 ```
+
+R3 若启用 auxiliary head，必须复用 B3/B4 的同一
+`hidden_risk_occupancy` 监督，不得另建标签定义。四 split sidecar 准备是
+数据发布必做项；是否启用 R3 head/loss 仍是实验选项，不会改变
+`RiskSample` 或 core schema/version。
 
 Day 8 前根据验证集结果只保留一个主模型。
 
@@ -1518,7 +1558,24 @@ outputs/snippets/<split>/<object_type>/...
 outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/samples.npz
 outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/metadata.jsonl
 outputs/event_centered_blind_spot/schema-v3/risk-data/<run-id>/<split>/shard-*/summary.json
+outputs/event_centered_blind_spot/schema-v3/risk-sidecars/<run-id>/<split>/shard-*/sidecars.npz
+outputs/event_centered_blind_spot/schema-v3/risk-sidecars/<run-id>/<split>/shard-*/summary.json
+outputs/event_centered_blind_spot/schema-v3/risk-sidecars/<run-id>/<split>/shard-*.risk-sidecar-pair-complete.json
+outputs/event_centered_blind_spot/schema-v3/risk-dataset-seals/<run-id>/<split>/...
 ```
+
+四 split sidecar/seal/打包验收清单：
+
+- [ ] 每个已接受 risk shard 有且仅有一个 sidecar + marker，无
+      missing/extra/duplicate `sample_id`；
+- [ ] 正式 loader 验证全部 split/shard/sample 边界、source risk semantic
+      digest、shape/dtype/finite/binary、全零边界和 `0.2...3.0 s`；
+- [ ] `train` / `calibration` / `val` / `test` 各有一个已重载的 authenticated
+      seal，绑定对应 risk collection、sidecar collection 与所有 pair markers；
+- [ ] 新完整训练 bundle 包含四 split risk shards、sidecars/markers、seals、
+      top-level manifest 和逐文件 checksum，不覆盖旧 bundle；
+- [ ] 解包后校验 archive/member SHA-256、无 symlink/不安全路径、全量
+      strict join 和确定性 collection digest。
 
 ## 17.2 风险
 
@@ -1669,6 +1726,7 @@ cross-attention → concatenate + CNN
 - 无泄漏 split；
 - 半合成事件生成；
 - 风险 GT；
+- 四 split hidden-occupancy sidecars、pair markers、authenticated seals 与完整训练包；
 - occupancy baseline；
 - risk model + calibration；
 - verify GT；
@@ -1688,7 +1746,7 @@ cross-attention → concatenate + CNN
 
 - JRDB 跨数据集；
 - Social-STGCNN/Trajectron++；
-- occupancy auxiliary head；
+- occupancy auxiliary head（sidecar 数据准备仍是 P0，此处只指启用 R3 head）；
 - 完整 ROS2 插件；
 - 真实机器人。
 

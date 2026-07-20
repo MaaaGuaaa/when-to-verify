@@ -97,6 +97,92 @@ def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
+def _framed_domain_digest(domain: bytes, value: object) -> str:
+    """Mirror the heldout producer's domain-separated semantic digest."""
+
+    payload = canonical_json(value).encode("utf-8")
+    return sha256_bytes(domain + len(payload).to_bytes(8, "big") + payload)
+
+
+def heldout_collection_semantic_digest(handoff: Mapping[str, object]) -> str:
+    """Reproduce the frozen heldout-finalizer collection semantic scope."""
+
+    generation_evidence = handoff["generation_report_evidence"]
+    assert isinstance(generation_evidence, Mapping)
+    shards = handoff["shards"]
+    assert isinstance(shards, list)
+    scope = {
+        "handoff_version": handoff["handoff_version"],
+        "schema_version": handoff["schema_version"],
+        "layout_version": handoff["layout_version"],
+        "split": handoff["split"],
+        "shard_count": handoff["shard_count"],
+        "sample_count": handoff["sample_count"],
+        "generation_semantic_digest": generation_evidence[
+            "semantic_digest_sha256"
+        ],
+        "class_prior": handoff["class_prior"],
+        "event_type_counts": handoff["event_type_counts"],
+        "provenance_coverage": handoff["provenance_coverage"],
+        "per_sample_array_layout": handoff["per_sample_array_layout"],
+        "shards": [
+            {
+                key: descriptor[key]
+                for key in (
+                    "shard_index",
+                    "relative_root",
+                    "sample_count",
+                    "manifest_digest",
+                    "semantic_digest",
+                    "payload_sha256",
+                    "metadata_sha256",
+                    "summary_sha256",
+                )
+            }
+            for descriptor in shards
+        ],
+    }
+    return _framed_domain_digest(
+        b"sop07-heldout-collection-semantic-v1\0",
+        scope,
+    )
+
+
+def _collection_per_sample_array_layout(
+    collection_root: Path,
+    shards: object,
+) -> dict[str, object]:
+    assert isinstance(shards, list)
+    normalized: dict[str, object] | None = None
+    for descriptor in shards:
+        assert isinstance(descriptor, Mapping)
+        relative_root = descriptor["relative_root"]
+        sample_count = descriptor["sample_count"]
+        assert isinstance(relative_root, str)
+        assert isinstance(sample_count, int)
+        summary = json.loads(
+            (collection_root / relative_root / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        layout = {
+            name: {
+                "dtype": spec["dtype"],
+                "order": spec["order"],
+                "per_sample_shape": spec["shape"][1:],
+            }
+            for name, spec in sorted(summary["array_layout"].items())
+            if spec["shape"][0] == sample_count
+        }
+        assert len(layout) == len(summary["array_layout"])
+        if normalized is None:
+            normalized = layout
+        else:
+            assert layout == normalized
+    assert normalized is not None
+    return normalized
+
+
 def write_canonical_json(path: Path, value: Mapping[str, object]) -> None:
     path.write_bytes((canonical_json(dict(value)) + "\n").encode("utf-8"))
 
@@ -163,6 +249,10 @@ def write_formal_collection_handoff(
     elif handoff_dialect == "heldout":
         if split not in {"calibration", "val", "test"}:
             raise ValueError("heldout handoff dialect requires a heldout split")
+        value["per_sample_array_layout"] = _collection_per_sample_array_layout(
+            collection_root,
+            value["shards"],
+        )
         report_semantics = {
             "code_commit": value["code_commit"],
             "event_count": value["sample_count"],
@@ -231,6 +321,9 @@ def write_formal_collection_handoff(
         }
         value["handoff_version"] = (
             "sop07_heldout_collection_complete_handoff_v1"
+        )
+        value["collection_semantic_digest_sha256"] = (
+            heldout_collection_semantic_digest(value)
         )
         value.pop("producer_version", None)
     else:
@@ -455,9 +548,68 @@ def create_formal_risk_publication(
     semantic_digest = sha256_bytes(
         canonical_json(collection_semantics).encode("utf-8")
     )
+    class_counts = {
+        "collision": sum(sample.collision_label for sample in samples),
+        "near_miss": sum(
+            sample.near_miss
+            for sample in samples
+            if sample.collision_label == 0
+        ),
+    }
+    class_counts["safe"] = len(samples) - sum(class_counts.values())
+    class_prior = {
+        name: {
+            "count": class_counts[name],
+            "rate": class_counts[name] / len(samples),
+        }
+        for name in ("collision", "near_miss", "safe")
+    }
+    event_type_counts = {
+        name: sum(sample.event_type == name for sample in samples)
+        for name in (
+            "collision",
+            "near_miss",
+            "temporal_safe",
+            "spatial_safe",
+            "irrelevant_hidden",
+            "empty_blind_spot",
+        )
+    }
+    provenances = [sample.metadata["provenance"] for sample in samples]
+    provenance_coverage = {
+        "unique_sample_id_count": len({sample.sample_id for sample in samples}),
+        "unique_pair_group_count": len(
+            {sample.pair_group_id for sample in samples}
+        ),
+        "unique_base_recording_count": len(
+            {value["base_recording_id"] for value in provenances}
+        ),
+        "unique_base_session_count": len(
+            {value["base_session_id"] for value in provenances}
+        ),
+        "unique_base_state_count": len(
+            {sample.base_state_id for sample in samples}
+        ),
+        "unique_source_recording_count": len(
+            {value["source_recording_id"] for value in provenances}
+        ),
+        "unique_source_session_count": len(
+            {value["source_session_id"] for value in provenances}
+        ),
+        "unique_source_snippet_count": len(
+            {value["source_snippet_id"] for value in provenances}
+        ),
+        "unique_seed_namespace_count": len(
+            {value["seed_namespace"] for value in provenances}
+        ),
+        "unique_trajectory_count": len(
+            {sample.metadata["trajectory_id"] for sample in samples}
+        ),
+    }
     handoff = {
         "artifact_role": f"sop07_{split}_collection_complete_handoff",
         "builder_version": "sop07_collection_handoff_builder_v1",
+        "class_prior": class_prior,
         "code_commit": SOP07_CODE_COMMIT,
         "collection_instance_digest_sha256": sha256_bytes(
             canonical_json(
@@ -471,9 +623,15 @@ def create_formal_risk_publication(
             "global_sample_id_uniqueness": "PROVEN",
             "physical_npz_merge_performed": False,
         },
+        "event_type_counts": event_type_counts,
         "handoff_version": "sop07_collection_complete_handoff_v1",
         "layout_version": RISK_SHARD_LAYOUT_VERSION,
+        "per_sample_array_layout": _collection_per_sample_array_layout(
+            collection_root,
+            descriptors,
+        ),
         "producer_version": "sop07_risk_dataset_cli_v3",
+        "provenance_coverage": provenance_coverage,
         "runtime_metadata": dict(runtime_metadata or {}),
         "sample_count": 12,
         "schema_version": SCHEMA_VERSION,
@@ -590,6 +748,7 @@ __all__ = [
     "TARGET_TYPE_POLICY_DIGEST",
     "canonical_json",
     "create_formal_risk_publication",
+    "heldout_collection_semantic_digest",
     "resign_dataset_seal",
     "rewrite_collection_handoff",
     "sha256_file",

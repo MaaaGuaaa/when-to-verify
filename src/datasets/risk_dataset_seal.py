@@ -59,6 +59,9 @@ _HELDOUT_COLLECTION_HANDOFF_ROLE = "sop07_heldout_collection_complete_handoff"
 _HELDOUT_GENERATION_REPORT_NAME = "batch_generation_report.json"
 _HELDOUT_GENERATION_REPORT_VERSION = "sop07_heldout_batch_generation_report_v1"
 _HELDOUT_GENERATION_REPORT_ROLE = "sop07_heldout_batch_generation_report"
+_HELDOUT_COLLECTION_SEMANTIC_DOMAIN = (
+    b"sop07-heldout-collection-semantic-v1\0"
+)
 _HELDOUT_SPLITS = frozenset({"calibration", "val", "test"})
 _COLLECTION_HANDOFF_NAME = "collection_complete_handoff.json"
 _DATASET_MANIFEST_NAME = "dataset_manifest.json"
@@ -328,6 +331,20 @@ def _read_json(path: Path, *, label: str) -> dict[str, object]:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _framed_domain_digest(domain: bytes, value: object, *, label: str) -> str:
+    try:
+        payload = _canonical_json(value).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RiskDataContractError(
+            f"{label} must be finite canonical JSON"
+        ) from exc
+    digest = hashlib.sha256()
+    digest.update(domain)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+    return digest.hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -1386,6 +1403,57 @@ def _target_policy_from_loaded_shard(
     return values
 
 
+def _heldout_collection_semantic_digest(
+    handoff: Mapping[str, object],
+    *,
+    descriptors: list[RiskShardDescriptor],
+    expected_split: str,
+    sample_count: int,
+) -> str:
+    """Recompute the frozen heldout-finalizer framed semantic identity."""
+
+    generation_evidence = handoff.get("generation_report_evidence")
+    if not isinstance(generation_evidence, Mapping):
+        raise RiskDataContractError(
+            "heldout collection generation report evidence is missing"
+        )
+    rich_scope: dict[str, Mapping[str, object]] = {}
+    for field in (
+        "class_prior",
+        "event_type_counts",
+        "provenance_coverage",
+        "per_sample_array_layout",
+    ):
+        value = handoff.get(field)
+        if not isinstance(value, Mapping):
+            raise RiskDataContractError(
+                f"heldout collection semantic scope {field} must be a mapping"
+            )
+        rich_scope[field] = value
+    scope = {
+        "handoff_version": _HELDOUT_COLLECTION_HANDOFF_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "layout_version": RISK_SHARD_LAYOUT_VERSION,
+        "split": expected_split,
+        "shard_count": len(descriptors),
+        "sample_count": sample_count,
+        "generation_semantic_digest": _require_sha256(
+            generation_evidence.get("semantic_digest_sha256"),
+            field="heldout generation semantic digest",
+        ),
+        "class_prior": rich_scope["class_prior"],
+        "event_type_counts": rich_scope["event_type_counts"],
+        "provenance_coverage": rich_scope["provenance_coverage"],
+        "per_sample_array_layout": rich_scope["per_sample_array_layout"],
+        "shards": [asdict(descriptor) for descriptor in descriptors],
+    }
+    return _framed_domain_digest(
+        _HELDOUT_COLLECTION_SEMANTIC_DOMAIN,
+        scope,
+        label="heldout collection semantic scope",
+    )
+
+
 def _formally_validate_collection(
     collection_root: Path,
     *,
@@ -1474,31 +1542,30 @@ def _formally_validate_collection(
         raise RiskDataContractError(
             "collection must contain exactly one consistent target_type_policy_digest"
         )
-    collection_semantics = {
-        "schema_version": SCHEMA_VERSION,
-        "layout_version": RISK_SHARD_LAYOUT_VERSION,
-        "split": expected_split,
-        "sample_count": len(sample_ids),
-        "shards": [
-            {
-                "shard_index": descriptor.shard_index,
-                "relative_root": descriptor.relative_root,
-                "sample_count": descriptor.sample_count,
-                "manifest_digest": descriptor.manifest_digest,
-                "semantic_digest": descriptor.semantic_digest,
-            }
-            for descriptor in descriptors
-        ],
-    }
-    recomputed_collection_digest = _sha256_bytes(
-        _canonical_json(collection_semantics).encode("utf-8")
-    )
     declared_collection_digest = _require_sha256(
         handoff.get("collection_semantic_digest_sha256"),
         field="collection_semantic_digest_sha256",
     )
-    if recomputed_collection_digest != declared_collection_digest:
-        raise RiskDataContractError("collection semantic digest mismatch")
+    if expected_split in _HELDOUT_SPLITS:
+        recomputed_collection_digest = _heldout_collection_semantic_digest(
+            handoff,
+            descriptors=descriptors,
+            expected_split=expected_split,
+            sample_count=len(sample_ids),
+        )
+        if recomputed_collection_digest != declared_collection_digest:
+            raise RiskDataContractError("collection semantic digest mismatch")
+    elif expected_split == "train":
+        # The accepted train producer did not publish its digest construction or
+        # builder evidence.  Treat this value as opaque producer provenance
+        # rather than inventing a formula: publication authenticity comes from
+        # the caller-pinned expected handoff SHA-256, which the immutable seal
+        # persists and rechecks.  Collection integrity remains independently
+        # enforced above by full formal shard reload, ordered descriptors, file
+        # checksums, semantic digests, sample counts, and global sample IDs.
+        pass
+    else:  # pragma: no cover - handoff dialect validation rejects this earlier
+        raise RiskDataContractError("unsupported SOP07 collection split")
     return tuple(descriptors), next(iter(target_policy_values))
 
 

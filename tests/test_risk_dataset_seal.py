@@ -42,6 +42,7 @@ from tests.fixtures.formal_risk_publication import (
     canonical_json,
     create_formal_risk_publication,
     create_formal_risk_sidecar_publication,
+    heldout_collection_semantic_digest,
     resign_dataset_seal,
     rewrite_collection_handoff,
     sha256_file,
@@ -160,6 +161,9 @@ def _rewrite_as_heldout_collection(
     )
     handoff.pop("producer_version", None)
     handoff.update(handoff_updates or {})
+    handoff["collection_semantic_digest_sha256"] = (
+        heldout_collection_semantic_digest(handoff)
+    )
     return rewrite_collection_handoff(publication, handoff)
 
 
@@ -388,6 +392,73 @@ def test_heldout_publisher_authenticates_report_and_normalizes_producer(
     assert loaded.manifest["collection_producer_version"] == (
         "sop07_risk_dataset_cli_v3"
     )
+
+
+def test_heldout_publisher_requires_framed_producer_collection_semantics(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split="val",
+        handoff_dialect="heldout",
+    )
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    assert handoff["collection_semantic_digest_sha256"] == (
+        heldout_collection_semantic_digest(handoff)
+    )
+
+    seal_root = _publish(
+        publication,
+        tmp_path / "seal",
+        expected_split="val",
+    )
+    assert _manifest(seal_root)["collection_semantic_digest_sha256"] == (
+        handoff["collection_semantic_digest_sha256"]
+    )
+
+
+def test_train_collection_semantic_digest_is_authenticated_opaque_identity(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(tmp_path / "upstream")
+    handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
+    handoff["collection_semantic_digest_sha256"] = "a" * 64
+    handoff_sha256 = rewrite_collection_handoff(publication, handoff)
+
+    seal_root = _publish(
+        publication,
+        tmp_path / "seal",
+        expected_handoff_sha256=handoff_sha256,
+    )
+    loaded = load_risk_dataset_seal(
+        seal_root,
+        collection_root=publication.collection_root,
+        expected_split="train",
+    )
+    assert loaded.manifest["collection_semantic_digest_sha256"] == "a" * 64
+
+
+def test_train_opaque_digest_does_not_weaken_handoff_or_shard_authentication(
+    tmp_path: Path,
+) -> None:
+    stale_sha = create_formal_risk_publication(tmp_path / "stale-sha")
+    handoff = json.loads(stale_sha.handoff_path.read_text(encoding="utf-8"))
+    handoff["collection_semantic_digest_sha256"] = "a" * 64
+    rewrite_collection_handoff(stale_sha, handoff)
+    with pytest.raises(RiskDataContractError, match="handoff SHA-256"):
+        _publish(stale_sha, tmp_path / "stale-sha-seal")
+
+    bad_shard = create_formal_risk_publication(tmp_path / "bad-shard")
+    handoff = json.loads(bad_shard.handoff_path.read_text(encoding="utf-8"))
+    handoff["collection_semantic_digest_sha256"] = "a" * 64
+    handoff["shards"][0]["semantic_digest"] = "f" * 64
+    handoff_sha256 = rewrite_collection_handoff(bad_shard, handoff)
+    with pytest.raises(RiskDataContractError, match="shard semantic digest"):
+        _publish(
+            bad_shard,
+            tmp_path / "bad-shard-seal",
+            expected_handoff_sha256=handoff_sha256,
+        )
 
 
 def test_collection_handoff_dialects_are_split_specific(tmp_path: Path) -> None:
@@ -1036,7 +1107,11 @@ def test_grid_type_remains_the_existing_contract(tmp_path: Path) -> None:
 def test_publisher_recomputes_collection_semantic_digest_after_formal_load(
     tmp_path: Path,
 ) -> None:
-    publication = create_formal_risk_publication(tmp_path / "upstream")
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        split="val",
+        handoff_dialect="heldout",
+    )
     handoff = json.loads(publication.handoff_path.read_text(encoding="utf-8"))
     handoff["collection_semantic_digest_sha256"] = "0" * 64
     resigned_handoff_sha256 = rewrite_collection_handoff(publication, handoff)
@@ -1045,6 +1120,7 @@ def test_publisher_recomputes_collection_semantic_digest_after_formal_load(
         _publish(
             publication,
             tmp_path / "seal",
+            expected_split="val",
             expected_handoff_sha256=resigned_handoff_sha256,
         )
     assert not (tmp_path / "seal").exists()

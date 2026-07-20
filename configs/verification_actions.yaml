@@ -1,0 +1,27 @@
+schema_version: "3.0.0"
+library_version: verification_actions_v1
+actions:
+  - action_id: yaw_left_10
+    duration_s: 0.50
+    delta_forward_m: 0.0
+    delta_yaw_deg: 10.0
+  - action_id: yaw_right_10
+    duration_s: 0.50
+    delta_forward_m: 0.0
+    delta_yaw_deg: -10.0
+  - action_id: yaw_left_20
+    duration_s: 0.75
+    delta_forward_m: 0.0
+    delta_yaw_deg: 20.0
+  - action_id: yaw_right_20
+    duration_s: 0.75
+    delta_forward_m: 0.0
+    delta_yaw_deg: -20.0
+  - action_id: forward_peek
+    duration_s: 0.80
+    delta_forward_m: 0.30
+    delta_yaw_deg: 0.0
+  - action_id: stop_scan
+    duration_s: 0.60
+    delta_forward_m: 0.0
+    delta_yaw_deg: 0.0

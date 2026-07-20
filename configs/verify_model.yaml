@@ -1,0 +1,19 @@
+schema_version: "3.0.0"
+model:
+  version: verification_concat_cnn_v0
+  spatial_channels: [8, 16, 32]
+  action_hidden_dim: 16
+  fusion_hidden_dim: 32
+loss:
+  huber_delta: 0.10
+  value_weight: 1.0
+  useful_weight: 0.5
+  ranking_weight: 0.5
+  ranking_margin: 0.05
+training:
+  seed: 42
+  epochs: 120
+  batch_size: 12
+  learning_rate: 0.003
+  weight_decay: 0.0
+  gradient_clip_norm: 5.0

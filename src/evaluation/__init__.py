@@ -1,1 +1,1 @@
-"""Risk baselines and finite, structured offline evaluation metrics."""
+"""Offline risk/verification baselines, metrics, and provenance checks."""

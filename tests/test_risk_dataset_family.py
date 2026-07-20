@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields, replace
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -106,6 +108,14 @@ def _resign_family(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _load_seal_cli_module() -> object:
+    spec = importlib.util.spec_from_file_location("risk_dataset_seal_cli", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_family_public_contract_round_trip_and_deep_immutability(
@@ -447,6 +457,66 @@ def test_family_loader_rejects_recomputed_non_proven_audit(
         load_risk_dataset_family(root)
 
 
+def test_family_loader_pins_one_manifest_snapshot_across_hash_and_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    members, _ = _publish_members(tmp_path / "source")
+    root = publish_risk_dataset_family(tmp_path / "family", members=members)
+    original = _family_manifest(root)
+    original_digest = original["risk_dataset_family_digest"]
+    replacement = json.loads(canonical_json(original))
+    replacement_members = replacement["members"]
+    replacement_audit = replacement["cross_split_audit"]
+    assert isinstance(replacement_members, dict)
+    assert isinstance(replacement_members["train"], dict)
+    assert isinstance(replacement_audit, dict)
+    replacement_counts = replacement_audit["authenticated_metadata_row_counts"]
+    assert isinstance(replacement_counts, dict)
+    replacement_members["train"]["sample_count"] = 13
+    replacement_counts["train"] = 13
+    replacement["risk_dataset_family_digest"] = _family_digest(replacement)
+    replacement_path = tmp_path / "replacement-family-manifest.json"
+    write_canonical_json(replacement_path, replacement)
+    manifest_path = root / "family_manifest.json"
+    real_hash = seal_module._sha256_file
+    real_open = seal_module.os.open
+    swapped = False
+
+    def replace_manifest_once() -> None:
+        nonlocal swapped
+        if not swapped:
+            os.replace(replacement_path, manifest_path)
+            swapped = True
+
+    def swap_after_path_hash(path: Path) -> str:
+        digest = real_hash(path)
+        if Path(path) == manifest_path:
+            replace_manifest_once()
+        return digest
+
+    def swap_after_pinned_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd is not None and os.fspath(path) == "family_manifest.json":
+            replace_manifest_once()
+        return descriptor
+
+    monkeypatch.setattr(seal_module, "_sha256_file", swap_after_path_hash)
+    monkeypatch.setattr(seal_module.os, "open", swap_after_pinned_open)
+
+    loaded = load_risk_dataset_family(root)
+
+    assert swapped is True
+    assert loaded.risk_dataset_family_digest == original_digest
+    assert loaded.members["train"]["sample_count"] == 12
+
+
 def test_publisher_reauthenticates_members_and_formally_reloads_metadata_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -459,30 +529,8 @@ def test_publisher_reauthenticates_members_and_formally_reloads_metadata_rows(
         sample_count=999,
         provenance={"forged": "true"},
     )
-    real_dataset_loader = seal_module.load_risk_dataset_seal
     real_shard_loader = seal_module.load_risk_shard
-    dataset_calls: list[tuple[str, str, str]] = []
     shard_calls: list[str] = []
-
-    def tracking_dataset_loader(
-        seal_root: str | Path,
-        *,
-        collection_root: str | Path,
-        expected_split: str,
-        expected_manifest_digest: str | None = None,
-        **kwargs: object,
-    ) -> LoadedRiskDataset:
-        del kwargs
-        assert expected_manifest_digest is not None
-        dataset_calls.append(
-            (Path(seal_root).name, expected_split, expected_manifest_digest)
-        )
-        return real_dataset_loader(
-            seal_root,
-            collection_root=collection_root,
-            expected_split=expected_split,
-            expected_manifest_digest=expected_manifest_digest,
-        )
 
     def tracking_shard_loader(
         root: str | Path,
@@ -491,26 +539,54 @@ def test_publisher_reauthenticates_members_and_formally_reloads_metadata_rows(
         shard_calls.append(Path(root).name)
         return real_shard_loader(root, **kwargs)
 
-    monkeypatch.setattr(
-        seal_module, "load_risk_dataset_seal", tracking_dataset_loader
-    )
     monkeypatch.setattr(seal_module, "load_risk_shard", tracking_shard_loader)
     family = load_risk_dataset_family(
         publish_risk_dataset_family(tmp_path / "family", members=members)
     )
 
-    assert [call[1] for call in dataset_calls] == list(MEMBER_ORDER)
-    assert [call[2] for call in dataset_calls] == [
-        members[split].risk_dataset_manifest_digest for split in MEMBER_ORDER
-    ]
     assert shard_calls == [
         shard
         for _split in MEMBER_ORDER
         for shard in (
             "shard-00000",
             "shard-00001",
-            "shard-00000",
-            "shard-00001",
         )
     ]
     assert family.members["train"]["sample_count"] == 12
+
+
+def test_family_publish_cli_formally_decodes_each_member_shard_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    members, _ = _publish_members(tmp_path / "source")
+    cli = _load_seal_cli_module()
+    real_shard_loader = seal_module.load_risk_shard
+    shard_calls: list[str] = []
+
+    def tracking_shard_loader(
+        root: str | Path,
+        **kwargs: object,
+    ) -> object:
+        shard_calls.append(Path(root).name)
+        return real_shard_loader(root, **kwargs)
+
+    monkeypatch.setattr(seal_module, "load_risk_shard", tracking_shard_loader)
+    argv = ["--output-dir", str(tmp_path / "cli-count-family")]
+    for split in MEMBER_ORDER:
+        argv.extend(
+            [
+                "--member",
+                split,
+                str(members[split].seal_root),
+                str(members[split].collection_root),
+                members[split].risk_dataset_manifest_digest,
+            ]
+        )
+
+    assert cli._main_family_publish(argv) == 0
+    assert shard_calls == [
+        shard
+        for _split in MEMBER_ORDER
+        for shard in ("shard-00000", "shard-00001")
+    ]

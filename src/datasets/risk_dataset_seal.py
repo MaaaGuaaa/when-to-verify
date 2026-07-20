@@ -639,12 +639,14 @@ def _load_base_config(path: Path) -> tuple[dict[str, object], GridSpec, dict[str
     return config, grid, grid_value
 
 
-def _parse_checksum_manifest(path: Path, *, label: str) -> dict[str, str]:
-    _require_regular_file(path, label=label)
+def _parse_checksum_manifest_bytes(
+    raw: bytes,
+    *,
+    label: str,
+) -> dict[str, str]:
     try:
-        raw = path.read_bytes()
         text = raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
+    except UnicodeError as exc:
         raise RiskDataContractError(f"failed to read {label}") from exc
     if not raw or not raw.endswith(b"\n"):
         raise RiskDataContractError(f"{label} must be non-empty and newline-terminated")
@@ -673,6 +675,15 @@ def _parse_checksum_manifest(path: Path, *, label: str) -> dict[str, str]:
     if text != expected_text:
         raise RiskDataContractError(f"{label} entries must be in canonical path order")
     return entries
+
+
+def _parse_checksum_manifest(path: Path, *, label: str) -> dict[str, str]:
+    _require_regular_file(path, label=label)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RiskDataContractError(f"failed to read {label}") from exc
+    return _parse_checksum_manifest_bytes(raw, label=label)
 
 
 def _load_authenticated_sop03_manifest(
@@ -1538,6 +1549,7 @@ def _formally_validate_collection(
     grid: GridSpec,
     expected_split: str,
     handoff: Mapping[str, object],
+    authenticated_metadata_rows: list[dict[str, object]] | None = None,
 ) -> tuple[tuple[RiskShardDescriptor, ...], str]:
     shard_roots = _discover_shards(collection_root)
     handoff_values = handoff.get("shards")
@@ -1607,6 +1619,10 @@ def _formally_validate_collection(
                     f"duplicate sample_id across SOP07 shards: {sample.sample_id}"
                 )
             sample_ids.add(sample.sample_id)
+        if authenticated_metadata_rows is not None:
+            authenticated_metadata_rows.extend(
+                dict(row) for row in loaded.manifest
+            )
         descriptors.append(descriptor)
 
     expected_count = _require_positive_int(
@@ -1616,6 +1632,13 @@ def _formally_validate_collection(
         raise RiskDataContractError("collection sample_count differs from shard totals")
     if len(sample_ids) != expected_count:
         raise RiskDataContractError("collection global sample identity count mismatch")
+    if (
+        authenticated_metadata_rows is not None
+        and len(authenticated_metadata_rows) != expected_count
+    ):
+        raise RiskDataContractError(
+            "collection authenticated metadata row count mismatch"
+        )
     if len(target_policy_values) != 1:
         raise RiskDataContractError(
             "collection must contain exactly one consistent target_type_policy_digest"
@@ -1940,15 +1963,16 @@ def _load_seal_manifest(seal_root: Path) -> dict[str, object]:
     return manifest
 
 
-def load_risk_dataset_seal(
+def _load_risk_dataset_seal_with_authenticated_rows(
     seal_root: str | Path,
     *,
     collection_root: str | Path,
     expected_split: str,
     expected_manifest_digest: str | None = None,
     sidecar_root: str | Path | None = None,
-) -> LoadedRiskDataset:
-    """Load only a complete v2 seal whose entire source collection still verifies."""
+    retain_authenticated_metadata_rows: bool,
+) -> tuple[LoadedRiskDataset, tuple[dict[str, object], ...]]:
+    """Strictly load one dataset while retaining its authenticated metadata rows."""
 
     seal_path = _absolute_without_symlink_resolution(Path(seal_root))
     collection_path = _absolute_without_symlink_resolution(Path(collection_root))
@@ -2030,11 +2054,15 @@ def load_risk_dataset_seal(
         or handoff.get("shard_count") != shard_count
     ):
         raise RiskDataContractError("dataset manifest source collection identity mismatch")
+    authenticated_metadata_rows: list[dict[str, object]] | None = (
+        [] if retain_authenticated_metadata_rows else None
+    )
     loaded_descriptors, loaded_target_digest = _formally_validate_collection(
         collection_path,
         grid=grid,
         expected_split=split,
         handoff=handoff,
+        authenticated_metadata_rows=authenticated_metadata_rows,
     )
     if loaded_descriptors != descriptors:
         raise RiskDataContractError("dataset shard descriptors differ from source handoff")
@@ -2082,7 +2110,7 @@ def load_risk_dataset_seal(
         "dynamic_objects_config_digest": dynamic_digest,
         "target_type_policy_digest": target_digest,
     }
-    return LoadedRiskDataset(
+    loaded_dataset = LoadedRiskDataset(
         seal_root=seal_path,
         collection_root=collection_path,
         manifest=_frozen_string_object_dict(manifest),
@@ -2093,6 +2121,28 @@ def load_risk_dataset_seal(
         risk_dataset_manifest_digest=dataset_digest,
         provenance=_frozen_string_string_dict(provenance),
     )
+    return loaded_dataset, tuple(authenticated_metadata_rows or ())
+
+
+def load_risk_dataset_seal(
+    seal_root: str | Path,
+    *,
+    collection_root: str | Path,
+    expected_split: str,
+    expected_manifest_digest: str | None = None,
+    sidecar_root: str | Path | None = None,
+) -> LoadedRiskDataset:
+    """Load only a complete v2 seal whose entire source collection still verifies."""
+
+    loaded, _ = _load_risk_dataset_seal_with_authenticated_rows(
+        seal_root,
+        collection_root=collection_root,
+        expected_split=expected_split,
+        expected_manifest_digest=expected_manifest_digest,
+        sidecar_root=sidecar_root,
+        retain_authenticated_metadata_rows=False,
+    )
+    return loaded
 
 
 def _canonical_mapping_copy(
@@ -2133,41 +2183,6 @@ def _family_common_contract(dataset: LoadedRiskDataset) -> dict[str, object]:
             "target_type_policy_digest"
         ],
     }
-
-
-def _load_family_member_metadata_rows(
-    dataset: LoadedRiskDataset,
-) -> tuple[dict[str, object], ...]:
-    rows: list[dict[str, object]] = []
-    for descriptor in dataset.shards:
-        shard_root = dataset.collection_root / descriptor.relative_root
-        try:
-            loaded_shard = load_risk_shard(
-                shard_root,
-                grid=dataset.grid,
-                split_audit_records=(),
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            raise RiskDataContractError(
-                "family formal load_risk_shard failed for "
-                f"{dataset.split}/{descriptor.relative_root}: {exc}"
-            ) from exc
-        if (
-            loaded_shard.summary.get("split") != dataset.split
-            or len(loaded_shard.manifest) != descriptor.sample_count
-            or loaded_shard.manifest_digest != descriptor.manifest_digest
-            or loaded_shard.semantic_digest != descriptor.semantic_digest
-        ):
-            raise RiskDataContractError(
-                "family member shard identity differs from authenticated seal: "
-                f"{dataset.split}/{descriptor.relative_root}"
-            )
-        rows.extend(dict(row) for row in loaded_shard.manifest)
-    if len(rows) != dataset.sample_count:
-        raise RiskDataContractError(
-            f"family authenticated metadata row count mismatch for {dataset.split}"
-        )
-    return tuple(rows)
 
 
 def _family_identity_sets(
@@ -2603,40 +2618,81 @@ def _write_family_seal(staging: Path, manifest: Mapping[str, object]) -> None:
     )
 
 
-def _load_family_manifest(root: Path) -> dict[str, object]:
+def _snapshot_family_files(root: Path) -> dict[str, bytes]:
+    """Read each exact family member once below one pinned directory FD."""
+
     _require_directory(root, label="risk dataset family root")
     try:
-        entries = list(os.scandir(root))
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
     except OSError as exc:
-        raise RiskDataContractError("failed to enumerate risk dataset family") from exc
-    actual_names = {entry.name for entry in entries}
-    missing = _REQUIRED_FAMILY_FILES - actual_names
-    unexpected = actual_names - _REQUIRED_FAMILY_FILES
-    if missing:
         raise RiskDataContractError(
-            "incomplete risk dataset family: missing " + ", ".join(sorted(missing))
-        )
-    if unexpected:
-        raise RiskDataContractError(
-            "unexpected risk dataset family files: "
-            + ", ".join(sorted(unexpected))
-        )
-    for entry in entries:
-        if entry.is_symlink():
+            "risk dataset family root must be a direct non-symlink directory"
+        ) from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
             raise RiskDataContractError(
-                f"risk dataset family contains a forbidden symlink: {entry.name}"
+                "risk dataset family root must be a directory"
             )
-        if not entry.is_file(follow_symlinks=False):
+        try:
+            actual_names = set(os.listdir(root_fd))
+        except OSError as exc:
             raise RiskDataContractError(
-                f"risk dataset family entry must be a regular file: {entry.name}"
+                "failed to enumerate pinned risk dataset family"
+            ) from exc
+        missing = _REQUIRED_FAMILY_FILES - actual_names
+        unexpected = actual_names - _REQUIRED_FAMILY_FILES
+        if missing:
+            raise RiskDataContractError(
+                "incomplete risk dataset family: missing "
+                + ", ".join(sorted(missing))
             )
-    marker = root / _COMPLETE_MARKER_NAME
-    if marker.read_bytes() != b"":
+        if unexpected:
+            raise RiskDataContractError(
+                "unexpected risk dataset family files: "
+                + ", ".join(sorted(unexpected))
+            )
+        snapshots: dict[str, bytes] = {}
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        for name in sorted(_REQUIRED_FAMILY_FILES):
+            try:
+                descriptor = os.open(name, flags, dir_fd=root_fd)
+            except OSError as exc:
+                raise RiskDataContractError(
+                    "risk dataset family entry is missing or a forbidden "
+                    f"symlink: {name}"
+                ) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RiskDataContractError(
+                        "risk dataset family entry must be a regular file: "
+                        f"{name}"
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                snapshots[name] = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        return snapshots
+    finally:
+        os.close(root_fd)
+
+
+def _load_family_manifest(root: Path) -> dict[str, object]:
+    snapshots = _snapshot_family_files(root)
+    marker = snapshots[_COMPLETE_MARKER_NAME]
+    if marker != b"":
         raise RiskDataContractError(
             "risk dataset family completion marker must be empty"
         )
-    checksum_entries = _parse_checksum_manifest(
-        root / _CHECKSUMS_NAME,
+    checksum_entries = _parse_checksum_manifest_bytes(
+        snapshots[_CHECKSUMS_NAME],
         label="risk dataset family checksum manifest",
     )
     expected_checksum_entries = {_COMPLETE_MARKER_NAME, _FAMILY_MANIFEST_NAME}
@@ -2645,15 +2701,14 @@ def _load_family_manifest(root: Path) -> dict[str, object]:
             "risk dataset family checksum coverage is not exact"
         )
     for relative in sorted(expected_checksum_entries):
-        if checksum_entries[relative] != _sha256_file(root / relative):
+        if checksum_entries[relative] != _sha256_bytes(snapshots[relative]):
             raise RiskDataContractError(
                 f"risk dataset family checksum mismatch for {relative}"
             )
-    manifest_path = root / _FAMILY_MANIFEST_NAME
+    raw = snapshots[_FAMILY_MANIFEST_NAME]
     try:
-        raw = manifest_path.read_bytes()
         text = raw.decode("utf-8")
-    except (OSError, UnicodeError) as exc:
+    except UnicodeError as exc:
         raise RiskDataContractError("failed to read dataset family manifest") from exc
     manifest = _strict_json_loads(text, label="dataset family manifest")
     if raw != (_canonical_json(manifest) + "\n").encode("utf-8"):
@@ -2663,12 +2718,12 @@ def _load_family_manifest(root: Path) -> dict[str, object]:
     return manifest
 
 
-def publish_risk_dataset_family(
+def _publish_risk_dataset_family_from_references(
     output_dir: str | Path,
     *,
-    members: Mapping[str, LoadedRiskDataset],
+    member_references: Mapping[str, tuple[str | Path, str | Path, str]],
 ) -> Path:
-    """Reauthenticate and atomically publish exactly four split dataset seals."""
+    """Reauthenticate referenced members once and publish their family seal."""
 
     output_path = _absolute_without_symlink_resolution(Path(output_dir))
     _assert_no_symlink_components(
@@ -2678,7 +2733,9 @@ def publish_risk_dataset_family(
         raise FileExistsError(
             f"refusing to overwrite immutable risk dataset family: {output_path}"
         )
-    if not isinstance(members, Mapping) or set(members) != set(
+    if not isinstance(member_references, Mapping) or set(
+        member_references
+    ) != set(
         _FAMILY_MEMBER_ORDER
     ):
         raise RiskDataContractError(
@@ -2691,18 +2748,20 @@ def publish_risk_dataset_family(
     row_counts: dict[str, int] = {}
     common_contract: dict[str, object] | None = None
     for split in _FAMILY_MEMBER_ORDER:
-        member = members[split]
-        if not isinstance(member, LoadedRiskDataset):
+        reference = member_references[split]
+        if not isinstance(reference, tuple) or len(reference) != 3:
             raise RiskDataContractError(
-                f"family member {split} must be a LoadedRiskDataset"
+                f"family member reference {split} must contain seal root, "
+                "collection root, and dataset digest"
             )
-        reloaded = load_risk_dataset_seal(
-            member.seal_root,
-            collection_root=member.collection_root,
+        seal_root, collection_root, expected_digest = reference
+        reloaded, rows = _load_risk_dataset_seal_with_authenticated_rows(
+            seal_root,
+            collection_root=collection_root,
             expected_split=split,
-            expected_manifest_digest=member.risk_dataset_manifest_digest,
+            expected_manifest_digest=expected_digest,
+            retain_authenticated_metadata_rows=True,
         )
-        rows = _load_family_member_metadata_rows(reloaded)
         observed_contract = _family_common_contract(reloaded)
         if common_contract is None:
             common_contract = observed_contract
@@ -2767,6 +2826,37 @@ def publish_risk_dataset_family(
             shutil.rmtree(staging)
         raise
     return output_path
+
+
+def publish_risk_dataset_family(
+    output_dir: str | Path,
+    *,
+    members: Mapping[str, LoadedRiskDataset],
+) -> Path:
+    """Reauthenticate and atomically publish exactly four split dataset seals."""
+
+    if not isinstance(members, Mapping) or set(members) != set(
+        _FAMILY_MEMBER_ORDER
+    ):
+        raise RiskDataContractError(
+            "risk dataset family members must be exactly train, calibration, val, test"
+        )
+    references: dict[str, tuple[str | Path, str | Path, str]] = {}
+    for split in _FAMILY_MEMBER_ORDER:
+        member = members[split]
+        if not isinstance(member, LoadedRiskDataset):
+            raise RiskDataContractError(
+                f"family member {split} must be a LoadedRiskDataset"
+            )
+        references[split] = (
+            member.seal_root,
+            member.collection_root,
+            member.risk_dataset_manifest_digest,
+        )
+    return _publish_risk_dataset_family_from_references(
+        output_dir,
+        member_references=references,
+    )
 
 
 def load_risk_dataset_family(

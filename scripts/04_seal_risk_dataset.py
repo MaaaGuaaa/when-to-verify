@@ -16,9 +16,9 @@ if str(_ROOT) not in sys.path:
 from src.datasets.risk_dataloader import RiskDataContractError  # noqa: E402
 from src.datasets.risk_dataset_seal import (  # noqa: E402
     LoadedRiskDatasetFamily,
+    _publish_risk_dataset_family_from_references,
     load_risk_dataset_family,
     load_risk_dataset_seal,
-    publish_risk_dataset_family,
     publish_risk_dataset_seal,
 )
 
@@ -154,18 +154,9 @@ def _main_family_publish(argv: list[str]) -> int:
         expected_digests = {
             split: by_split[split][2] for split in _FAMILY_MEMBER_ORDER
         }
-        members = {
-            split: load_risk_dataset_seal(
-                by_split[split][0],
-                collection_root=by_split[split][1],
-                expected_split=split,
-                expected_manifest_digest=expected_digests[split],
-            )
-            for split in _FAMILY_MEMBER_ORDER
-        }
-        family_root = publish_risk_dataset_family(
+        family_root = _publish_risk_dataset_family_from_references(
             args.output_dir,
-            members=members,
+            member_references=by_split,
         )
         loaded = load_risk_dataset_family(
             family_root,

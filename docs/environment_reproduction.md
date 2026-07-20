@@ -96,6 +96,7 @@ PY
 ```bash
 ENV_PYTHON="$(command -v python)"
 GPU_PARTITION="gpu"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 srun --partition="$GPU_PARTITION" \
   --gres=gpu:1 \
@@ -105,6 +106,10 @@ srun --partition="$GPU_PARTITION" \
   "$ENV_PYTHON" -c \
   'import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))'
 ```
+
+所有启用 `torch.use_deterministic_algorithms(True)` 的 GPU 训练与测试作业都必须在
+Python 进程启动前设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`；否则 CUDA 10.2 及以上的
+CuBLAS 线性层会被 PyTorch 的确定性门禁拒绝。该变量属于运行环境，不改变模型或数据契约。
 
 若站点不使用 `--gres=gpu:1`，只替换资源申请参数，不修改项目代码或科学配置。
 
@@ -143,6 +148,7 @@ print("PyYAML", yaml.__version__)
 print("torch", torch.__version__)
 print("torch CUDA build", torch.version.cuda)
 PY
+printf 'CUBLAS_WORKSPACE_CONFIG=%s\n' "${CUBLAS_WORKSPACE_CONFIG:-unset}"
 git rev-parse HEAD
 ```
 

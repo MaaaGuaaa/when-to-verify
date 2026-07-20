@@ -28,6 +28,7 @@ from src.datasets.risk_dataset import (
     build_trajectory_channels,
     validate_risk_sample_for_publication,
 )
+from src.datasets.risk_evaluation_metadata import OOD_ROUTING_RULE_VERSION
 from src.datasets.snippet_library import MotionSnippet
 from src.datasets.shard_writer import load_risk_shard, write_risk_shard
 from src.generation.dynamic_object_transplant import (
@@ -857,6 +858,113 @@ def test_formal_group_sidecar_api_preserves_risk_samples_and_keeps_labels_separa
     assert all(not sidecar.hidden_risk_occupancy.flags.writeable for sidecar in sidecars)
 
 
+def test_formal_group_triple_api_aligns_evaluation_records_without_sample_leakage() -> None:
+    triple_inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+    legacy_inputs = _formal_sop06_group_inputs(
+        include_empty=True, include_context=True
+    )
+
+    samples, sidecars, records = (
+        risk_dataset_module.build_risk_samples_sidecars_and_evaluation_records_from_sop06_group(
+            **triple_inputs
+        )
+    )
+    legacy_samples, legacy_sidecars = (
+        risk_dataset_module.build_risk_samples_and_sidecars_from_sop06_group(
+            **legacy_inputs
+        )
+    )
+
+    ordered_ids = tuple(sample.sample_id for sample in samples)
+    assert tuple(sidecar.sample_id for sidecar in sidecars) == ordered_ids
+    assert tuple(record["sample_id"] for record in records) == ordered_ids
+    assert tuple(sample.event_type for sample in samples) == (
+        "collision",
+        "empty_blind_spot",
+    )
+    assert all(
+        record["pair_eligible"]
+        is triple_inputs["group"].eligible_for_strict_evaluation
+        for record in records
+    )
+    assert all(record["ood_tag"] == "in_distribution" for record in records)
+    assert all(
+        record["ood_evidence"]["source"] == "default_in_distribution"
+        for record in records
+    )
+    assert records[0]["target_footprint_spec"] == {
+        "kind": "circle",
+        "radius_m": 0.2,
+    }
+    assert records[1]["critical_object_id"] is None
+    assert records[1]["target_footprint_spec"] is None
+    assert records[1]["footprint_kind"] == "none"
+    assert all(
+        len(record["robot_footprint_provenance"]["base_config_digest_sha256"])
+        == 64
+        for record in records
+    )
+    forbidden_eval_fields = {
+        "critical_area_fraction",
+        "age_s",
+        "density_fraction",
+        "pair_eligible",
+        "ood_tag",
+        "ood_evidence",
+        "robot_footprint_provenance",
+        "target_footprint_spec",
+    }
+    assert all(
+        forbidden_eval_fields.isdisjoint(sample.metadata) for sample in samples
+    )
+
+    assert ordered_ids == tuple(sample.sample_id for sample in legacy_samples)
+    assert ordered_ids == tuple(sidecar.sample_id for sidecar in legacy_sidecars)
+    for sample, legacy in zip(samples, legacy_samples, strict=True):
+        for field in fields(RiskSample):
+            actual = getattr(sample, field.name)
+            expected = getattr(legacy, field.name)
+            if isinstance(actual, np.ndarray):
+                np.testing.assert_array_equal(actual, expected)
+            else:
+                assert actual == expected
+
+
+def test_formal_group_triple_api_routes_explicit_source_ood_without_sample_leakage() -> None:
+    inputs = _formal_sop06_group_inputs()
+    source_snippet = inputs["source_snippet"]
+    inputs["source_snippet"] = replace(
+        source_snippet,
+        provenance={
+            **source_snippet.provenance,
+            "ood_tag": "map_stress",
+            "ood_evidence": {
+                "rule_version": OOD_ROUTING_RULE_VERSION,
+                "source": "explicit_source_provenance",
+                "reason": "the source map belongs to the stress cohort",
+            },
+        },
+    )
+
+    samples, _, records = (
+        risk_dataset_module.build_risk_samples_sidecars_and_evaluation_records_from_sop06_group(
+            **inputs
+        )
+    )
+
+    assert all(record["ood_tag"] == "map_stress" for record in records)
+    assert all(
+        record["ood_evidence"]["source"] == "explicit_source_provenance"
+        for record in records
+    )
+    assert all("ood_tag" not in sample.metadata["provenance"] for sample in samples)
+    assert all(
+        "ood_evidence" not in sample.metadata["provenance"] for sample in samples
+    )
+
+
 def test_risk_only_group_adapter_never_builds_oracle_sidecars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -879,6 +987,36 @@ def test_risk_only_group_adapter_never_builds_oracle_sidecars(
         "collision",
         "empty_blind_spot",
     )
+
+
+def test_existing_group_apis_never_derive_evaluation_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_evaluation_builder(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("legacy APIs must not derive evaluation metadata")
+
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "derive_robot_footprint_provenance",
+        forbidden_evaluation_builder,
+    )
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "derive_production_evaluation_record",
+        forbidden_evaluation_builder,
+    )
+
+    samples = risk_dataset_module.build_risk_samples_from_sop06_group(
+        **_formal_sop06_group_inputs()
+    )
+    combined_samples, sidecars = (
+        risk_dataset_module.build_risk_samples_and_sidecars_from_sop06_group(
+            **_formal_sop06_group_inputs()
+        )
+    )
+
+    assert len(samples) == len(combined_samples) == len(sidecars) == 1
 
 
 def test_combined_group_adapter_builds_one_sidecar_per_variant(

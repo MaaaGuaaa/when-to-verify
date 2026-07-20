@@ -8,6 +8,21 @@
 
 **Tech Stack:** Python 3.10, NumPy 1.24, PyTorch 2.0, pytest, existing schema-3 contracts and geometry, Slurm; no new dependencies.
 
+### Approved Task 6 amendment (2026-07-20)
+
+- The accepted occupancy sidecar layout remains
+  `risk_label_sidecar_v1`; evaluation metadata does not add fields or files to
+  that layout.
+- Production evaluation records form an independent, sample-ID-bound sibling
+  collection beside the risk dataset and occupancy-sidecar collections.
+- Task 6 owns the required oracle/renderer-boundary integration in
+  `src/datasets/risk_dataset.py`, including the formal triple-return API.  The
+  existing risk-only and risk-plus-occupancy-sidecar APIs retain their exact
+  signatures and results.
+- Task 7 binds and validates three distinct identities: the four-split risk
+  dataset family digest, the occupancy-sidecar collection digest, and the
+  evaluation-record collection digest.  None may substitute for another.
+
 ---
 
 ## Global execution rules
@@ -708,6 +723,7 @@ $G commit -m "feat(occupancy): train production risk baselines"
 - Create: `tests/test_risk_dataset_family.py`
 - Create: `tests/test_production_evaluation_metadata.py`
 - Modify: `src/datasets/risk_dataset_seal.py`
+- Modify: `src/datasets/risk_dataset.py`
 - Modify: `src/generation/risk_sidecars.py`
 - Modify: `src/datasets/sidecar_writer.py`
 - Modify: `scripts/04_seal_risk_dataset.py`
@@ -763,6 +779,8 @@ def derive_production_evaluation_record(
     age_max_s: float,
     pair_eligible: bool,
     ood_tag: str,
+    robot_footprint_provenance: Mapping[str, object],
+    ood_evidence: Mapping[str, object],
 ) -> dict[str, object]
 
 def validate_production_evaluation_record(
@@ -773,8 +791,11 @@ def validate_production_evaluation_record(
 ```
 
 Freeze rule versions and calculate fields once at the oracle/renderer boundary.
-Do not put them in model inputs. Store the records alongside sidecar shards and
-bind their ordered digest.
+Do not put them in `RiskSample` inputs or metadata.  Add a formal API returning
+aligned `(samples, occupancy_sidecars, evaluation_records)` while leaving the
+two existing wrappers unchanged.  Publish evaluation records to their own
+sibling collection, without changing `risk_label_sidecar_v1`, and bind their
+ordered sample-ID digest independently.
 
 - [ ] **Step 5: Verify GREEN through Slurm and commit**
 
@@ -814,6 +835,10 @@ Require mode-specific production rows without toy-only `background_id`, strict
 base/source role identities, structured target/robot footprint specs, family
 and evaluation-metadata digests, field-specific provenance digests, canonical
 `empty_blind_spot`, and cohort digest changes after any label/group tamper.
+Prediction tables and downstream artifacts must separately bind the risk
+dataset family digest, occupancy-sidecar collection digest, and evaluation-
+record collection digest; equality or presence of one never authenticates the
+other two.
 
 Calibration tests must fit calibration only, allow/report session overlap, and
 reject recording/source/snippet/pair/seed overlap or family-member mismatch.

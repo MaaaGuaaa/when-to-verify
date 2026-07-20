@@ -39,6 +39,11 @@ from src.generation.dynamic_object_transplant import (
     transplant_snippet,
 )
 from src.datasets.snippet_library import MOTION_SNIPPET_LAYOUT, MotionSnippet
+from src.datasets.risk_evaluation_metadata import (
+    OOD_ROUTING_RULE_VERSION,
+    derive_production_evaluation_record,
+    derive_robot_footprint_provenance,
+)
 from src.generation.event_sampler import (
     SOP05_GENERATOR_ALGORITHM_VERSION,
     GeneratedEvent,
@@ -113,6 +118,9 @@ _FORBIDDEN_METADATA_KEY_TOKENS = (
     "hidden_object_ids",
 )
 _RISK_INPUT_ADAPTER_VERSION = "sop06_group_to_risk_samples_v2"
+_EVALUATION_ONLY_SOURCE_PROVENANCE_KEYS = frozenset(
+    {"ood_tag", "ood_evidence"}
+)
 _RISK_SHARD_SNAPSHOT_MEMBERS = (
     "samples.npz",
     "metadata.jsonl",
@@ -920,6 +928,11 @@ def _build_formal_source(
             "world_id": world.world_id,
             "trajectory_primitive": trajectory_primitive,
             "occluders": occluders,
+            **{
+                key: deepcopy(source_snippet.provenance[key])
+                for key in _EVALUATION_ONLY_SOURCE_PROVENANCE_KEYS
+                if key in source_snippet.provenance
+            },
         },
         name="provenance",
     )
@@ -1749,7 +1762,12 @@ def _build_risk_sample_and_optional_sidecar_from_rendered(
             source.trajectory.trajectory_id, name="trajectory_id"
         ),
         "provenance": _canonical_metadata_copy(
-            source.provenance, name="provenance"
+            {
+                key: value
+                for key, value in source.provenance.items()
+                if key not in _EVALUATION_ONLY_SOURCE_PROVENANCE_KEYS
+            },
+            name="provenance",
         ),
         "label_audit": {
             "risk_gt_version": RISK_GT_VERSION,
@@ -1837,7 +1855,15 @@ def _build_risk_samples_from_sop06_group_impl(
     risk_config: Mapping[str, object],
     dataset_seed: int,
     include_sidecars: bool,
-) -> tuple[tuple[RiskSample, ...], tuple[RiskLabelSidecar, ...]]:
+    include_evaluation_records: bool = False,
+) -> (
+    tuple[tuple[RiskSample, ...], tuple[RiskLabelSidecar, ...]]
+    | tuple[
+        tuple[RiskSample, ...],
+        tuple[RiskLabelSidecar, ...],
+        tuple[dict[str, object], ...],
+    ]
+):
     """Atomically assemble one formal group with optional oracle sidecars."""
 
     if not isinstance(base_config, Mapping):
@@ -1881,6 +1907,8 @@ def _build_risk_samples_from_sop06_group_impl(
     if base_config_dict.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
     normalized_risk = _normalized_risk_config(risk_config_snapshot)
+    if include_evaluation_records and not include_sidecars:
+        raise ValueError("evaluation records require the formal sidecar boundary")
 
     base_session_id, transplant_seed, paired_seed = _validate_formal_inputs(
         group=group,
@@ -1911,6 +1939,20 @@ def _build_risk_samples_from_sop06_group_impl(
 
     samples: list[RiskSample] = []
     sidecars: list[RiskLabelSidecar] = []
+    evaluation_records: list[dict[str, object]] = []
+    robot_footprint: Footprint | None = None
+    robot_footprint_provenance: Mapping[str, object] | None = None
+    age_max_s: object = None
+    if include_evaluation_records:
+        robot_footprint = _robot_footprint(base_config_dict)
+        robot_footprint_provenance = derive_robot_footprint_provenance(
+            base_config=base_config_dict,
+            effective_footprint=robot_footprint,
+        )
+        age_config = base_config_dict.get("age_map")
+        if not isinstance(age_config, Mapping):
+            raise TypeError("base_config.age_map must be a mapping")
+        age_max_s = age_config.get("a_max_s")
     for variant, rendered in zip(
         group.variants, rendered_group.observations, strict=True
     ):
@@ -1949,7 +1991,86 @@ def _build_risk_samples_from_sop06_group_impl(
                     "formal sidecar construction unexpectedly returned None"
                 )
             sidecars.append(sidecar)
+        if include_evaluation_records:
+            if robot_footprint is None or robot_footprint_provenance is None:
+                raise RuntimeError(
+                    "evaluation footprint context was not initialized"
+                )
+            raw_ood_tag = source.provenance.get("ood_tag")
+            raw_ood_evidence = source.provenance.get("ood_evidence")
+            if raw_ood_tag is None and raw_ood_evidence is None:
+                ood_tag = "in_distribution"
+                ood_evidence: Mapping[str, object] = {
+                    "rule_version": OOD_ROUTING_RULE_VERSION,
+                    "source": "default_in_distribution",
+                    "reason": (
+                        "source provenance declares no explicit OOD routing tag"
+                    ),
+                }
+            elif raw_ood_tag is None or raw_ood_evidence is None:
+                raise ValueError(
+                    "source provenance must declare both ood_tag and ood_evidence"
+                )
+            else:
+                ood_tag = raw_ood_tag
+                if not isinstance(raw_ood_evidence, Mapping):
+                    raise TypeError("source provenance ood_evidence must be a mapping")
+                ood_evidence = raw_ood_evidence
+            evaluation_records.append(
+                derive_production_evaluation_record(
+                    sample=sample,
+                    source=source,
+                    rendered=rendered,
+                    robot_footprint=robot_footprint,
+                    age_max_s=age_max_s,
+                    pair_eligible=group.eligible_for_strict_evaluation,
+                    ood_tag=ood_tag,
+                    robot_footprint_provenance=robot_footprint_provenance,
+                    ood_evidence=ood_evidence,
+                )
+            )
+    if include_evaluation_records:
+        return tuple(samples), tuple(sidecars), tuple(evaluation_records)
     return tuple(samples), tuple(sidecars)
+
+
+def build_risk_samples_sidecars_and_evaluation_records_from_sop06_group(
+    *,
+    group: PairedEventGroup,
+    mother_event: GeneratedEvent,
+    source_snippet: MotionSnippet,
+    base_state: BaseState,
+    trajectory: LocalTrajectory,
+    oracle_context: OracleContext,
+    base_config: Mapping[str, object],
+    paired_config: PairedVariantConfig,
+    risk_config: Mapping[str, object],
+    dataset_seed: int,
+) -> tuple[
+    tuple[RiskSample, ...],
+    tuple[RiskLabelSidecar, ...],
+    tuple[dict[str, object], ...],
+]:
+    """Build aligned model samples, label sidecars, and evaluation records."""
+
+    result = _build_risk_samples_from_sop06_group_impl(
+        group=group,
+        mother_event=mother_event,
+        source_snippet=source_snippet,
+        base_state=base_state,
+        trajectory=trajectory,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        paired_config=paired_config,
+        risk_config=risk_config,
+        dataset_seed=dataset_seed,
+        include_sidecars=True,
+        include_evaluation_records=True,
+    )
+    if len(result) != 3:  # pragma: no cover - private return invariant
+        raise RuntimeError("formal evaluation assembly returned no records")
+    samples, sidecars, records = result
+    return samples, sidecars, records
 
 
 def build_risk_samples_and_sidecars_from_sop06_group(

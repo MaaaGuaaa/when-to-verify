@@ -52,6 +52,13 @@ from src.datasets.shard_writer import (
     LoadedRiskShard,
     load_risk_shard,
 )
+from src.datasets.sidecar_writer import load_risk_sidecar_shard
+from src.geometry import (
+    RectangleFootprint,
+    inflate_footprint,
+    rasterize_footprint,
+)
+from src.planning.differential_drive import rollout_constant_control
 
 if TYPE_CHECKING:
     from src.datasets.risk_dataset_seal import LoadedRiskDataset
@@ -111,6 +118,79 @@ class RiskBatch:
 
 
 @dataclass(frozen=True)
+class ProductionOccupancyBatch:
+    """Strictly separated deployment inputs, query inputs, and oracle targets."""
+
+    model_inputs: dict[str, torch.Tensor]
+    targets: dict[str, torch.Tensor]
+    query_inputs: dict[str, torch.Tensor]
+    occupancy_targets: dict[str, torch.Tensor]
+    sample_ids: tuple[str, ...]
+    split: str
+    provenance: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if tuple(self.model_inputs) != MODEL_INPUT_KEYS:
+            raise RiskDataContractError(
+                "occupancy model_inputs must contain the exact RiskBatch four keys"
+            )
+        validate_model_input_mapping(self.model_inputs)
+        if tuple(self.targets) != TARGET_KEYS:
+            raise RiskDataContractError("occupancy risk target keys mismatch")
+        if tuple(self.query_inputs) != (
+            "robot_endpoint_footprints",
+            "endpoint_times_s",
+        ):
+            raise RiskDataContractError("occupancy query input keys mismatch")
+        if tuple(self.occupancy_targets) != ("hidden_risk_occupancy",):
+            raise RiskDataContractError("occupancy target keys mismatch")
+        batch_size = len(self.sample_ids)
+        if batch_size < 1 or len(set(self.sample_ids)) != batch_size:
+            raise RiskDataContractError(
+                "occupancy batch sample IDs must be non-empty and unique"
+            )
+        for namespace, mapping in (
+            ("targets", self.targets),
+            ("query_inputs", self.query_inputs),
+            ("occupancy_targets", self.occupancy_targets),
+        ):
+            if not isinstance(mapping, Mapping):
+                raise RiskDataContractError(f"{namespace} must be a mapping")
+            for key, tensor in mapping.items():
+                if not torch.is_tensor(tensor) or tensor.dtype != torch.float32:
+                    raise RiskDataContractError(
+                        f"{namespace}.{key} must be a float32 tensor"
+                    )
+                if not bool(torch.isfinite(tensor).all()):
+                    raise RiskDataContractError(
+                        f"{namespace}.{key} contains NaN/Inf"
+                    )
+        hidden = self.occupancy_targets["hidden_risk_occupancy"]
+        query = self.query_inputs["robot_endpoint_footprints"]
+        endpoints = self.query_inputs["endpoint_times_s"]
+        if hidden.ndim != 4 or query.ndim != 4 or hidden.shape != query.shape:
+            raise RiskDataContractError(
+                "occupancy/query masks must share [B,T,H,W] shape"
+            )
+        if int(hidden.shape[0]) != batch_size or int(hidden.shape[1]) != 15:
+            raise RiskDataContractError("occupancy masks must have shape [B,15,H,W]")
+        if endpoints.shape != (15,):
+            raise RiskDataContractError("endpoint_times_s must have shape [15]")
+        expected_endpoints = torch.arange(
+            1, 16, dtype=torch.float32, device=endpoints.device
+        ) * 0.2
+        if not torch.equal(endpoints, expected_endpoints):
+            raise RiskDataContractError(
+                "endpoint_times_s must equal exact endpoints 0.2..3.0"
+            )
+        for name, tensor in (("hidden", hidden), ("query", query)):
+            if bool(((tensor != 0.0) & (tensor != 1.0)).any()):
+                raise RiskDataContractError(f"{name} occupancy masks must be binary")
+        if any(int(tensor.shape[0]) != batch_size for tensor in self.targets.values()):
+            raise RiskDataContractError("occupancy risk targets batch dimension mismatch")
+
+
+@dataclass(frozen=True)
 class ProductionRiskSubset:
     """Authenticated deterministic sample membership for production training."""
 
@@ -132,6 +212,27 @@ class RiskStreamCursor:
     samples_yielded: int
     dataset_manifest_digest: str
     subset_digest_sha256: str
+
+
+@dataclass(frozen=True)
+class OccupancyStreamCursor:
+    """Risk-stream position additionally bound to one sidecar publication."""
+
+    risk_cursor: RiskStreamCursor
+    sidecar_collection_digest_sha256: str
+    query_layout_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.risk_cursor, RiskStreamCursor):
+            raise RiskDataContractError(
+                "occupancy cursor risk_cursor must be a RiskStreamCursor"
+            )
+        _require_sha256(
+            self.sidecar_collection_digest_sha256,
+            "occupancy cursor sidecar_collection_digest_sha256",
+        )
+        if self.query_layout_version != "constant_control_robot_endpoint_query_v1":
+            raise RiskDataContractError("occupancy cursor query layout mismatch")
 
 
 @dataclass(frozen=True)
@@ -582,6 +683,166 @@ def _load_validated_production_shard(
             )
         sample_ids.add(sample.sample_id)
     return loaded
+
+
+_ROBOT_ENDPOINT_MASK_CACHE_MAX_ENTRIES = 128
+_ROBOT_ENDPOINT_MASK_CACHE: OrderedDict[tuple[object, ...], np.ndarray] = OrderedDict()
+
+
+def production_endpoint_times_from_query_geometry(
+    query_geometry: Mapping[str, object],
+) -> np.ndarray:
+    """Derive SOP08 future query times without consulting oracle sidecars."""
+
+    if not isinstance(query_geometry, Mapping):
+        raise RiskDataContractError("occupancy query_geometry must be a mapping")
+    future_steps = query_geometry.get("future_steps")
+    if type(future_steps) is not int or future_steps != 15:
+        raise RiskDataContractError("occupancy query future_steps must equal 15")
+    dt_value = query_geometry.get("future_dt_s")
+    if type(dt_value) not in {int, float} or not math.isclose(
+        float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise RiskDataContractError("occupancy query future_dt_s must equal 0.2")
+    endpoint_times = (
+        np.arange(1, future_steps + 1, dtype=np.float32)
+        * np.float32(dt_value)
+    )
+    if endpoint_times.shape != (15,) or not np.isfinite(endpoint_times).all():
+        raise RiskDataContractError("derived occupancy endpoint times are invalid")
+    return np.ascontiguousarray(endpoint_times, dtype=np.float32)
+
+
+def _finite_primitive_value(value: object, *, field: str) -> float:
+    if type(value) not in {int, float}:
+        raise RiskDataContractError(f"trajectory_primitive.{field} must be finite")
+    result = float(value)
+    if not math.isfinite(result):
+        raise RiskDataContractError(f"trajectory_primitive.{field} must be finite")
+    return result
+
+
+def reconstruct_production_robot_endpoint_footprints(
+    sample: RiskSample,
+    *,
+    grid: GridSpec,
+    query_geometry: Mapping[str, object],
+) -> np.ndarray:
+    """Rebuild query-only endpoint masks from a trusted constant primitive.
+
+    ``trajectory_channels`` are deliberately ignored: their swept/first-arrival
+    maps cannot losslessly recover the endpoint footprint sequence.
+    """
+
+    _validate_production_sample(sample, grid=grid, expected_split=sample.split)
+    if not isinstance(query_geometry, Mapping) or set(query_geometry) != {
+        "query_layout_version",
+        "base_config_digest",
+        "robot_model",
+        "robot_length_m",
+        "robot_width_m",
+        "robot_inflation_m",
+        "future_steps",
+        "future_dt_s",
+    }:
+        raise RiskDataContractError("occupancy query_geometry fields mismatch")
+    if query_geometry.get("query_layout_version") != (
+        "constant_control_robot_endpoint_query_v1"
+    ) or query_geometry.get("robot_model") != "differential_drive":
+        raise RiskDataContractError("unsupported occupancy query reconstruction")
+    base_config_digest = _require_blake2b128(
+        query_geometry.get("base_config_digest"), "query_geometry.base_config_digest"
+    )
+    if query_geometry.get("future_steps") != 15 or grid.future_steps != 15:
+        raise RiskDataContractError("occupancy query future_steps must equal 15")
+    dt_value = query_geometry.get("future_dt_s")
+    if type(dt_value) not in {int, float} or not math.isclose(
+        float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise RiskDataContractError("occupancy query future_dt_s must equal 0.2")
+    provenance = sample.metadata.get("provenance") if isinstance(
+        sample.metadata, Mapping
+    ) else None
+    if not isinstance(provenance, Mapping):
+        raise RiskDataContractError("sample provenance is missing")
+    sample_config_digest = _require_blake2b128(
+        provenance.get("base_config_digest"), "sample base_config_digest"
+    )
+    if sample_config_digest != base_config_digest:
+        raise RiskDataContractError(
+            "sample base_config_digest differs from authenticated query geometry"
+        )
+    primitive = provenance.get("trajectory_primitive")
+    if not isinstance(primitive, Mapping) or set(primitive) != {
+        "v_mps",
+        "omega_radps",
+    }:
+        raise RiskDataContractError(
+            "trajectory_primitive must contain exact constant v_mps/omega_radps"
+        )
+    v = _finite_primitive_value(primitive.get("v_mps"), field="v_mps")
+    omega = _finite_primitive_value(
+        primitive.get("omega_radps"), field="omega_radps"
+    )
+    geometry_values: list[float] = []
+    for field in ("robot_length_m", "robot_width_m", "robot_inflation_m"):
+        value = query_geometry.get(field)
+        if type(value) not in {int, float} or not math.isfinite(float(value)):
+            raise RiskDataContractError(f"query_geometry.{field} must be finite")
+        geometry_values.append(float(value))
+    length, width, inflation = geometry_values
+    if length <= 0.0 or width <= 0.0 or inflation < 0.0:
+        raise RiskDataContractError("occupancy robot footprint dimensions are invalid")
+    if not (
+        math.isclose(length, 0.70, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(width, 0.55, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(inflation, 0.15, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        raise RiskDataContractError(
+            "occupancy frozen robot footprint must be 0.70x0.55m + 0.15m inflation"
+        )
+    cache_key = (
+        base_config_digest,
+        v,
+        omega,
+        grid.height,
+        grid.width,
+        grid.resolution_m,
+        15,
+        0.2,
+        length,
+        width,
+        inflation,
+    )
+    cached = _ROBOT_ENDPOINT_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        _ROBOT_ENDPOINT_MASK_CACHE.move_to_end(cache_key)
+        return np.array(cached, dtype=np.float32, order="C", copy=True)
+    poses, _ = rollout_constant_control(v=v, omega=omega, dt_s=0.2, steps=15)
+    footprint = inflate_footprint(RectangleFootprint(length, width), inflation)
+    masks = np.ascontiguousarray(
+        np.stack(
+            [
+                rasterize_footprint(footprint, pose, grid).astype(
+                    np.float32, copy=False
+                )
+                for pose in poses
+            ],
+            axis=0,
+        ),
+        dtype=np.float32,
+    )
+    if masks.shape != (15, grid.height, grid.width) or not np.isin(
+        masks, (0.0, 1.0)
+    ).all():
+        raise RiskDataContractError("reconstructed endpoint masks are invalid")
+    frozen = np.array(masks, dtype=np.float32, order="C", copy=True)
+    frozen.setflags(write=False)
+    _ROBOT_ENDPOINT_MASK_CACHE[cache_key] = frozen
+    _ROBOT_ENDPOINT_MASK_CACHE.move_to_end(cache_key)
+    while len(_ROBOT_ENDPOINT_MASK_CACHE) > _ROBOT_ENDPOINT_MASK_CACHE_MAX_ENTRIES:
+        _ROBOT_ENDPOINT_MASK_CACHE.popitem(last=False)
+    return np.array(frozen, dtype=np.float32, order="C", copy=True)
 
 
 def _production_provenance_fields(value: object) -> set[str]:
@@ -1311,6 +1572,247 @@ def iter_production_risk_batches(
         del loaded
 
 
+def iter_production_occupancy_batches(
+    dataset: "LoadedRiskDataset",
+    *,
+    sidecar_root: str | Path,
+    subset: ProductionRiskSubset,
+    batch_size: int,
+    seed: int,
+    epoch: int,
+    start_cursor: OccupancyStreamCursor | None = None,
+) -> Iterator[tuple[ProductionOccupancyBatch, OccupancyStreamCursor]]:
+    """Join authenticated risk/sidecar shards before yielding any oracle target.
+
+    A complete collection preflight formally reloads every risk shard, sidecar,
+    and pair marker.  Every Task4 robot mask must equal a fresh query-only
+    reconstruction; the raw sidecar object is then discarded and cannot reach
+    a model or scorer.
+    """
+
+    from src.datasets.risk_dataset_seal import (
+        load_occupancy_sidecar_collection,
+    )
+
+    loaded_dataset = _validate_loaded_risk_dataset(dataset)
+    if loaded_dataset.grid.history_steps != 8:
+        raise RiskDataContractError("SOP08 production requires history_steps=8")
+    if loaded_dataset.grid.future_steps != 15:
+        raise RiskDataContractError("SOP08 production requires future_steps=15")
+    grid_manifest = loaded_dataset.manifest.get("grid")
+    if not isinstance(grid_manifest, Mapping) or not math.isclose(
+        float(grid_manifest.get("sample_dt_s", math.nan)),
+        0.2,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RiskDataContractError("SOP08 production requires sample_dt_s=0.2")
+    sidecar_collection = load_occupancy_sidecar_collection(
+        loaded_dataset,
+        sidecar_root=sidecar_root,
+    )
+    section = loaded_dataset.manifest.get("occupancy_sidecars")
+    if not isinstance(section, Mapping):  # defensive after formal loader
+        raise RiskDataContractError("occupancy_sidecars manifest section is missing")
+    query_geometry = sidecar_collection.query_geometry
+    independent_endpoint_times = production_endpoint_times_from_query_geometry(
+        query_geometry
+    )
+    if start_cursor is None:
+        risk_start_cursor = None
+    else:
+        if not isinstance(start_cursor, OccupancyStreamCursor):
+            raise RiskDataContractError(
+                "occupancy start_cursor must be an OccupancyStreamCursor"
+            )
+        if start_cursor.sidecar_collection_digest_sha256 != (
+            sidecar_collection.collection_digest_sha256
+        ):
+            raise RiskDataContractError(
+                "occupancy cursor sidecar collection digest mismatch"
+            )
+        if start_cursor.query_layout_version != query_geometry[
+            "query_layout_version"
+        ]:
+            raise RiskDataContractError("occupancy cursor query layout mismatch")
+        risk_start_cursor = start_cursor.risk_cursor
+    sample_to_shard: dict[str, int] = {}
+
+    # Complete preflight before constructing the underlying yielding iterator.
+    for risk_descriptor, sidecar_descriptor in zip(
+        loaded_dataset.shards, sidecar_collection.shards
+    ):
+        loaded_risk = _load_validated_production_shard(
+            loaded_dataset, risk_descriptor
+        )
+        sample_ids = tuple(sample.sample_id for sample in loaded_risk.samples)
+        try:
+            loaded_sidecar = load_risk_sidecar_shard(
+                sidecar_collection.root / sidecar_descriptor.relative_root,
+                grid=loaded_dataset.grid,
+                expected_sample_ids=sample_ids,
+                expected_source_risk_shard_semantic_digest=(
+                    risk_descriptor.semantic_digest
+                ),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RiskDataContractError(
+                f"occupancy sidecar preflight reload failed: {exc}"
+            ) from exc
+        if (
+            loaded_sidecar.semantic_digest
+            != sidecar_descriptor.sidecar_semantic_digest
+        ):
+            raise RiskDataContractError(
+                "occupancy sidecar semantic digest differs from seal"
+            )
+        if not np.array_equal(
+            independent_endpoint_times,
+            loaded_sidecar.future_endpoint_times_s,
+        ):
+            raise RiskDataContractError(
+                "independently derived endpoint times differ from sidecar cache"
+            )
+        for row_index, sample in enumerate(loaded_risk.samples):
+            if sample.sample_id in sample_to_shard:
+                raise RiskDataContractError(
+                    "duplicate sample ID across occupancy sidecar shards"
+                )
+            reconstructed = reconstruct_production_robot_endpoint_footprints(
+                sample,
+                grid=loaded_dataset.grid,
+                query_geometry=query_geometry,
+            )
+            if not np.array_equal(
+                reconstructed,
+                loaded_sidecar.robot_future_footprints[row_index],
+            ):
+                raise RiskDataContractError(
+                    "Task4 robot footprint sidecar differs from query-only reconstruction"
+                )
+            sample_to_shard[sample.sample_id] = risk_descriptor.shard_index
+        del loaded_sidecar
+        del loaded_risk
+
+    if len(sample_to_shard) != loaded_dataset.sample_count:
+        raise RiskDataContractError("occupancy preflight sample identity count mismatch")
+    risk_stream = iter_production_risk_batches(
+        loaded_dataset,
+        subset=subset,
+        batch_size=batch_size,
+        seed=seed,
+        epoch=epoch,
+        start_cursor=risk_start_cursor,
+    )
+    for risk_batch, cursor in risk_stream:
+        shard_indices = {sample_to_shard[sample_id] for sample_id in risk_batch.sample_ids}
+        if len(shard_indices) != 1:
+            raise RiskDataContractError(
+                "one occupancy batch must not interleave risk shards"
+            )
+        shard_index = next(iter(shard_indices))
+        risk_descriptor = loaded_dataset.shards[shard_index]
+        sidecar_descriptor = sidecar_collection.shards[shard_index]
+        loaded_risk = _load_validated_production_shard(
+            loaded_dataset, risk_descriptor
+        )
+        ordered_ids = tuple(sample.sample_id for sample in loaded_risk.samples)
+        try:
+            loaded_sidecar = load_risk_sidecar_shard(
+                sidecar_collection.root / sidecar_descriptor.relative_root,
+                grid=loaded_dataset.grid,
+                expected_sample_ids=ordered_ids,
+                expected_source_risk_shard_semantic_digest=(
+                    risk_descriptor.semantic_digest
+                ),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RiskDataContractError(
+                f"occupancy sidecar batch reload failed: {exc}"
+            ) from exc
+        if (
+            loaded_sidecar.semantic_digest
+            != sidecar_descriptor.sidecar_semantic_digest
+        ):
+            raise RiskDataContractError(
+                "occupancy sidecar semantic digest differs from authenticated seal"
+            )
+        endpoints = production_endpoint_times_from_query_geometry(query_geometry)
+        if not np.array_equal(
+            endpoints,
+            loaded_sidecar.future_endpoint_times_s,
+        ):
+            raise RiskDataContractError(
+                "independently derived endpoint times differ from sidecar cache"
+            )
+        row_by_id = {sample_id: index for index, sample_id in enumerate(ordered_ids)}
+        sample_by_id = {sample.sample_id: sample for sample in loaded_risk.samples}
+        indices = [row_by_id[sample_id] for sample_id in risk_batch.sample_ids]
+        reconstructed_masks = np.stack(
+            [
+                reconstruct_production_robot_endpoint_footprints(
+                    sample_by_id[sample_id],
+                    grid=loaded_dataset.grid,
+                    query_geometry=query_geometry,
+                )
+                for sample_id in risk_batch.sample_ids
+            ],
+            axis=0,
+        )
+        published_masks = np.array(
+            loaded_sidecar.robot_future_footprints[indices],
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        if not np.array_equal(reconstructed_masks, published_masks):
+            raise RiskDataContractError(
+                "Task4 robot footprint sidecar changed after collection preflight"
+            )
+        hidden = np.array(
+            loaded_sidecar.hidden_risk_occupancy[indices],
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        occupancy_batch = ProductionOccupancyBatch(
+            model_inputs=dict(risk_batch.model_inputs),
+            targets=dict(risk_batch.targets),
+            query_inputs={
+                "robot_endpoint_footprints": torch.from_numpy(
+                    np.ascontiguousarray(reconstructed_masks, dtype=np.float32)
+                ),
+                "endpoint_times_s": torch.from_numpy(endpoints),
+            },
+            occupancy_targets={
+                "hidden_risk_occupancy": torch.from_numpy(hidden),
+            },
+            sample_ids=risk_batch.sample_ids,
+            split=risk_batch.split,
+            provenance={
+                **dict(risk_batch.provenance),
+                "occupancy_sidecar_collection_digest_sha256": (
+                    sidecar_collection.collection_digest_sha256
+                ),
+                "occupancy_query_layout_version": query_geometry[
+                    "query_layout_version"
+                ],
+            },
+        )
+        occupancy_cursor = OccupancyStreamCursor(
+            risk_cursor=cursor,
+            sidecar_collection_digest_sha256=(
+                sidecar_collection.collection_digest_sha256
+            ),
+            query_layout_version=str(query_geometry["query_layout_version"]),
+        )
+        yield occupancy_batch, occupancy_cursor
+        del loaded_sidecar
+        del loaded_risk
+        del occupancy_batch
+        del occupancy_cursor
+
+
 def collate_risk_samples(
     samples: Sequence[RiskSample],
     *,
@@ -1466,6 +1968,8 @@ __all__ = [
     "MODEL_INPUT_KEYS",
     "PRODUCTION_DATASET_LAYOUT_VERSION",
     "TARGET_KEYS",
+    "ProductionOccupancyBatch",
+    "OccupancyStreamCursor",
     "ProductionRiskSubset",
     "RiskBatch",
     "RiskDataContractError",
@@ -1473,8 +1977,11 @@ __all__ = [
     "collate_production_risk_samples",
     "collate_risk_samples",
     "iter_production_risk_batches",
+    "iter_production_occupancy_batches",
     "load_production_risk_dataset",
+    "production_endpoint_times_from_query_geometry",
     "select_production_risk_subset",
+    "reconstruct_production_robot_endpoint_footprints",
     "validate_model_input_mapping",
     "validate_toy_dataset_manifest",
 ]

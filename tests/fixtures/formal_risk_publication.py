@@ -30,10 +30,24 @@ from src.datasets.shard_writer import (
     load_risk_shard,
     write_risk_shard,
 )
+from src.datasets.sidecar_writer import (
+    load_risk_sidecar_shard,
+    risk_sidecar_pair_completion_marker_path,
+    write_risk_sidecar_pair_completion_marker,
+    write_risk_sidecar_shard,
+)
 from src.datasets.sop03_publication import publish_checksum_envelope
+from src.generation.risk_sidecars import RiskLabelSidecar
+from src.geometry import (
+    RectangleFootprint,
+    inflate_footprint,
+    rasterize_footprint,
+)
 from src.generation.observation_renderer import RENDERER_LAYOUT_VERSION
 from src.generation.risk_gt import RISK_GT_VERSION
+from src.planning.differential_drive import rollout_constant_control
 from src.utils.config import DEFAULT_CONFIG, load_config
+from src.utils.seeding import stable_digest
 
 
 G1_SPLIT_MANIFEST_DIGEST = "1" * 32
@@ -55,6 +69,14 @@ class FormalRiskPublication:
     grid: GridSpec
     g1_split_manifest_digest: str
     target_type_policy_digest: str
+
+
+@dataclass(frozen=True)
+class FormalRiskSidecarPublication:
+    """One complete sidecar collection paired with every formal risk shard."""
+
+    root: Path
+    sidecar_root: Path
 
 
 def canonical_json(value: object) -> str:
@@ -102,20 +124,26 @@ def resign_dataset_seal(seal_root: Path) -> None:
     )
 
 
-def _base_config() -> dict[str, object]:
+def _base_config(*, history_steps: int = 2, future_steps: int = 3) -> dict[str, object]:
     config = deepcopy(DEFAULT_CONFIG)
     config["bev"].update(  # type: ignore[union-attr]
         {
             "range_m": 2.0,
             "resolution_m": 0.5,
             "size": 4,
-            "history_steps": 2,
+            "history_steps": history_steps,
             "history_dt_s": 0.2,
-            "future_steps": 3,
+            "future_steps": future_steps,
             "future_dt_s": 0.2,
         }
     )
+    config["trajectories"]["horizon_s"] = 0.2 * future_steps  # type: ignore[index]
     return config
+
+
+def _base_config_digest(config: Mapping[str, object]) -> str:
+    payload = canonical_json(dict(config))
+    return stable_digest(payload, size=16)
 
 
 def _sample(
@@ -124,6 +152,7 @@ def _sample(
     grid: GridSpec,
     split: str,
     target_type_policy_digest: str,
+    base_config_digest: str,
 ) -> RiskSample:
     event_types = (
         "collision",
@@ -190,6 +219,11 @@ def _sample(
                 "source_snippet_id": f"source-snippet-{index:03d}",
                 "seed_namespace": f"sop07/{split}/formal-{index:03d}",
                 "target_type_policy_digest": target_type_policy_digest,
+                "base_config_digest": base_config_digest,
+                "trajectory_primitive": {
+                    "v_mps": 0.0,
+                    "omega_radps": 0.0,
+                },
             },
             "label_audit": {
                 "risk_gt_version": RISK_GT_VERSION,
@@ -210,6 +244,8 @@ def create_formal_risk_publication(
     g1_split_manifest_digest: str = G1_SPLIT_MANIFEST_DIGEST,
     target_type_policy_digest: str = TARGET_TYPE_POLICY_DIGEST,
     runtime_metadata: Mapping[str, object] | None = None,
+    history_steps: int = 2,
+    future_steps: int = 3,
 ) -> FormalRiskPublication:
     """Publish one compact formal SOP03 provenance root and SOP07 collection."""
 
@@ -217,11 +253,16 @@ def create_formal_risk_publication(
     config_dir = root / "config"
     config_dir.mkdir()
     base_config_path = config_dir / "base.yaml"
+    raw_base_config = _base_config(
+        history_steps=history_steps,
+        future_steps=future_steps,
+    )
     base_config_path.write_text(
-        yaml.safe_dump(_base_config(), sort_keys=True), encoding="utf-8"
+        yaml.safe_dump(raw_base_config, sort_keys=True), encoding="utf-8"
     )
     base_config = load_config(base_config_path)
     grid = build_grid_spec(base_config)
+    base_config_digest = _base_config_digest(base_config)
 
     sop03_root = root / "sop03"
     sop03_root.mkdir()
@@ -261,6 +302,7 @@ def create_formal_risk_publication(
             grid=grid,
             split=split,
             target_type_policy_digest=target_type_policy_digest,
+            base_config_digest=base_config_digest,
         )
         for index in range(12)
     )
@@ -357,6 +399,90 @@ def create_formal_risk_publication(
         g1_split_manifest_digest=g1_split_manifest_digest,
         target_type_policy_digest=target_type_policy_digest,
     )
+
+
+def create_formal_risk_sidecar_publication(
+    publication: FormalRiskPublication,
+    root: Path,
+) -> FormalRiskSidecarPublication:
+    """Publish real Task4 sidecars and pair markers for every risk shard."""
+
+    root.mkdir(parents=True, exist_ok=False)
+    base_config = load_config(publication.base_config_path)
+    robot_config = base_config["robot"]
+    robot_footprint = inflate_footprint(
+        RectangleFootprint(
+            float(robot_config["length_m"]),
+            float(robot_config["width_m"]),
+        ),
+        float(robot_config["inflation_m"]),
+    )
+    dt_s = float(base_config["bev"]["future_dt_s"])
+    poses, _ = rollout_constant_control(
+        v=0.0,
+        omega=0.0,
+        dt_s=dt_s,
+        steps=publication.grid.future_steps,
+    )
+    robot_masks = np.stack(
+        [
+            rasterize_footprint(robot_footprint, pose, publication.grid).astype(
+                np.uint8,
+                copy=False,
+            )
+            for pose in poses
+        ],
+        axis=0,
+    )
+    endpoint_times = (
+        np.arange(1, publication.grid.future_steps + 1, dtype=np.float32)
+        * np.float32(dt_s)
+    )
+    for descriptor_index in range(2):
+        risk_root = publication.collection_root / f"shard-{descriptor_index:05d}"
+        loaded_risk = load_risk_shard(risk_root, grid=publication.grid)
+        sidecars: list[RiskLabelSidecar] = []
+        for sample_index, sample in enumerate(loaded_risk.samples):
+            hidden = np.zeros_like(robot_masks, dtype=np.uint8)
+            if sample.collision_label or sample.near_miss:
+                row = (sample_index + descriptor_index) % publication.grid.height
+                column = (2 * sample_index + descriptor_index) % publication.grid.width
+                hidden[:, row, column] = 1
+            sidecars.append(
+                RiskLabelSidecar(
+                    sample_id=sample.sample_id,
+                    hidden_risk_occupancy=hidden,
+                    robot_future_footprints=robot_masks,
+                    future_endpoint_times_s=endpoint_times,
+                )
+            )
+        sidecar_shard_root = root / f"shard-{descriptor_index:05d}"
+        write_risk_sidecar_shard(
+            sidecars,
+            sidecar_shard_root,
+            grid=publication.grid,
+            split=loaded_risk.summary["split"],
+            shard_index=descriptor_index,
+            source_risk_shard_semantic_digest=loaded_risk.semantic_digest,
+        )
+        loaded_sidecar = load_risk_sidecar_shard(
+            sidecar_shard_root,
+            grid=publication.grid,
+            expected_sample_ids=tuple(sample.sample_id for sample in loaded_risk.samples),
+            expected_source_risk_shard_semantic_digest=loaded_risk.semantic_digest,
+        )
+        marker_path = risk_sidecar_pair_completion_marker_path(sidecar_shard_root)
+        write_risk_sidecar_pair_completion_marker(
+            marker_path,
+            risk_root=risk_root,
+            sidecar_root=sidecar_shard_root,
+            split=loaded_sidecar.split,
+            shard_index=descriptor_index,
+            sample_ids=loaded_sidecar.sample_ids,
+            risk_shard_semantic_digest=loaded_risk.semantic_digest,
+            sidecar_shard_semantic_digest=loaded_sidecar.semantic_digest,
+        )
+    return FormalRiskSidecarPublication(root=root, sidecar_root=root)
 
 
 __all__ = [

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Authenticate an SOP07 collection and publish one risk_dataset_v2 seal."""
+"""Seal an SOP07 collection and optional authenticated SOP08 sidecars."""
 
 from __future__ import annotations
 
@@ -38,6 +38,14 @@ def _parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--collection-root", type=Path, required=True)
+    parser.add_argument(
+        "--sidecar-root",
+        type=Path,
+        help=(
+            "Optional complete Task4 sidecar collection; when supplied, every "
+            "risk/sidecar/marker triple is sealed for SOP08."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--base-config", type=Path, required=True)
     parser.add_argument("--split-provenance", type=Path, required=True)
@@ -62,27 +70,33 @@ def main() -> int:
             expected_collection_handoff_sha256=(
                 args.expected_collection_handoff_sha256
             ),
+            sidecar_root=args.sidecar_root,
         )
         loaded = load_risk_dataset_seal(
             seal_root,
             collection_root=args.collection_root,
             expected_split=args.split,
+            sidecar_root=args.sidecar_root,
         )
     except (RiskDataContractError, FileExistsError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    result = {
+        "risk_dataset_manifest_digest": loaded.risk_dataset_manifest_digest,
+        "sample_count": loaded.sample_count,
+        "seal_root": str(seal_root),
+        "shard_count": len(loaded.shards),
+        "split": loaded.split,
+        "status": "complete",
+    }
+    occupancy_sidecars = loaded.manifest.get("occupancy_sidecars")
+    if isinstance(occupancy_sidecars, dict):
+        result["occupancy_sidecar_collection_digest_sha256"] = (
+            occupancy_sidecars["collection_digest_sha256"]
+        )
     print(
         json.dumps(
-            {
-                "risk_dataset_manifest_digest": (
-                    loaded.risk_dataset_manifest_digest
-                ),
-                "sample_count": loaded.sample_count,
-                "seal_root": str(seal_root),
-                "shard_count": len(loaded.shards),
-                "split": loaded.split,
-                "status": "complete",
-            },
+            result,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,

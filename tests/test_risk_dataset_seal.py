@@ -29,6 +29,7 @@ from src.datasets.risk_dataset_seal import (
     RISK_DATASET_LAYOUT_VERSION,
     LoadedRiskDataset,
     RiskShardDescriptor,
+    load_occupancy_sidecar_collection,
     canonical_dynamic_objects_digest,
     load_risk_dataset_seal,
     publish_risk_dataset_seal,
@@ -40,6 +41,7 @@ from tests.fixtures.formal_risk_publication import (
     FormalRiskPublication,
     canonical_json,
     create_formal_risk_publication,
+    create_formal_risk_sidecar_publication,
     resign_dataset_seal,
     rewrite_collection_handoff,
     sha256_file,
@@ -57,6 +59,7 @@ def _publish(
     *,
     expected_split: str = "train",
     expected_handoff_sha256: str | None = None,
+    sidecar_root: Path | None = None,
 ) -> Path:
     return publish_risk_dataset_seal(
         output_dir,
@@ -67,6 +70,7 @@ def _publish(
         expected_collection_handoff_sha256=(
             expected_handoff_sha256 or publication.handoff_sha256
         ),
+        sidecar_root=sidecar_root,
     )
 
 
@@ -640,6 +644,108 @@ def test_cli_success_argument_failure_and_overwrite_failure(tmp_path: Path) -> N
     )
     assert bad_argument.returncode == 2
     assert "64 lowercase" in bad_argument.stderr
+
+
+def test_cli_can_seal_an_authenticated_occupancy_sidecar_collection(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        history_steps=8,
+        future_steps=15,
+    )
+    sidecars = create_formal_risk_sidecar_publication(
+        publication,
+        tmp_path / "sidecars",
+    )
+    seal_root = tmp_path / "occupancy-seal"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--collection-root",
+            str(publication.collection_root),
+            "--sidecar-root",
+            str(sidecars.sidecar_root),
+            "--output-dir",
+            str(seal_root),
+            "--base-config",
+            str(publication.base_config_path),
+            "--split-provenance",
+            str(publication.split_provenance_path),
+            "--split",
+            "train",
+            "--expected-collection-handoff-sha256",
+            publication.handoff_sha256,
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    manifest = _manifest(seal_root)
+    assert payload["occupancy_sidecar_collection_digest_sha256"] == (
+        manifest["occupancy_sidecars"]["collection_digest_sha256"]
+    )
+
+
+def test_sidecar_seal_rejects_missing_extra_and_reordered_evidence(
+    tmp_path: Path,
+) -> None:
+    publication = create_formal_risk_publication(
+        tmp_path / "upstream",
+        history_steps=8,
+        future_steps=15,
+    )
+    sidecars = create_formal_risk_sidecar_publication(
+        publication,
+        tmp_path / "sidecars",
+    )
+    seal_root = _publish(
+        publication,
+        tmp_path / "seal",
+        sidecar_root=sidecars.sidecar_root,
+    )
+    loaded = load_risk_dataset_seal(
+        seal_root,
+        collection_root=publication.collection_root,
+        expected_split="train",
+        sidecar_root=sidecars.sidecar_root,
+    )
+
+    extra = sidecars.sidecar_root / "unexpected.txt"
+    extra.write_text("not admitted", encoding="utf-8")
+    with pytest.raises(RiskDataContractError, match="missing/extra"):
+        load_occupancy_sidecar_collection(
+            loaded,
+            sidecar_root=sidecars.sidecar_root,
+        )
+    extra.unlink()
+
+    marker = sidecars.sidecar_root / (
+        "shard-00001.risk-sidecar-pair-complete.json"
+    )
+    marker.rename(marker.with_suffix(".missing"))
+    with pytest.raises(RiskDataContractError, match="missing/extra"):
+        load_occupancy_sidecar_collection(
+            loaded,
+            sidecar_root=sidecars.sidecar_root,
+        )
+    marker.with_suffix(".missing").rename(marker)
+
+    manifest = _manifest(seal_root)
+    sidecar_section = manifest["occupancy_sidecars"]
+    sidecar_section["shards"] = list(reversed(sidecar_section["shards"]))
+    write_canonical_json(seal_root / "dataset_manifest.json", manifest)
+    resign_dataset_seal(seal_root)
+    with pytest.raises(RiskDataContractError, match="descriptor|digest|contiguous"):
+        load_risk_dataset_seal(
+            seal_root,
+            collection_root=publication.collection_root,
+            expected_split="train",
+            sidecar_root=sidecars.sidecar_root,
+        )
 
 
 def test_fixture_is_two_contiguous_formal_shards_with_twelve_samples(

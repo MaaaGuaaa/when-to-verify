@@ -37,11 +37,20 @@ from src.datasets.shard_writer import (
     LoadedRiskShard,
     load_risk_shard,
 )
+from src.datasets.sidecar_writer import (
+    RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION,
+    RISK_SIDECAR_SHARD_LAYOUT_VERSION,
+    load_risk_sidecar_pair_completion_marker,
+    load_risk_sidecar_shard,
+    risk_sidecar_pair_completion_marker_path,
+)
 from src.utils.config import ConfigError, load_config
+from src.utils.seeding import stable_digest
 
 
 RISK_DATASET_LAYOUT_VERSION = "risk_dataset_v2"
 RISK_DATASET_FAMILY_LAYOUT_VERSION = "risk_dataset_family_v1"
+RISK_SIDECAR_COLLECTION_LAYOUT_VERSION = "risk_label_sidecar_collection_v1"
 
 _COLLECTION_HANDOFF_VERSION = "sop07_collection_complete_handoff_v1"
 _COLLECTION_HANDOFF_NAME = "collection_complete_handoff.json"
@@ -112,6 +121,35 @@ _DATASET_MANIFEST_KEYS = frozenset(
         "risk_dataset_manifest_digest",
     }
 )
+_DATASET_MANIFEST_WITH_SIDECARS_KEYS = frozenset(
+    {*_DATASET_MANIFEST_KEYS, "occupancy_sidecars"}
+)
+_SIDECAR_DESCRIPTOR_KEYS = frozenset(
+    {
+        "shard_index",
+        "relative_root",
+        "marker_relative_path",
+        "sample_count",
+        "sidecar_semantic_digest",
+        "source_risk_shard_semantic_digest",
+        "pair_marker_digest_sha256",
+        "ordered_sample_ids_digest_sha256",
+    }
+)
+_SIDECAR_COLLECTION_KEYS = frozenset(
+    {
+        "collection_layout_version",
+        "sidecar_shard_layout_version",
+        "pair_completion_marker_version",
+        "base_risk_dataset_manifest_digest",
+        "base_config_digest",
+        "query_geometry",
+        "sample_count",
+        "shard_count",
+        "shards",
+        "collection_digest_sha256",
+    }
+)
 _RUNTIME_IDENTITY_FIELDS = frozenset(
     {"collection_handoff_sha256", "collection_instance_digest_sha256"}
 )
@@ -144,6 +182,31 @@ class LoadedRiskDataset:
     sample_count: int
     risk_dataset_manifest_digest: str
     provenance: dict[str, str]
+
+
+@dataclass(frozen=True)
+class SidecarShardDescriptor:
+    """One ordered sidecar shard and its exact risk-pair completion proof."""
+
+    shard_index: int
+    relative_root: str
+    marker_relative_path: str
+    sample_count: int
+    sidecar_semantic_digest: str
+    source_risk_shard_semantic_digest: str
+    pair_marker_digest_sha256: str
+    ordered_sample_ids_digest_sha256: str
+
+
+@dataclass(frozen=True)
+class LoadedRiskSidecarCollection:
+    """Fully verified SOP08 sidecars bound to one base risk dataset."""
+
+    root: Path
+    shards: tuple[SidecarShardDescriptor, ...]
+    sample_count: int
+    collection_digest_sha256: str
+    query_geometry: dict[str, object]
 
 
 class _FrozenDict(dict):
@@ -289,6 +352,15 @@ def _require_nonnegative_int(value: object, *, field: str) -> int:
     if type(value) is not int or value < 0:
         raise RiskDataContractError(f"{field} must be a non-negative integer")
     return value
+
+
+def _require_positive_finite_float(value: object, *, field: str) -> float:
+    if type(value) not in {int, float}:
+        raise RiskDataContractError(f"{field} must be a positive finite number")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0.0:
+        raise RiskDataContractError(f"{field} must be a positive finite number")
+    return result
 
 
 def _absolute_without_symlink_resolution(path: Path) -> Path:
@@ -779,6 +851,386 @@ def _descriptor_from_mapping(
     )
 
 
+def _base_config_digest(config: Mapping[str, object]) -> str:
+    """Match SOP07's frozen ``stable_digest(canonical_config, size=16)``."""
+
+    try:
+        payload = _canonical_json(dict(config))
+    except (TypeError, ValueError) as exc:
+        raise RiskDataContractError("base config must be finite canonical JSON") from exc
+    return stable_digest(payload, size=16)
+
+
+def _query_geometry_from_config(
+    config: Mapping[str, object], *, base_config_digest: str, grid: GridSpec
+) -> dict[str, object]:
+    robot = config.get("robot")
+    bev = config.get("bev")
+    if not isinstance(robot, Mapping) or not isinstance(bev, Mapping):
+        raise RiskDataContractError("base config robot/bev query geometry is missing")
+    if robot.get("model") != "differential_drive":
+        raise RiskDataContractError(
+            "SOP08 production query reconstruction requires differential_drive"
+        )
+    dt_s = _require_positive_finite_float(
+        bev.get("future_dt_s"), field="base config bev.future_dt_s"
+    )
+    if not math.isclose(dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12):
+        raise RiskDataContractError("SOP08 future_dt_s must equal 0.2")
+    if grid.future_steps != 15:
+        raise RiskDataContractError("SOP08 future_steps must equal 15")
+    length = _require_positive_finite_float(
+        robot.get("length_m"), field="base config robot.length_m"
+    )
+    width = _require_positive_finite_float(
+        robot.get("width_m"), field="base config robot.width_m"
+    )
+    inflation_value = robot.get("inflation_m")
+    if type(inflation_value) not in {int, float}:
+        raise RiskDataContractError("base config robot.inflation_m must be finite")
+    inflation = float(inflation_value)
+    if not math.isfinite(inflation) or inflation < 0.0:
+        raise RiskDataContractError(
+            "base config robot.inflation_m must be finite and non-negative"
+        )
+    if not (
+        math.isclose(length, 0.70, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(width, 0.55, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(inflation, 0.15, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        raise RiskDataContractError(
+            "SOP08 frozen robot query footprint must be 0.70x0.55m + 0.15m inflation"
+        )
+    return {
+        "query_layout_version": "constant_control_robot_endpoint_query_v1",
+        "base_config_digest": _require_blake2b128(
+            base_config_digest, field="base_config_digest"
+        ),
+        "robot_model": "differential_drive",
+        "robot_length_m": length,
+        "robot_width_m": width,
+        "robot_inflation_m": inflation,
+        "future_steps": grid.future_steps,
+        "future_dt_s": dt_s,
+    }
+
+
+def _validate_query_geometry(value: object, *, grid: GridSpec) -> dict[str, object]:
+    keys = {
+        "query_layout_version",
+        "base_config_digest",
+        "robot_model",
+        "robot_length_m",
+        "robot_width_m",
+        "robot_inflation_m",
+        "future_steps",
+        "future_dt_s",
+    }
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise RiskDataContractError("occupancy query_geometry fields mismatch")
+    if value.get("query_layout_version") != (
+        "constant_control_robot_endpoint_query_v1"
+    ):
+        raise RiskDataContractError("occupancy query geometry layout mismatch")
+    if value.get("robot_model") != "differential_drive":
+        raise RiskDataContractError("occupancy query robot model mismatch")
+    digest = _require_blake2b128(
+        value.get("base_config_digest"), field="query_geometry.base_config_digest"
+    )
+    length = _require_positive_finite_float(
+        value.get("robot_length_m"), field="query_geometry.robot_length_m"
+    )
+    width = _require_positive_finite_float(
+        value.get("robot_width_m"), field="query_geometry.robot_width_m"
+    )
+    inflation_value = value.get("robot_inflation_m")
+    if type(inflation_value) not in {int, float}:
+        raise RiskDataContractError(
+            "query_geometry.robot_inflation_m must be finite and non-negative"
+        )
+    inflation = float(inflation_value)
+    if not math.isfinite(inflation) or inflation < 0.0:
+        raise RiskDataContractError(
+            "query_geometry.robot_inflation_m must be finite and non-negative"
+        )
+    if not (
+        math.isclose(length, 0.70, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(width, 0.55, rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(inflation, 0.15, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        raise RiskDataContractError("occupancy frozen robot footprint mismatch")
+    steps = _require_positive_int(
+        value.get("future_steps"), field="query_geometry.future_steps"
+    )
+    dt_s = _require_positive_finite_float(
+        value.get("future_dt_s"), field="query_geometry.future_dt_s"
+    )
+    if steps != grid.future_steps or steps != 15 or not math.isclose(
+        dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise RiskDataContractError("occupancy query time grid mismatch")
+    return {
+        "query_layout_version": "constant_control_robot_endpoint_query_v1",
+        "base_config_digest": digest,
+        "robot_model": "differential_drive",
+        "robot_length_m": length,
+        "robot_width_m": width,
+        "robot_inflation_m": inflation,
+        "future_steps": steps,
+        "future_dt_s": dt_s,
+    }
+
+
+def _sidecar_descriptor_from_mapping(
+    value: object, *, position: int
+) -> SidecarShardDescriptor:
+    if not isinstance(value, Mapping) or set(value) != _SIDECAR_DESCRIPTOR_KEYS:
+        raise RiskDataContractError(
+            f"occupancy sidecar descriptor {position} fields mismatch"
+        )
+    shard_index = _require_nonnegative_int(
+        value.get("shard_index"), field=f"occupancy shards[{position}].shard_index"
+    )
+    if shard_index != position:
+        raise RiskDataContractError(
+            "occupancy sidecar shard indices must be contiguous from zero"
+        )
+    relative_root = _require_nonempty_string(
+        value.get("relative_root"), field=f"occupancy shards[{position}].relative_root"
+    )
+    expected_root = f"shard-{position:05d}"
+    if relative_root != expected_root:
+        raise RiskDataContractError("occupancy sidecar relative_root ordering mismatch")
+    marker_relative_path = _require_nonempty_string(
+        value.get("marker_relative_path"),
+        field=f"occupancy shards[{position}].marker_relative_path",
+    )
+    expected_marker = f"{expected_root}.risk-sidecar-pair-complete.json"
+    if marker_relative_path != expected_marker:
+        raise RiskDataContractError("occupancy sidecar marker path mismatch")
+    return SidecarShardDescriptor(
+        shard_index=shard_index,
+        relative_root=relative_root,
+        marker_relative_path=marker_relative_path,
+        sample_count=_require_positive_int(
+            value.get("sample_count"),
+            field=f"occupancy shards[{position}].sample_count",
+        ),
+        sidecar_semantic_digest=_require_sha256(
+            value.get("sidecar_semantic_digest"),
+            field=f"occupancy shards[{position}].sidecar_semantic_digest",
+        ),
+        source_risk_shard_semantic_digest=_require_sha256(
+            value.get("source_risk_shard_semantic_digest"),
+            field=(
+                f"occupancy shards[{position}].source_risk_shard_semantic_digest"
+            ),
+        ),
+        pair_marker_digest_sha256=_require_sha256(
+            value.get("pair_marker_digest_sha256"),
+            field=f"occupancy shards[{position}].pair_marker_digest_sha256",
+        ),
+        ordered_sample_ids_digest_sha256=_require_sha256(
+            value.get("ordered_sample_ids_digest_sha256"),
+            field=(
+                f"occupancy shards[{position}].ordered_sample_ids_digest_sha256"
+            ),
+        ),
+    )
+
+
+def _sidecar_collection_digest(payload: Mapping[str, object]) -> str:
+    projection = {
+        key: value
+        for key, value in payload.items()
+        if key != "collection_digest_sha256"
+    }
+    return _sha256_bytes(_canonical_json(projection).encode("utf-8"))
+
+
+def _validate_sidecar_collection_section(
+    value: object,
+    *,
+    grid: GridSpec,
+    base_risk_dataset_manifest_digest: str,
+) -> tuple[tuple[SidecarShardDescriptor, ...], dict[str, object], str]:
+    if not isinstance(value, Mapping) or set(value) != _SIDECAR_COLLECTION_KEYS:
+        raise RiskDataContractError("occupancy_sidecars section fields mismatch")
+    if value.get("collection_layout_version") != (
+        RISK_SIDECAR_COLLECTION_LAYOUT_VERSION
+    ):
+        raise RiskDataContractError("occupancy sidecar collection layout mismatch")
+    if value.get("sidecar_shard_layout_version") != (
+        RISK_SIDECAR_SHARD_LAYOUT_VERSION
+    ):
+        raise RiskDataContractError("occupancy sidecar shard layout mismatch")
+    if value.get("pair_completion_marker_version") != (
+        RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION
+    ):
+        raise RiskDataContractError("occupancy pair marker version mismatch")
+    if _require_sha256(
+        value.get("base_risk_dataset_manifest_digest"),
+        field="occupancy base risk dataset digest",
+    ) != base_risk_dataset_manifest_digest:
+        raise RiskDataContractError("occupancy sidecars base risk digest mismatch")
+    base_config_digest = _require_blake2b128(
+        value.get("base_config_digest"), field="occupancy base_config_digest"
+    )
+    query_geometry = _validate_query_geometry(value.get("query_geometry"), grid=grid)
+    if query_geometry["base_config_digest"] != base_config_digest:
+        raise RiskDataContractError("occupancy query/base config digest mismatch")
+    sample_count = _require_positive_int(
+        value.get("sample_count"), field="occupancy sidecar sample_count"
+    )
+    shard_count = _require_positive_int(
+        value.get("shard_count"), field="occupancy sidecar shard_count"
+    )
+    raw_shards = value.get("shards")
+    if not isinstance(raw_shards, (list, tuple)) or len(raw_shards) != shard_count:
+        raise RiskDataContractError("occupancy sidecar shard descriptors are incomplete")
+    descriptors = tuple(
+        _sidecar_descriptor_from_mapping(item, position=index)
+        for index, item in enumerate(raw_shards)
+    )
+    if sum(item.sample_count for item in descriptors) != sample_count:
+        raise RiskDataContractError("occupancy sidecar sample count mismatch")
+    declared_digest = _require_sha256(
+        value.get("collection_digest_sha256"),
+        field="occupancy sidecar collection digest",
+    )
+    if declared_digest != _sidecar_collection_digest(value):
+        raise RiskDataContractError("occupancy sidecar collection digest mismatch")
+    return descriptors, query_geometry, declared_digest
+
+
+def _formally_validate_sidecar_collection(
+    sidecar_root: Path,
+    *,
+    collection_root: Path,
+    risk_descriptors: tuple[RiskShardDescriptor, ...],
+    grid: GridSpec,
+    expected_split: str,
+    base_risk_dataset_manifest_digest: str,
+    base_config_digest: str,
+    query_geometry: Mapping[str, object],
+    expected_section: Mapping[str, object] | None = None,
+) -> LoadedRiskSidecarCollection:
+    _require_directory(sidecar_root, label="occupancy sidecar collection root")
+    expected_names = {
+        name
+        for descriptor in risk_descriptors
+        for name in (
+            descriptor.relative_root,
+            f"{descriptor.relative_root}.risk-sidecar-pair-complete.json",
+        )
+    }
+    try:
+        entries = list(os.scandir(sidecar_root))
+    except OSError as exc:
+        raise RiskDataContractError("failed to enumerate occupancy sidecars") from exc
+    actual_names = {entry.name for entry in entries}
+    if actual_names != expected_names:
+        raise RiskDataContractError(
+            "occupancy sidecar collection has missing/extra entries: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    if any(entry.is_symlink() for entry in entries):
+        raise RiskDataContractError("occupancy sidecar collection forbids symlinks")
+
+    sidecar_descriptors: list[SidecarShardDescriptor] = []
+    for risk_descriptor in risk_descriptors:
+        risk_root = collection_root / risk_descriptor.relative_root
+        try:
+            loaded_risk = load_risk_shard(
+                risk_root, grid=grid, split_audit_records=()
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RiskDataContractError(
+                f"formal risk reload failed for occupancy join: {exc}"
+            ) from exc
+        if loaded_risk.semantic_digest != risk_descriptor.semantic_digest:
+            raise RiskDataContractError("occupancy join risk shard digest mismatch")
+        sample_ids = tuple(sample.sample_id for sample in loaded_risk.samples)
+        sidecar_shard_root = sidecar_root / risk_descriptor.relative_root
+        marker_path = risk_sidecar_pair_completion_marker_path(sidecar_shard_root)
+        try:
+            loaded_sidecar = load_risk_sidecar_shard(
+                sidecar_shard_root,
+                grid=grid,
+                expected_sample_ids=sample_ids,
+                expected_source_risk_shard_semantic_digest=(
+                    risk_descriptor.semantic_digest
+                ),
+            )
+            marker = load_risk_sidecar_pair_completion_marker(
+                marker_path,
+                expected_risk_root=risk_root,
+                expected_sidecar_root=sidecar_shard_root,
+                expected_split=expected_split,
+                expected_shard_index=risk_descriptor.shard_index,
+                expected_sample_ids=sample_ids,
+                expected_risk_shard_semantic_digest=risk_descriptor.semantic_digest,
+                expected_sidecar_shard_semantic_digest=(
+                    loaded_sidecar.semantic_digest
+                ),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise RiskDataContractError(
+                f"formal sidecar/marker load failed for {risk_descriptor.relative_root}: {exc}"
+            ) from exc
+        if (
+            loaded_sidecar.split != expected_split
+            or loaded_sidecar.shard_index != risk_descriptor.shard_index
+            or loaded_sidecar.sample_ids != sample_ids
+        ):
+            raise RiskDataContractError("occupancy sidecar/risk ordered join mismatch")
+        sidecar_descriptors.append(
+            SidecarShardDescriptor(
+                shard_index=risk_descriptor.shard_index,
+                relative_root=risk_descriptor.relative_root,
+                marker_relative_path=marker_path.name,
+                sample_count=len(sample_ids),
+                sidecar_semantic_digest=loaded_sidecar.semantic_digest,
+                source_risk_shard_semantic_digest=(
+                    loaded_sidecar.source_risk_shard_semantic_digest
+                ),
+                pair_marker_digest_sha256=marker.marker_digest_sha256,
+                ordered_sample_ids_digest_sha256=(
+                    marker.ordered_sample_ids_digest_sha256
+                ),
+            )
+        )
+
+    section: dict[str, object] = {
+        "collection_layout_version": RISK_SIDECAR_COLLECTION_LAYOUT_VERSION,
+        "sidecar_shard_layout_version": RISK_SIDECAR_SHARD_LAYOUT_VERSION,
+        "pair_completion_marker_version": (
+            RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION
+        ),
+        "base_risk_dataset_manifest_digest": base_risk_dataset_manifest_digest,
+        "base_config_digest": base_config_digest,
+        "query_geometry": dict(query_geometry),
+        "sample_count": sum(item.sample_count for item in sidecar_descriptors),
+        "shard_count": len(sidecar_descriptors),
+        "shards": [asdict(item) for item in sidecar_descriptors],
+    }
+    section["collection_digest_sha256"] = _sidecar_collection_digest(section)
+    if expected_section is not None and _canonical_json(expected_section) != (
+        _canonical_json(section)
+    ):
+        raise RiskDataContractError(
+            "occupancy sidecar collection differs from authenticated seal"
+        )
+    return LoadedRiskSidecarCollection(
+        root=sidecar_root,
+        shards=tuple(sidecar_descriptors),
+        sample_count=int(section["sample_count"]),
+        collection_digest_sha256=str(section["collection_digest_sha256"]),
+        query_geometry=_frozen_string_object_dict(dict(query_geometry)),
+    )
+
+
 def _target_policy_from_loaded_shard(
     loaded: LoadedRiskShard,
     *,
@@ -921,7 +1373,8 @@ def _semantic_manifest_projection(manifest: Mapping[str, object]) -> dict[str, o
     return {
         key: value
         for key, value in manifest.items()
-        if key != "risk_dataset_manifest_digest" and key not in _RUNTIME_IDENTITY_FIELDS
+        if key not in {"risk_dataset_manifest_digest", "occupancy_sidecars"}
+        and key not in _RUNTIME_IDENTITY_FIELDS
     }
 
 
@@ -942,9 +1395,13 @@ def validate_risk_dataset_manifest(manifest: Mapping[str, object]) -> str:
 
     if not isinstance(manifest, Mapping):
         raise RiskDataContractError("dataset manifest must be a mapping")
-    if set(manifest) != _DATASET_MANIFEST_KEYS:
-        missing_keys = sorted(_DATASET_MANIFEST_KEYS - set(manifest))
-        extra_keys = sorted(set(manifest) - _DATASET_MANIFEST_KEYS)
+    actual_keys = frozenset(manifest)
+    if actual_keys not in {
+        _DATASET_MANIFEST_KEYS,
+        _DATASET_MANIFEST_WITH_SIDECARS_KEYS,
+    }:
+        missing_keys = sorted(_DATASET_MANIFEST_KEYS - actual_keys)
+        extra_keys = sorted(actual_keys - _DATASET_MANIFEST_WITH_SIDECARS_KEYS)
         raise RiskDataContractError(
             "dataset manifest keys mismatch: "
             f"missing={missing_keys}, unexpected={extra_keys}"
@@ -956,6 +1413,12 @@ def validate_risk_dataset_manifest(manifest: Mapping[str, object]) -> str:
     recomputed_digest = _risk_dataset_manifest_digest(manifest)
     if recomputed_digest != declared_digest:
         raise RiskDataContractError("risk dataset manifest digest mismatch")
+    if "occupancy_sidecars" in manifest:
+        _validate_sidecar_collection_section(
+            manifest["occupancy_sidecars"],
+            grid=_grid_from_manifest(manifest.get("grid")),
+            base_risk_dataset_manifest_digest=declared_digest,
+        )
     return declared_digest
 
 
@@ -985,6 +1448,7 @@ def publish_risk_dataset_seal(
     split_provenance_path: str | Path,
     expected_split: str,
     expected_collection_handoff_sha256: str,
+    sidecar_root: str | Path | None = None,
 ) -> Path:
     """Authenticate an accepted SOP07 collection and atomically publish its seal."""
 
@@ -1063,6 +1527,45 @@ def publish_risk_dataset_seal(
     }
     dataset_digest = _risk_dataset_manifest_digest(manifest)
     manifest["risk_dataset_manifest_digest"] = dataset_digest
+    sidecar_path: Path | None = None
+    if sidecar_root is not None:
+        sidecar_path = _absolute_without_symlink_resolution(Path(sidecar_root))
+        base_config_digest = _base_config_digest(config)
+        query_geometry = _query_geometry_from_config(
+            config,
+            base_config_digest=base_config_digest,
+            grid=grid,
+        )
+        loaded_sidecars = _formally_validate_sidecar_collection(
+            sidecar_path,
+            collection_root=collection_path,
+            risk_descriptors=descriptors,
+            grid=grid,
+            expected_split=split,
+            base_risk_dataset_manifest_digest=dataset_digest,
+            base_config_digest=base_config_digest,
+            query_geometry=query_geometry,
+        )
+        manifest["occupancy_sidecars"] = {
+            "collection_layout_version": RISK_SIDECAR_COLLECTION_LAYOUT_VERSION,
+            "sidecar_shard_layout_version": RISK_SIDECAR_SHARD_LAYOUT_VERSION,
+            "pair_completion_marker_version": (
+                RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION
+            ),
+            "base_risk_dataset_manifest_digest": dataset_digest,
+            "base_config_digest": base_config_digest,
+            "query_geometry": query_geometry,
+            "sample_count": loaded_sidecars.sample_count,
+            "shard_count": len(loaded_sidecars.shards),
+            "shards": [asdict(item) for item in loaded_sidecars.shards],
+            "collection_digest_sha256": (
+                loaded_sidecars.collection_digest_sha256
+            ),
+        }
+        # Sidecars are an independent label publication.  They must not alter
+        # the already-authenticated base risk dataset semantic identity.
+        if _risk_dataset_manifest_digest(manifest) != dataset_digest:
+            raise RuntimeError("occupancy sidecars changed base risk dataset digest")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _assert_no_symlink_components(output_path.parent, label="dataset seal output parent")
@@ -1079,6 +1582,7 @@ def publish_risk_dataset_seal(
             collection_root=collection_path,
             expected_split=split,
             expected_manifest_digest=dataset_digest,
+            sidecar_root=sidecar_path,
         )
         if (
             reloaded.sample_count != handoff["sample_count"]
@@ -1144,9 +1648,13 @@ def _load_seal_manifest(seal_root: Path) -> dict[str, object]:
     expected_raw = (_canonical_json(manifest) + "\n").encode("utf-8")
     if raw != expected_raw:
         raise RiskDataContractError("dataset manifest is not canonical compact JSON")
-    if set(manifest) != _DATASET_MANIFEST_KEYS:
-        missing_keys = sorted(_DATASET_MANIFEST_KEYS - set(manifest))
-        extra_keys = sorted(set(manifest) - _DATASET_MANIFEST_KEYS)
+    actual_keys = frozenset(manifest)
+    if actual_keys not in {
+        _DATASET_MANIFEST_KEYS,
+        _DATASET_MANIFEST_WITH_SIDECARS_KEYS,
+    }:
+        missing_keys = sorted(_DATASET_MANIFEST_KEYS - actual_keys)
+        extra_keys = sorted(actual_keys - _DATASET_MANIFEST_WITH_SIDECARS_KEYS)
         raise RiskDataContractError(
             "dataset manifest keys mismatch: "
             f"missing={missing_keys}, unexpected={extra_keys}"
@@ -1160,6 +1668,7 @@ def load_risk_dataset_seal(
     collection_root: str | Path,
     expected_split: str,
     expected_manifest_digest: str | None = None,
+    sidecar_root: str | Path | None = None,
 ) -> LoadedRiskDataset:
     """Load only a complete v2 seal whose entire source collection still verifies."""
 
@@ -1248,6 +1757,39 @@ def load_risk_dataset_seal(
             "target_type_policy_digest differs from formally loaded shard provenance"
         )
 
+    sidecar_section = manifest.get("occupancy_sidecars")
+    if sidecar_section is not None:
+        sidecar_descriptors, query_geometry, _ = (
+            _validate_sidecar_collection_section(
+                sidecar_section,
+                grid=grid,
+                base_risk_dataset_manifest_digest=dataset_digest,
+            )
+        )
+        if (
+            len(sidecar_descriptors) != shard_count
+            or sum(item.sample_count for item in sidecar_descriptors) != sample_count
+        ):
+            raise RiskDataContractError(
+                "occupancy sidecar collection differs from base risk shard counts"
+            )
+        if sidecar_root is not None:
+            _formally_validate_sidecar_collection(
+                _absolute_without_symlink_resolution(Path(sidecar_root)),
+                collection_root=collection_path,
+                risk_descriptors=descriptors,
+                grid=grid,
+                expected_split=split,
+                base_risk_dataset_manifest_digest=dataset_digest,
+                base_config_digest=str(sidecar_section["base_config_digest"]),
+                query_geometry=query_geometry,
+                expected_section=sidecar_section,
+            )
+    elif sidecar_root is not None:
+        raise RiskDataContractError(
+            "dataset seal does not contain an occupancy_sidecars publication"
+        )
+
     provenance = {
         "g1_split_manifest_digest": g1_digest,
         "risk_dataset_manifest_digest": dataset_digest,
@@ -1267,13 +1809,53 @@ def load_risk_dataset_seal(
     )
 
 
+def load_occupancy_sidecar_collection(
+    dataset: LoadedRiskDataset,
+    *,
+    sidecar_root: str | Path,
+) -> LoadedRiskSidecarCollection:
+    """Fully reload sidecars and pair markers bound by ``dataset``."""
+
+    if not isinstance(dataset, LoadedRiskDataset):
+        raise RiskDataContractError(
+            "occupancy sidecars require an authenticated LoadedRiskDataset"
+        )
+    section = dataset.manifest.get("occupancy_sidecars")
+    if not isinstance(section, Mapping):
+        raise RiskDataContractError(
+            "dataset seal does not contain an occupancy_sidecars publication"
+        )
+    descriptors, query_geometry, _ = _validate_sidecar_collection_section(
+        section,
+        grid=dataset.grid,
+        base_risk_dataset_manifest_digest=dataset.risk_dataset_manifest_digest,
+    )
+    if len(descriptors) != len(dataset.shards):
+        raise RiskDataContractError("occupancy sidecar/risk shard count mismatch")
+    return _formally_validate_sidecar_collection(
+        _absolute_without_symlink_resolution(Path(sidecar_root)),
+        collection_root=dataset.collection_root,
+        risk_descriptors=dataset.shards,
+        grid=dataset.grid,
+        expected_split=dataset.split,
+        base_risk_dataset_manifest_digest=dataset.risk_dataset_manifest_digest,
+        base_config_digest=str(section["base_config_digest"]),
+        query_geometry=query_geometry,
+        expected_section=section,
+    )
+
+
 __all__ = [
     "RISK_DATASET_FAMILY_LAYOUT_VERSION",
     "RISK_DATASET_LAYOUT_VERSION",
+    "RISK_SIDECAR_COLLECTION_LAYOUT_VERSION",
     "LoadedRiskDataset",
+    "LoadedRiskSidecarCollection",
     "RiskShardDescriptor",
+    "SidecarShardDescriptor",
     "canonical_dynamic_objects_digest",
     "load_risk_dataset_seal",
+    "load_occupancy_sidecar_collection",
     "publish_risk_dataset_seal",
     "validate_risk_dataset_manifest",
 ]

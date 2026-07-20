@@ -1689,7 +1689,7 @@ def _build_risk_sample_and_optional_sidecar_from_rendered(
     source_snippet: MotionSnippet | None = None,
     oracle_context: OracleContext | None = None,
     include_sidecar: bool = False,
-) -> tuple[RiskSample, RiskLabelSidecar | None]:
+) -> tuple[RiskSample, RiskLabelSidecar | None, RiskGroundTruth]:
     grid = build_grid_spec(dict(base_config))
     if not np.array_equal(
         source.observed_static_occupancy,
@@ -1805,7 +1805,7 @@ def _build_risk_sample_and_optional_sidecar_from_rendered(
         metadata=metadata,
     )
     validate_risk_sample_for_publication(sample, grid)
-    return sample, sidecar
+    return sample, sidecar, labels
 
 
 def build_risk_sample(
@@ -1833,7 +1833,7 @@ def build_risk_sample(
         sensor_config=source.sensor_config,
         config=base_config_dict,
     )
-    sample, _ = _build_risk_sample_and_optional_sidecar_from_rendered(
+    sample, _, _ = _build_risk_sample_and_optional_sidecar_from_rendered(
         source,
         rendered,
         base_config=base_config_dict,
@@ -1972,17 +1972,19 @@ def _build_risk_samples_from_sop06_group_impl(
             paired_seed=paired_seed,
         )
         _validate_source_join(source)
-        sample, sidecar = _build_risk_sample_and_optional_sidecar_from_rendered(
-            source,
-            rendered,
-            base_config=base_config_dict,
-            normalized_risk=normalized_risk,
-            formal_variant=variant,
-            paired_config=paired_config,
-            mother_event=mother_event,
-            source_snippet=source_snippet,
-            oracle_context=oracle_context,
-            include_sidecar=include_sidecars,
+        sample, sidecar, ground_truth = (
+            _build_risk_sample_and_optional_sidecar_from_rendered(
+                source,
+                rendered,
+                base_config=base_config_dict,
+                normalized_risk=normalized_risk,
+                formal_variant=variant,
+                paired_config=paired_config,
+                mother_event=mother_event,
+                source_snippet=source_snippet,
+                oracle_context=oracle_context,
+                include_sidecar=include_sidecars,
+            )
         )
         samples.append(sample)
         if include_sidecars:
@@ -2021,6 +2023,7 @@ def _build_risk_samples_from_sop06_group_impl(
                     sample=sample,
                     source=source,
                     rendered=rendered,
+                    ground_truth=ground_truth,
                     robot_footprint=robot_footprint,
                     age_max_s=age_max_s,
                     pair_eligible=group.eligible_for_strict_evaluation,

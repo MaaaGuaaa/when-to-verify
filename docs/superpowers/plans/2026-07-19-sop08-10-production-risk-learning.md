@@ -22,6 +22,11 @@
 - Task 7 binds and validates three distinct identities: the four-split risk
   dataset family digest, the occupancy-sidecar collection digest, and the
   evaluation-record collection digest.  None may substitute for another.
+- Records returned directly by the oracle/renderer boundary are in-memory
+  `unpublished` values.  Formal authentication belongs to the sibling
+  evaluation-collection publisher, which must join each record to an
+  authenticated risk shard and verify its sample ID and labels.  This status
+  is not added to `RiskSample` inputs or metadata.
 
 ---
 
@@ -775,6 +780,7 @@ def derive_production_evaluation_record(
     sample: RiskSample,
     source: RiskBuildInput,
     rendered: RenderedObservation,
+    ground_truth: RiskGroundTruth,
     robot_footprint: Footprint,
     age_max_s: float,
     pair_eligible: bool,

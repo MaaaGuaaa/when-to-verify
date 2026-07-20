@@ -965,6 +965,48 @@ def test_formal_group_triple_api_routes_explicit_source_ood_without_sample_leaka
     )
 
 
+def test_formal_group_triple_api_reuses_exact_oracle_ground_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _formal_sop06_group_inputs()
+    real_compute = risk_dataset_module.compute_hidden_risk_gt
+    real_derive = risk_dataset_module.derive_production_evaluation_record
+    computed_ground_truth = []
+    received_ground_truth = []
+
+    def tracked_compute(*args, **kwargs):
+        result = real_compute(*args, **kwargs)
+        computed_ground_truth.append(result)
+        return result
+
+    def tracked_derive(**kwargs):
+        received_ground_truth.append(kwargs.get("ground_truth"))
+        return real_derive(**kwargs)
+
+    monkeypatch.setattr(
+        risk_dataset_module, "compute_hidden_risk_gt", tracked_compute
+    )
+    monkeypatch.setattr(
+        risk_dataset_module,
+        "derive_production_evaluation_record",
+        tracked_derive,
+    )
+
+    _, _, records = (
+        risk_dataset_module.build_risk_samples_sidecars_and_evaluation_records_from_sop06_group(
+            **inputs
+        )
+    )
+
+    assert len(computed_ground_truth) == len(received_ground_truth) == len(records)
+    assert all(
+        computed is received
+        for computed, received in zip(
+            computed_ground_truth, received_ground_truth, strict=True
+        )
+    )
+
+
 def test_risk_only_group_adapter_never_builds_oracle_sidecars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

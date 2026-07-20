@@ -11,6 +11,8 @@ import pytest
 
 from src.contracts import (
     HISTORY_CHANNELS,
+    POSE_TIME_LAYOUT_VERSION,
+    SCHEMA_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
     BaseState,
@@ -18,6 +20,7 @@ from src.contracts import (
     OracleWorld,
     RiskSample,
 )
+from src.generation.risk_gt import RiskGroundTruth
 from src.datasets.risk_dataset import RiskBuildInput
 from src.datasets.risk_evaluation_metadata import (
     ALLOWED_OOD_TAGS,
@@ -154,11 +157,42 @@ def _boundary_fixture() -> tuple[RiskSample, RiskBuildInput, RenderedObservation
             "label_audit": {
                 "critical_object_id": TARGET_ID,
                 "critical_object_type": "human",
+                "time_to_min_clearance_s": 0.4,
                 "has_hidden_target": True,
             },
         },
     )
     return sample, source, rendered
+
+
+def _ground_truth() -> RiskGroundTruth:
+    return RiskGroundTruth(
+        schema_version=SCHEMA_VERSION,
+        pose_time_layout_version=POSE_TIME_LAYOUT_VERSION,
+        collision_label=1,
+        risk_severity=1.0,
+        min_clearance=-0.1,
+        near_miss=0,
+        first_collision_time=0.4,
+        time_to_min_clearance=0.4,
+        critical_object_id=TARGET_ID,
+        critical_object_type="human",
+        has_hidden_target=True,
+    )
+
+
+def _empty_ground_truth() -> RiskGroundTruth:
+    return replace(
+        _ground_truth(),
+        collision_label=0,
+        risk_severity=0.0,
+        min_clearance=5.0,
+        first_collision_time=None,
+        time_to_min_clearance=None,
+        critical_object_id=None,
+        critical_object_type=None,
+        has_hidden_target=False,
+    )
 
 
 def _robot_provenance() -> dict[str, object]:
@@ -185,6 +219,7 @@ def _derive() -> dict[str, object]:
         sample=sample,
         source=source,
         rendered=rendered,
+        ground_truth=_ground_truth(),
         robot_footprint=RectangleFootprint(0.7, 0.5),
         age_max_s=5.0,
         pair_eligible=True,
@@ -255,6 +290,7 @@ def test_derivation_rejects_renderer_and_sample_shape_or_channel_mismatch() -> N
             sample=sample,
             source=source,
             rendered=bad_rendered,
+            ground_truth=_ground_truth(),
             robot_footprint=RectangleFootprint(0.7, 0.5),
             age_max_s=5.0,
             pair_eligible=True,
@@ -264,6 +300,38 @@ def test_derivation_rejects_renderer_and_sample_shape_or_channel_mismatch() -> N
                 "rule_version": OOD_ROUTING_RULE_VERSION,
                 "source": "explicit_source_provenance",
                 "reason": "held-out motion cohort",
+            },
+        )
+
+
+def test_derivation_rejects_consistent_sample_source_label_forgery() -> None:
+    sample, source, rendered = _boundary_fixture()
+    source = replace(source, event_type="spatial_safe")
+    sample = replace(
+        sample,
+        event_type="spatial_safe",
+        collision_label=0,
+        risk_severity=0.2,
+        min_clearance=0.4,
+        near_miss=0,
+        first_collision_time=None,
+    )
+
+    with pytest.raises(ValueError, match="ground_truth.*collision_label"):
+        derive_production_evaluation_record(
+            sample=sample,
+            source=source,
+            rendered=rendered,
+            ground_truth=_ground_truth(),
+            robot_footprint=RectangleFootprint(0.7, 0.5),
+            age_max_s=5.0,
+            pair_eligible=True,
+            ood_tag="in_distribution",
+            robot_footprint_provenance=_robot_provenance(),
+            ood_evidence={
+                "rule_version": OOD_ROUTING_RULE_VERSION,
+                "source": "default_in_distribution",
+                "reason": "no explicit OOD provenance was published",
             },
         )
 
@@ -331,6 +399,7 @@ def test_empty_target_uses_null_nested_fields_and_none_flat_kind() -> None:
         "label_audit": {
             "critical_object_id": None,
             "critical_object_type": None,
+            "time_to_min_clearance_s": None,
             "has_hidden_target": False,
         },
     }
@@ -348,6 +417,7 @@ def test_empty_target_uses_null_nested_fields_and_none_flat_kind() -> None:
         sample=empty_sample,
         source=empty_source,
         rendered=rendered,
+        ground_truth=_empty_ground_truth(),
         robot_footprint=RectangleFootprint(0.7, 0.5),
         age_max_s=5.0,
         pair_eligible=False,
@@ -409,6 +479,7 @@ def test_pair_eligibility_is_strictly_boolean() -> None:
             sample=sample,
             source=source,
             rendered=rendered,
+            ground_truth=_ground_truth(),
             robot_footprint=RectangleFootprint(0.7, 0.5),
             age_max_s=5.0,
             pair_eligible=1,
@@ -447,6 +518,7 @@ def test_derivation_rejects_identity_tamper() -> None:
             sample=replace(sample, sample_id="tampered-sample"),
             source=source,
             rendered=rendered,
+            ground_truth=_ground_truth(),
             robot_footprint=RectangleFootprint(0.7, 0.5),
             age_max_s=5.0,
             pair_eligible=True,
@@ -486,6 +558,7 @@ def test_empty_critical_region_has_zero_fraction_and_age() -> None:
         sample=sample,
         source=source,
         rendered=rendered,
+        ground_truth=_ground_truth(),
         robot_footprint=RectangleFootprint(0.7, 0.5),
         age_max_s=5.0,
         pair_eligible=True,
@@ -522,6 +595,7 @@ def test_density_derivation_fails_when_current_visible_region_is_empty() -> None
             sample=sample,
             source=source,
             rendered=rendered,
+            ground_truth=_ground_truth(),
             robot_footprint=RectangleFootprint(0.7, 0.5),
             age_max_s=5.0,
             pair_eligible=True,

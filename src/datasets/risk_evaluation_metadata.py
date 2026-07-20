@@ -18,11 +18,14 @@ import numpy as np
 
 from src.contracts import (
     HISTORY_CHANNELS,
+    POSE_TIME_LAYOUT_VERSION,
+    SCHEMA_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
     RiskSample,
 )
 from src.generation.observation_renderer import RenderedObservation
+from src.generation.risk_gt import RiskGroundTruth
 from src.geometry import (
     CircleFootprint,
     Footprint,
@@ -556,11 +559,45 @@ def _target_fields(
     }
 
 
+def _join_ground_truth(
+    sample: RiskSample, ground_truth: RiskGroundTruth
+) -> None:
+    if not isinstance(ground_truth, RiskGroundTruth):
+        raise TypeError("ground_truth must be a RiskGroundTruth")
+    if ground_truth.schema_version != SCHEMA_VERSION:
+        raise ValueError("ground_truth schema_version mismatch")
+    if ground_truth.pose_time_layout_version != POSE_TIME_LAYOUT_VERSION:
+        raise ValueError("ground_truth pose_time_layout_version mismatch")
+    for field in (
+        "collision_label",
+        "risk_severity",
+        "min_clearance",
+        "near_miss",
+        "first_collision_time",
+    ):
+        if getattr(sample, field) != getattr(ground_truth, field):
+            raise ValueError(f"ground_truth {field} differs from sample")
+
+    audit = sample.metadata.get("label_audit")
+    if not isinstance(audit, Mapping):
+        raise TypeError("sample label_audit must be a mapping")
+    audit_fields = {
+        "critical_object_id": ground_truth.critical_object_id,
+        "critical_object_type": ground_truth.critical_object_type,
+        "time_to_min_clearance_s": ground_truth.time_to_min_clearance,
+        "has_hidden_target": ground_truth.has_hidden_target,
+    }
+    for field, expected in audit_fields.items():
+        if audit.get(field) != expected:
+            raise ValueError(f"ground_truth {field} differs from sample label_audit")
+
+
 def derive_production_evaluation_record(
     *,
     sample: RiskSample,
     source: RiskBuildInput,
     rendered: RenderedObservation,
+    ground_truth: RiskGroundTruth,
     robot_footprint: Footprint,
     age_max_s: float,
     pair_eligible: bool,
@@ -568,7 +605,12 @@ def derive_production_evaluation_record(
     robot_footprint_provenance: Mapping[str, object],
     ood_evidence: Mapping[str, object],
 ) -> dict[str, object]:
-    """Derive one production record while oracle/source objects are available."""
+    """Derive one in-memory unpublished record at the oracle boundary.
+
+    The returned record is not a formally authenticated publication.  The
+    sibling evaluation-collection publisher must later bind it to an
+    authenticated risk shard and verify its sample identity and labels.
+    """
 
     from src.datasets.risk_dataset import RiskBuildInput as RiskBuildInputType
 
@@ -578,6 +620,7 @@ def derive_production_evaluation_record(
         raise TypeError("source must be a RiskBuildInput")
     if not isinstance(rendered, RenderedObservation):
         raise TypeError("rendered must be a RenderedObservation")
+    _join_ground_truth(sample, ground_truth)
     identity = _joined_identity(sample, source)
     grouping = _derive_grouping_fields(
         sample=sample,
@@ -595,11 +638,11 @@ def derive_production_evaluation_record(
             RISK_EVALUATION_RECORD_LAYOUT_VERSION
         ),
         **identity,
-        "collision_label": sample.collision_label,
-        "risk_severity": sample.risk_severity,
-        "min_clearance": sample.min_clearance,
-        "near_miss": sample.near_miss,
-        "first_collision_time": sample.first_collision_time,
+        "collision_label": ground_truth.collision_label,
+        "risk_severity": ground_truth.risk_severity,
+        "min_clearance": ground_truth.min_clearance,
+        "near_miss": ground_truth.near_miss,
+        "first_collision_time": ground_truth.first_collision_time,
         "blind_type": _require_nonempty_string(
             source.provenance.get("blind_spot_type"), name="blind_type"
         ),

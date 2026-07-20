@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import io
 import json
 from pathlib import Path
-from typing import Mapping
+import pickle
+from typing import BinaryIO, Mapping
 
 import torch
 from torch import nn
@@ -54,6 +56,18 @@ RISK_PRODUCTION_PROVENANCE_KEYS = frozenset(
         "risk_dataset_manifest_digest",
         "dynamic_objects_config_digest",
         "target_type_policy_digest",
+        "training_stage",
+        "training_subset_digest_sha256",
+        "validation_risk_dataset_manifest_digest",
+        "risk_dataset_family_digest",
+        "global_cross_split_leakage",
+        "code_commit",
+        "runtime_environment_digest_sha256",
+        "training_data_scale",
+        "scientific_claim_eligible",
+        "selected_sample_count",
+        "consumed_sample_count",
+        "consumed_sample_ids_digest_sha256",
     }
 )
 RISK_CHECKPOINT_TOP_LEVEL_KEYS = frozenset(
@@ -236,12 +250,23 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
         provenance["seed"], bool
     ):
         raise RiskDataContractError("checkpoint seed must be an integer")
+    nullable_fields = (
+        {
+            "validation_risk_dataset_manifest_digest",
+            "risk_dataset_family_digest",
+        }
+        if mode == "production"
+        else set()
+    )
     string_fields = expected_keys - {
         "schema_version",
         "channel_spec",
         "model_variant",
         "seed",
-    }
+        "scientific_claim_eligible",
+        "selected_sample_count",
+        "consumed_sample_count",
+    } - nullable_fields
     for field in string_fields:
         value = provenance[field]
         if not isinstance(value, str) or not value:
@@ -265,6 +290,139 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
             raise RiskDataContractError(
                 "toy training and validation dataset manifest digests must be distinct"
             )
+        return
+
+    digest_contract = {
+        "g1_split_manifest_digest": (32, "BLAKE2b-128"),
+        "target_type_policy_digest": (32, "BLAKE2b-128"),
+        "risk_dataset_manifest_digest": (64, "SHA-256"),
+        "dynamic_objects_config_digest": (64, "SHA-256"),
+        "config_digest": (64, "SHA-256"),
+        "training_subset_digest_sha256": (64, "SHA-256"),
+        "runtime_environment_digest_sha256": (64, "SHA-256"),
+        "consumed_sample_ids_digest_sha256": (64, "SHA-256"),
+    }
+    for field, (length, algorithm) in digest_contract.items():
+        value = provenance[field]
+        if len(value) != length or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise RiskDataContractError(
+                f"checkpoint provenance {field} must be a lowercase {algorithm} digest"
+            )
+    code_commit = provenance["code_commit"]
+    if (
+        not isinstance(code_commit, str)
+        or len(code_commit) != 40
+        or any(character not in "0123456789abcdef" for character in code_commit)
+    ):
+        raise RiskDataContractError(
+            "checkpoint provenance code_commit must be a lowercase 40-character commit"
+        )
+    for field in ("selected_sample_count", "consumed_sample_count"):
+        value = provenance[field]
+        if type(value) is not int or value < 1:
+            raise RiskDataContractError(
+                f"checkpoint provenance {field} must be a positive integer"
+            )
+    if provenance["consumed_sample_count"] > provenance["selected_sample_count"]:
+        raise RiskDataContractError(
+            "checkpoint provenance consumed_sample_count exceeds selected_sample_count"
+        )
+    data_scale = provenance["training_data_scale"]
+    eligibility = provenance["scientific_claim_eligible"]
+    if data_scale not in {
+        "one_shard_smoke",
+        "fixture_standin",
+        "real_1k",
+        "formal_50k",
+    }:
+        raise RiskDataContractError(
+            "checkpoint provenance training_data_scale mismatch"
+        )
+    if type(eligibility) is not bool:
+        raise RiskDataContractError(
+            "checkpoint provenance scientific_claim_eligible must be boolean"
+        )
+    if (data_scale in {"one_shard_smoke", "fixture_standin"}) != (
+        eligibility is False
+    ):
+        raise RiskDataContractError(
+            "checkpoint provenance scientific claim eligibility/scale mismatch"
+        )
+    if data_scale == "real_1k" and (
+        provenance["selected_sample_count"] != 1000
+        or provenance["consumed_sample_count"] != 1000
+    ):
+        raise RiskDataContractError(
+            "real_1k checkpoint provenance requires exactly 1000 consumed samples"
+        )
+    training_stage = provenance["training_stage"]
+    if training_stage not in {
+        "one_shard_smoke",
+        "real_1k_overfit",
+        "formal_50k",
+    }:
+        raise RiskDataContractError("checkpoint provenance training_stage mismatch")
+    if training_stage == "one_shard_smoke" and data_scale != "one_shard_smoke":
+        raise RiskDataContractError(
+            "one_shard_smoke checkpoint provenance scale mismatch"
+        )
+    if training_stage == "real_1k_overfit":
+        if data_scale not in {"fixture_standin", "real_1k"}:
+            raise RiskDataContractError(
+                "real_1k_overfit checkpoint provenance scale mismatch"
+            )
+        if provenance["consumed_sample_count"] != provenance["selected_sample_count"]:
+            raise RiskDataContractError(
+                "real_1k_overfit checkpoint must consume all selected samples"
+            )
+        if data_scale == "fixture_standin" and provenance[
+            "selected_sample_count"
+        ] >= 1000:
+            raise RiskDataContractError(
+                "fixture_standin checkpoint must contain fewer than 1000 samples"
+            )
+    if training_stage == "formal_50k" and data_scale != "formal_50k":
+        raise RiskDataContractError("formal_50k checkpoint provenance scale mismatch")
+    if provenance["global_cross_split_leakage"] not in {
+        "NOT_PROVEN",
+        "PROVEN",
+    }:
+        raise RiskDataContractError(
+            "checkpoint provenance global_cross_split_leakage must be NOT_PROVEN or PROVEN"
+        )
+    validation_digest = provenance["validation_risk_dataset_manifest_digest"]
+    family_digest = provenance["risk_dataset_family_digest"]
+    for field, value in (
+        ("validation_risk_dataset_manifest_digest", validation_digest),
+        ("risk_dataset_family_digest", family_digest),
+    ):
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise RiskDataContractError(
+                f"checkpoint provenance {field} must be None or a lowercase SHA-256 digest"
+            )
+    if training_stage == "formal_50k":
+        if validation_digest is None or family_digest is None:
+            raise RiskDataContractError(
+                "formal_50k checkpoint requires validation and dataset-family digests"
+            )
+        if provenance["global_cross_split_leakage"] != "PROVEN":
+            raise RiskDataContractError(
+                "formal_50k checkpoint requires global_cross_split_leakage=PROVEN"
+            )
+    elif (
+        validation_digest is not None
+        or family_digest is not None
+        or provenance["global_cross_split_leakage"] != "NOT_PROVEN"
+    ):
+        raise RiskDataContractError(
+            "smoke/1k checkpoint provenance must use no validation/family digest and NOT_PROVEN"
+        )
 
 
 def _model_state_digest(state_dict: Mapping[str, torch.Tensor]) -> str:
@@ -393,16 +551,31 @@ def save_risk_checkpoint(
 
 
 def load_risk_checkpoint(
-    path: str | Path,
+    path: str | Path | bytes | bytearray | memoryview | BinaryIO,
     *,
     expected_mode: str,
     expected_provenance: Mapping[str, object] | None = None,
 ) -> tuple[RiskModel, dict[str, object]]:
     """Load a checkpoint only after version/mode/provenance validation."""
 
+    source: object
+    if isinstance(path, (bytes, bytearray, memoryview)):
+        source = io.BytesIO(bytes(path))
+    elif isinstance(path, (str, Path)):
+        source = Path(path)
+    elif hasattr(path, "read") and hasattr(path, "seek"):
+        source = path
+        try:
+            path.seek(0)
+        except (OSError, ValueError) as error:
+            raise RiskDataContractError(
+                f"unable to seek risk checkpoint snapshot: {error}"
+            ) from error
+    else:
+        raise TypeError("checkpoint source must be a path, bytes, or seekable file")
     try:
-        payload = torch.load(Path(path), map_location="cpu")
-    except (OSError, RuntimeError) as error:
+        payload = torch.load(source, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, EOFError, pickle.UnpicklingError) as error:
         raise RiskDataContractError(f"unable to load risk checkpoint: {error}") from error
     if not isinstance(payload, dict):
         raise RiskDataContractError("risk checkpoint payload must be a mapping")
@@ -479,7 +652,7 @@ def load_risk_checkpoint(
     return model, payload
 
 
-def _batch_loss(
+def compute_risk_batch_loss(
     model: RiskModel,
     batch: object,
     *,
@@ -493,6 +666,146 @@ def _batch_loss(
         lambda_collision=lambda_collision,
     )
     return output, losses
+
+
+def production_trajectory_query_sensitivity(
+    model: RiskModel,
+    batch: object,
+) -> dict[str, object]:
+    """Measure label-free conditioning on authenticated production queries.
+
+    A complete trajectory query consists of its spatial trajectory channels and
+    matching ``(v, omega)`` robot state, so both components are always permuted
+    together.  Targets are deliberately never inspected.
+    """
+
+    if getattr(batch, "split", None) != "train":
+        raise RiskDataContractError(
+            "production trajectory sensitivity requires a train batch"
+        )
+    model_inputs = getattr(batch, "model_inputs", None)
+    if not isinstance(model_inputs, Mapping):
+        raise RiskDataContractError(
+            "production trajectory sensitivity requires model_inputs"
+        )
+    provenance = getattr(batch, "provenance", None)
+    if not isinstance(provenance, Mapping) or provenance.get("mode") != "production":
+        raise RiskDataContractError(
+            "production trajectory sensitivity requires authenticated production provenance"
+        )
+    sample_ids = tuple(getattr(batch, "sample_ids", ()))
+    trajectory = model_inputs.get("trajectory_channels")
+    robot_state = model_inputs.get("robot_state")
+    if not isinstance(trajectory, torch.Tensor) or not isinstance(
+        robot_state, torch.Tensor
+    ):
+        raise RiskDataContractError(
+            "production trajectory sensitivity requires tensor query components"
+        )
+    sample_count = len(sample_ids)
+    if (
+        sample_count < 2
+        or trajectory.shape[0] != sample_count
+        or robot_state.shape[0] != sample_count
+    ):
+        raise RiskDataContractError(
+            "production trajectory sensitivity requires at least two aligned rows"
+        )
+
+    indices = torch.arange(sample_count, device=trajectory.device)
+    best_permutation: torch.Tensor | None = None
+    best_changed_count = -1
+    best_shift = -1
+    for shift in range(1, sample_count):
+        permutation = torch.roll(indices, shifts=-shift)
+        trajectory_changed = torch.any(
+            (trajectory[permutation] != trajectory).reshape(sample_count, -1), dim=1
+        )
+        robot_state_changed = torch.any(
+            (robot_state[permutation] != robot_state).reshape(sample_count, -1), dim=1
+        )
+        changed_count = int(
+            torch.count_nonzero(trajectory_changed | robot_state_changed).item()
+        )
+        if changed_count > best_changed_count:
+            best_permutation = permutation
+            best_changed_count = changed_count
+            best_shift = shift
+    if best_permutation is None or best_changed_count < 1:
+        raise RiskDataContractError(
+            "production rows do not provide a changed legal trajectory query"
+        )
+
+    counterfactual_inputs = {
+        **model_inputs,
+        "trajectory_channels": trajectory[best_permutation],
+        "robot_state": robot_state[best_permutation],
+    }
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        reference = model(model_inputs)
+        counterfactual = model(counterfactual_inputs)
+    if was_training:
+        model.train()
+    quantile_delta = float(
+        torch.mean(torch.abs(reference["quantiles"] - counterfactual["quantiles"]))
+        .detach()
+        .cpu()
+        .item()
+    )
+    logit_delta = float(
+        torch.mean(
+            torch.abs(
+                reference["collision_logits"] - counterfactual["collision_logits"]
+            )
+        )
+        .detach()
+        .cpu()
+        .item()
+    )
+    probability_delta = float(
+        torch.mean(
+            torch.abs(reference["p_collision"] - counterfactual["p_collision"])
+        )
+        .detach()
+        .cpu()
+        .item()
+    )
+    combined_delta = quantile_delta + logit_delta + probability_delta
+    if not all(
+        torch.isfinite(torch.tensor(value)).item()
+        for value in (
+            quantile_delta,
+            logit_delta,
+            probability_delta,
+            combined_delta,
+        )
+    ):
+        raise RiskDataContractError(
+            "production trajectory sensitivity contains NaN/Inf"
+        )
+    return {
+        "protocol": "deterministic_permutation_of_authenticated_production_query",
+        "diagnostic_kind": "legal_counterfactual_query_conditioning_sensitivity",
+        "split": "train",
+        "sample_count": sample_count,
+        "source_dataset_manifest_digest": provenance.get(
+            "risk_dataset_manifest_digest"
+        ),
+        "query_components_permuted": ["trajectory_channels", "robot_state"],
+        "permutation_shift": best_shift,
+        "changed_query_count": best_changed_count,
+        "unchanged_query_count": sample_count - best_changed_count,
+        "labels_accessed": False,
+        "used_for_training_or_selection": False,
+        "quantile_mean_absolute_delta": quantile_delta,
+        "collision_logit_mean_absolute_delta": logit_delta,
+        "collision_probability_mean_absolute_delta": probability_delta,
+        "combined_mean_absolute_delta": combined_delta,
+        "materiality_threshold": TRAJECTORY_SENSITIVITY_EPSILON,
+        "materially_sensitive": combined_delta > TRAJECTORY_SENSITIVITY_EPSILON,
+    }
 
 
 def trajectory_ablation_sensitivity(
@@ -701,10 +1014,10 @@ def train_toy_risk_model(
 
     model.eval()
     with torch.no_grad():
-        _, initial_losses = _batch_loss(
+        _, initial_losses = compute_risk_batch_loss(
             model, train_batch, lambda_collision=lambda_collision
         )
-        _, initial_validation_losses = _batch_loss(
+        _, initial_validation_losses = compute_risk_batch_loss(
             model, validation_batch, lambda_collision=lambda_collision
         )
     initial_loss = float(initial_losses["total"].item())
@@ -716,17 +1029,17 @@ def train_toy_risk_model(
     for step in range(1, optimization_steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        _, losses = _batch_loss(
+        _, losses = compute_risk_batch_loss(
             model, train_batch, lambda_collision=lambda_collision
         )
         losses["total"].backward()
         optimizer.step()
         model.eval()
         with torch.no_grad():
-            _, current_losses = _batch_loss(
+            _, current_losses = compute_risk_batch_loss(
                 model, train_batch, lambda_collision=lambda_collision
             )
-            _, current_validation_losses = _batch_loss(
+            _, current_validation_losses = compute_risk_batch_loss(
                 model, validation_batch, lambda_collision=lambda_collision
             )
         history.append(float(current_losses["total"].item()))
@@ -740,10 +1053,10 @@ def train_toy_risk_model(
     model.load_state_dict(best_state, strict=True)
     model.eval()
     with torch.no_grad():
-        train_output, final_losses = _batch_loss(
+        train_output, final_losses = compute_risk_batch_loss(
             model, train_batch, lambda_collision=lambda_collision
         )
-        validation_output, validation_losses = _batch_loss(
+        validation_output, validation_losses = compute_risk_batch_loss(
             model, validation_batch, lambda_collision=lambda_collision
         )
     crossings = (
@@ -811,8 +1124,10 @@ __all__ = [
     "RISK_MODEL_VARIANTS",
     "TRAJECTORY_SENSITIVITY_EPSILON",
     "RiskModel",
+    "compute_risk_batch_loss",
     "load_risk_checkpoint",
     "noncrossing_quantiles",
+    "production_trajectory_query_sensitivity",
     "save_risk_checkpoint",
     "trajectory_ablation_sensitivity",
     "train_toy_risk_model",

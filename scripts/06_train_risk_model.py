@@ -30,6 +30,7 @@ from src.datasets.risk_dataloader import (  # noqa: E402
     RiskDataContractError,
     collate_risk_samples,
     load_production_risk_dataset,
+    select_production_risk_subset,
 )
 from src.datasets.toy_risk_learning import (  # noqa: E402
     assert_toy_split_isolation,
@@ -42,6 +43,10 @@ from src.models.risk_model import (  # noqa: E402
     load_risk_checkpoint,
     save_risk_checkpoint,
     train_toy_risk_model,
+)
+from src.training.risk_trainer import (  # noqa: E402
+    ProductionRiskTrainingConfig,
+    train_production_risk_model,
 )
 
 ARTIFACT_LAYOUT_VERSION = "sop09_toy_risk_training_v2"
@@ -59,6 +64,23 @@ _CONFIG_KEYS = {
     "learning_rate",
     "lambda_collision",
     "lambda_occupancy_aux",
+    "optimizer",
+}
+_PRODUCTION_CONFIG_KEYS = {
+    "mode",
+    "stage",
+    "variant",
+    "seed",
+    "device",
+    "hidden_channels",
+    "max_samples",
+    "batch_size",
+    "epochs",
+    "gradient_accumulation_steps",
+    "learning_rate",
+    "weight_decay",
+    "lambda_collision",
+    "checkpoint_interval_steps",
     "optimizer",
 }
 
@@ -95,19 +117,24 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _load_config(path: Path) -> dict[str, object]:
+def _load_yaml_mapping(path: Path) -> dict[str, object]:
     with path.open("r", encoding="utf-8") as handle:
         value = yaml.safe_load(handle)
     if not isinstance(value, dict):
         raise RiskDataContractError("risk model config must be a mapping")
+    return dict(value)
+
+
+def _load_config(path: Path) -> dict[str, object]:
+    value = _load_yaml_mapping(path)
     unknown = sorted(set(value) - _CONFIG_KEYS)
     missing = sorted(_CONFIG_KEYS - set(value))
     if unknown:
         raise RiskDataContractError(f"unknown risk model config keys: {unknown}")
     if missing:
         raise RiskDataContractError(f"missing risk model config keys: {missing}")
-    if value["mode"] not in {"toy", "production"}:
-        raise RiskDataContractError("risk model config mode must be toy or production")
+    if value["mode"] != "toy":
+        raise RiskDataContractError("toy risk model config mode must be toy")
     if value["variants"] != ["r0", "r1"]:
         raise RiskDataContractError("toy comparison variants must be exactly [r0, r1]")
     if value["optimizer"] != "AdamW":
@@ -134,7 +161,81 @@ def _load_config(path: Path) -> dict[str, object]:
     return dict(value)
 
 
+def _load_production_config(path: Path) -> dict[str, object]:
+    value = _load_yaml_mapping(path)
+    unknown = sorted(set(value) - _PRODUCTION_CONFIG_KEYS)
+    missing = sorted(_PRODUCTION_CONFIG_KEYS - set(value))
+    if unknown:
+        raise RiskDataContractError(
+            f"unknown production risk model config keys: {unknown}"
+        )
+    if missing:
+        raise RiskDataContractError(
+            f"missing production risk model config keys: {missing}"
+        )
+    if value["mode"] != "production":
+        raise RiskDataContractError("production risk model config mode must be production")
+    if value["optimizer"] != "AdamW":
+        raise RiskDataContractError("SOP09 production optimizer must be AdamW")
+    max_samples = value["max_samples"]
+    if type(max_samples) is not int or max_samples < 1:
+        raise RiskDataContractError("production max_samples must be a positive integer")
+    ProductionRiskTrainingConfig(
+        **{
+            key: value[key]
+            for key in (
+                "stage",
+                "variant",
+                "seed",
+                "device",
+                "hidden_channels",
+                "batch_size",
+                "epochs",
+                "gradient_accumulation_steps",
+                "learning_rate",
+                "weight_decay",
+                "lambda_collision",
+                "checkpoint_interval_steps",
+            )
+        }
+    )
+    return dict(value)
+
+
 def _effective_config(args: argparse.Namespace) -> dict[str, object]:
+    raw = _load_yaml_mapping(args.config)
+    if raw.get("mode") == "production":
+        config = _load_production_config(args.config)
+        for argument, field in (
+            (args.variant, "variant"),
+            (args.stage, "stage"),
+            (args.max_samples, "max_samples"),
+            (args.batch_size, "batch_size"),
+            (args.device, "device"),
+            (args.hidden_channels, "hidden_channels"),
+        ):
+            if argument is not None:
+                config[field] = argument
+        ProductionRiskTrainingConfig(
+            **{
+                key: config[key]
+                for key in (
+                    "stage",
+                    "variant",
+                    "seed",
+                    "device",
+                    "hidden_channels",
+                    "batch_size",
+                    "epochs",
+                    "gradient_accumulation_steps",
+                    "learning_rate",
+                    "weight_decay",
+                    "lambda_collision",
+                    "checkpoint_interval_steps",
+                )
+            }
+        )
+        return config
     config = _load_config(args.config)
     for argument, field in (
         (args.optimization_steps, "optimization_steps"),
@@ -170,8 +271,41 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-count", type=_positive_int)
     parser.add_argument("--grid-size", type=_positive_int)
     parser.add_argument("--hidden-channels", type=_positive_int)
-    parser.add_argument("--production-data-root", type=Path)
+    parser.add_argument("--train-seal-root", type=Path)
+    parser.add_argument("--train-collection-root", type=Path)
+    parser.add_argument("--validation-seal-root", type=Path)
+    parser.add_argument("--validation-collection-root", type=Path)
+    parser.add_argument("--variant", choices=("r0", "r1"))
+    parser.add_argument(
+        "--stage",
+        choices=("one_shard_smoke", "real_1k_overfit", "formal_50k"),
+    )
+    parser.add_argument("--max-samples", type=_positive_int)
+    parser.add_argument("--batch-size", type=_positive_int)
+    parser.add_argument("--device")
+    parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--resume-publication-instance-digest")
+    parser.add_argument("--cross-split-audit", type=Path)
     return parser
+
+
+def _load_cross_split_audit(path: Path | None) -> Mapping[str, object] | None:
+    if path is None:
+        return None
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite constant: {token}")
+            ),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise RiskDataContractError(
+            f"unable to load finite cross-split audit JSON: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise RiskDataContractError("cross-split audit must be a JSON mapping")
+    return value
 
 
 def main() -> int:
@@ -182,11 +316,79 @@ def main() -> int:
     try:
         config = _effective_config(args)
         if config["mode"] == "production":
-            if args.production_data_root is None:
+            if args.train_seal_root is None or args.train_collection_root is None:
                 raise RiskDataContractError(
-                    "production mode requires --production-data-root with dataset-level v2"
+                    "production mode requires --train-seal-root and --train-collection-root"
                 )
-            load_production_risk_dataset(args.production_data_root)
+            validation_paths = (
+                args.validation_seal_root,
+                args.validation_collection_root,
+            )
+            if (validation_paths[0] is None) != (validation_paths[1] is None):
+                raise RiskDataContractError(
+                    "validation seal and collection roots must be supplied together"
+                )
+            train_dataset = load_production_risk_dataset(
+                args.train_seal_root,
+                collection_root=args.train_collection_root,
+                expected_split="train",
+            )
+            validation_dataset = (
+                None
+                if validation_paths[0] is None
+                else load_production_risk_dataset(
+                    validation_paths[0],
+                    collection_root=validation_paths[1],
+                    expected_split="val",
+                )
+            )
+            subset = select_production_risk_subset(
+                train_dataset,
+                max_samples=int(config["max_samples"]),
+                seed=int(config["seed"]),
+            )
+            training_config = ProductionRiskTrainingConfig(
+                **{
+                    key: config[key]
+                    for key in (
+                        "stage",
+                        "variant",
+                        "seed",
+                        "device",
+                        "hidden_channels",
+                        "batch_size",
+                        "epochs",
+                        "gradient_accumulation_steps",
+                        "learning_rate",
+                        "weight_decay",
+                        "lambda_collision",
+                        "checkpoint_interval_steps",
+                    )
+                }
+            )
+            result = train_production_risk_model(
+                train_dataset=train_dataset,
+                train_subset=subset,
+                config=training_config,
+                output_dir=args.output_dir,
+                code_commit=args.code_commit,
+                validation_dataset=validation_dataset,
+                resume_from=args.resume_from,
+                resume_expected_publication_instance_digest_sha256=(
+                    args.resume_publication_instance_digest
+                ),
+                cross_split_audit=_load_cross_split_audit(args.cross_split_audit),
+            )
+            print(
+                json.dumps(
+                    {
+                        "output_dir": str(result.output_dir),
+                        "semantic_digest_sha256": result.semantic_digest_sha256,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
     except (OSError, ValueError, RiskDataContractError) as error:
         parser.error(str(error))
 

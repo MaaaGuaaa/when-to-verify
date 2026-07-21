@@ -18,7 +18,7 @@ import re
 import shutil
 import stat
 import tempfile
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from src.contracts import (
     HISTORY_CHANNELS,
@@ -38,6 +38,7 @@ from src.datasets.shard_writer import (
 from src.datasets.sidecar_writer import (
     RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION,
     RISK_SIDECAR_SHARD_LAYOUT_VERSION,
+    LoadedRiskSidecarShard,
     load_risk_sidecar_pair_completion_marker,
     load_risk_sidecar_shard,
     risk_sidecar_pair_completion_marker_path,
@@ -262,6 +263,12 @@ class RiskShardDescriptor:
     summary_sha256: str
 
 
+_AuthenticatedRiskShardConsumer = Callable[
+    [int, GridSpec, RiskShardDescriptor, LoadedRiskShard],
+    None,
+]
+
+
 @dataclass(frozen=True)
 class LoadedRiskDataset:
     """A fully validated dataset seal and its immutable shard collection."""
@@ -310,6 +317,25 @@ class SidecarShardDescriptor:
     source_risk_shard_semantic_digest: str
     pair_marker_digest_sha256: str
     ordered_sample_ids_digest_sha256: str
+
+
+@dataclass(frozen=True)
+class _AuthenticatedRiskSidecarPair:
+    """One sidecar shard authenticated against an already decoded risk shard."""
+
+    total_sample_count: int
+    grid: GridSpec
+    query_geometry: Mapping[str, object]
+    risk_descriptor: RiskShardDescriptor
+    risk_shard: LoadedRiskShard
+    sidecar_descriptor: SidecarShardDescriptor
+    sidecar_shard: LoadedRiskSidecarShard
+
+
+_AuthenticatedRiskSidecarPairConsumer = Callable[
+    [_AuthenticatedRiskSidecarPair],
+    None,
+]
 
 
 @dataclass(frozen=True)
@@ -1358,18 +1384,11 @@ def _validate_sidecar_collection_section(
     return descriptors, query_geometry, declared_digest
 
 
-def _formally_validate_sidecar_collection(
+def _validate_sidecar_collection_root(
     sidecar_root: Path,
     *,
-    collection_root: Path,
     risk_descriptors: tuple[RiskShardDescriptor, ...],
-    grid: GridSpec,
-    expected_split: str,
-    base_risk_dataset_manifest_digest: str,
-    base_config_digest: str,
-    query_geometry: Mapping[str, object],
-    expected_section: Mapping[str, object] | None = None,
-) -> LoadedRiskSidecarCollection:
+) -> None:
     _require_directory(sidecar_root, label="occupancy sidecar collection root")
     expected_names = {
         name
@@ -1393,6 +1412,91 @@ def _formally_validate_sidecar_collection(
     if any(entry.is_symlink() for entry in entries):
         raise RiskDataContractError("occupancy sidecar collection forbids symlinks")
 
+
+def _validate_authenticated_sidecar_pair(
+    sidecar_root: Path,
+    *,
+    collection_root: Path,
+    risk_descriptor: RiskShardDescriptor,
+    loaded_risk: LoadedRiskShard,
+    grid: GridSpec,
+    expected_split: str,
+) -> tuple[SidecarShardDescriptor, LoadedRiskSidecarShard]:
+    if not isinstance(loaded_risk, LoadedRiskShard):
+        raise RiskDataContractError("occupancy pair requires a decoded risk shard")
+    if loaded_risk.semantic_digest != risk_descriptor.semantic_digest:
+        raise RiskDataContractError("occupancy join risk shard digest mismatch")
+    sample_ids = tuple(sample.sample_id for sample in loaded_risk.samples)
+    risk_root = collection_root / risk_descriptor.relative_root
+    sidecar_shard_root = sidecar_root / risk_descriptor.relative_root
+    marker_path = risk_sidecar_pair_completion_marker_path(sidecar_shard_root)
+    try:
+        loaded_sidecar = load_risk_sidecar_shard(
+            sidecar_shard_root,
+            grid=grid,
+            expected_sample_ids=sample_ids,
+            expected_source_risk_shard_semantic_digest=(
+                risk_descriptor.semantic_digest
+            ),
+        )
+        marker = load_risk_sidecar_pair_completion_marker(
+            marker_path,
+            expected_risk_root=risk_root,
+            expected_sidecar_root=sidecar_shard_root,
+            expected_split=expected_split,
+            expected_shard_index=risk_descriptor.shard_index,
+            expected_sample_ids=sample_ids,
+            expected_risk_shard_semantic_digest=risk_descriptor.semantic_digest,
+            expected_sidecar_shard_semantic_digest=(
+                loaded_sidecar.semantic_digest
+            ),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise RiskDataContractError(
+            "formal sidecar/marker load failed for "
+            f"{risk_descriptor.relative_root}: {exc}"
+        ) from exc
+    if (
+        loaded_sidecar.split != expected_split
+        or loaded_sidecar.shard_index != risk_descriptor.shard_index
+        or loaded_sidecar.sample_ids != sample_ids
+    ):
+        raise RiskDataContractError("occupancy sidecar/risk ordered join mismatch")
+    return (
+        SidecarShardDescriptor(
+            shard_index=risk_descriptor.shard_index,
+            relative_root=risk_descriptor.relative_root,
+            marker_relative_path=marker_path.name,
+            sample_count=len(sample_ids),
+            sidecar_semantic_digest=loaded_sidecar.semantic_digest,
+            source_risk_shard_semantic_digest=(
+                loaded_sidecar.source_risk_shard_semantic_digest
+            ),
+            pair_marker_digest_sha256=marker.marker_digest_sha256,
+            ordered_sample_ids_digest_sha256=(
+                marker.ordered_sample_ids_digest_sha256
+            ),
+        ),
+        loaded_sidecar,
+    )
+
+
+def _formally_validate_sidecar_collection(
+    sidecar_root: Path,
+    *,
+    collection_root: Path,
+    risk_descriptors: tuple[RiskShardDescriptor, ...],
+    grid: GridSpec,
+    expected_split: str,
+    base_risk_dataset_manifest_digest: str,
+    base_config_digest: str,
+    query_geometry: Mapping[str, object],
+    expected_section: Mapping[str, object] | None = None,
+) -> LoadedRiskSidecarCollection:
+    _validate_sidecar_collection_root(
+        sidecar_root,
+        risk_descriptors=risk_descriptors,
+    )
     sidecar_descriptors: list[SidecarShardDescriptor] = []
     for risk_descriptor in risk_descriptors:
         risk_root = collection_root / risk_descriptor.relative_root
@@ -1406,56 +1510,15 @@ def _formally_validate_sidecar_collection(
             ) from exc
         if loaded_risk.semantic_digest != risk_descriptor.semantic_digest:
             raise RiskDataContractError("occupancy join risk shard digest mismatch")
-        sample_ids = tuple(sample.sample_id for sample in loaded_risk.samples)
-        sidecar_shard_root = sidecar_root / risk_descriptor.relative_root
-        marker_path = risk_sidecar_pair_completion_marker_path(sidecar_shard_root)
-        try:
-            loaded_sidecar = load_risk_sidecar_shard(
-                sidecar_shard_root,
-                grid=grid,
-                expected_sample_ids=sample_ids,
-                expected_source_risk_shard_semantic_digest=(
-                    risk_descriptor.semantic_digest
-                ),
-            )
-            marker = load_risk_sidecar_pair_completion_marker(
-                marker_path,
-                expected_risk_root=risk_root,
-                expected_sidecar_root=sidecar_shard_root,
-                expected_split=expected_split,
-                expected_shard_index=risk_descriptor.shard_index,
-                expected_sample_ids=sample_ids,
-                expected_risk_shard_semantic_digest=risk_descriptor.semantic_digest,
-                expected_sidecar_shard_semantic_digest=(
-                    loaded_sidecar.semantic_digest
-                ),
-            )
-        except (OSError, TypeError, ValueError) as exc:
-            raise RiskDataContractError(
-                f"formal sidecar/marker load failed for {risk_descriptor.relative_root}: {exc}"
-            ) from exc
-        if (
-            loaded_sidecar.split != expected_split
-            or loaded_sidecar.shard_index != risk_descriptor.shard_index
-            or loaded_sidecar.sample_ids != sample_ids
-        ):
-            raise RiskDataContractError("occupancy sidecar/risk ordered join mismatch")
-        sidecar_descriptors.append(
-            SidecarShardDescriptor(
-                shard_index=risk_descriptor.shard_index,
-                relative_root=risk_descriptor.relative_root,
-                marker_relative_path=marker_path.name,
-                sample_count=len(sample_ids),
-                sidecar_semantic_digest=loaded_sidecar.semantic_digest,
-                source_risk_shard_semantic_digest=(
-                    loaded_sidecar.source_risk_shard_semantic_digest
-                ),
-                pair_marker_digest_sha256=marker.marker_digest_sha256,
-                ordered_sample_ids_digest_sha256=(
-                    marker.ordered_sample_ids_digest_sha256
-                ),
-            )
+        sidecar_descriptor, _ = _validate_authenticated_sidecar_pair(
+            sidecar_root,
+            collection_root=collection_root,
+            risk_descriptor=risk_descriptor,
+            loaded_risk=loaded_risk,
+            grid=grid,
+            expected_split=expected_split,
         )
+        sidecar_descriptors.append(sidecar_descriptor)
 
     section: dict[str, object] = {
         "collection_layout_version": RISK_SIDECAR_COLLECTION_LAYOUT_VERSION,
@@ -1566,6 +1629,7 @@ def _formally_validate_collection(
     expected_split: str,
     handoff: Mapping[str, object],
     authenticated_metadata_rows: list[dict[str, object]] | None = None,
+    authenticated_shard_consumer: _AuthenticatedRiskShardConsumer | None = None,
 ) -> tuple[tuple[RiskShardDescriptor, ...], str]:
     shard_roots = _discover_shards(collection_root)
     handoff_values = handoff.get("shards")
@@ -1638,6 +1702,13 @@ def _formally_validate_collection(
         if authenticated_metadata_rows is not None:
             authenticated_metadata_rows.extend(
                 dict(row) for row in loaded.manifest
+            )
+        if authenticated_shard_consumer is not None:
+            authenticated_shard_consumer(
+                int(handoff["sample_count"]),
+                grid,
+                descriptor,
+                loaded,
             )
         descriptors.append(descriptor)
 
@@ -1987,6 +2058,10 @@ def _load_risk_dataset_seal_with_authenticated_rows(
     expected_manifest_digest: str | None = None,
     sidecar_root: str | Path | None = None,
     retain_authenticated_metadata_rows: bool,
+    authenticated_shard_consumer: _AuthenticatedRiskShardConsumer | None = None,
+    authenticated_sidecar_pair_consumer: (
+        _AuthenticatedRiskSidecarPairConsumer | None
+    ) = None,
 ) -> tuple[LoadedRiskDataset, tuple[dict[str, object], ...]]:
     """Strictly load one dataset while retaining its authenticated metadata rows."""
 
@@ -2070,24 +2145,10 @@ def _load_risk_dataset_seal_with_authenticated_rows(
         or handoff.get("shard_count") != shard_count
     ):
         raise RiskDataContractError("dataset manifest source collection identity mismatch")
-    authenticated_metadata_rows: list[dict[str, object]] | None = (
-        [] if retain_authenticated_metadata_rows else None
-    )
-    loaded_descriptors, loaded_target_digest = _formally_validate_collection(
-        collection_path,
-        grid=grid,
-        expected_split=split,
-        handoff=handoff,
-        authenticated_metadata_rows=authenticated_metadata_rows,
-    )
-    if loaded_descriptors != descriptors:
-        raise RiskDataContractError("dataset shard descriptors differ from source handoff")
-    if loaded_target_digest != target_digest:
-        raise RiskDataContractError(
-            "target_type_policy_digest differs from formally loaded shard provenance"
-        )
-
     sidecar_section = manifest.get("occupancy_sidecars")
+    sidecar_descriptors: tuple[SidecarShardDescriptor, ...] = ()
+    query_geometry: dict[str, object] | None = None
+    sidecar_path: Path | None = None
     if sidecar_section is not None:
         sidecar_descriptors, query_geometry, _ = (
             _validate_sidecar_collection_section(
@@ -2104,20 +2165,108 @@ def _load_risk_dataset_seal_with_authenticated_rows(
                 "occupancy sidecar collection differs from base risk shard counts"
             )
         if sidecar_root is not None:
-            _formally_validate_sidecar_collection(
-                _absolute_without_symlink_resolution(Path(sidecar_root)),
-                collection_root=collection_path,
-                risk_descriptors=descriptors,
-                grid=grid,
-                expected_split=split,
-                base_risk_dataset_manifest_digest=dataset_digest,
-                base_config_digest=str(sidecar_section["base_config_digest"]),
-                query_geometry=query_geometry,
-                expected_section=sidecar_section,
-            )
+            sidecar_path = _absolute_without_symlink_resolution(Path(sidecar_root))
     elif sidecar_root is not None:
         raise RiskDataContractError(
             "dataset seal does not contain an occupancy_sidecars publication"
+        )
+    if authenticated_sidecar_pair_consumer is not None and sidecar_path is None:
+        raise RiskDataContractError(
+            "authenticated sidecar pair consumer requires sidecar_root"
+        )
+
+    authenticated_metadata_rows: list[dict[str, object]] | None = (
+        [] if retain_authenticated_metadata_rows else None
+    )
+    integrated_sidecar_descriptors: list[SidecarShardDescriptor] = []
+    formal_shard_consumer = authenticated_shard_consumer
+    if authenticated_sidecar_pair_consumer is not None:
+        assert sidecar_path is not None
+        assert query_geometry is not None
+        _validate_sidecar_collection_root(
+            sidecar_path,
+            risk_descriptors=descriptors,
+        )
+        frozen_query_geometry = _frozen_string_object_dict(query_geometry)
+
+        def consume_authenticated_shard_and_sidecar(
+            total_sample_count: int,
+            callback_grid: GridSpec,
+            risk_descriptor: RiskShardDescriptor,
+            loaded_risk: LoadedRiskShard,
+        ) -> None:
+            if authenticated_shard_consumer is not None:
+                authenticated_shard_consumer(
+                    total_sample_count,
+                    callback_grid,
+                    risk_descriptor,
+                    loaded_risk,
+                )
+            sidecar_descriptor, loaded_sidecar = (
+                _validate_authenticated_sidecar_pair(
+                    sidecar_path,
+                    collection_root=collection_path,
+                    risk_descriptor=risk_descriptor,
+                    loaded_risk=loaded_risk,
+                    grid=callback_grid,
+                    expected_split=split,
+                )
+            )
+            expected_sidecar_descriptor = sidecar_descriptors[
+                risk_descriptor.shard_index
+            ]
+            if sidecar_descriptor != expected_sidecar_descriptor:
+                raise RiskDataContractError(
+                    "occupancy sidecar pair differs from authenticated seal"
+                )
+            integrated_sidecar_descriptors.append(sidecar_descriptor)
+            authenticated_sidecar_pair_consumer(
+                _AuthenticatedRiskSidecarPair(
+                    total_sample_count=total_sample_count,
+                    grid=callback_grid,
+                    query_geometry=frozen_query_geometry,
+                    risk_descriptor=risk_descriptor,
+                    risk_shard=loaded_risk,
+                    sidecar_descriptor=sidecar_descriptor,
+                    sidecar_shard=loaded_sidecar,
+                )
+            )
+
+        formal_shard_consumer = consume_authenticated_shard_and_sidecar
+
+    loaded_descriptors, loaded_target_digest = _formally_validate_collection(
+        collection_path,
+        grid=grid,
+        expected_split=split,
+        handoff=handoff,
+        authenticated_metadata_rows=authenticated_metadata_rows,
+        authenticated_shard_consumer=formal_shard_consumer,
+    )
+    if loaded_descriptors != descriptors:
+        raise RiskDataContractError("dataset shard descriptors differ from source handoff")
+    if loaded_target_digest != target_digest:
+        raise RiskDataContractError(
+            "target_type_policy_digest differs from formally loaded shard provenance"
+        )
+
+    if authenticated_sidecar_pair_consumer is not None:
+        if tuple(integrated_sidecar_descriptors) != sidecar_descriptors:
+            raise RiskDataContractError(
+                "integrated occupancy validation did not cover each sidecar shard"
+            )
+    elif sidecar_path is not None:
+        assert sidecar_section is not None
+        assert query_geometry is not None
+        _formally_validate_sidecar_collection(
+            sidecar_path,
+            collection_root=collection_path,
+            risk_descriptors=descriptors,
+            grid=grid,
+            expected_split=split,
+            base_risk_dataset_manifest_digest=dataset_digest,
+            base_config_digest=str(sidecar_section["base_config_digest"]),
+            query_geometry=query_geometry,
+            expected_section=sidecar_section,
         )
 
     provenance = {
@@ -2157,6 +2306,33 @@ def load_risk_dataset_seal(
         expected_manifest_digest=expected_manifest_digest,
         sidecar_root=sidecar_root,
         retain_authenticated_metadata_rows=False,
+    )
+    return loaded
+
+
+def _load_risk_dataset_seal_with_consumers(
+    seal_root: str | Path,
+    *,
+    collection_root: str | Path,
+    expected_split: str,
+    expected_manifest_digest: str | None = None,
+    sidecar_root: str | Path | None = None,
+    authenticated_shard_consumer: _AuthenticatedRiskShardConsumer | None = None,
+    authenticated_sidecar_pair_consumer: (
+        _AuthenticatedRiskSidecarPairConsumer | None
+    ) = None,
+) -> LoadedRiskDataset:
+    """Strictly load a seal while consuming each authenticated decoded shard."""
+
+    loaded, _ = _load_risk_dataset_seal_with_authenticated_rows(
+        seal_root,
+        collection_root=collection_root,
+        expected_split=expected_split,
+        expected_manifest_digest=expected_manifest_digest,
+        sidecar_root=sidecar_root,
+        retain_authenticated_metadata_rows=False,
+        authenticated_shard_consumer=authenticated_shard_consumer,
+        authenticated_sidecar_pair_consumer=authenticated_sidecar_pair_consumer,
     )
     return loaded
 

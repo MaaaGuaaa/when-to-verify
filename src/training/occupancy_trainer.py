@@ -32,6 +32,7 @@ from src.datasets.risk_dataloader import (
     iter_production_occupancy_batches,
 )
 from src.datasets.risk_dataset_seal import LoadedRiskDataset
+from src.datasets.risk_training_store import AuthenticatedOccupancySnapshot
 from src.evaluation.risk_baselines import score_production_occupancy_baseline
 from src.models.occupancy_baseline import (
     ConvGRUOccupancyPredictor,
@@ -829,6 +830,7 @@ def train_production_occupancy_baselines(
     code_commit: str,
     resume_from: str | Path | None = None,
     resume_expected_publication_instance_digest_sha256: str | None = None,
+    training_snapshot: AuthenticatedOccupancySnapshot | None = None,
 ) -> ProductionOccupancyTrainingResult:
     """Run exactly one B3 step and one frozen-B3/B4 step, then publish."""
     if not isinstance(config, ProductionOccupancyTrainingConfig):
@@ -856,6 +858,26 @@ def train_production_occupancy_baselines(
         raise TypeError("train_subset must be ProductionRiskSubset")
     if train_subset.dataset_manifest_digest != train_dataset.risk_dataset_manifest_digest:
         raise ValueError("training subset dataset digest mismatch")
+    if training_snapshot is not None:
+        if not isinstance(training_snapshot, AuthenticatedOccupancySnapshot):
+            raise TypeError(
+                "training_snapshot must be an AuthenticatedOccupancySnapshot"
+            )
+        if (
+            training_snapshot.split != "train"
+            or training_snapshot.source_identity.get(
+                "risk_dataset_manifest_digest"
+            )
+            != train_dataset.risk_dataset_manifest_digest
+            or training_snapshot.select_subset(
+                max_samples=train_subset.max_samples,
+                seed=train_subset.seed,
+            )
+            != train_subset
+        ):
+            raise ValueError(
+                "authenticated occupancy snapshot does not match the training subset"
+            )
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA smoke requires an allocated CUDA GPU")
@@ -868,14 +890,24 @@ def train_production_occupancy_baselines(
     occupancy_positive = occupancy_negative = 0
     collision_positive = collision_negative = 0
     statistics_samples = 0
-    for batch, _ in iter_production_occupancy_batches(
-        train_dataset,
-        sidecar_root=sidecar_root,
-        subset=train_subset,
-        batch_size=config.batch_size,
-        seed=config.seed,
-        epoch=0,
-    ):
+    stream = (
+        iter_production_occupancy_batches(
+            train_dataset,
+            sidecar_root=sidecar_root,
+            subset=train_subset,
+            batch_size=config.batch_size,
+            seed=config.seed,
+            epoch=0,
+        )
+        if training_snapshot is None
+        else training_snapshot.iter_batches(
+            subset=train_subset,
+            batch_size=config.batch_size,
+            seed=config.seed,
+            epoch=0,
+        )
+    )
+    for batch, _ in stream:
         if first_batch is None:
             first_batch = batch
         hidden = batch.occupancy_targets["hidden_risk_occupancy"]

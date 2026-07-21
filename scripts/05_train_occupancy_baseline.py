@@ -39,6 +39,9 @@ from src.datasets.risk_dataloader import (  # noqa: E402
     select_production_risk_subset,
 )
 from src.datasets.risk_dataset_seal import load_risk_dataset_seal  # noqa: E402
+from src.datasets.risk_training_store import (  # noqa: E402
+    load_authenticated_occupancy_snapshot,
+)
 from src.evaluation.risk_baselines import (  # noqa: E402
     BASELINE_SPECS,
     OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
@@ -62,6 +65,7 @@ from src.training.occupancy_trainer import (  # noqa: E402
     ProductionOccupancyTrainingConfig,
     train_production_occupancy_baselines,
 )
+from src.training.distributed import discover_distributed_runtime  # noqa: E402
 
 
 _CONFIG_SCHEMA: dict[str, Any] = {
@@ -279,17 +283,44 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
             if key not in {"mode", "max_samples", "optimizer"}
         }
     )
-    dataset = load_risk_dataset_seal(
-        args.dataset_seal_root,
-        collection_root=args.risk_collection_root,
-        expected_split="train",
-        sidecar_root=args.sidecar_collection_root,
-    )
-    subset = select_production_risk_subset(
-        dataset,
-        max_samples=int(config["max_samples"]),
-        seed=training_config.seed,
-    )
+    runtime = discover_distributed_runtime(training_config.device)
+    if runtime.is_distributed:
+        raise ValueError(
+            "production occupancy training does not support WORLD_SIZE>1"
+        )
+    training_snapshot = None
+    if args.training_cache_mode == "authenticated_snapshot":
+        if args.training_cache_root is None:
+            raise ValueError(
+                "authenticated_snapshot requires --training-cache-root"
+            )
+        dataset, training_snapshot = load_authenticated_occupancy_snapshot(
+            args.dataset_seal_root,
+            collection_root=args.risk_collection_root,
+            sidecar_root=args.sidecar_collection_root,
+            expected_split="train",
+            cache_root=args.training_cache_root,
+        )
+        subset = training_snapshot.select_subset(
+            max_samples=int(config["max_samples"]),
+            seed=training_config.seed,
+        )
+    else:
+        if args.training_cache_root is not None:
+            raise ValueError(
+                "--training-cache-root requires authenticated_snapshot mode"
+            )
+        dataset = load_risk_dataset_seal(
+            args.dataset_seal_root,
+            collection_root=args.risk_collection_root,
+            expected_split="train",
+            sidecar_root=args.sidecar_collection_root,
+        )
+        subset = select_production_risk_subset(
+            dataset,
+            max_samples=int(config["max_samples"]),
+            seed=training_config.seed,
+        )
     result = train_production_occupancy_baselines(
         train_dataset=dataset,
         train_subset=subset,
@@ -301,6 +332,7 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
         resume_expected_publication_instance_digest_sha256=(
             args.resume_publication_instance_digest
         ),
+        training_snapshot=training_snapshot,
     )
     return {
         "artifact": str(result.output_dir),
@@ -804,6 +836,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device")
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--resume-publication-instance-digest")
+    parser.add_argument(
+        "--training-cache-mode",
+        choices=("strict", "authenticated_snapshot"),
+        default="strict",
+    )
+    parser.add_argument("--training-cache-root", type=Path)
     return parser
 
 

@@ -33,6 +33,11 @@ from src.datasets.risk_dataloader import (  # noqa: E402
     select_production_risk_subset,
 )
 from src.datasets.risk_dataset_seal import load_risk_dataset_family  # noqa: E402
+from src.datasets.risk_training_store import (  # noqa: E402
+    build_authenticated_risk_training_view,
+    load_authenticated_risk_snapshot,
+    open_authenticated_risk_snapshot_descriptor,
+)
 from src.datasets.toy_risk_learning import (  # noqa: E402
     assert_toy_split_isolation,
     frozen_channel_spec,
@@ -48,6 +53,15 @@ from src.models.risk_model import (  # noqa: E402
 from src.training.risk_trainer import (  # noqa: E402
     ProductionRiskTrainingConfig,
     train_production_risk_model,
+)
+from src.training.distributed import (  # noqa: E402
+    broadcast_rank_zero_setup,
+    destroy_distributed_process_group,
+    discover_distributed_runtime,
+    initialize_distributed_process_group,
+)
+from src.training.risk_ddp_trainer import (  # noqa: E402
+    train_distributed_production_risk_model,
 )
 
 ARTIFACT_LAYOUT_VERSION = "sop09_toy_risk_training_v2"
@@ -287,7 +301,214 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--resume-publication-instance-digest")
     parser.add_argument("--dataset-family-root", type=Path)
+    parser.add_argument("--distributed", action="store_true")
+    parser.add_argument(
+        "--training-cache-mode",
+        choices=("strict", "authenticated_snapshot"),
+        default="strict",
+    )
+    parser.add_argument("--training-cache-root", type=Path)
     return parser
+
+
+def _distributed_rank_zero_snapshot_setup(
+    args: argparse.Namespace,
+    *,
+    config: Mapping[str, object],
+    training_config: ProductionRiskTrainingConfig,
+    world_size: int,
+) -> dict[str, object]:
+    if args.training_cache_mode != "authenticated_snapshot":
+        raise RiskDataContractError(
+            "distributed training requires --training-cache-mode authenticated_snapshot"
+        )
+    if args.training_cache_root is None:
+        raise RiskDataContractError(
+            "distributed training requires --training-cache-root"
+        )
+    if args.train_seal_root is None or args.train_collection_root is None:
+        raise RiskDataContractError(
+            "production mode requires --train-seal-root and --train-collection-root"
+        )
+    validation_paths = (
+        args.validation_seal_root,
+        args.validation_collection_root,
+    )
+    if (validation_paths[0] is None) != (validation_paths[1] is None):
+        raise RiskDataContractError(
+            "validation seal and collection roots must be supplied together"
+        )
+
+    family_digest: str | None = None
+    leakage_status = "NOT_PROVEN"
+    expected_train_digest: str | None = None
+    expected_validation_digest: str | None = None
+    if training_config.stage == "formal_50k":
+        if args.dataset_family_root is None or validation_paths[0] is None:
+            raise RiskDataContractError(
+                "formal_50k distributed training requires typed family and validation roots"
+            )
+        family = load_risk_dataset_family(args.dataset_family_root)
+        leakage_status = str(
+            family.cross_split_audit["global_cross_split_leakage"]
+        )
+        if leakage_status != "PROVEN":
+            raise RiskDataContractError(
+                "formal_50k typed family leakage gate is not PROVEN"
+            )
+        family_digest = family.risk_dataset_family_digest
+        expected_train_digest = str(
+            family.members["train"]["risk_dataset_manifest_digest"]
+        )
+        expected_validation_digest = str(
+            family.members["val"]["risk_dataset_manifest_digest"]
+        )
+    elif validation_paths[0] is not None or args.dataset_family_root is not None:
+        raise RiskDataContractError(
+            "smoke/overfit distributed training rejects validation and family inputs"
+        )
+
+    train_dataset, train_snapshot = load_authenticated_risk_snapshot(
+        args.train_seal_root,
+        collection_root=args.train_collection_root,
+        expected_split="train",
+        cache_root=args.training_cache_root,
+        expected_manifest_digest=expected_train_digest,
+    )
+    train_subset = train_snapshot.select_subset(
+        max_samples=int(config["max_samples"]),
+        seed=training_config.seed,
+    )
+    build_authenticated_risk_training_view(
+        train_snapshot,
+        subset=train_subset,
+        split_role="train",
+        world_size=world_size,
+        batch_size=training_config.batch_size,
+        gradient_accumulation_steps=(
+            training_config.gradient_accumulation_steps
+        ),
+    )
+    if expected_train_digest is not None and (
+        train_dataset.risk_dataset_manifest_digest != expected_train_digest
+    ):
+        raise RiskDataContractError(
+            "typed family train member differs from authenticated snapshot source"
+        )
+
+    validation_descriptor: dict[str, object] | None = None
+    if validation_paths[0] is not None:
+        validation_dataset, validation_snapshot = (
+            load_authenticated_risk_snapshot(
+                validation_paths[0],
+                collection_root=validation_paths[1],
+                expected_split="val",
+                cache_root=args.training_cache_root,
+                expected_manifest_digest=expected_validation_digest,
+            )
+        )
+        validation_subset = validation_snapshot.select_subset(
+            max_samples=validation_dataset.sample_count,
+            seed=training_config.seed,
+        )
+        build_authenticated_risk_training_view(
+            validation_snapshot,
+            subset=validation_subset,
+            split_role="validation",
+            world_size=world_size,
+            batch_size=training_config.batch_size,
+            gradient_accumulation_steps=(
+                training_config.gradient_accumulation_steps
+            ),
+        )
+        validation_descriptor = validation_snapshot.descriptor()
+
+    return {
+        "train_snapshot": train_snapshot.descriptor(),
+        "validation_snapshot": validation_descriptor,
+        "dataset_family_digest_sha256": family_digest,
+        "global_cross_split_leakage": leakage_status,
+    }
+
+
+def _run_distributed_production(
+    args: argparse.Namespace,
+    *,
+    config: Mapping[str, object],
+    training_config: ProductionRiskTrainingConfig,
+    runtime,
+) -> ProductionRiskTrainingResult:
+    setup = broadcast_rank_zero_setup(
+        runtime,
+        lambda: _distributed_rank_zero_snapshot_setup(
+            args,
+            config=config,
+            training_config=training_config,
+            world_size=runtime.world_size,
+        ),
+    )
+    train_snapshot_value = setup.get("train_snapshot")
+    if not isinstance(train_snapshot_value, Mapping):
+        raise RiskDataContractError("distributed train snapshot descriptor is invalid")
+    train_snapshot = open_authenticated_risk_snapshot_descriptor(
+        train_snapshot_value
+    )
+    train_subset = train_snapshot.select_subset(
+        max_samples=int(config["max_samples"]),
+        seed=training_config.seed,
+    )
+    train_view = build_authenticated_risk_training_view(
+        train_snapshot,
+        subset=train_subset,
+        split_role="train",
+        world_size=runtime.world_size,
+        batch_size=training_config.batch_size,
+        gradient_accumulation_steps=(
+            training_config.gradient_accumulation_steps
+        ),
+    )
+    validation_view = None
+    validation_snapshot_value = setup.get("validation_snapshot")
+    if validation_snapshot_value is not None:
+        if not isinstance(validation_snapshot_value, Mapping):
+            raise RiskDataContractError(
+                "distributed validation snapshot descriptor is invalid"
+            )
+        validation_snapshot = open_authenticated_risk_snapshot_descriptor(
+            validation_snapshot_value
+        )
+        validation_subset = validation_snapshot.select_subset(
+            max_samples=len(validation_snapshot.sample_ids),
+            seed=training_config.seed,
+        )
+        validation_view = build_authenticated_risk_training_view(
+            validation_snapshot,
+            subset=validation_subset,
+            split_role="validation",
+            world_size=runtime.world_size,
+            batch_size=training_config.batch_size,
+            gradient_accumulation_steps=(
+                training_config.gradient_accumulation_steps
+            ),
+        )
+    return train_distributed_production_risk_model(
+        train_view=train_view,
+        validation_view=validation_view,
+        config=training_config,
+        output_dir=args.output_dir,
+        code_commit=args.code_commit,
+        runtime=runtime,
+        dataset_family_digest_sha256=setup.get(
+            "dataset_family_digest_sha256"
+        ),
+        global_cross_split_leakage=str(
+            setup.get("global_cross_split_leakage")
+        ),
+        resume_from=args.resume_from,
+        resume_expected_publication_instance_digest_sha256=(
+            args.resume_publication_instance_digest
+        ),
+    )
 
 
 def main() -> int:
@@ -295,6 +516,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.output_dir.exists():
         parser.error(f"refusing to overwrite existing output: {args.output_dir}")
+    process_group_initialized = False
     try:
         config = _effective_config(args)
         if config["mode"] == "production":
@@ -310,25 +532,6 @@ def main() -> int:
                 raise RiskDataContractError(
                     "validation seal and collection roots must be supplied together"
                 )
-            train_dataset = load_production_risk_dataset(
-                args.train_seal_root,
-                collection_root=args.train_collection_root,
-                expected_split="train",
-            )
-            validation_dataset = (
-                None
-                if validation_paths[0] is None
-                else load_production_risk_dataset(
-                    validation_paths[0],
-                    collection_root=validation_paths[1],
-                    expected_split="val",
-                )
-            )
-            subset = select_production_risk_subset(
-                train_dataset,
-                max_samples=int(config["max_samples"]),
-                seed=int(config["seed"]),
-            )
             training_config = ProductionRiskTrainingConfig(
                 **{
                     key: config[key]
@@ -348,35 +551,95 @@ def main() -> int:
                     )
                 }
             )
-            result = train_production_risk_model(
-                train_dataset=train_dataset,
-                train_subset=subset,
-                config=training_config,
-                output_dir=args.output_dir,
-                code_commit=args.code_commit,
-                validation_dataset=validation_dataset,
-                resume_from=args.resume_from,
-                resume_expected_publication_instance_digest_sha256=(
-                    args.resume_publication_instance_digest
-                ),
-                dataset_family=(
-                    None
-                    if args.dataset_family_root is None
-                    else load_risk_dataset_family(args.dataset_family_root)
-                ),
-            )
-            print(
-                json.dumps(
-                    {
-                        "output_dir": str(result.output_dir),
-                        "semantic_digest_sha256": result.semantic_digest_sha256,
-                    },
-                    sort_keys=True,
+            runtime = discover_distributed_runtime(training_config.device)
+            if runtime.is_distributed and not args.distributed:
+                raise RiskDataContractError(
+                    "WORLD_SIZE>1 requires explicit --distributed"
                 )
-            )
+            if args.distributed:
+                if not runtime.is_distributed:
+                    raise RiskDataContractError(
+                        "--distributed requires torchrun with WORLD_SIZE>1"
+                    )
+                initialize_distributed_process_group(runtime)
+                process_group_initialized = True
+                result = _run_distributed_production(
+                    args,
+                    config=config,
+                    training_config=training_config,
+                    runtime=runtime,
+                )
+            else:
+                if args.training_cache_mode != "strict":
+                    raise RiskDataContractError(
+                        "single-device training preserves the strict loader path"
+                    )
+                if args.training_cache_root is not None:
+                    raise RiskDataContractError(
+                        "--training-cache-root requires authenticated_snapshot mode"
+                    )
+                train_dataset = load_production_risk_dataset(
+                    args.train_seal_root,
+                    collection_root=args.train_collection_root,
+                    expected_split="train",
+                )
+                validation_dataset = (
+                    None
+                    if validation_paths[0] is None
+                    else load_production_risk_dataset(
+                        validation_paths[0],
+                        collection_root=validation_paths[1],
+                        expected_split="val",
+                    )
+                )
+                subset = select_production_risk_subset(
+                    train_dataset,
+                    max_samples=int(config["max_samples"]),
+                    seed=int(config["seed"]),
+                )
+                result = train_production_risk_model(
+                    train_dataset=train_dataset,
+                    train_subset=subset,
+                    config=training_config,
+                    output_dir=args.output_dir,
+                    code_commit=args.code_commit,
+                    validation_dataset=validation_dataset,
+                    resume_from=args.resume_from,
+                    resume_expected_publication_instance_digest_sha256=(
+                        args.resume_publication_instance_digest
+                    ),
+                    dataset_family=(
+                        None
+                        if args.dataset_family_root is None
+                        else load_risk_dataset_family(args.dataset_family_root)
+                    ),
+                )
+            if not args.distributed or runtime.is_rank_zero:
+                print(
+                    json.dumps(
+                        {
+                            "output_dir": str(result.output_dir),
+                            "semantic_digest_sha256": (
+                                result.semantic_digest_sha256
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
             return 0
+        if args.distributed or args.training_cache_mode != "strict":
+            raise RiskDataContractError(
+                "distributed/authenticated snapshot options require production mode"
+            )
+        if args.training_cache_root is not None:
+            raise RiskDataContractError(
+                "--training-cache-root requires production authenticated_snapshot mode"
+            )
     except (OSError, ValueError, RiskDataContractError) as error:
         parser.error(str(error))
+    finally:
+        if process_group_initialized:
+            destroy_distributed_process_group()
 
     seed = int(config["seed"])
     grid_size = int(config["grid_size"])

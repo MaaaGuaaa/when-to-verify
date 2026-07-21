@@ -27,6 +27,9 @@ from src.datasets.risk_dataset_seal import (
     load_risk_dataset_seal,
     publish_risk_dataset_seal,
 )
+from src.datasets.risk_training_store import (
+    load_authenticated_occupancy_snapshot,
+)
 from src.evaluation.risk_baselines import score_production_occupancy_baseline
 from src.models.occupancy_baseline import (
     ConvGRUOccupancyPredictor,
@@ -280,6 +283,39 @@ def _training_config(*, device: str = "cpu") -> ProductionOccupancyTrainingConfi
         b2_a_max_s=5.0,
         sigma_time_s=2.0,
     )
+
+
+def test_authenticated_snapshot_trainer_does_not_reopen_strict_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, subset, sidecar_root = _production_fixture(tmp_path)
+    _, snapshot = load_authenticated_occupancy_snapshot(
+        dataset.seal_root,
+        collection_root=dataset.collection_root,
+        sidecar_root=sidecar_root,
+        expected_split="train",
+        cache_root=tmp_path / "cache",
+    )
+
+    def forbidden_strict_iterator(*args, **kwargs):
+        raise AssertionError("snapshot trainer must not reopen source sidecars")
+
+    monkeypatch.setattr(
+        "src.training.occupancy_trainer.iter_production_occupancy_batches",
+        forbidden_strict_iterator,
+    )
+    result = train_production_occupancy_baselines(
+        train_dataset=dataset,
+        train_subset=subset,
+        sidecar_root=sidecar_root,
+        config=_training_config(),
+        output_dir=tmp_path / "snapshot-output",
+        code_commit="a" * 40,
+        training_snapshot=snapshot,
+    )
+
+    assert result.output_dir.is_dir()
 
 
 def test_real_fixture_one_shard_smoke_freezes_b3_and_publishes_bound_artifact(

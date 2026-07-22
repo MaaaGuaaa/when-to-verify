@@ -20,6 +20,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.calibration.split_conformal import (  # noqa: E402
+    BASELINE_SPEC_LAYOUT_VERSION,
+    FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
     OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
     RISK_CHECKPOINT_LAYOUT_VERSION,
     apply_split_conformal,
@@ -181,6 +183,11 @@ def _assert_same_calibration_protocol(
         "seed",
         "channel_spec",
         "config_digest_sha256",
+        "evaluation_record_collection_digest_sha256",
+        "occupancy_sidecar_collection_digest_sha256",
+        "prediction_protocol_layout_version",
+        "prediction_protocol_digest_sha256",
+        "cohort_binding_digest_sha256",
     ):
         if main_artifact.get(field) != baseline_artifact.get(field):
             raise ValueError(
@@ -218,7 +225,7 @@ def _expected_artifact_provenance(table: dict[str, Any]) -> dict[str, Any]:
         "channel_spec": table["channel_spec"],
         "config_digest_sha256": table["config_digest_sha256"],
     }
-    if table["checkpoint_layout_version"] == OCCUPANCY_CHECKPOINT_LAYOUT_VERSION:
+    if table["checkpoint_layout_version"] != RISK_CHECKPOINT_LAYOUT_VERSION:
         expected["prediction_semantics"] = table["prediction_semantics"]
     if table["mode"] == "production":
         expected["risk_dataset_family_layout_version"] = table[
@@ -227,6 +234,18 @@ def _expected_artifact_provenance(table: dict[str, Any]) -> dict[str, Any]:
         expected["risk_dataset_family_digest"] = table[
             "risk_dataset_family_digest"
         ]
+        if "prediction_protocol_digest_sha256" in table:
+            for field in (
+                "evaluation_record_collection_layout_version",
+                "evaluation_record_collection_digest_sha256",
+                "occupancy_sidecar_collection_digest_sha256",
+                "prediction_protocol_layout_version",
+                "prediction_protocol_digest_sha256",
+                "cohort_binding_digest_sha256",
+                "score_definition",
+                "quantile_proxy_policy",
+            ):
+                expected[field] = table[field]
     return expected
 
 
@@ -310,12 +329,14 @@ def main() -> int:
             expected_split="test",
             dataset_family=dataset_family,
         )
-        if baseline_table["checkpoint_layout_version"] != (
-            OCCUPANCY_CHECKPOINT_LAYOUT_VERSION
-        ):
+        if baseline_table["checkpoint_layout_version"] not in {
+            OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
+            FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
+            BASELINE_SPEC_LAYOUT_VERSION,
+        }:
             raise ValueError(
-                "baseline prediction table must bind an "
-                f"{OCCUPANCY_CHECKPOINT_LAYOUT_VERSION} checkpoint"
+                "baseline prediction table must bind a supported occupancy "
+                "checkpoint or deterministic baseline spec"
             )
         baseline_artifact = validate_calibration_artifact(
             _read_json(args.baseline_calibration_artifact),
@@ -343,6 +364,17 @@ def main() -> int:
             raise ValueError(
                 "main and occupancy baseline test cohort digest mismatch"
             )
+        for field in (
+            "evaluation_record_collection_digest_sha256",
+            "occupancy_sidecar_collection_digest_sha256",
+            "prediction_protocol_digest_sha256",
+            "cohort_binding_digest_sha256",
+        ):
+            if table.get(field) != baseline_table.get(field):
+                raise ValueError(
+                    "main and occupancy baseline production binding mismatch: "
+                    f"{field}"
+                )
         _assert_same_calibration_protocol(artifact, baseline_artifact)
         baseline_isolation = assert_calibration_artifact_test_isolation(
             baseline_artifact,

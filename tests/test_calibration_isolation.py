@@ -622,6 +622,8 @@ def test_calibration_cli_accepts_toy_table_and_production_fails_closed(
     assert completed.returncode == 0, completed.stderr
     assert (output_dir / "calibration.json").is_file()
     assert (output_dir / "manifest.json").is_file()
+    assert (output_dir / "checksums.sha256").is_file()
+    assert (output_dir / ".producer-complete").is_file()
 
     rejected = subprocess.run(
         [

@@ -340,6 +340,8 @@ def _sample(
     target_type_policy_digest: str,
     base_config_digest: str,
     identity_prefixes: Mapping[str, str],
+    base_session_id: str,
+    source_session_id: str,
 ) -> RiskSample:
     event_types = (
         "collision",
@@ -404,9 +406,9 @@ def _sample(
             "trajectory_id": f"trajectory-{index % 3}",
             "provenance": {
                 "base_recording_id": identities["base_recording_id"],
-                "base_session_id": "formal-base-session",
+                "base_session_id": base_session_id,
                 "source_recording_id": identities["source_recording_id"],
-                "source_session_id": "formal-source-session",
+                "source_session_id": source_session_id,
                 "source_snippet_id": identities["source_snippet_id"],
                 "seed_namespace": identities["seed_namespace"],
                 "target_type_policy_digest": target_type_policy_digest,
@@ -440,6 +442,8 @@ def create_formal_risk_publication(
     handoff_dialect: str = "legacy",
     identity_prefixes: Mapping[str, str] | None = None,
     dynamic_human_radius_m: float | None = None,
+    base_session_id: str = "formal-base-session",
+    source_session_id: str = "formal-source-session",
 ) -> FormalRiskPublication:
     """Publish one compact formal SOP03 provenance root and SOP07 collection."""
 
@@ -520,6 +524,8 @@ def create_formal_risk_publication(
             target_type_policy_digest=target_type_policy_digest,
             base_config_digest=base_config_digest,
             identity_prefixes=prefixes,
+            base_session_id=base_session_id,
+            source_session_id=source_session_id,
         )
         for index in range(12)
     )

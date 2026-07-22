@@ -1,0 +1,42 @@
+{
+  "alpha": 0.1,
+  "baseline_quantile_proxy_policy": "q50=q80=q90=q95=raw_score_before_conformal",
+  "global_calibration_rule": "one_sided_split_conformal_finite_sample",
+  "grouped_calibration": {
+    "combination_policy": "one_dimension_at_a_time",
+    "continuous_group_bins": {
+      "age_s": [
+        0.0,
+        1.0,
+        3.0,
+        5.0
+      ],
+      "critical_area_fraction": [
+        0.0,
+        0.05,
+        0.2,
+        1.0
+      ],
+      "density_fraction": [
+        0.0,
+        0.01,
+        0.05,
+        1.0
+      ]
+    },
+    "group_dimensions": [
+      "blind_type",
+      "critical_area_fraction",
+      "age_s",
+      "density_fraction",
+      "target_object_type",
+      "footprint_kind"
+    ],
+    "layout_version": "grouped_risk_calibration_v2",
+    "min_group_size": 20
+  },
+  "prediction_key": "q90",
+  "prediction_table_layout_version": "risk_prediction_table_v2",
+  "protocol_digest_sha256": "1552f082c5b183c6ef9164ea2a4ec911065697248319f4b21cd90c6d6e11732f",
+  "protocol_layout_version": "shared_risk_prediction_protocol_v1"
+}

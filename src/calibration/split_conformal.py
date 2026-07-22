@@ -18,6 +18,10 @@ from typing import Any
 import numpy as np
 
 from src.datasets.risk_dataloader import RiskDataContractError
+from src.datasets.risk_evaluation_metadata import (
+    RISK_EVALUATION_RECORD_FIELDS,
+    validate_production_evaluation_record,
+)
 from src.datasets.risk_dataset_seal import (
     RISK_DATASET_FAMILY_LAYOUT_VERSION,
     LoadedRiskDatasetFamily,
@@ -34,8 +38,17 @@ PREDICTION_COHORT_LAYOUT_VERSION = "risk_prediction_cohort_v1"
 CALIBRATION_ARTIFACT_LAYOUT_VERSION = "risk_calibration_v3"
 RISK_CHECKPOINT_LAYOUT_VERSION = "risk_model_checkpoint_v2"
 OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = "occupancy_baseline_checkpoint_v2"
+FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = (
+    "sop08_formal_occupancy_checkpoint_v1"
+)
+BASELINE_SPEC_LAYOUT_VERSION = "deterministic_occupancy_baseline_spec_v1"
 CHECKPOINT_LAYOUT_VERSIONS = frozenset(
-    {RISK_CHECKPOINT_LAYOUT_VERSION, OCCUPANCY_CHECKPOINT_LAYOUT_VERSION}
+    {
+        RISK_CHECKPOINT_LAYOUT_VERSION,
+        OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
+        FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
+        BASELINE_SPEC_LAYOUT_VERSION,
+    }
 )
 
 IDENTITY_FIELDS: tuple[str, ...] = (
@@ -47,6 +60,32 @@ IDENTITY_FIELDS: tuple[str, ...] = (
     "snippet_id",
     "base_state_id",
     "seed_namespace",
+)
+PRODUCTION_EVALUATION_IDENTITY_FIELDS: tuple[str, ...] = (
+    "sample_id",
+    "pair_group_id",
+    "base_recording_id",
+    "base_session_id",
+    "source_recording_id",
+    "source_session_id",
+    "source_object_id",
+    "source_snippet_id",
+    "base_state_id",
+    "seed_namespace",
+)
+_PRODUCTION_FAMILY_FORBIDDEN_OVERLAPS: tuple[str, ...] = (
+    "sample_id",
+    "base_recording_id",
+    "source_recording_id",
+    "base_source_cross_role_recording_id",
+    "source_snippet_id",
+    "pair_group_id",
+    "seed_namespace",
+)
+_PRODUCTION_FAMILY_ALLOWED_OVERLAPS: tuple[str, ...] = (
+    "base_session_id",
+    "source_session_id",
+    "base_source_cross_role_session_id",
 )
 
 ROW_STRING_FIELDS: tuple[str, ...] = (
@@ -312,9 +351,15 @@ def prediction_table_cohort_digest(table: Mapping[str, Any]) -> str:
     rows = table.get("rows")
     if not isinstance(rows, list):
         raise CalibrationContractError("prediction table rows must be a list")
+    cohort_fields = (
+        RISK_EVALUATION_RECORD_FIELDS
+        if mode == "production"
+        and "evaluation_record_collection_digest_sha256" in table
+        else tuple(sorted(TOY_MANIFEST_ROW_KEYS))
+    )
     try:
         cohort_rows = [
-            {field: row[field] for field in sorted(TOY_MANIFEST_ROW_KEYS)}
+            {field: row[field] for field in cohort_fields}
             for row in rows
         ]
     except (KeyError, TypeError) as exc:
@@ -408,6 +453,39 @@ def _validate_row(row: Mapping[str, Any], *, table_split: str, index: int) -> No
             )
 
 
+def _validate_production_evaluation_prediction_row(
+    row: Mapping[str, Any],
+    *,
+    table_split: str,
+    index: int,
+) -> None:
+    expected_fields = set(RISK_EVALUATION_RECORD_FIELDS) | set(PREDICTION_FIELDS)
+    if set(row) != expected_fields:
+        raise CalibrationContractError(
+            f"production prediction row {index} fields are invalid"
+        )
+    evaluation_record = {
+        field: row[field] for field in RISK_EVALUATION_RECORD_FIELDS
+    }
+    try:
+        validated = validate_production_evaluation_record(evaluation_record)
+    except (TypeError, ValueError) as exc:
+        raise CalibrationContractError(
+            f"production prediction row {index} evaluation record is invalid"
+        ) from exc
+    if validated["split"] != table_split:
+        raise CalibrationContractError(
+            f"production prediction row {index} split mismatch"
+        )
+    for field in PREDICTION_FIELDS:
+        _probability(row[field], f"production prediction row {index} {field}")
+    quantiles = [float(row[field]) for field in ("q50", "q80", "q90", "q95")]
+    if any(left > right for left, right in zip(quantiles, quantiles[1:])):
+        raise CalibrationContractError(
+            f"production prediction row {index} has crossing risk quantiles"
+        )
+
+
 def validate_prediction_table(
     table: Mapping[str, Any],
     *,
@@ -472,12 +550,19 @@ def validate_prediction_table(
                 "risk prediction table must not contain prediction_semantics"
             )
     else:
-        if result.get("checkpoint_digest_kind") != (
-            "occupancy_checkpoint_semantic_sha256"
-        ):
-            raise CalibrationContractError(
-                "occupancy prediction table checkpoint_digest_kind must be "
+        expected_digest_kind = {
+            OCCUPANCY_CHECKPOINT_LAYOUT_VERSION: (
                 "occupancy_checkpoint_semantic_sha256"
+            ),
+            FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION: (
+                "formal_occupancy_checkpoint_semantic_sha256"
+            ),
+            BASELINE_SPEC_LAYOUT_VERSION: "baseline_spec_sha256",
+        }[checkpoint_layout_version]
+        if result.get("checkpoint_digest_kind") != expected_digest_kind:
+            raise CalibrationContractError(
+                "baseline prediction table checkpoint_digest_kind must be "
+                f"{expected_digest_kind}"
             )
         if result.get("prediction_semantics") != (
             "scalar_baseline_score_repeated_for_common_calibration"
@@ -518,6 +603,14 @@ def validate_prediction_table(
             split=split,
             label="prediction table",
         )
+        if "evaluation_record_collection_digest_sha256" in result:
+            for field in (
+                "evaluation_record_collection_digest_sha256",
+                "occupancy_sidecar_collection_digest_sha256",
+                "prediction_protocol_digest_sha256",
+                "cohort_binding_digest_sha256",
+            ):
+                _hex_digest(result.get(field), field, length=64)
 
     rows = result.get("rows")
     if not isinstance(rows, list) or not rows:
@@ -526,7 +619,16 @@ def validate_prediction_table(
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             raise CalibrationContractError(f"prediction row {index} must be a mapping")
-        _validate_row(row, table_split=split, index=index)
+        if mode == "production" and (
+            "evaluation_record_collection_digest_sha256" in result
+        ):
+            _validate_production_evaluation_prediction_row(
+                row,
+                table_split=split,
+                index=index,
+            )
+        else:
+            _validate_row(row, table_split=split, index=index)
         sample_id = str(row["sample_id"])
         if sample_id in seen_ids:
             raise CalibrationContractError(
@@ -620,10 +722,18 @@ def apply_split_conformal(predicted_quantile: Any, *, correction: float) -> np.n
     return np.clip(prediction + correction_value, 0.0, 1.0)
 
 
+def _identity_fields_for_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    if rows and "base_recording_id" in rows[0]:
+        return PRODUCTION_EVALUATION_IDENTITY_FIELDS
+    return IDENTITY_FIELDS
+
+
 def _identity_manifest(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
     return {
         field: sorted({str(row[field]) for row in rows})
-        for field in IDENTITY_FIELDS
+        for field in _identity_fields_for_rows(rows)
     }
 
 
@@ -679,7 +789,7 @@ def fit_calibration_artifact(
         },
         "fitted_identities": _identity_manifest(rows),
     }
-    if table["checkpoint_layout_version"] == OCCUPANCY_CHECKPOINT_LAYOUT_VERSION:
+    if table["checkpoint_layout_version"] != RISK_CHECKPOINT_LAYOUT_VERSION:
         artifact["prediction_semantics"] = table["prediction_semantics"]
     if table["mode"] == "toy":
         artifact["toy_dataset_manifest_digest"] = table[
@@ -695,6 +805,18 @@ def fit_calibration_artifact(
             "target_type_policy_digest",
         ):
             artifact[field] = table[field]
+        if "evaluation_record_collection_digest_sha256" in table:
+            for field in (
+                "evaluation_record_collection_layout_version",
+                "evaluation_record_collection_digest_sha256",
+                "occupancy_sidecar_collection_digest_sha256",
+                "prediction_protocol_layout_version",
+                "prediction_protocol_digest_sha256",
+                "cohort_binding_digest_sha256",
+                "score_definition",
+                "quantile_proxy_policy",
+            ):
+                artifact[field] = table[field]
     artifact["semantic_digest"] = calibration_artifact_semantic_digest(artifact)
     return artifact
 
@@ -761,12 +883,19 @@ def validate_calibration_artifact(
                 "risk calibration artifact must not contain prediction_semantics"
             )
     else:
-        if result.get("checkpoint_digest_kind") != (
-            "occupancy_checkpoint_semantic_sha256"
-        ):
-            raise CalibrationContractError(
-                "occupancy calibration artifact checkpoint_digest_kind must be "
+        expected_digest_kind = {
+            OCCUPANCY_CHECKPOINT_LAYOUT_VERSION: (
                 "occupancy_checkpoint_semantic_sha256"
+            ),
+            FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION: (
+                "formal_occupancy_checkpoint_semantic_sha256"
+            ),
+            BASELINE_SPEC_LAYOUT_VERSION: "baseline_spec_sha256",
+        }[checkpoint_layout_version]
+        if result.get("checkpoint_digest_kind") != expected_digest_kind:
+            raise CalibrationContractError(
+                "baseline calibration artifact checkpoint_digest_kind must be "
+                f"{expected_digest_kind}"
             )
         if result.get("prediction_semantics") != (
             "scalar_baseline_score_repeated_for_common_calibration"
@@ -815,6 +944,36 @@ def validate_calibration_artifact(
             split="calibration",
             label="calibration artifact",
         )
+        has_evaluation_binding = (
+            "evaluation_record_collection_digest_sha256" in result
+        )
+        evaluation_fields = (
+            "evaluation_record_collection_layout_version",
+            "evaluation_record_collection_digest_sha256",
+            "occupancy_sidecar_collection_digest_sha256",
+            "prediction_protocol_layout_version",
+            "prediction_protocol_digest_sha256",
+            "cohort_binding_digest_sha256",
+            "score_definition",
+            "quantile_proxy_policy",
+        )
+        if has_evaluation_binding:
+            for field in evaluation_fields:
+                if field not in result:
+                    raise CalibrationContractError(
+                        f"calibration artifact is missing {field}"
+                    )
+            for field in (
+                "evaluation_record_collection_digest_sha256",
+                "occupancy_sidecar_collection_digest_sha256",
+                "prediction_protocol_digest_sha256",
+                "cohort_binding_digest_sha256",
+            ):
+                _hex_digest(result.get(field), field, length=64)
+        elif any(field in result for field in evaluation_fields):
+            raise CalibrationContractError(
+                "calibration artifact evaluation/protocol binding is partial"
+            )
     global_fit = result.get("global")
     if not isinstance(global_fit, Mapping):
         raise CalibrationContractError("artifact global fit must be a mapping")
@@ -846,9 +1005,14 @@ def validate_calibration_artifact(
             "global correction must lie within the recorded residual bounds"
         )
     identities = result.get("fitted_identities")
-    if not isinstance(identities, Mapping) or set(identities) != set(IDENTITY_FIELDS):
+    identity_fields = (
+        PRODUCTION_EVALUATION_IDENTITY_FIELDS
+        if "evaluation_record_collection_digest_sha256" in result
+        else IDENTITY_FIELDS
+    )
+    if not isinstance(identities, Mapping) or set(identities) != set(identity_fields):
         raise CalibrationContractError("artifact fitted_identities must be a mapping")
-    for field in IDENTITY_FIELDS:
+    for field in identity_fields:
         values = identities.get(field)
         if not isinstance(values, list) or not values or any(
             not isinstance(value, str) or not value for value in values
@@ -896,9 +1060,24 @@ def validate_calibration_artifact(
 def assert_calibration_test_isolation(
     calibration_rows: Sequence[Mapping[str, Any]],
     test_rows: Sequence[Mapping[str, Any]],
+    *,
+    dataset_family: LoadedRiskDatasetFamily | None = None,
 ) -> dict[str, int]:
-    """Reject any strict identity overlap between calibration and test rows."""
+    """Apply strict toy isolation or the authenticated production family policy."""
 
+    for name, rows in (("calibration", calibration_rows), ("test", test_rows)):
+        if (
+            not isinstance(rows, Sequence)
+            or isinstance(rows, (str, bytes))
+            or not rows
+            or not isinstance(rows[0], Mapping)
+        ):
+            raise CalibrationContractError(f"{name}_rows must be a non-empty row sequence")
+    identity_fields = _identity_fields_for_rows(calibration_rows)
+    if _identity_fields_for_rows(test_rows) != identity_fields:
+        raise CalibrationContractError(
+            "calibration/test identity schemas differ"
+        )
     for name, rows, expected_split in (
         ("calibration", calibration_rows, "calibration"),
         ("test", test_rows, "test"),
@@ -912,13 +1091,31 @@ def assert_calibration_test_isolation(
                 raise CalibrationContractError(
                     f"{name} row {index} must have split {expected_split!r}"
                 )
-            for field in IDENTITY_FIELDS:
+            for field in identity_fields:
                 if field not in row:
                     raise CalibrationContractError(
                         f"{name} row {index} is missing identity field {field}"
                     )
+    if identity_fields == PRODUCTION_EVALUATION_IDENTITY_FIELDS:
+        family = _reauthenticate_dataset_family(dataset_family, mode="production")
+        assert family is not None
+        _validate_family_split_sample_ids(
+            calibration_rows,
+            split="calibration",
+            dataset_family=family,
+        )
+        _validate_family_split_sample_ids(
+            test_rows,
+            split="test",
+            dataset_family=family,
+        )
+        return _production_family_isolation_report(family)
+    if dataset_family is not None:
+        raise CalibrationContractError(
+            "toy calibration/test isolation must not use a dataset family"
+        )
     result: dict[str, int] = {}
-    for field in IDENTITY_FIELDS:
+    for field in identity_fields:
         calibration_values = {str(row[field]) for row in calibration_rows}
         test_values = {str(row[field]) for row in test_rows}
         overlap = sorted(calibration_values & test_values)
@@ -927,6 +1124,102 @@ def assert_calibration_test_isolation(
                 f"calibration/test identity overlap for {field}: {overlap[:5]}"
             )
         result[field] = 0
+    return result
+
+
+def _validate_family_split_sample_ids(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    split: str,
+    dataset_family: LoadedRiskDatasetFamily,
+) -> None:
+    sample_ids = [str(row["sample_id"]) for row in rows]
+    member = dataset_family.members[split]
+    if len(sample_ids) != member["sample_count"] or (
+        risk_dataset_family_sample_ids_digest(sample_ids)
+        != member["sample_ids_digest_sha256"]
+    ):
+        raise CalibrationContractError(
+            f"{split} isolation rows do not match the authenticated family member"
+        )
+
+
+def _family_calibration_test_overlap_values(
+    entry: object,
+    *,
+    field: str,
+) -> tuple[str, ...]:
+    if not isinstance(entry, Mapping):
+        raise CalibrationContractError(
+            f"dataset family overlap audit is invalid for {field}"
+        )
+    pairs = entry.get("split_pair_overlaps")
+    if not isinstance(pairs, Sequence) or isinstance(pairs, (str, bytes)):
+        raise CalibrationContractError(
+            f"dataset family split-pair audit is invalid for {field}"
+        )
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            continue
+        if (
+            pair.get("left_split") == "calibration"
+            and pair.get("right_split") == "test"
+        ):
+            values = pair.get("overlap_values")
+            count = pair.get("overlap_count")
+            if (
+                not isinstance(values, Sequence)
+                or isinstance(values, (str, bytes))
+                or any(not isinstance(value, str) or not value for value in values)
+                or list(values) != sorted(set(values))
+                or count != len(values)
+            ):
+                raise CalibrationContractError(
+                    f"dataset family calibration/test audit is invalid for {field}"
+                )
+            return tuple(values)
+    raise CalibrationContractError(
+        f"dataset family calibration/test audit is missing for {field}"
+    )
+
+
+def _production_family_isolation_report(
+    dataset_family: LoadedRiskDatasetFamily,
+) -> dict[str, int]:
+    audit = dataset_family.cross_split_audit
+    if audit.get("policy_version") != "thor_recording_generalization_v1":
+        raise CalibrationContractError(
+            "unsupported production calibration/test isolation policy"
+        )
+    result: dict[str, int] = {}
+    for category, fields, reject_overlap in (
+        (
+            "forbidden_overlaps",
+            _PRODUCTION_FAMILY_FORBIDDEN_OVERLAPS,
+            True,
+        ),
+        (
+            "allowed_overlaps",
+            _PRODUCTION_FAMILY_ALLOWED_OVERLAPS,
+            False,
+        ),
+    ):
+        entries = audit.get(category)
+        if not isinstance(entries, Mapping) or set(entries) != set(fields):
+            raise CalibrationContractError(
+                f"dataset family {category} coverage mismatch"
+            )
+        for field in fields:
+            values = _family_calibration_test_overlap_values(
+                entries[field],
+                field=field,
+            )
+            if reject_overlap and values:
+                raise CalibrationContractError(
+                    f"calibration/test forbidden identity overlap for {field}: "
+                    f"{list(values[:5])}"
+                )
+            result[field] = len(values)
     return result
 
 
@@ -943,18 +1236,37 @@ def assert_calibration_artifact_test_isolation(
         dataset_family=dataset_family,
     )
     identities = validated["fitted_identities"]
-    result: dict[str, int] = {}
+    identity_fields = tuple(identities)
     for index, row in enumerate(test_rows):
         if not isinstance(row, Mapping):
             raise CalibrationContractError(f"test row {index} must be a mapping")
         if row.get("split") != "test":
             raise CalibrationContractError(f"test row {index} must have split 'test'")
-        for field in IDENTITY_FIELDS:
+        for field in identity_fields:
             if field not in row:
                 raise CalibrationContractError(
                     f"test row {index} is missing identity field {field}"
                 )
-    for field in IDENTITY_FIELDS:
+    if validated["mode"] == "production":
+        family = _reauthenticate_dataset_family(dataset_family, mode="production")
+        assert family is not None
+        calibration_rows = [
+            {"sample_id": sample_id}
+            for sample_id in identities["sample_id"]
+        ]
+        _validate_family_split_sample_ids(
+            calibration_rows,
+            split="calibration",
+            dataset_family=family,
+        )
+        _validate_family_split_sample_ids(
+            test_rows,
+            split="test",
+            dataset_family=family,
+        )
+        return _production_family_isolation_report(family)
+    result: dict[str, int] = {}
+    for field in identity_fields:
         fitted = set(identities[field])
         overlap = sorted(fitted & {str(row[field]) for row in test_rows})
         if overlap:

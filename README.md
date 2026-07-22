@@ -48,6 +48,29 @@ deterministic generation, hand-derived toy answers, and NPZ/JSON
 serialization. This minimal command does not install PyTorch and is not a
 complete training environment.
 
+### Formal baseline comparison
+
+The production SOP-08--10 path uses the repository ConvGRU occupancy baseline.
+It does not require an external occupancy model. The fixed calibration protocol
+is [`configs/prediction_protocol_production.json`](./configs/prediction_protocol_production.json).
+
+1. Publish one evaluation-record collection per calibration/test member with
+   `scripts/04_publish_risk_evaluation_records.py`.
+2. Train B3/B4 with `scripts/05_train_occupancy_baseline.py --stage formal_50k`;
+   supply the typed family plus explicit train/val risk, sidecar, seal, and
+   authenticated snapshot roots.
+3. Run `scripts/09_predict_risk.py --stage calibration` once. It writes R0,
+   R1, and B1--B4 tables over one ordered calibration cohort.
+4. Run `scripts/07_calibrate_risk.py` for each table with the same
+   `--prediction-protocol`, placing the six sealed outputs under method-named
+   directories.
+5. Run `scripts/09_predict_risk.py --stage complete` with the calibration
+   prediction and calibration-artifact roots. Test data is opened only after
+   all six calibration artifacts pass authentication.
+
+Use each command's `--help` for the explicit immutable input roots. Formal
+artifacts remain ineligible for paper claims until the target-scale runs finish.
+
 The exact core, test, and current training dependency versions are also
 recorded in `pyproject.toml`. CUDA 11.8 requires the additional PyTorch wheel
 index documented in the environment guide.

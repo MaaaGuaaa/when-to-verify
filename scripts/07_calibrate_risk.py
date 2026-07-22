@@ -22,6 +22,7 @@ from src.calibration.grouped_calibration import (  # noqa: E402
     fit_grouped_calibration,
 )
 from src.calibration.split_conformal import (  # noqa: E402
+    CALIBRATION_ARTIFACT_LAYOUT_VERSION,
     calibration_artifact_semantic_digest,
     fit_calibration_artifact,
     validate_calibration_artifact,
@@ -32,6 +33,10 @@ from src.datasets.risk_dataset_seal import (  # noqa: E402
     LoadedRiskDatasetFamily,
     load_risk_dataset_family,
 )
+from src.evaluation.prediction_tables import (  # noqa: E402
+    validate_prediction_protocol,
+)
+from src.utils.atomic_publish import atomic_rename_noreplace  # noqa: E402
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -73,7 +78,25 @@ def _publish(output_dir: Path, files: dict[str, dict[str, Any]]) -> None:
     try:
         for name, value in files.items():
             _write_json(staging / name, value)
-        os.replace(staging, output_dir)
+        checksums = {
+            name: _sha256(staging / name) for name in sorted(files)
+        }
+        checksums_bytes = "".join(
+            f"{digest}  {name}\n" for name, digest in checksums.items()
+        ).encode("ascii")
+        (staging / "checksums.sha256").write_bytes(checksums_bytes)
+        marker = {
+            "calibration_artifact_layout_version": (
+                CALIBRATION_ARTIFACT_LAYOUT_VERSION
+            ),
+            "calibration_semantic_digest": files["calibration.json"][
+                "semantic_digest"
+            ],
+            "manifest_sha256": _sha256(staging / "manifest.json"),
+            "checksums_sha256": hashlib.sha256(checksums_bytes).hexdigest(),
+        }
+        _write_json(staging / ".producer-complete", marker)
+        atomic_rename_noreplace(staging, output_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -83,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("toy", "production"), required=True)
     parser.add_argument("--prediction-table", type=Path, required=True)
+    parser.add_argument("--prediction-protocol", type=Path)
     parser.add_argument("--dataset-family-root", type=Path)
     parser.add_argument("--split", default="calibration")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -112,6 +136,38 @@ def main() -> int:
         expected_split="calibration",
         dataset_family=dataset_family,
     )
+    protocol_path = getattr(args, "prediction_protocol", None)
+    protocol = None
+    if "prediction_protocol_digest_sha256" in table:
+        if protocol_path is None:
+            raise ValueError(
+                "protocol-bound production table requires --prediction-protocol"
+            )
+        protocol = validate_prediction_protocol(_read_json(protocol_path))
+        if table["prediction_protocol_digest_sha256"] != protocol[
+            "protocol_digest_sha256"
+        ]:
+            raise ValueError("prediction table/protocol digest mismatch")
+        grouped_protocol = protocol["grouped_calibration"]
+        if not isinstance(grouped_protocol, dict):
+            raise ValueError("prediction protocol grouped calibration is invalid")
+        if float(args.alpha) != float(protocol["alpha"]):
+            raise ValueError("--alpha differs from the shared prediction protocol")
+        if args.prediction_key != protocol["prediction_key"]:
+            raise ValueError(
+                "--prediction-key differs from the shared prediction protocol"
+            )
+        if args.min_group_size != grouped_protocol["min_group_size"]:
+            raise ValueError(
+                "--min-group-size differs from the shared prediction protocol"
+            )
+        grouped_dimensions = tuple(grouped_protocol["group_dimensions"])
+    else:
+        if protocol_path is not None:
+            raise ValueError(
+                "--prediction-protocol requires a protocol-bound prediction table"
+            )
+        grouped_dimensions = GROUP_DIMENSIONS
     artifact = fit_calibration_artifact(
         table,
         alpha=args.alpha,
@@ -122,7 +178,7 @@ def main() -> int:
         table["rows"],
         alpha=args.alpha,
         prediction_key=args.prediction_key,
-        dimensions=GROUP_DIMENSIONS,
+        dimensions=grouped_dimensions,
         min_group_size=args.min_group_size,
     )
     artifact["semantic_digest"] = calibration_artifact_semantic_digest(artifact)
@@ -199,6 +255,26 @@ def main() -> int:
                 ),
             }
         )
+        if protocol is not None:
+            manifest.update(
+                {
+                    "prediction_protocol_layout_version": protocol[
+                        "protocol_layout_version"
+                    ],
+                    "prediction_protocol_digest_sha256": protocol[
+                        "protocol_digest_sha256"
+                    ],
+                    "evaluation_record_collection_digest_sha256": table[
+                        "evaluation_record_collection_digest_sha256"
+                    ],
+                    "occupancy_sidecar_collection_digest_sha256": table[
+                        "occupancy_sidecar_collection_digest_sha256"
+                    ],
+                    "cohort_binding_digest_sha256": table[
+                        "cohort_binding_digest_sha256"
+                    ],
+                }
+            )
     _publish(
         args.output_dir,
         {"calibration.json": artifact, "manifest.json": manifest},

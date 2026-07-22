@@ -101,6 +101,7 @@ _RECORD_KEYS = frozenset(
         "contact_policy_rule_version",
     }
 )
+RISK_EVALUATION_RECORD_FIELDS = tuple(sorted(_RECORD_KEYS))
 _ROBOT_PROVENANCE_KEYS = frozenset(
     {
         "rule_version",

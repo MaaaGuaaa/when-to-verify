@@ -265,7 +265,20 @@ def test_production_round_trip_binds_authenticated_family_and_split_members(
     assert test_table["risk_dataset_manifest_digest"] == family.members["test"][
         "risk_dataset_manifest_digest"
     ]
-    assert set(isolation.values()) == {0}
+    assert isolation["base_session_id"] == 1
+    assert isolation["source_session_id"] == 1
+    assert all(
+        isolation[field] == 0
+        for field in (
+            "sample_id",
+            "base_recording_id",
+            "source_recording_id",
+            "base_source_cross_role_recording_id",
+            "source_snippet_id",
+            "pair_group_id",
+            "seed_namespace",
+        )
+    )
 
 
 def test_production_apis_require_reauthenticated_typed_family(

@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from src.evaluation.prediction_tables import build_prediction_protocol
+
 
 ROOT = Path(__file__).parents[1]
 FAMILY_DIGEST = "f" * 64
@@ -274,6 +276,53 @@ def test_production_calibration_publishes_family_bound_manifest(
     assert manifest["calibration_count"] == 1
 
 
+def test_production_calibration_rejects_protocol_alpha_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script(
+        "production_calibration_protocol_mismatch",
+        "scripts/07_calibrate_risk.py",
+    )
+    protocol = build_prediction_protocol(
+        alpha=0.2,
+        prediction_key="q90",
+        min_group_size=1,
+    )
+    protocol_path = tmp_path / "prediction-protocol.json"
+    _write_json(protocol_path, protocol)
+    table = _table("calibration")
+    table["prediction_protocol_digest_sha256"] = protocol[
+        "protocol_digest_sha256"
+    ]
+    table_path = tmp_path / "calibration-table.json"
+    _write_json(table_path, table)
+    monkeypatch.setattr(
+        module,
+        "parse_args",
+        lambda: argparse.Namespace(
+            mode="production",
+            prediction_table=table_path,
+            prediction_protocol=protocol_path,
+            dataset_family_root=tmp_path / "family",
+            split="calibration",
+            output_dir=tmp_path / "output",
+            alpha=0.1,
+            prediction_key="q90",
+            min_group_size=1,
+        ),
+    )
+    monkeypatch.setattr(module, "load_risk_dataset_family", lambda root: _family())
+    monkeypatch.setattr(
+        module,
+        "validate_prediction_table",
+        lambda value, **kwargs: table,
+    )
+
+    with pytest.raises(ValueError, match="alpha"):
+        module.main()
+
+
 def _patch_eval_dependencies(
     module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -306,6 +355,27 @@ def _patch_eval_dependencies(
         "calibration_artifact_semantic_digest",
         lambda value: METRICS_DIGEST,
     )
+
+
+def test_offline_protocol_gate_rejects_shared_protocol_digest_drift() -> None:
+    module = _load_script(
+        "production_eval_protocol_gate",
+        "scripts/10_eval_offline.py",
+    )
+    main = {
+        "alpha": 0.1,
+        "prediction_key": "q90",
+        "fit_split": "calibration",
+        "fitted_identities": {"sample_id": ["c0"]},
+        "prediction_protocol_digest_sha256": "a" * 64,
+    }
+    baseline = {
+        **main,
+        "prediction_protocol_digest_sha256": "b" * 64,
+    }
+
+    with pytest.raises(ValueError, match="prediction_protocol_digest"):
+        module._assert_same_calibration_protocol(main, baseline)
 
 
 def test_production_eval_publishes_family_and_isolation_metadata(

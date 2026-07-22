@@ -578,6 +578,98 @@ def test_optional_sidecar_root_publishes_separate_id_bound_shard(
     _assert_pair_staging_clean(request)
 
 
+def test_optional_evaluation_root_uses_aligned_triple_builder(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = (_event("event-a", state_id="base-a", trajectory_id="trajectory-a"),)
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        output_dir=tmp_path / "risk-parent" / "risk-shard",
+        sidecar_output_dir=tmp_path / "sidecar-parent" / "sidecar-shard",
+        evaluation_record_output_dir=(
+            tmp_path / "evaluation-parent" / "evaluation-shard"
+        ),
+    )
+    calls, _, _, _ = _install_success_dependencies(
+        cli_module,
+        monkeypatch,
+        events=events,
+        output_dir=request.output_dir,
+    )
+    _install_success_sidecar_dependencies(cli_module, monkeypatch, calls)
+    triple_calls: list[dict[str, object]] = []
+
+    def triple_builder(**kwargs):
+        triple_calls.append(kwargs)
+        samples, sidecars = cli_module.build_risk_samples_and_sidecars_from_sop06_group(
+            **kwargs
+        )
+        records = tuple(
+            {"sample_id": sample.sample_id, "split": "train"}
+            for sample in samples
+        )
+        return samples, sidecars, records
+
+    replay_publish_calls: list[tuple[Path, tuple[object, ...]]] = []
+
+    def publish_replay(path, *, risk_shard, records):
+        replay_publish_calls.append((Path(path), tuple(records)))
+        Path(path).mkdir(parents=True)
+        return Path(path)
+
+    def load_replay(path, *, risk_shard):
+        return SimpleNamespace(
+            sample_ids=tuple(sample.sample_id for sample in risk_shard.samples),
+            semantic_digest_sha256="b" * 64,
+            source_risk_shard_semantic_digest=risk_shard.semantic_digest,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_risk_samples_sidecars_and_evaluation_records_from_sop06_group",
+        triple_builder,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "publish_risk_evaluation_replay_shard",
+        publish_replay,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_risk_evaluation_replay_shard",
+        load_replay,
+    )
+
+    report = cli_module.run_risk_dataset(request)
+
+    assert len(triple_calls) == 1
+    assert len(replay_publish_calls) == 1
+    assert replay_publish_calls[0][0] != request.evaluation_record_output_dir
+    assert request.evaluation_record_output_dir is not None
+    assert request.evaluation_record_output_dir.is_dir()
+    assert report["evaluation_record_output_dir"] == str(
+        request.evaluation_record_output_dir
+    )
+    assert report["evaluation_replay_semantic_digest_sha256"] == "b" * 64
+
+
+def test_evaluation_output_requires_sidecar_boundary_before_loading_inputs(
+    cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    request = replace(
+        _request(cli_module, tmp_path, event_count=1, sample_count=3),
+        evaluation_record_output_dir=tmp_path / "evaluation-shard",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_inputs",
+        lambda value: pytest.fail("invalid triple output must fail before input load"),
+    )
+
+    with pytest.raises(cli_module.RiskDatasetRunError, match="sidecar"):
+        cli_module.run_risk_dataset(request)
+
+
 def test_complete_pair_uses_pinned_risk_snapshot_guard(
     cli_module, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

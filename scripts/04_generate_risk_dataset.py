@@ -26,8 +26,13 @@ if str(_ROOT) not in sys.path:
 from src.contracts import ContractError, SCHEMA_VERSION, build_grid_spec  # noqa: E402
 from src.datasets.risk_dataset import (  # noqa: E402
     build_risk_samples_and_sidecars_from_sop06_group,
+    build_risk_samples_sidecars_and_evaluation_records_from_sop06_group,
     build_risk_samples_from_sop06_group,
     pin_risk_shard_snapshot,
+)
+from src.datasets.risk_evaluation_store import (  # noqa: E402
+    load_risk_evaluation_replay_shard,
+    publish_risk_evaluation_replay_shard,
 )
 from src.datasets.sidecar_writer import (  # noqa: E402
     _atomic_rename_directory_noreplace as _atomic_pair_cleanup_claim_noreplace,
@@ -87,6 +92,7 @@ class RiskDatasetRunRequest:
     expected_sample_count: int
     checksum_workers: int
     sidecar_output_dir: Path | None = None
+    evaluation_record_output_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,14 @@ def _parser() -> argparse.ArgumentParser:
             "optional separate immutable root for oracle-only SOP08 labels"
         ),
     )
+    parser.add_argument(
+        "--evaluation-record-output-dir",
+        type=Path,
+        help=(
+            "optional immutable replay shard of evaluation-only records; "
+            "requires --sidecar-output-dir"
+        ),
+    )
     parser.add_argument("--shard-index", type=_nonnegative_int, required=True)
     parser.add_argument(
         "--expected-event-count", type=_positive_int, required=True
@@ -233,6 +247,32 @@ def _validate_request(request: RiskDatasetRunRequest) -> None:
             raise FileExistsError(
                 "refusing to overwrite immutable risk/sidecar pair marker: "
                 f"{marker_path}"
+            )
+    if request.evaluation_record_output_dir is not None:
+        if request.sidecar_output_dir is None:
+            raise RiskDatasetRunError(
+                "evaluation record output requires the formal sidecar boundary"
+            )
+        if not isinstance(request.evaluation_record_output_dir, Path):
+            raise TypeError("evaluation_record_output_dir must be a Path or None")
+        evaluation_root = request.evaluation_record_output_dir.resolve(
+            strict=False
+        )
+        risk_root = request.output_dir.resolve(strict=False)
+        sidecar_root = request.sidecar_output_dir.resolve(strict=False)
+        roots = (risk_root, sidecar_root, evaluation_root)
+        if any(
+            left == right or left in right.parents or right in left.parents
+            for index, left in enumerate(roots)
+            for right in roots[index + 1 :]
+        ):
+            raise RiskDatasetRunError(
+                "risk, sidecar, and evaluation output directories must not be nested"
+            )
+        if os.path.lexists(request.evaluation_record_output_dir):
+            raise FileExistsError(
+                "refusing to overwrite immutable evaluation replay shard: "
+                f"{request.evaluation_record_output_dir}"
             )
 
 
@@ -497,6 +537,7 @@ def _publish_risk_sidecar_pair(
     request: RiskDatasetRunRequest,
     sample_values: tuple[object, ...],
     sidecars: tuple[object, ...],
+    evaluation_records: tuple[Mapping[str, object], ...],
     grid: object,
 ):
     """Publish both immutable roots and their external marker as one protocol."""
@@ -508,6 +549,7 @@ def _publish_risk_sidecar_pair(
     )
     staging_containers: list[_OwnedFilesystemPath] = []
     published_paths: list[_OwnedFilesystemPath] = []
+    final_evaluation = None
     try:
         risk_container, risk_staging = _make_pair_staging_target(
             request.output_dir
@@ -551,6 +593,27 @@ def _publish_risk_sidecar_pair(
         if staged_sidecars.sample_ids != staged_ids:
             raise ValueError("formal sidecar staging reload sample IDs mismatch")
 
+        evaluation_staging = None
+        staged_evaluation = None
+        if request.evaluation_record_output_dir is not None:
+            evaluation_container, evaluation_staging = _make_pair_staging_target(
+                request.evaluation_record_output_dir
+            )
+            staging_containers.append(evaluation_container)
+            publish_risk_evaluation_replay_shard(
+                evaluation_staging,
+                risk_shard=staged_risk,
+                records=evaluation_records,
+            )
+            staged_evaluation = load_risk_evaluation_replay_shard(
+                evaluation_staging,
+                risk_shard=staged_risk,
+            )
+            if staged_evaluation.sample_ids != staged_ids:
+                raise ValueError(
+                    "formal evaluation replay staging sample IDs mismatch"
+                )
+
         risk_published = _commit_staged_path(
             risk_staging,
             request.output_dir,
@@ -563,6 +626,14 @@ def _publish_risk_sidecar_pair(
             expected_file_type=stat.S_IFDIR,
         )
         published_paths.append(sidecar_published)
+        if evaluation_staging is not None:
+            assert request.evaluation_record_output_dir is not None
+            evaluation_published = _commit_staged_path(
+                evaluation_staging,
+                request.evaluation_record_output_dir,
+                expected_file_type=stat.S_IFDIR,
+            )
+            published_paths.append(evaluation_published)
 
         final_risk = load_risk_shard(request.output_dir, grid=grid)
         final_ids = tuple(sample.sample_id for sample in final_risk.samples)
@@ -582,6 +653,20 @@ def _publish_risk_sidecar_pair(
         )
         if final_sidecars.semantic_digest != staged_sidecars.semantic_digest:
             raise ValueError("final sidecar shard differs from verified staging")
+        if request.evaluation_record_output_dir is not None:
+            assert staged_evaluation is not None
+            final_evaluation = load_risk_evaluation_replay_shard(
+                request.evaluation_record_output_dir,
+                risk_shard=final_risk,
+            )
+            if (
+                final_evaluation.semantic_digest_sha256
+                != staged_evaluation.semantic_digest_sha256
+                or final_evaluation.sample_ids != final_ids
+            ):
+                raise ValueError(
+                    "final evaluation replay shard differs from verified staging"
+                )
 
         marker_container, marker_staging = _make_pair_staging_target(
             marker_final
@@ -643,6 +728,7 @@ def _publish_risk_sidecar_pair(
             complete_pair.sidecar_shard,
             complete_pair.completion_marker,
             marker_final,
+            final_evaluation,
         )
     except BaseException as exc:
         cleanup_errors: list[str] = []
@@ -901,6 +987,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
     snippet_index = _snippet_index(sop03)
     samples: list[object] = []
     sidecars: list[object] = []
+    evaluation_records: list[Mapping[str, object]] = []
     groups: list[object] = []
     accepted_sources: list[tuple[object, object]] = []
     rejection_reasons: Counter[str] = Counter()
@@ -945,17 +1032,27 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
                 "risk_config": base_config["risk_gt"],
                 "dataset_seed": request.seed,
             }
-            if request.sidecar_output_dir is None:
+            if request.evaluation_record_output_dir is not None:
+                (
+                    group_samples,
+                    group_sidecars,
+                    group_evaluation_records,
+                ) = build_risk_samples_sidecars_and_evaluation_records_from_sop06_group(
+                    **adapter_kwargs
+                )
+            elif request.sidecar_output_dir is None:
                 group_samples = build_risk_samples_from_sop06_group(
                     **adapter_kwargs
                 )
                 group_sidecars: tuple[object, ...] = ()
+                group_evaluation_records: tuple[Mapping[str, object], ...] = ()
             else:
                 group_samples, group_sidecars = (
                     build_risk_samples_and_sidecars_from_sop06_group(
                         **adapter_kwargs
                     )
                 )
+                group_evaluation_records = ()
         except (TypeError, ValueError) as exc:
             raise RiskDatasetRunError(
                 "failed to atomically assemble risk samples for "
@@ -963,6 +1060,7 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
             ) from exc
         samples.extend(group_samples)
         sidecars.extend(group_sidecars)
+        evaluation_records.extend(group_evaluation_records)
 
     sample_values = tuple(samples)
     if len(sample_values) != request.expected_sample_count:
@@ -986,10 +1084,19 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
             raise RiskDatasetRunError(
                 "assembled sidecars do not align with RiskSample IDs"
             )
+    if request.evaluation_record_output_dir is not None:
+        evaluation_ids = tuple(
+            record.get("sample_id") for record in evaluation_records
+        )
+        if evaluation_ids != sample_ids:
+            raise RiskDatasetRunError(
+                "assembled evaluation records do not align with RiskSample IDs"
+            )
 
     loaded_sidecars = None
     loaded_pair_marker = None
     pair_marker_path = None
+    loaded_evaluation = None
     if request.sidecar_output_dir is None:
         try:
             write_risk_shard(
@@ -1014,10 +1121,12 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
             loaded_sidecars,
             loaded_pair_marker,
             pair_marker_path,
+            loaded_evaluation,
         ) = _publish_risk_sidecar_pair(
             request=request,
             sample_values=sample_values,
             sidecars=tuple(sidecars),
+            evaluation_records=tuple(evaluation_records),
             grid=grid,
         )
 
@@ -1060,6 +1169,17 @@ def run_risk_dataset(request: RiskDatasetRunRequest) -> dict[str, object]:
                 ),
             }
         )
+    if loaded_evaluation is not None:
+        report.update(
+            {
+                "evaluation_record_output_dir": str(
+                    request.evaluation_record_output_dir
+                ),
+                "evaluation_replay_semantic_digest_sha256": (
+                    loaded_evaluation.semantic_digest_sha256
+                ),
+            }
+        )
     json.dumps(report, sort_keys=True, allow_nan=False)
     return report
 
@@ -1094,6 +1214,7 @@ def main() -> int:
         expected_sample_count=args.expected_sample_count,
         checksum_workers=args.checksum_workers,
         sidecar_output_dir=args.sidecar_output_dir,
+        evaluation_record_output_dir=args.evaluation_record_output_dir,
     )
     try:
         report = run_risk_dataset(request)

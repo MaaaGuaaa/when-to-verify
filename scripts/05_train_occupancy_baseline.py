@@ -38,7 +38,10 @@ from src.datasets.toy_risk_learning import (  # noqa: E402
 from src.datasets.risk_dataloader import (  # noqa: E402
     select_production_risk_subset,
 )
-from src.datasets.risk_dataset_seal import load_risk_dataset_seal  # noqa: E402
+from src.datasets.risk_dataset_seal import (  # noqa: E402
+    load_risk_dataset_family,
+    load_risk_dataset_seal,
+)
 from src.datasets.risk_training_store import (  # noqa: E402
     load_authenticated_occupancy_snapshot,
 )
@@ -268,6 +271,11 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
     config = _load_production_config(args.config)
     if args.stage is not None:
         config["stage"] = args.stage
+        if args.stage == "one_shard_smoke":
+            config["occupancy_epochs"] = 1
+            config["aggregator_epochs"] = 1
+            config["gradient_accumulation_steps"] = 1
+            config["checkpoint_interval_steps"] = 1
     if args.seed is not None:
         config["seed"] = _nonnegative_int(args.seed, "--seed")
     if args.max_samples is not None:
@@ -288,7 +296,53 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError(
             "production occupancy training does not support WORLD_SIZE>1"
         )
+    validation_paths = (
+        args.validation_dataset_seal_root,
+        args.validation_risk_collection_root,
+        args.validation_sidecar_collection_root,
+    )
+    if any(value is None for value in validation_paths) and any(
+        value is not None for value in validation_paths
+    ):
+        raise ValueError(
+            "validation dataset seal, risk collection, and sidecar collection "
+            "roots must be supplied together"
+        )
+    formal = training_config.stage == "formal_50k"
+    if formal:
+        if args.dataset_family_root is None or any(
+            value is None for value in validation_paths
+        ):
+            raise ValueError(
+                "formal_50k requires --dataset-family-root and all validation roots"
+            )
+        if args.training_cache_mode != "authenticated_snapshot":
+            raise ValueError(
+                "formal_50k requires --training-cache-mode authenticated_snapshot"
+            )
+    elif args.dataset_family_root is not None or any(
+        value is not None for value in validation_paths
+    ):
+        raise ValueError(
+            "smoke/overfit occupancy training rejects validation and family inputs"
+        )
+
+    dataset_family = (
+        load_risk_dataset_family(args.dataset_family_root) if formal else None
+    )
+    expected_train_digest = (
+        str(dataset_family.members["train"]["risk_dataset_manifest_digest"])
+        if dataset_family is not None
+        else None
+    )
+    expected_validation_digest = (
+        str(dataset_family.members["val"]["risk_dataset_manifest_digest"])
+        if dataset_family is not None
+        else None
+    )
     training_snapshot = None
+    validation_dataset = None
+    validation_snapshot = None
     if args.training_cache_mode == "authenticated_snapshot":
         if args.training_cache_root is None:
             raise ValueError(
@@ -300,11 +354,26 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
             sidecar_root=args.sidecar_collection_root,
             expected_split="train",
             cache_root=args.training_cache_root,
+            expected_manifest_digest=expected_train_digest,
         )
         subset = training_snapshot.select_subset(
             max_samples=int(config["max_samples"]),
             seed=training_config.seed,
         )
+        if formal:
+            assert validation_paths[0] is not None
+            assert validation_paths[1] is not None
+            assert validation_paths[2] is not None
+            validation_dataset, validation_snapshot = (
+                load_authenticated_occupancy_snapshot(
+                    validation_paths[0],
+                    collection_root=validation_paths[1],
+                    sidecar_root=validation_paths[2],
+                    expected_split="val",
+                    cache_root=args.training_cache_root,
+                    expected_manifest_digest=expected_validation_digest,
+                )
+            )
     else:
         if args.training_cache_root is not None:
             raise ValueError(
@@ -333,6 +402,10 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
             args.resume_publication_instance_digest
         ),
         training_snapshot=training_snapshot,
+        validation_dataset=validation_dataset,
+        validation_sidecar_root=args.validation_sidecar_collection_root,
+        dataset_family=dataset_family,
+        validation_snapshot=validation_snapshot,
     )
     return {
         "artifact": str(result.output_dir),
@@ -341,7 +414,11 @@ def _run_production(args: argparse.Namespace) -> dict[str, object]:
             result.publication_instance_digest_sha256
         ),
         "risk_dataset_manifest_digest": dataset.risk_dataset_manifest_digest,
-        "scientific_gate": "engineering_only_without_validation_family",
+        "scientific_gate": (
+            "formal_validation_selected"
+            if formal
+            else "engineering_only_without_validation_family"
+        ),
     }
 
 
@@ -827,6 +904,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-seal-root", type=Path)
     parser.add_argument("--risk-collection-root", type=Path)
     parser.add_argument("--sidecar-collection-root", type=Path)
+    parser.add_argument("--validation-dataset-seal-root", type=Path)
+    parser.add_argument("--validation-risk-collection-root", type=Path)
+    parser.add_argument("--validation-sidecar-collection-root", type=Path)
+    parser.add_argument("--dataset-family-root", type=Path)
     parser.add_argument(
         "--stage",
         choices=("one_shard_smoke", "real_1k_overfit", "formal_50k"),

@@ -247,3 +247,124 @@ def test_occupancy_cli_rejects_world_size_before_source_load(
 
     assert module.main() == 2
     assert source_loaded is False
+
+
+def test_formal_occupancy_cli_loads_typed_train_and_val_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script(OCCUPANCY_SCRIPT, "occupancy_formal_cli_wiring")
+    train_dataset = SimpleNamespace(
+        split="train",
+        risk_dataset_manifest_digest="1" * 64,
+    )
+    val_dataset = SimpleNamespace(
+        split="val",
+        risk_dataset_manifest_digest="2" * 64,
+    )
+    train_subset = SimpleNamespace(sample_ids=tuple(f"train-{i}" for i in range(50_000)))
+    val_subset = SimpleNamespace(sample_ids=("val-0",))
+    train_snapshot = SimpleNamespace(
+        select_subset=lambda **kwargs: train_subset,
+    )
+    val_snapshot = SimpleNamespace(
+        select_subset=lambda **kwargs: val_subset,
+    )
+    family = SimpleNamespace(
+        risk_dataset_family_digest="3" * 64,
+        members={
+            "train": {"risk_dataset_manifest_digest": "1" * 64},
+            "val": {"risk_dataset_manifest_digest": "2" * 64},
+        },
+    )
+    loads: list[tuple[Path, Path, Path, str, Path]] = []
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        module,
+        "discover_distributed_runtime",
+        lambda configured_device: DistributedRuntime(0, 1, 0, "gloo", "cpu"),
+    )
+
+    def load_snapshot(
+        seal_root,
+        *,
+        collection_root,
+        sidecar_root,
+        expected_split,
+        cache_root,
+        **kwargs,
+    ):
+        loads.append(
+            (
+                Path(seal_root),
+                Path(collection_root),
+                Path(sidecar_root),
+                expected_split,
+                Path(cache_root),
+            )
+        )
+        return (
+            (train_dataset, train_snapshot)
+            if expected_split == "train"
+            else (val_dataset, val_snapshot)
+        )
+
+    monkeypatch.setattr(module, "load_authenticated_occupancy_snapshot", load_snapshot)
+    monkeypatch.setattr(module, "load_risk_dataset_family", lambda path: family)
+
+    def train(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            output_dir=tmp_path / "output",
+            semantic_digest_sha256="4" * 64,
+            publication_instance_digest_sha256="5" * 64,
+        )
+
+    monkeypatch.setattr(module, "train_production_occupancy_baselines", train)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(OCCUPANCY_SCRIPT),
+            "--config",
+            str(OCCUPANCY_CONFIG),
+            "--mode",
+            "production",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--dataset-seal-root",
+            str(tmp_path / "train-seal"),
+            "--risk-collection-root",
+            str(tmp_path / "train-collection"),
+            "--sidecar-collection-root",
+            str(tmp_path / "train-sidecars"),
+            "--validation-dataset-seal-root",
+            str(tmp_path / "val-seal"),
+            "--validation-risk-collection-root",
+            str(tmp_path / "val-collection"),
+            "--validation-sidecar-collection-root",
+            str(tmp_path / "val-sidecars"),
+            "--dataset-family-root",
+            str(tmp_path / "family"),
+            "--stage",
+            "formal_50k",
+            "--max-samples",
+            "50000",
+            "--device",
+            "cpu",
+            "--training-cache-mode",
+            "authenticated_snapshot",
+            "--training-cache-root",
+            str(tmp_path / "cache"),
+        ],
+    )
+
+    assert module.main() == 0
+    assert [item[3] for item in loads] == ["train", "val"]
+    assert captured["train_dataset"] is train_dataset
+    assert captured["validation_dataset"] is val_dataset
+    assert captured["training_snapshot"] is train_snapshot
+    assert captured["validation_snapshot"] is val_snapshot
+    assert captured["dataset_family"] is family
+    assert captured["validation_sidecar_root"] == tmp_path / "val-sidecars"

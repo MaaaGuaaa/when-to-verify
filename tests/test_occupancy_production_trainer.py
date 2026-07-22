@@ -393,18 +393,32 @@ def test_scale_and_resume_gates_fail_closed_without_creating_output(
     tmp_path: Path,
 ) -> None:
     dataset, subset, sidecar_root = _production_fixture(tmp_path)
-    for stage in ("real_1k_overfit", "formal_50k"):
-        output = tmp_path / stage
-        with pytest.raises(ValueError, match=f"{stage}.*not implemented"):
-            train_production_occupancy_baselines(
-                train_dataset=dataset,
-                train_subset=subset,
-                sidecar_root=sidecar_root,
-                config=replace(_training_config(), stage=stage),  # type: ignore[arg-type]
-                output_dir=output,
-                code_commit="c" * 40,
-            )
-        assert not output.exists()
+    overfit_output = tmp_path / "real_1k_overfit"
+    with pytest.raises(ValueError, match="real_1k_overfit.*not implemented"):
+        train_production_occupancy_baselines(
+            train_dataset=dataset,
+            train_subset=subset,
+            sidecar_root=sidecar_root,
+            config=replace(_training_config(), stage="real_1k_overfit"),
+            output_dir=overfit_output,
+            code_commit="c" * 40,
+        )
+    assert not overfit_output.exists()
+
+    formal_output = tmp_path / "formal_50k"
+    with pytest.raises(
+        ValueError,
+        match="formal_50k.*validation",
+    ):
+        train_production_occupancy_baselines(
+            train_dataset=dataset,
+            train_subset=subset,
+            sidecar_root=sidecar_root,
+            config=replace(_training_config(), stage="formal_50k"),
+            output_dir=formal_output,
+            code_commit="c" * 40,
+        )
+    assert not formal_output.exists()
     resume_output = tmp_path / "resume"
     with pytest.raises(ValueError, match="resume.*not implemented"):
         train_production_occupancy_baselines(

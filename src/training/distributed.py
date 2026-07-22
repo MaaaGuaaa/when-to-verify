@@ -18,6 +18,7 @@ from src.datasets.risk_dataloader import RiskDataContractError
 _PARTITION_LAYOUT_VERSION = "sop09_synchronous_partition_v1"
 _RUNTIME_ENVIRONMENT_NAMES = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
 _MAX_SETUP_ENVELOPE_BYTES = 64 * 1024
+_SETUP_CONTROL_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,16 @@ def initialize_distributed_process_group(
         arguments["init_method"] = init_method
     try:
         dist.init_process_group(**arguments)
+        # NCCL initializes communicators lazily on the first collective.  Do
+        # that before rank zero can spend minutes materializing a snapshot,
+        # otherwise peer ranks can time out waiting for the unique ID.
+        if runtime.backend == "nccl":
+            dist.barrier(device_ids=[runtime.local_rank])
+        else:
+            dist.barrier()
     except (OSError, RuntimeError, ValueError) as exc:
+        if dist.is_initialized():
+            dist.destroy_process_group()
         raise RiskDataContractError(f"failed to initialize distributed process group: {exc}") from exc
 
 
@@ -211,25 +221,41 @@ def broadcast_rank_zero_setup(
     if not dist.is_available() or not dist.is_initialized():
         raise RiskDataContractError("distributed process group must be initialized before setup")
 
-    object_list: list[object | None] = [None]
-    if runtime.is_rank_zero:
+    control_group = None
+    if runtime.backend == "nccl":
         try:
-            value = setup()
-            if not isinstance(value, Mapping):
-                raise RiskDataContractError("rank-zero setup result must be a mapping")
-            payload = dict(value)
-            envelope: dict[str, object] = {"ok": True, "payload": payload}
-            encoded = _canonical_json_bytes(envelope)
-            if len(encoded) > _MAX_SETUP_ENVELOPE_BYTES:
-                raise RiskDataContractError("rank-zero setup envelope exceeds size limit")
-        except Exception as exc:
-            envelope = {
-                "ok": False,
-                "error_type": type(exc).__name__,
-                "message": str(exc)[:4096],
-            }
-        object_list[0] = envelope
-    dist.broadcast_object_list(object_list, src=0)
+            control_group = dist.new_group(
+                backend="gloo",
+                timeout=timedelta(seconds=_SETUP_CONTROL_TIMEOUT_SECONDS),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RiskDataContractError(
+                f"failed to initialize rank-zero setup control group: {exc}"
+            ) from exc
+
+    object_list: list[object | None] = [None]
+    try:
+        if runtime.is_rank_zero:
+            try:
+                value = setup()
+                if not isinstance(value, Mapping):
+                    raise RiskDataContractError("rank-zero setup result must be a mapping")
+                payload = dict(value)
+                envelope: dict[str, object] = {"ok": True, "payload": payload}
+                encoded = _canonical_json_bytes(envelope)
+                if len(encoded) > _MAX_SETUP_ENVELOPE_BYTES:
+                    raise RiskDataContractError("rank-zero setup envelope exceeds size limit")
+            except Exception as exc:
+                envelope = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:4096],
+                }
+            object_list[0] = envelope
+        dist.broadcast_object_list(object_list, src=0, group=control_group)
+    finally:
+        if control_group is not None:
+            dist.destroy_process_group(control_group)
     received = object_list[0]
     if not isinstance(received, Mapping) or received.get("ok") not in {True, False}:
         raise RiskDataContractError("distributed setup envelope is invalid")

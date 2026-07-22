@@ -229,6 +229,62 @@ def test_query_footprints_reconstruct_stop_straight_turn_and_reverse_exactly(
     assert np.array_equal(actual, expected)
 
 
+def test_query_footprints_restore_float32_frozen_primitive_exactly(
+    tmp_path: Path,
+) -> None:
+    publication, sidecars = _publication(tmp_path)
+    dataset = _seal(
+        tmp_path / "seal",
+        publication,
+        sidecar_root=sidecars.sidecar_root,
+    )
+    sample = _first_risk_sample(publication)
+    metadata = dict(sample.metadata)
+    provenance = dict(metadata["provenance"])
+    serialized_v = float(np.float32(0.6))
+    provenance["trajectory_primitive"] = {
+        "v_mps": serialized_v,
+        "omega_radps": 0.0,
+    }
+    metadata["provenance"] = provenance
+    grid = replace(dataset.grid, height=160, width=160, resolution_m=0.1)
+    candidate = replace(
+        sample,
+        metadata=metadata,
+        bev_history=np.zeros(
+            (
+                grid.history_steps,
+                grid.n_history_channels,
+                grid.height,
+                grid.width,
+            ),
+            dtype=np.float32,
+        ),
+        state_channels=np.zeros(
+            (grid.n_state_channels, grid.height, grid.width), dtype=np.float32
+        ),
+        trajectory_channels=np.zeros(
+            (grid.n_trajectory_channels, grid.height, grid.width),
+            dtype=np.float32,
+        ),
+    )
+
+    actual = reconstruct_production_robot_endpoint_footprints(
+        candidate,
+        grid=grid,
+        query_geometry=_query_geometry(dataset),
+    )
+    expected = _expected_robot_masks(grid=grid, v=0.6, omega=0.0)
+    expanded = _expected_robot_masks(
+        grid=grid,
+        v=serialized_v,
+        omega=0.0,
+    )
+
+    assert not np.array_equal(expanded, expected)
+    assert np.array_equal(actual, expected)
+
+
 def test_query_reconstruction_fails_closed_on_missing_or_mismatched_provenance(
     tmp_path: Path,
 ) -> None:

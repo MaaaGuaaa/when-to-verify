@@ -100,6 +100,8 @@ _SUBSET_DIGEST_DOMAIN = "risk-production-subset-v1"
 _SHARD_ORDER_DOMAIN = "risk-production-shard-order-v1"
 _ROW_ORDER_DOMAIN = "risk-production-row-order-v1"
 _PRODUCTION_TARGET_CHANNELS = (*TARGET_KEYS, "first_collision_time")
+_FROZEN_LINEAR_PRIMITIVES = (-0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8)
+_FROZEN_ANGULAR_PRIMITIVES = (-0.8, -0.4, 0.0, 0.4, 0.8)
 
 
 class RiskDataContractError(ValueError):
@@ -713,12 +715,23 @@ def production_endpoint_times_from_query_geometry(
     return np.ascontiguousarray(endpoint_times, dtype=np.float32)
 
 
-def _finite_primitive_value(value: object, *, field: str) -> float:
+def _finite_primitive_value(
+    value: object,
+    *,
+    field: str,
+    frozen_values: tuple[float, ...],
+) -> float:
     if type(value) not in {int, float}:
         raise RiskDataContractError(f"trajectory_primitive.{field} must be finite")
     result = float(value)
     if not math.isfinite(result):
         raise RiskDataContractError(f"trajectory_primitive.{field} must be finite")
+    # SOP04 stores controls as float32 but rasterized the trajectory produced
+    # from the configured decimal primitive. Restore that canonical value before
+    # reintegration so grid-boundary cells reproduce the published query mask.
+    for frozen in frozen_values:
+        if result == float(np.float32(frozen)):
+            return frozen
     return result
 
 
@@ -780,9 +793,15 @@ def reconstruct_production_robot_endpoint_footprints(
         raise RiskDataContractError(
             "trajectory_primitive must contain exact constant v_mps/omega_radps"
         )
-    v = _finite_primitive_value(primitive.get("v_mps"), field="v_mps")
+    v = _finite_primitive_value(
+        primitive.get("v_mps"),
+        field="v_mps",
+        frozen_values=_FROZEN_LINEAR_PRIMITIVES,
+    )
     omega = _finite_primitive_value(
-        primitive.get("omega_radps"), field="omega_radps"
+        primitive.get("omega_radps"),
+        field="omega_radps",
+        frozen_values=_FROZEN_ANGULAR_PRIMITIVES,
     )
     geometry_values: list[float] = []
     for field in ("robot_length_m", "robot_width_m", "robot_inflation_m"):

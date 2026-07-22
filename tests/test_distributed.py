@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import timedelta
 import multiprocessing
 from pathlib import Path
 import queue
@@ -175,6 +176,29 @@ def test_discover_distributed_runtime_rejects_multi_node_topology(monkeypatch):
         discover_distributed_runtime("cpu")
 
 
+def test_initialize_distributed_process_group_eagerly_synchronizes(monkeypatch):
+    runtime = DistributedRuntime(0, 2, 0, "gloo", "cpu")
+    events = []
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        dist,
+        "init_process_group",
+        lambda **kwargs: events.append(("init", kwargs)),
+    )
+    monkeypatch.setattr(
+        dist,
+        "barrier",
+        lambda: events.append(("barrier", None)),
+    )
+
+    initialize_distributed_process_group(runtime, init_method="file:///tmp/ddp-init")
+
+    assert [event[0] for event in events] == ["init", "barrier"]
+    assert events[0][1]["backend"] == "gloo"
+
+
 def test_synchronous_partition_plan_is_exact_for_non_divisible_input():
     sample_ids = tuple(f"sample-{index:02d}" for index in range(11))
 
@@ -249,6 +273,40 @@ def test_gloo_rank_zero_setup_failure_reaches_every_rank_and_destroys_group(tmp_
     assert results[0][3] == results[1][3]
     assert "fixture setup failed" in str(results[0][3])
     assert [result[-1] for result in results] == [False, False]
+
+
+def test_nccl_rank_zero_setup_uses_long_timeout_gloo_control_group(monkeypatch):
+    runtime = DistributedRuntime(0, 2, 0, "nccl", "cuda:0")
+    control_group = object()
+    events = []
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def new_group(**kwargs):
+        events.append(("new_group", kwargs))
+        return control_group
+
+    def broadcast(object_list, *, src, group):
+        events.append(("broadcast", src, group, object_list[0]))
+
+    monkeypatch.setattr(dist, "new_group", new_group)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(
+        dist,
+        "destroy_process_group",
+        lambda group: events.append(("destroy", group)),
+    )
+
+    result = broadcast_rank_zero_setup(runtime, lambda: {"sample_count": 11})
+
+    assert result == {"sample_count": 11}
+    assert events[0] == (
+        "new_group",
+        {"backend": "gloo", "timeout": timedelta(hours=2)},
+    )
+    assert events[1][0:3] == ("broadcast", 0, control_group)
+    assert events[2] == ("destroy", control_group)
 
 
 def test_gloo_ragged_accumulation_matches_synchronous_single_process_schedule(

@@ -12,8 +12,8 @@ target_history_visibility:
   policy_version: target_history_visibility_policy_v1
   min_trailing_hidden_frames: 2
   weights:
-    seen_then_occluded: 0.8
-    unseen_in_history_window: 0.2
+    seen_then_occluded: 1.0
+    unseen_in_history_window: 0.0
 
 conflict_time_range_s: [1.0, 2.2]
 max_local_curvature_per_m: 1.0
@@ -35,8 +35,8 @@ occluders:
 
 blind_reachability:
   algorithm_version: blind_reachability_quota_first_v3
-  obstacle_proposals_per_trajectory: 64
-  snippet_candidates_per_proposal: 64
+  obstacle_proposals_per_trajectory: 8
+  snippet_candidates_per_proposal: 8
   interaction_range_m: [1.0, 4.0]
   bearing_bin_count: 12
   yaw_step_deg: 30.0

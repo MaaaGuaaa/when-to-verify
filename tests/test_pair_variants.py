@@ -36,6 +36,11 @@ from src.generation.event_sampler import (
     load_generator_config,
     normalize_generator_config,
 )
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    classify_history_visibility,
+    normalize_history_visibility_policy,
+)
 from src.generation.paired_variants import (
     PairGenerationError,
     PairedVariantConfigError,
@@ -348,9 +353,9 @@ def test_paired_config_freezes_thresholds_coverage_and_digest() -> None:
     assert first.lateral_offset_step_m == 0.025
     assert first.lateral_offset_max_m == 3.0
     assert first.paired_generator_algorithm_version == (
-        "independent_partial_pairs_v1"
+        "independent_partial_pairs_v2"
     )
-    assert first.group_contract_version == "sop06_partial_pair_group_v1"
+    assert first.group_contract_version == "sop06_partial_pair_group_v2"
     assert first.mother_required_variants == ("collision",)
     assert first.training_minimum_contrast_count == 0
     assert first.audit_requires_all_variants is True
@@ -362,9 +367,9 @@ def test_partial_pair_versions_are_public_frozen_constants() -> None:
         paired_variants_module,
         "PAIRED_GENERATOR_ALGORITHM_VERSION",
         None,
-    ) == "independent_partial_pairs_v1"
+    ) == "independent_partial_pairs_v2"
     assert paired_variants_module.PAIRED_GROUP_CONTRACT_VERSION == (
-        "sop06_partial_pair_group_v1"
+        "sop06_partial_pair_group_v2"
     )
 
 
@@ -372,9 +377,9 @@ def test_paired_config_rejects_unknown_keys_and_weak_irrelevant_threshold() -> N
     valid = {
         "schema_version": SCHEMA_VERSION,
         "paired_generator_algorithm_version": (
-            "independent_partial_pairs_v1"
+            "independent_partial_pairs_v2"
         ),
-        "group_contract_version": "sop06_partial_pair_group_v1",
+        "group_contract_version": "sop06_partial_pair_group_v2",
         "near_miss_clearance_range_m": [0.05, 0.35],
         "temporal_offset_candidates_s": [
             0.8,
@@ -451,9 +456,9 @@ def test_singleton_collision_group_is_training_eligible_partial() -> None:
     assert group.by_kind == {"collision": group.variants[0]}
     assert group.variants[0].world.metadata[
         "paired_generator_algorithm_version"
-    ] == "independent_partial_pairs_v1"
+    ] == "independent_partial_pairs_v2"
     assert group.variants[0].world.metadata["pair_group_contract_version"] == (
-        "sop06_partial_pair_group_v1"
+        "sop06_partial_pair_group_v2"
     )
 
 
@@ -583,7 +588,7 @@ def test_partial_generator_rejects_v1_mother(complete_pair) -> None:
 
     with pytest.raises(
         PairGenerationError,
-        match=paired_variants_module.BLIND_REACHABILITY_ALGORITHM_VERSION,
+        match=paired_variants_module.SOP05_GENERATOR_ALGORITHM_VERSION,
     ) as exc_info:
         generate_paired_variants(
             mother_event=replace(mother, world=old_world),
@@ -824,6 +829,9 @@ def test_temporal_variant_audits_transplant_errors_and_exhausts_schedule(
         oracle_context=oracle,
         base_config=config,
         paired_config=paired_config,
+        history_visibility_policy=normalize_history_visibility_policy(
+            mother.world.metadata["target_history_visibility_policy"]
+        ),
         pair_group_id=group.pair_group_id,
         seed=20260716,
         environment=environment,
@@ -1061,7 +1069,7 @@ def test_v5_environment_partial_group_renders_without_joint_pair_version(
     config, _, base, oracle, _, mother, paired_config, group = complete_pair
     assert mother.event_kind == "environment"
     assert mother.world.metadata["generator_algorithm_version"] == (
-        paired_variants_module.BLIND_REACHABILITY_ALGORITHM_VERSION
+        paired_variants_module.SOP05_GENERATOR_ALGORITHM_VERSION
     )
     assert "joint_pair_generator_algorithm_version" not in (
         mother.world.metadata
@@ -1236,11 +1244,23 @@ def test_variant_metadata_separates_mother_join_evidence_from_paired_world(
 def test_pair_recomputes_auditable_history_visibility_for_every_variant(
     complete_pair,
 ) -> None:
-    *_, group = complete_pair
+    *_, mother, _, group = complete_pair
+    policy = normalize_history_visibility_policy(
+        mother.world.metadata["target_history_visibility_policy"]
+    )
     for variant in group.variants:
         if variant.target is None:
             assert variant.target_visibility_history is None
             assert variant.visibility_sequence is None
+            assert variant.world.metadata[
+                "target_history_visibility_regime"
+            ] is None
+            assert variant.world.metadata[
+                "target_history_last_visible_index"
+            ] is None
+            assert variant.world.metadata[
+                "target_history_trailing_hidden_frames"
+            ] is None
             continue
         assert variant.target_visibility_history is not None
         assert variant.target_visibility_history.shape == (8,)
@@ -1250,6 +1270,257 @@ def test_pair_recomputes_auditable_history_visibility_for_every_variant(
         assert variant.visibility_sequence.dtype == np.bool_
         assert not bool(variant.target_visibility_history[-1])
         assert variant.target_visibility_history[-1] == variant.visibility_sequence[0]
+        assessment = classify_history_visibility(
+            variant.target_visibility_history,
+            policy,
+        )
+        assert variant.world.metadata[
+            "target_history_visibility_regime"
+        ] == assessment.regime
+        assert variant.world.metadata[
+            "target_history_last_visible_index"
+        ] == assessment.last_visible_index
+        assert variant.world.metadata[
+            "target_history_trailing_hidden_frames"
+        ] == assessment.trailing_hidden_frames
+        assert variant.world.metadata[
+            "target_history_visibility_policy_version"
+        ] == HISTORY_VISIBILITY_POLICY_VERSION
+        assert variant.world.metadata[
+            "target_history_visibility_policy"
+        ] == policy.as_dict()
+        assert variant.world.metadata[
+            "target_history_visibility_policy_digest"
+        ] == policy.digest
+
+
+def test_nonempty_variant_history_regime_drift_is_rejected(
+    complete_pair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    real_geometric_variant = paired_variants_module._geometric_variant
+    if bool(np.any(mother.target_visibility_history)):
+        drifted_history = np.zeros(8, dtype=bool)
+    else:
+        drifted_history = np.asarray(
+            [True, True, True, True, False, False, False, False],
+            dtype=bool,
+        )
+
+    def drift_near_miss_history(*, variant_kind: str, **kwargs):
+        variant, reason = real_geometric_variant(
+            variant_kind=variant_kind,
+            **kwargs,
+        )
+        if variant_kind != "near_miss" or variant is None:
+            return variant, reason
+        metadata = {
+            **variant.world.metadata,
+            "target_visibility_history": [
+                bool(value) for value in drifted_history
+            ],
+        }
+        return (
+            replace(
+                variant,
+                world=replace(variant.world, metadata=metadata),
+                target_visibility_history=drifted_history.copy(),
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_geometric_variant",
+        drift_near_miss_history,
+    )
+    group = generate_paired_variants(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
+        base_state=base,
+        trajectory=trajectory,
+        oracle_context=oracle,
+        base_config=config,
+        paired_config=paired_config,
+        seed=20260716,
+    )
+
+    assert "near_miss" not in group.by_kind
+    assert group.missing_variant_reasons["near_miss"] == (
+        "target_history_visibility_regime_changed"
+    )
+
+
+def test_geometric_variant_skips_history_regime_mismatch_and_continues(
+    complete_pair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, _ = complete_pair
+    policy = normalize_history_visibility_policy(
+        mother.world.metadata["target_history_visibility_policy"]
+    )
+    mother_regime = classify_history_visibility(
+        mother.target_visibility_history,
+        policy,
+    ).regime
+    environment = paired_variants_module._pair_environment(
+        mother_event=mother,
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        critical_clearance_threshold_m=(
+            paired_config.near_miss_clearance_range_m[1]
+        ),
+    )
+    candidate_pool = paired_variants_module._geometric_candidate_pool(
+        mother_event=mother,
+        trajectory=trajectory,
+        environment=environment,
+        paired_config=paired_config,
+    )
+    ranked = paired_variants_module._ranked_geometric_candidates(
+        mother_event=mother,
+        paired_config=paired_config,
+        variant_kind="near_miss",
+        pool=candidate_pool,
+    )
+    assert len(ranked) >= 2
+    wrong_history = np.zeros(8, dtype=np.bool_)
+    right_history = mother.target_visibility_history.copy()
+    visibility = np.asarray(
+        [False] * 8 + [False] + [True] * 7,
+        dtype=np.bool_,
+    )
+    validation_calls = 0
+
+    def validate_candidate(_target, **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        return (
+            (wrong_history if validation_calls == 1 else right_history),
+            visibility,
+        )
+
+    sentinel = object()
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_validate_target_candidate",
+        validate_candidate,
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_make_variant",
+        lambda **_kwargs: sentinel,
+    )
+
+    variant, reason = paired_variants_module._geometric_variant(
+        variant_kind="near_miss",
+        mother_event=mother,
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        paired_config=paired_config,
+        history_visibility_policy=policy,
+        required_history_regime=mother_regime,
+        pair_group_id="pair-test-history-filter",
+        seed=20260716,
+        environment=environment,
+        candidate_pool=candidate_pool,
+    )
+
+    assert variant is sentinel
+    assert reason is None
+    assert validation_calls >= 2
+
+
+def test_temporal_variant_skips_history_regime_mismatch_and_continues(
+    complete_pair,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, mother, paired_config, group = (
+        complete_pair
+    )
+    policy = normalize_history_visibility_policy(
+        mother.world.metadata["target_history_visibility_policy"]
+    )
+    mother_regime = classify_history_visibility(
+        mother.target_visibility_history,
+        policy,
+    ).regime
+    environment = paired_variants_module._pair_environment(
+        mother_event=mother,
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        critical_clearance_threshold_m=(
+            paired_config.near_miss_clearance_range_m[1]
+        ),
+    )
+    wrong_history = np.zeros(8, dtype=np.bool_)
+    right_history = mother.target_visibility_history.copy()
+    visibility = np.asarray(
+        [False] * 8 + [False] + [True] * 7,
+        dtype=np.bool_,
+    )
+    validation_calls = 0
+
+    def validate_candidate(_target, **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        return (
+            (wrong_history if validation_calls == 1 else right_history),
+            visibility,
+        )
+
+    sentinel = object()
+    monkeypatch.setattr(
+        paired_variants_module,
+        "transplant_snippet",
+        lambda *_args, **_kwargs: mother.target,
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_target_clearances",
+        lambda *_args, **_kwargs: np.ones(15, dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_paths_spatially_intersect",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_validate_target_candidate",
+        validate_candidate,
+    )
+    monkeypatch.setattr(
+        paired_variants_module,
+        "_make_variant",
+        lambda **_kwargs: sentinel,
+    )
+
+    variant, reason = paired_variants_module._temporal_variant(
+        mother_event=mother,
+        source_snippet=_exact_safe_curve_snippet(),
+        trajectory=trajectory,
+        base_state=base,
+        oracle_context=oracle,
+        base_config=config,
+        paired_config=paired_config,
+        history_visibility_policy=policy,
+        required_history_regime=mother_regime,
+        pair_group_id=group.pair_group_id,
+        seed=20260716,
+        environment=environment,
+    )
+
+    assert variant is sentinel
+    assert reason is None
+    assert validation_calls == 2
 
 
 @pytest.mark.parametrize(

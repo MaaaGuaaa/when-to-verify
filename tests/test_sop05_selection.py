@@ -6,10 +6,29 @@ import json
 import pytest
 
 from src.generation import sop05_selection as selection
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    SEEN_THEN_OCCLUDED,
+    UNSEEN_IN_HISTORY_WINDOW,
+    normalize_history_visibility_policy,
+)
 
 
 SEED = 60_505
-SELECTION_VERSION = "sop05_diversity_total_selection_v1"
+SELECTION_VERSION = "sop05_history_stratified_selection_v2"
+
+
+def _history_policy():
+    return normalize_history_visibility_policy(
+        {
+            "policy_version": HISTORY_VISIBILITY_POLICY_VERSION,
+            "min_trailing_hidden_frames": 2,
+            "weights": {
+                SEEN_THEN_OCCLUDED: 0.8,
+                UNSEEN_IN_HISTORY_WINDOW: 0.2,
+            },
+        }
+    )
 
 
 def _candidate(
@@ -21,6 +40,7 @@ def _candidate(
     occluder_type: str = "wall",
     crossing_side: int = -1,
     conflict_index: int = 4,
+    history_visibility_regime: str = SEEN_THEN_OCCLUDED,
 ) -> selection.Sop05SelectionCandidate:
     return selection.Sop05SelectionCandidate(
         base_state_id=base_state_id,
@@ -30,6 +50,7 @@ def _candidate(
         occluder_type=occluder_type,
         crossing_side=crossing_side,
         conflict_index=conflict_index,
+        history_visibility_regime=history_visibility_regime,
     )
 
 
@@ -41,6 +62,7 @@ def _expected_key(candidate: selection.Sop05SelectionCandidate) -> tuple[str, ..
             candidate.base_state_id,
             candidate.trajectory_id,
             candidate.generated_event_id,
+            candidate.history_visibility_regime,
         ],
         sort_keys=True,
         separators=(",", ":"),
@@ -59,8 +81,8 @@ def test_diversity_total_selector_versions_and_key_are_frozen() -> None:
     candidate = _candidate(7)
     assert selection.SOP05_DIVERSITY_TOTAL_SELECTION_VERSION == SELECTION_VERSION
     assert selection.SOP05_TOTAL_QUOTA_SELECTION_VERSION == SELECTION_VERSION
-    assert selection.SOP05_PAIR_REPORT_VERSION == "sop05_pair_generation_report_v4"
-    assert selection.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v6"
+    assert selection.SOP05_PAIR_REPORT_VERSION == "sop05_pair_generation_report_v5"
+    assert selection.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v7"
     assert selection.sop05_selection_key(SEED, candidate) == _expected_key(candidate)
 
 
@@ -72,10 +94,16 @@ def test_diversity_selector_is_independent_of_worker_candidate_order() -> None:
         _candidate(4, object_type="vehicle"),
     )
     expected = selection.select_sop05_event_ids(
-        candidates, seed=SEED, accepted_quota=3
+        candidates,
+        seed=SEED,
+        accepted_quota=3,
+        history_visibility_policy=_history_policy(),
     )
     assert selection.select_sop05_event_ids(
-        tuple(reversed(candidates)), seed=SEED, accepted_quota=3
+        tuple(reversed(candidates)),
+        seed=SEED,
+        accepted_quota=3,
+        history_visibility_policy=_history_policy(),
     ) == expected
 
 
@@ -83,9 +111,12 @@ def test_diversity_is_a_soft_ranking_and_never_a_hard_quota() -> None:
     duplicate_pattern = tuple(_candidate(index) for index in range(7))
     assert len(
         selection.select_sop05_event_ids(
-            duplicate_pattern, seed=SEED, accepted_quota=7
-        )
-    ) == 7
+            duplicate_pattern,
+            seed=SEED,
+            accepted_quota=7,
+            history_visibility_policy=_history_policy(),
+        ).event_ids
+    ) < 7
 
 
 def test_greedy_ranking_prefers_new_diversity_before_stable_tie_breaks() -> None:
@@ -103,8 +134,11 @@ def test_greedy_ranking_prefers_new_diversity_before_stable_tie_breaks() -> None
         ),
     )
     selected = selection.select_sop05_event_ids(
-        candidates, seed=SEED, accepted_quota=2
-    )
+        candidates,
+        seed=SEED,
+        accepted_quota=2,
+        history_visibility_policy=_history_policy(),
+    ).event_ids
     assert "event-03" in selected
 
 
@@ -112,15 +146,78 @@ def test_selector_returns_every_available_candidate_below_requested_total() -> N
     candidates = (_candidate(1), _candidate(2))
     assert set(
         selection.select_sop05_event_ids(
-            candidates, seed=SEED, accepted_quota=5
-        )
+            candidates,
+            seed=SEED,
+            accepted_quota=5,
+            history_visibility_policy=_history_policy(),
+        ).event_ids
     ) == {"event-01", "event-02"}
+
+
+def test_selector_enforces_exact_eighty_twenty_history_composition() -> None:
+    candidates = tuple(
+        _candidate(index, history_visibility_regime=regime)
+        for index, regime in enumerate(
+            [SEEN_THEN_OCCLUDED] * 12 + [UNSEEN_IN_HISTORY_WINDOW] * 6
+        )
+    )
+
+    result = selection.select_sop05_event_ids(
+        tuple(reversed(candidates)),
+        seed=SEED,
+        accepted_quota=10,
+        history_visibility_policy=_history_policy(),
+    )
+
+    assert len(result.event_ids) == 10
+    assert result.required_counts == {
+        SEEN_THEN_OCCLUDED: 8,
+        UNSEEN_IN_HISTORY_WINDOW: 2,
+    }
+    assert result.selected_counts == result.required_counts
+    assert result.deficits == {
+        SEEN_THEN_OCCLUDED: 0,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
+    assert result.quota_met is True
+
+
+def test_selector_does_not_backfill_missing_seen_quota_with_unseen() -> None:
+    candidates = tuple(
+        _candidate(index, history_visibility_regime=regime)
+        for index, regime in enumerate(
+            [SEEN_THEN_OCCLUDED] * 2 + [UNSEEN_IN_HISTORY_WINDOW] * 20
+        )
+    )
+
+    result = selection.select_sop05_event_ids(
+        candidates,
+        seed=SEED,
+        accepted_quota=10,
+        history_visibility_policy=_history_policy(),
+    )
+
+    assert len(result.event_ids) == 4
+    assert result.selected_counts == {
+        SEEN_THEN_OCCLUDED: 2,
+        UNSEEN_IN_HISTORY_WINDOW: 2,
+    }
+    assert result.deficits == {
+        SEEN_THEN_OCCLUDED: 6,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
+    assert result.quota_met is False
 
 
 @pytest.mark.parametrize("seed", [-1, True, 1.5, "7"])
 def test_selector_rejects_invalid_seed(seed: object) -> None:
     with pytest.raises(ValueError, match="seed"):
-        selection.select_sop05_event_ids((), seed=seed, accepted_quota=1)
+        selection.select_sop05_event_ids(
+            (),
+            seed=seed,
+            accepted_quota=1,
+            history_visibility_policy=_history_policy(),
+        )
 
 
 @pytest.mark.parametrize("accepted_quota", [0, -1, True, 1.5, "3"])
@@ -128,6 +225,7 @@ def test_selector_rejects_invalid_total(accepted_quota: object) -> None:
     with pytest.raises(ValueError, match="quota"):
         selection.select_sop05_event_ids(
             (), seed=SEED, accepted_quota=accepted_quota
+            , history_visibility_policy=_history_policy()
         )
 
 
@@ -136,6 +234,7 @@ def test_selector_rejects_duplicate_event_or_canonical_keys() -> None:
     with pytest.raises(ValueError, match="unique"):
         selection.select_sop05_event_ids(
             (candidate, candidate), seed=SEED, accepted_quota=1
+            , history_visibility_policy=_history_policy()
         )
 
 
@@ -162,6 +261,7 @@ def test_canonical_candidate_rejects_malformed_identity_or_diversity(
         "occluder_type": "wall",
         "crossing_side": -1,
         "conflict_index": 4,
+        "history_visibility_regime": SEEN_THEN_OCCLUDED,
     }
     values.update(updates)
     with pytest.raises((TypeError, ValueError)):

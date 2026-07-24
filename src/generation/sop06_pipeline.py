@@ -19,7 +19,7 @@ from src.contracts import (
     validate_oracle_context,
 )
 
-from .blind_reachability import BLIND_REACHABILITY_ALGORITHM_VERSION
+from .event_sampler import SOP05_GENERATOR_ALGORITHM_VERSION
 from .event_target_motion_shard import (
     EventTargetMotionRecord,
     compute_motion_array_digest,
@@ -89,11 +89,11 @@ def _validate_joint_six_pack_versions(
                 f"{PAIRED_GROUP_CONTRACT_VERSION}"
             )
         if mother_world.metadata.get("generator_algorithm_version") != (
-            BLIND_REACHABILITY_ALGORITHM_VERSION
+            SOP05_GENERATOR_ALGORITHM_VERSION
         ):
             raise ValueError(
                 "formal SOP06 mother generator_algorithm_version must equal "
-                f"{BLIND_REACHABILITY_ALGORITHM_VERSION}"
+                f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
             )
         return
     if mother_world.metadata.get("event_kind") != "environment":
@@ -699,11 +699,11 @@ def _validate_formal_mother_world(world: OracleWorld) -> None:
             )
         raise ValueError("mother contains unsupported joint-pair identity")
     if world.metadata.get("generator_algorithm_version") != (
-        BLIND_REACHABILITY_ALGORITHM_VERSION
+        SOP05_GENERATOR_ALGORITHM_VERSION
     ):
         raise ValueError(
             "formal SOP06 mother generator_algorithm_version must equal "
-            f"{BLIND_REACHABILITY_ALGORITHM_VERSION}"
+            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
         )
     target_provenance = world.metadata.get("target_provenance")
     if not isinstance(target_provenance, Mapping):

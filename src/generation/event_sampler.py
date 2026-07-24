@@ -31,6 +31,7 @@ from src.geometry import (
     intersects,
     points_in_grid,
     rasterize_footprint,
+    raycast_candidate_visibility,
     raycast_visibility,
     trajectory_signed_clearances,
     world_to_grid,
@@ -46,6 +47,15 @@ from .dynamic_object_transplant import (
     sample_motion_snippet,
     transplant_reachability_candidate,
     transplant_snippet,
+)
+from .history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    HISTORY_VISIBILITY_REGIMES,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    HistoryVisibilityPolicy,
+    allocate_history_visibility_counts,
+    classify_history_visibility,
+    normalize_history_visibility_policy,
 )
 from .blind_reachability import (
     BLIND_REACHABILITY_ALGORITHM_VERSION,
@@ -101,7 +111,10 @@ from .robot_sweep_cache import (
 
 
 _EVENT_TYPES = ("environment", "structural", "mixed")
-SOP05_GENERATOR_ALGORITHM_VERSION = BLIND_REACHABILITY_ALGORITHM_VERSION
+SOP05_REACHABILITY_ALGORITHM_VERSION = BLIND_REACHABILITY_ALGORITHM_VERSION
+SOP05_GENERATOR_ALGORITHM_VERSION = (
+    "blind_reachability_history_stratified_v4"
+)
 SOP05_GENERATOR_SCHEMA_VERSION = "3.0.0"
 _GENERATED_EVENT_ID_DOMAIN = "sop05-generated-event-lineage-id-v2"
 _GENERATED_EVENT_IDENTITY_VERSION = "sop05_generated_event_lineage_v2"
@@ -362,6 +375,7 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         "schema_version",
         "production_event_kind",
         "target_type_policy",
+        "target_history_visibility",
         "conflict_time_range_s",
         "max_local_curvature_per_m",
         "crossing_angle_max_deg",
@@ -401,10 +415,10 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         raise GeneratorConfigError(
             "blind_reachability keys do not match the frozen v5 schema"
         )
-    if blind["algorithm_version"] != SOP05_GENERATOR_ALGORITHM_VERSION:
+    if blind["algorithm_version"] != SOP05_REACHABILITY_ALGORITHM_VERSION:
         raise GeneratorConfigError(
             "blind_reachability.algorithm_version must be "
-            f"{SOP05_GENERATOR_ALGORITHM_VERSION}"
+            f"{SOP05_REACHABILITY_ALGORITHM_VERSION}"
         )
     occluders = config["occluders"]
     occluder_expected = {"types", "wall", "shelf", "pillar"}
@@ -415,6 +429,15 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
             config["target_type_policy"]
             if isinstance(config["target_type_policy"], TargetTypePolicy)
             else normalize_target_type_policy(config["target_type_policy"])
+        )
+        history_visibility_policy = (
+            config["target_history_visibility"]
+            if isinstance(
+                config["target_history_visibility"], HistoryVisibilityPolicy
+            )
+            else normalize_history_visibility_policy(
+                config["target_history_visibility"]
+            )
         )
         causal_occluders = normalize_causal_occluder_config(
             {
@@ -469,6 +492,7 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
         "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
         "production_event_kind": "environment",
         "target_type_policy": policy,
+        "target_history_visibility": history_visibility_policy,
         "conflict_time_range_s": _range_pair(
             config["conflict_time_range_s"],
             name="conflict_time_range_s",
@@ -487,7 +511,7 @@ def normalize_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
             for key in ("types", "wall", "shelf", "pillar")
         },
         "blind_reachability": {
-            "algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
+            "algorithm_version": SOP05_REACHABILITY_ALGORITHM_VERSION,
             "obstacle_proposals_per_trajectory": _positive_integer(
                 blind["obstacle_proposals_per_trajectory"],
                 name="blind_reachability.obstacle_proposals_per_trajectory",
@@ -524,10 +548,12 @@ def load_generator_config(path: str | Path) -> dict[str, object]:
 
 def _jsonable_generator_config(config: Mapping[str, Any]) -> dict[str, object]:
     policy = config["target_type_policy"]
+    history_visibility_policy = config["target_history_visibility"]
     return {
         "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
         "production_event_kind": "environment",
         "target_type_policy": policy.as_dict(),
+        "target_history_visibility": history_visibility_policy.as_dict(),
         "conflict_time_range_s": list(config["conflict_time_range_s"]),
         "max_local_curvature_per_m": config["max_local_curvature_per_m"],
         "crossing_angle_max_deg": config["crossing_angle_max_deg"],
@@ -1272,6 +1298,11 @@ def _target_visibility_history(
                 grid,
             )
         sensor_pose = base_state.robot_history[history_index]
+        target_mask = rasterize_footprint(
+            target_footprint,
+            target.history_poses[history_index],
+            grid,
+        )
         if event_kind in {"structural", "mixed"}:
             visibility = build_structural_visibility(
                 occupied,
@@ -1279,18 +1310,20 @@ def _target_visibility_history(
                 sensor_pose=sensor_pose,
                 blind_spot=structural,
             )
+            history_visibility[history_index] = footprint_visibility_sequence(
+                target_footprint,
+                target.history_poses[history_index : history_index + 1],
+                visibility,
+                grid,
+            )[0]
         else:
-            visibility = raycast_visibility(
+            visibility = raycast_candidate_visibility(
                 occupied,
+                target_mask,
                 grid,
                 sensor_pose=sensor_pose,
             )
-        history_visibility[history_index] = footprint_visibility_sequence(
-            target_footprint,
-            target.history_poses[history_index : history_index + 1],
-            visibility,
-            grid,
-        )[0]
+            history_visibility[history_index] = bool(visibility.any())
     if history_visibility.shape != (8,) or history_visibility.dtype != np.bool_:
         raise _EventRejection("target_visibility_history_contract_invalid")
     return history_visibility
@@ -1804,12 +1837,14 @@ def _build_v5_event(
     static_occupancy: np.ndarray,
     grid,
     policy: TargetTypePolicy,
+    history_visibility_policy: HistoryVisibilityPolicy,
     generator_digest: str,
 ) -> GeneratedEvent:
     target = accepted["target"]
     placement = accepted["placement"]
     visibility_sequence = accepted["visibility_sequence"]
     target_visibility_history = accepted["target_visibility_history"]
+    history_visibility_assessment = accepted["history_visibility_assessment"]
     conflict_index = int(accepted["conflict_index"])
     conflict_time_s = float(accepted["conflict_time_s"])
     attempt_seed = int(accepted["attempt_seed"])
@@ -1911,6 +1946,24 @@ def _build_v5_event(
         ],
         "target_visibility_history_layout": (
             "target_visibility_history8_current7_v1"
+        ),
+        "target_history_visibility_regime": (
+            history_visibility_assessment.regime
+        ),
+        "target_history_last_visible_index": (
+            history_visibility_assessment.last_visible_index
+        ),
+        "target_history_trailing_hidden_frames": (
+            history_visibility_assessment.trailing_hidden_frames
+        ),
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": (
+            history_visibility_policy.as_dict()
+        ),
+        "target_history_visibility_policy_digest": (
+            history_visibility_policy.digest
         ),
         "context_dynamic_object_ids": sorted(
             oracle_context.dynamic_object_future
@@ -2049,6 +2102,17 @@ def _generate_v5_events(
         trajectory_id=trajectory.trajectory_id,
     )
     policy: TargetTypePolicy = normalized["target_type_policy"]
+    history_visibility_policy: HistoryVisibilityPolicy = normalized[
+        "target_history_visibility"
+    ]
+    requested_history_counts = allocate_history_visibility_counts(
+        desired_count,
+        history_visibility_policy,
+        seed=int(seed),
+        namespace=(
+            f"{base_state.state_id}|{trajectory.trajectory_id}"
+        ),
+    )
     snippets = _ordered_policy_snippets(
         snippet_libraries, split=base_state.split, policy=policy
     )
@@ -2102,7 +2166,15 @@ def _generate_v5_events(
     candidate_ids: list[str] = []
     transform_ids: list[str] = []
     exact_validation_ids: list[str] = []
-    accepted_candidates = _BoundedAcceptedCandidates(limit=desired_count)
+    accepted_candidates_by_history = {
+        regime: _BoundedAcceptedCandidates(limit=count)
+        for regime, count in requested_history_counts.items()
+        if count > 0
+    }
+    exact_history_counts = {
+        **{regime: 0 for regime in HISTORY_VISIBILITY_REGIMES},
+        INELIGIBLE_HISTORY_VISIBILITY: 0,
+    }
     unresolved_by_anchor: dict[tuple[str, str, int], int] = {}
     quota_satisfied = False
 
@@ -2387,7 +2459,20 @@ def _generate_v5_events(
                             )
                             continue
                         counters["exact_validation_accepted_count"] += 1
-                        accepted_candidates.add(
+                        history_visibility_assessment = (
+                            classify_history_visibility(
+                                target_visibility_history,
+                                history_visibility_policy,
+                            )
+                        )
+                        exact_history_counts[
+                            history_visibility_assessment.regime
+                        ] += 1
+                        history_bucket = accepted_candidates_by_history.get(
+                            history_visibility_assessment.regime
+                        )
+                        if history_bucket is not None:
+                            history_bucket.add(
                             {
                                 "decision": decision,
                                 "region": region,
@@ -2399,6 +2484,9 @@ def _generate_v5_events(
                                 "target_visibility_history": (
                                     target_visibility_history
                                 ),
+                                "history_visibility_assessment": (
+                                    history_visibility_assessment
+                                ),
                                 "conflict_index": conflict.conflict_index,
                                 "conflict_time_s": conflict.conflict_time_s,
                                 "proposal_index": parameters.proposal_index,
@@ -2406,8 +2494,14 @@ def _generate_v5_events(
                             }
                         )
                         quota_satisfied = (
-                            counters["exact_validation_accepted_count"]
-                            >= desired_count
+                            all(
+                                len(accepted_candidates_by_history[regime])
+                                >= requested_count
+                                for regime, requested_count in (
+                                    requested_history_counts.items()
+                                )
+                                if requested_count > 0
+                            )
                         )
                         if quota_satisfied:
                             break
@@ -2421,7 +2515,20 @@ def _generate_v5_events(
             break
 
     generator_digest = _generator_digest(normalized)
-    selected = accepted_candidates.items()
+    selected = tuple(
+        sorted(
+            (
+                item
+                for regime in HISTORY_VISIBILITY_REGIMES
+                for item in (
+                    accepted_candidates_by_history[regime].items()
+                    if regime in accepted_candidates_by_history
+                    else ()
+                )
+            ),
+            key=_accepted_candidate_key,
+        )
+    )
     events = tuple(
         _build_v5_event(
             accepted=item,
@@ -2432,11 +2539,28 @@ def _generate_v5_events(
             static_occupancy=static_occupancy,
             grid=grid,
             policy=policy,
+            history_visibility_policy=history_visibility_policy,
             generator_digest=generator_digest,
         )
         for event_index, item in enumerate(selected)
     )
     cache_stats = sweep_cache.stats
+    accepted_history_counts = {
+        regime: (
+            len(accepted_candidates_by_history[regime])
+            if regime in accepted_candidates_by_history
+            else 0
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    history_deficits = {
+        regime: max(
+            0,
+            requested_history_counts[regime]
+            - accepted_history_counts[regime],
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
     summary = {
         "schema_version": SOP05_GENERATOR_SCHEMA_VERSION,
         "seed": int(seed),
@@ -2462,6 +2586,16 @@ def _generate_v5_events(
         },
         "target_type_policy": policy.as_dict(),
         "target_type_policy_digest": policy.digest,
+        "target_history_visibility_policy": (
+            history_visibility_policy.as_dict()
+        ),
+        "target_history_visibility_policy_digest": (
+            history_visibility_policy.digest
+        ),
+        "requested_history_visibility_counts": requested_history_counts,
+        "exact_history_visibility_counts": exact_history_counts,
+        "accepted_history_visibility_counts": accepted_history_counts,
+        "history_visibility_deficits": history_deficits,
         "generator_config_digest": generator_digest,
         "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
         "production_event_kind": "environment",

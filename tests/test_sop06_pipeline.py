@@ -22,8 +22,8 @@ from src.generation.event_target_motion_shard import (
     compute_footprint_spec_digest,
     create_event_target_motion_record,
 )
-from src.generation.blind_reachability import (
-    BLIND_REACHABILITY_ALGORITHM_VERSION,
+from src.generation.event_sampler import (
+    SOP05_GENERATOR_ALGORITHM_VERSION,
 )
 from src.generation.dynamic_object_transplant import (
     TransplantedDynamicObject,
@@ -711,7 +711,7 @@ def _formal_partial_group_fixture() -> tuple[dict[str, object], PairedEventGroup
     mother_metadata = dict(inputs["world"].metadata)
     mother_metadata.pop("joint_pair_generator_algorithm_version", None)
     mother_metadata["generator_algorithm_version"] = (
-        BLIND_REACHABILITY_ALGORITHM_VERSION
+        SOP05_GENERATOR_ALGORITHM_VERSION
     )
     inputs["world"] = replace(inputs["world"], metadata=mother_metadata)
     variant = _paired_variant(inputs, empty=False)
@@ -728,9 +728,9 @@ def _formal_partial_group_fixture() -> tuple[dict[str, object], PairedEventGroup
     variant_metadata = {
         **variant.world.metadata,
         "paired_generator_algorithm_version": (
-            "independent_partial_pairs_v1"
+            "independent_partial_pairs_v2"
         ),
-        "pair_group_contract_version": "sop06_partial_pair_group_v1",
+        "pair_group_contract_version": "sop06_partial_pair_group_v2",
         "paired_coverage_mask": list(coverage_mask),
         "paired_coverage": coverage,
         "paired_missing_variant_reasons": missing_reasons,
@@ -919,7 +919,7 @@ def test_formal_mother_consumer_rejects_v1_mother() -> None:
         },
     )
 
-    with pytest.raises(ValueError, match=BLIND_REACHABILITY_ALGORITHM_VERSION):
+    with pytest.raises(ValueError, match=SOP05_GENERATOR_ALGORITHM_VERSION):
         pipeline.render_sop06_mother_event(
             record=inputs["record"],
             world=old_world,
@@ -1000,7 +1000,7 @@ def test_formal_pair_group_consumers_reject_v1_mother(entry: str) -> None:
     else:
         render = pipeline.render_sop06_partial_pair_group
 
-    with pytest.raises(ValueError, match=BLIND_REACHABILITY_ALGORITHM_VERSION):
+    with pytest.raises(ValueError, match=SOP05_GENERATOR_ALGORITHM_VERSION):
         render(
             group=group,
             mother_record=inputs["record"],

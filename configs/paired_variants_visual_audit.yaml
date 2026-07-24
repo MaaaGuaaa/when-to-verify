@@ -7,8 +7,8 @@ temporal_offset_candidates_s: [0.8, -0.8, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5]
 spatial_safe_clearance_range_m: [0.5, 1.0]
 irrelevant_min_clearance_m: 1.5
 
-lateral_offset_step_m: 0.025
-lateral_offset_max_m: 3.0
+lateral_offset_step_m: 0.1
+lateral_offset_max_m: 2.0
 
 mother_required_variants: [collision]
 training_minimum_contrast_count: 0

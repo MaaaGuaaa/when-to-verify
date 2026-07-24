@@ -41,6 +41,16 @@ from src.generation.event_target_motion_shard import (
     create_event_target_motion_record,
     load_event_target_motion_shard,
 )
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    HISTORY_VISIBILITY_REGIMES,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    SEEN_THEN_OCCLUDED,
+    UNSEEN_IN_HISTORY_WINDOW,
+    allocate_history_visibility_counts,
+    classify_history_visibility,
+    normalize_history_visibility_policy,
+)
 from src.generation.sop05_input_adapter import ProducerEvidence, StablePair
 from src.geometry import RectangleFootprint, inflate_footprint
 
@@ -167,20 +177,20 @@ def test_sop05_generation_contract_versions_are_exact() -> None:
     selection = importlib.import_module("src.generation.sop05_selection")
     identity = _publication_identity_sut()
 
-    assert module.SOP05_RUN_VERSION == "sop05_generation_run_v6"
-    assert module.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v3"
+    assert module.SOP05_RUN_VERSION == "sop05_generation_run_v7"
+    assert module.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v4"
     assert module.SOP05_GENERATION_SUMMARY_VERSION == (
-        "sop05_generation_summary_v3"
+        "sop05_generation_summary_v4"
     )
     assert module.SOP05_INPUT_LOCK_VERSION == "sop05_input_lock_v2"
     assert selection.SOP05_PAIR_REPORT_VERSION == (
-        "sop05_pair_generation_report_v4"
+        "sop05_pair_generation_report_v5"
     )
     assert selection.SOP05_DIVERSITY_TOTAL_SELECTION_VERSION == (
-        "sop05_diversity_total_selection_v1"
+        "sop05_history_stratified_selection_v2"
     )
     assert module.SOP05_GENERATOR_ALGORITHM_VERSION == (
-        "blind_reachability_quota_first_v3"
+        "blind_reachability_history_stratified_v4"
     )
     assert identity.SOP05_PUBLICATION_IDENTITY_VERSION == (
         "sop05_publication_semantic_digest_v2"
@@ -377,6 +387,7 @@ def _generated_event(
     attempt_index: int | None = None,
     attempt_seed: int = 17,
     canonical_identity: bool = False,
+    history_visibility_regime: str = UNSEEN_IN_HISTORY_WINDOW,
 ) -> GeneratedEvent:
     history = np.zeros((8, 3), dtype=np.float32)
     history[:, 0] = np.float32(offset)
@@ -575,6 +586,29 @@ def _generated_event(
         },
     )
     visibility = [False] * 4 + [True] * 12
+    if history_visibility_regime == SEEN_THEN_OCCLUDED:
+        target_visibility_history = np.asarray(
+            [False, True, True, True, True, True, False, False],
+            dtype=np.bool_,
+        )
+        last_visible_index = 5
+        trailing_hidden_frames = 2
+    elif history_visibility_regime == UNSEEN_IN_HISTORY_WINDOW:
+        target_visibility_history = np.zeros(8, dtype=np.bool_)
+        last_visible_index = None
+        trailing_hidden_frames = 8
+    else:
+        raise ValueError("unsupported fixture history visibility regime")
+    history_visibility_policy = normalize_history_visibility_policy(
+        {
+            "policy_version": HISTORY_VISIBILITY_POLICY_VERSION,
+            "min_trailing_hidden_frames": 2,
+            "weights": {
+                SEEN_THEN_OCCLUDED: 0.8,
+                UNSEEN_IN_HISTORY_WINDOW: 0.2,
+            },
+        }
+    )
     metadata = {
         **build_event_target_motion_world_metadata(record),
         "schema_version": "3.0.0",
@@ -589,9 +623,23 @@ def _generated_event(
         "attempt_index": resolved_attempt_index,
         "target_provenance": provenance,
         "visibility_sequence": visibility,
-        "target_visibility_history": [False] * 8,
+        "target_visibility_history": [
+            bool(value) for value in target_visibility_history
+        ],
         "target_visibility_history_layout": (
             "target_visibility_history8_current7_v1"
+        ),
+        "target_history_visibility_regime": history_visibility_regime,
+        "target_history_last_visible_index": last_visible_index,
+        "target_history_trailing_hidden_frames": trailing_hidden_frames,
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": (
+            history_visibility_policy.as_dict()
+        ),
+        "target_history_visibility_policy_digest": (
+            history_visibility_policy.digest
         ),
         "context_dynamic_object_ids": [],
         "causal_occluder_proposal_id": proposal_id,
@@ -622,7 +670,7 @@ def _generated_event(
         target=target,
         target_motion_record=record,
         visibility_sequence=np.array(visibility, dtype=np.bool_),
-        target_visibility_history=np.zeros(8, dtype=np.bool_),
+        target_visibility_history=target_visibility_history,
         conflict_time_s=1.0,
         conflict_index=4,
     )
@@ -655,6 +703,29 @@ def _report(
         for index in range(10 - len(proposal_ids))
     )
     policy = prepared.generator_config["target_type_policy"]
+    history_policy = prepared.generator_config["target_history_visibility"]
+    pair_base_state_id = "base-b" if seed == 102 else "base-a"
+    requested_history_counts = allocate_history_visibility_counts(
+        10,
+        history_policy,
+        seed=seed,
+        namespace=f"{pair_base_state_id}|trajectory-a",
+    )
+    accepted_history_counts = {regime: 0 for regime in HISTORY_VISIBILITY_REGIMES}
+    for event in events:
+        assessment = classify_history_visibility(
+            event.target_visibility_history,
+            history_policy,
+        )
+        accepted_history_counts[assessment.regime] += 1
+    history_deficits = {
+        regime: max(
+            0,
+            requested_history_counts[regime]
+            - accepted_history_counts[regime],
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
     return EventGenerationReport(
         events=events,
         summary={
@@ -697,6 +768,15 @@ def _report(
             },
             "target_type_policy": policy.as_dict(),
             "target_type_policy_digest": policy.digest,
+            "target_history_visibility_policy": history_policy.as_dict(),
+            "target_history_visibility_policy_digest": history_policy.digest,
+            "requested_history_visibility_counts": requested_history_counts,
+            "exact_history_visibility_counts": {
+                **accepted_history_counts,
+                INELIGIBLE_HISTORY_VISIBILITY: 0,
+            },
+            "accepted_history_visibility_counts": accepted_history_counts,
+            "history_visibility_deficits": history_deficits,
             "generator_config_digest": _generator_digest(
                 prepared.generator_config
             ),
@@ -764,6 +844,11 @@ def _prepared_with_reports(
             event_index=index,
             attempt_seed=10200 + index,
             canonical_identity=True,
+            history_visibility_regime=(
+                SEEN_THEN_OCCLUDED
+                if index < 8
+                else UNSEEN_IN_HISTORY_WINDOW
+            ),
         )
         for index, kind in enumerate(("environment",) * 9)
     )
@@ -782,6 +867,7 @@ def _prepared_with_reports(
             event_index=0,
             attempt_seed=10100,
             canonical_identity=True,
+            history_visibility_regime=UNSEEN_IN_HISTORY_WINDOW,
         ),
     )
     return prepared, {
@@ -1129,7 +1215,7 @@ def test_scientific_run_identity_ignores_workers_and_resolved_input_roots(
     )
 
 
-def test_run_identity_binds_only_the_total_selection_contract(
+def test_run_identity_binds_history_stratified_selection_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _sut()
@@ -1138,8 +1224,8 @@ def test_run_identity_binds_only_the_total_selection_contract(
     prepared = module.prepare_sop05_run(_request(module, tmp_path))
 
     identity_payload = {
-        "version": "sop05_generation_run_v6",
-        "selection_version": "sop05_diversity_total_selection_v1",
+        "version": "sop05_generation_run_v7",
+        "selection_version": "sop05_history_stratified_selection_v2",
         "producer_source_identity": prepared.producer_source_identity,
         "split": prepared.request.split,
         "sop03": {
@@ -1173,6 +1259,12 @@ def test_run_identity_binds_only_the_total_selection_contract(
         ),
         "target_type_policy": prepared.target_type_policy,
         "target_type_policy_digest": prepared.target_type_policy_digest,
+        "target_history_visibility_policy": (
+            prepared.target_history_visibility_policy
+        ),
+        "target_history_visibility_policy_digest": (
+            prepared.target_history_visibility_policy_digest
+        ),
         "accepted_quota": prepared.request.accepted_quota,
         "events_per_pair": prepared.request.events_per_pair,
     }
@@ -1466,6 +1558,60 @@ def test_parallel_pair_collection_completes_with_full_mixed_kind_quota(
     }
     assert "required_event_kind_counts" not in collection.generation_summary
     assert "quota_deficits" not in collection.generation_summary
+
+
+def test_collection_does_not_backfill_missing_seen_history_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _sut()
+    prepared, _ = _prepared_with_reports(module, tmp_path, monkeypatch)
+    _install_thread_pair_pool(monkeypatch, module)
+    policy_digest = prepared.generator_config["target_type_policy"].digest
+    all_unseen = tuple(
+        _generated_event(
+            f"all-unseen-{index}",
+            "environment",
+            prepared.grid,
+            float(index),
+            "base-b" if index < 9 else "base-a",
+            target_type_policy_digest=policy_digest,
+            target_type_policy=prepared.target_type_policy,
+            generator_config_digest=(
+                prepared.generator_config_semantic_digest
+            ),
+            event_index=index if index < 9 else 0,
+            attempt_seed=12000 + index,
+            canonical_identity=True,
+            history_visibility_regime=UNSEEN_IN_HISTORY_WINDOW,
+        )
+        for index in range(10)
+    )
+    reports = {
+        102: _report(prepared, 102, all_unseen[:9]),
+        101: _report(prepared, 101, all_unseen[9:]),
+    }
+    monkeypatch.setattr(
+        module,
+        "generate_events",
+        lambda **kwargs: reports[kwargs["seed"]],
+    )
+
+    collection = module.collect_sop05_generation(prepared)
+
+    assert collection.generation_summary["required_history_visibility_counts"] == {
+        SEEN_THEN_OCCLUDED: 8,
+        UNSEEN_IN_HISTORY_WINDOW: 2,
+    }
+    assert collection.generation_summary["selected_history_visibility_counts"] == {
+        SEEN_THEN_OCCLUDED: 0,
+        UNSEEN_IN_HISTORY_WINDOW: 2,
+    }
+    assert collection.generation_summary["history_visibility_deficits"] == {
+        SEEN_THEN_OCCLUDED: 8,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
+    assert collection.generation_summary["selected_count"] == 2
+    assert collection.generation_summary["quota_met"] is False
 
 
 def test_collection_rejects_report_count_mismatch_and_global_identity_replay(
@@ -1922,8 +2068,8 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     )
     assert manifest["run_state"] == "complete"
     assert manifest["run_id"] == prepared.run_id
-    assert manifest["manifest_version"] == "sop05_run_manifest_v3"
-    assert manifest["producer_version"] == "sop05_generation_run_v6"
+    assert manifest["manifest_version"] == "sop05_run_manifest_v4"
+    assert manifest["producer_version"] == "sop05_generation_run_v7"
     assert manifest["runtime"] == {
         "checksum_workers": 2,
         "git_executable": str(prepared.request.git_executable),
@@ -1947,7 +2093,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         result.output_dir / "configs/generator.yaml"
     )
     assert manifest["scientific_request"]["selection_version"] == (
-        "sop05_diversity_total_selection_v1"
+        "sop05_history_stratified_selection_v2"
     )
     assert "required_event_kind_counts" not in manifest["scientific_request"]
     generation_summary = json.loads(
@@ -1956,7 +2102,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         )
     )
     assert generation_summary["summary_version"] == (
-        "sop05_generation_summary_v3"
+        "sop05_generation_summary_v4"
     )
     assert generation_summary["quota_met"] is True
     assert generation_summary["selected_event_kind_counts"] == {
@@ -1972,10 +2118,10 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
     ]
     assert [row["rank"] for row in report_rows] == [0, 1]
     assert report_rows[0]["report_version"] == (
-        "sop05_pair_generation_report_v4"
+        "sop05_pair_generation_report_v5"
     )
     assert report_rows[0]["selection_version"] == (
-        "sop05_diversity_total_selection_v1"
+        "sop05_history_stratified_selection_v2"
     )
     assert [
         row["generated_event_id"]
@@ -2021,7 +2167,7 @@ def test_success_publication_writes_one_strict_shard_and_complete_marker(
         result.publication_semantic_digest
     )
     marker_payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert marker_payload["marker_version"] == "sop05_producer_complete_v3"
+    assert marker_payload["marker_version"] == "sop05_producer_complete_v4"
     assert marker_payload["publication_identity_version"] == (
         "sop05_publication_semantic_digest_v2"
     )
@@ -2073,6 +2219,7 @@ def test_complete_publication_requires_formal_consumer_round_trip_before_exposur
         generator_config_digest=prepared.generator_config_semantic_digest,
         event_index=0,
         attempt_seed=10200,
+        history_visibility_regime=SEEN_THEN_OCCLUDED,
     )
     tampered_reports = {
         **reports,
@@ -2174,7 +2321,7 @@ def test_quota_shortfall_publishes_explicit_partial_failure_without_marker(
     )
     assert manifest["run_state"] == "quota_unmet"
     assert summary["run_state"] == "quota_unmet"
-    assert summary["summary_version"] == "sop05_generation_summary_v3"
+    assert summary["summary_version"] == "sop05_generation_summary_v4"
     assert summary["selected_count"] == 6
     assert summary["selected_event_kind_counts"] == {
         "environment": 6,
@@ -2242,7 +2389,7 @@ def test_publication_rejects_selection_order_drift(
     )
 
     with pytest.raises(
-        module.Sop05RunError, match="frozen diversity-total selection"
+        module.Sop05RunError, match="frozen history-stratified selection"
     ):
         module.publish_sop05_generation(prepared, tampered)
 

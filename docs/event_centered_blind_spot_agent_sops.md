@@ -715,7 +715,9 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 - [x] `scripts/05_generate_events.py` 必须显式接收目录外
       `--sop04-handoff-digest`；`sop05_input_lock_v2` 和 run identity 必须绑定 bank/layout、
       时间参数、offset digest、bank semantic digest 与 external handoff digest
-- [x] SOP05 正式母事件生成协议固定为 `blind_reachability_quota_first_v3`，
+- [x] SOP05 正式母事件生成协议固定为 `blind_reachability_history_stratified_v4`，
+      低层 reachability 固定为 `blind_reachability_quota_first_v3`，producer/report 固定为
+      `sop05_generation_run_v7` / `sop05_pair_generation_report_v5`，
       `schema_version=3.0.0`，`production_event_kind=environment`；历史
       `joint_occluder_first_v4` 仅作迁移记录，producer 和正式 loader 必须拒绝。
       `reachability_candidate_se2_v2` 的 `ReachabilityIdentity` / candidate 显式绑定
@@ -755,8 +757,16 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       `snippet_candidates_per_proposal=64` 条真实 SOP03 snippet，达到本 pair 的
       `requested_event_count` 后停止未执行候选。不得以 quota-first 为由跳过已进入
       exact 阶段的碰撞、完整 footprint 隐藏、连续出现、动力学或 23 点无外推检查
-- [x] formal loader 必须拒绝紧邻旧三元组 `blind_reachability_first_v2` /
-      `sop05_generation_run_v5` / `sop05_pair_generation_report_v3`。批量矩形栅格化的
+- [x] exact-valid 候选按 8 帧历史分为 `seen_then_occluded`（至少一帧可见，末尾至少
+      连续 2 帧不可见）和 `unseen_in_history_window`（8 帧全不可见）；默认请求
+      `80% / 20%`。两层均要求当前隐藏、未来连续出现并与候选轨迹碰撞
+- [x] history 权重是 pair/run 两级硬配额；某层不足不得跨层回填，run 必须保持
+      `quota_unmet`。该比例只作为受控实验组成，不得解释为自然场景频率
+- [x] event、pair report、run summary 分别保存 policy/digest、regime、最后可见 index、
+      trailing-hidden 数和 requested/exact/accepted/deficit 计数；loader 从 8 帧向量
+      重算并拒绝任何重封装后的 metadata 漂移
+- [x] formal loader 必须拒绝旧 `sop05_generation_run_v6` /
+      `sop05_pair_generation_report_v4` / `sop05_diversity_total_selection_v1`。批量矩形栅格化的
       数值边界须回退 scalar authority；并行调度须同时限制 running 与 ready reports
 - [x] 真实 train smoke 应覆盖 5、20、100 pair；生产 `max_pairs` 至少为目标 quota
       预留 5–10% 失败余量，并保存 quota-unmet 与扫满预算 pair，不得静默跳过
@@ -790,7 +800,8 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### 验收
 
-- 当前机器人到隐藏目标历史位置的视线被截断或位于 FOV 外
+- 当前帧目标不可见；`seen_then_occluded` 样本允许且要求历史中至少一帧曾可见，
+  `unseen_in_history_window` 才要求 8 帧全部不可见
 - 目标未来从遮挡边界连续出现
 - 目标轨迹与静态/新遮挡物无相交
 - 遮挡物与候选轨迹 swept volume 无相交
@@ -805,7 +816,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### 当前验证状态
 
-- [x] SOP05 v2 代码契约和 unit/toy-fixture 测试
+- [x] SOP05 history-stratified v4/v7 代码契约和 unit/toy-fixture 测试
 - [ ] 随机 10–100 个真实 schema 3 样本 smoke 与人工几何审查
 - [ ] 100 个可视化事件和 5,000 个可用 base events 规模验收
 
@@ -840,8 +851,8 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
 
 ### SOP
 
-- [x] 配对生成器固定为 `independent_partial_pairs_v1`，group contract 固定为
-      `sop06_partial_pair_group_v1`；配置只将 `collision` 作为 mother-required 位，
+- [x] 配对生成器固定为 `independent_partial_pairs_v2`，group contract 固定为
+      `sop06_partial_pair_group_v2`；配置只将 `collision` 作为 mother-required 位，
       `training_minimum_contrast_count=0`
 - [x] 从同一 base/trajectory/occluder/target dynamic object 生成 collision
 - [x] 生成 near-miss，最小安全间隔目标 `0.05–0.35 m`
@@ -857,6 +868,10 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       recording 或从其他 session 替换 snippet
 - [x] 每类 negative 都从已验收的 collision 母事件独立尝试；一类失败只记录该位
       missing reason，不重采样母遮挡物，不作废其他变体
+- [x] 所有非空 variant 使用 mother 的同一 history policy 重算可见性，并保持相同
+      regime；漂移位以 `target_history_visibility_regime_changed` 拒绝。
+      `empty_blind_spot` 是 target-removal negative，对 `seen_then_occluded` mother
+      不声称保持完全相同的历史观测输入
 - [x] 正式 v5 producer/consumer 必须拒绝历史 `joint_environment_pair_v2`，并返回
       `joint_environment_pair_v2_retired`；不得以 joint multi-LOS 完整组搜索作为训练门槛
 - [x] 生成 irrelevant-hidden，确保有隐藏目标且同步 signed clearance `≥1.5 m`
@@ -960,7 +975,7 @@ pytest tests/test_trajectory_rollout.py tests/test_trajectory_filters.py tests/t
       shape/dtype/finite、固定 boundary、canonical JSONL、manifest/semantic digest 与 split leakage，
       通过后才原子 rename
 - [x] `scripts/04_generate_risk_dataset.py` 对一个 formal
-      `independent_partial_pairs_v1` group 的所有已成功 variants 做原子
+      `independent_partial_pairs_v2` group 的所有已成功 variants 做原子
       `RiskSample` 组装/发布；缺位保留 coverage + stable reason，只有
       conditional complete audit 路径要求六位齐全。CLI exact sample count 是
       shard 总边界，不是每 group 六类 quota

@@ -342,6 +342,44 @@ def test_prepared_sweep_far_aabb_skips_exact_clearance(
     )
 
 
+def test_prepared_sweep_center_radius_bound_skips_exact_clearance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = _grid()
+    prepared = prepare_occluder_collision_sweep(
+        _raw_sweep(
+            np.asarray(
+                [[-1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+                dtype=np.float64,
+            )
+        ),
+        grid=grid,
+    )
+
+    def unexpected_exact_clearance(*args: object, **kwargs: object):
+        del args, kwargs
+        raise AssertionError(
+            "certified center-radius bounds must skip exact clearance"
+        )
+
+    monkeypatch.setattr(
+        occluder_sampler_module,
+        "trajectory_signed_clearances",
+        unexpected_exact_clearance,
+    )
+    monkeypatch.setattr(
+        occluder_sampler_module,
+        "signed_clearance",
+        unexpected_exact_clearance,
+    )
+
+    assert not occluder_sampler_module._prepared_intersects_robot_sweep(
+        RectangleFootprint(0.002, 0.002),
+        np.asarray([-1.0, 1.0, 0.0], dtype=np.float64),
+        prepared,
+    )
+
+
 def test_collision_validator_accepts_mixed_raw_and_prepared_sweeps_in_order() -> None:
     grid = _grid()
     clear_raw = _raw_sweep(

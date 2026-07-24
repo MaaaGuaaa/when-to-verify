@@ -43,10 +43,17 @@ from src.generation.event_sampler import (
     load_generator_config,
     normalize_generator_config,
 )
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    SEEN_THEN_OCCLUDED,
+    UNSEEN_IN_HISTORY_WINDOW,
+)
 from src.generation.robot_sweep_cache import (
     RobotSweepCache,
     RobotSweepCacheIdentityError,
 )
+from src.generation.occluder_sampler import OccluderPlacement
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.geometry import (
     CircleFootprint,
@@ -557,6 +564,14 @@ def _generator_config(event_kind: str = "structural") -> dict:
         "schema_version": "3.0.0",
         "production_event_kind": "environment",
         "target_type_policy": _policy(),
+        "target_history_visibility": {
+            "policy_version": HISTORY_VISIBILITY_POLICY_VERSION,
+            "min_trailing_hidden_frames": 2,
+            "weights": {
+                SEEN_THEN_OCCLUDED: 1.0,
+                UNSEEN_IN_HISTORY_WINDOW: 0.0,
+            },
+        },
         "conflict_time_range_s": [1.8, 1.8],
         "max_local_curvature_per_m": 1.0,
         "crossing_angle_max_deg": 35.0,
@@ -1556,6 +1571,7 @@ def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
         "schema_version",
         "production_event_kind",
         "target_type_policy",
+        "target_history_visibility",
         "conflict_time_range_s",
         "max_local_curvature_per_m",
         "crossing_angle_max_deg",
@@ -1575,6 +1591,14 @@ def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
             "carried_object": 0.0,
             "unknown_dynamic": 0.0,
         }
+        assert config["target_history_visibility"].weights == {
+            SEEN_THEN_OCCLUDED: 0.8,
+            UNSEEN_IN_HISTORY_WINDOW: 0.2,
+        }
+        assert (
+            config["target_history_visibility"].min_trailing_hidden_frames
+            == 2
+        )
         assert config["time_scale_range"] == (1.0, 1.0)
         assert config["blind_reachability"]["algorithm_version"] == (
             "blind_reachability_quota_first_v3"
@@ -1611,7 +1635,7 @@ def test_generator_config_rejects_v4_normal_offset_key() -> None:
         normalize_generator_config(config)
 
 
-def test_generator_config_freezes_v5_algorithm_token() -> None:
+def test_generator_config_freezes_history_stratified_algorithm_token() -> None:
     config = _generator_config()
     config["blind_reachability"]["algorithm_version"] = "future_algorithm"
 
@@ -1620,7 +1644,7 @@ def test_generator_config_freezes_v5_algorithm_token() -> None:
 
     assert (
         event_sampler_module.SOP05_GENERATOR_ALGORITHM_VERSION
-        == "blind_reachability_quota_first_v3"
+        == "blind_reachability_history_stratified_v4"
     )
 
 
@@ -2027,6 +2051,13 @@ def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> 
     assert event.world.metadata["target_visibility_history_layout"] == (
         "target_visibility_history8_current7_v1"
     )
+    history_policy = generator_config["target_history_visibility"]
+    assert event.world.metadata["target_history_visibility_policy"] == (
+        history_policy.as_dict()
+    )
+    assert event.world.metadata[
+        "target_history_visibility_policy_digest"
+    ] == history_policy.digest
     for object_id in event.world.dynamic_object_trajectories:
         np.testing.assert_array_equal(
             event.world.dynamic_object_trajectories[object_id],
@@ -2145,6 +2176,184 @@ def test_target_visibility_history_recomputes_moving_sensor_and_context_per_fram
         )
         np.testing.assert_array_equal(sensor_pose, robot_history[index])
         assert used_structural is structural
+
+
+def test_environment_history_raycast_evaluates_only_target_footprint_cells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, grid, base, oracle, _, _ = _base_inputs()
+    target = _valid_physics_target()
+    target_footprint = footprint_from_spec(target.footprint_spec)
+    placement_footprint = RectangleFootprint(0.6, 0.6)
+    placement_pose = np.asarray([0.8, 0.0, 0.0], dtype=np.float32)
+    placement_mask = rasterize_footprint(
+        placement_footprint, placement_pose, grid
+    )
+    placement = OccluderPlacement(
+        occluder={"occluder_id": "targeted-history"},
+        footprint=placement_footprint,
+        pose=placement_pose,
+        mask=placement_mask,
+        attempt=0,
+        rejection_reasons={},
+    )
+    observed: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+    def targeted(
+        occupancy: np.ndarray,
+        candidate_mask: np.ndarray,
+        _grid,
+        *,
+        sensor_pose: np.ndarray,
+    ) -> np.ndarray:
+        index = len(observed)
+        observed.append(
+            (
+                np.asarray(occupancy).copy(),
+                candidate_mask.copy(),
+                np.asarray(sensor_pose).copy(),
+            )
+        )
+        return (
+            candidate_mask.copy()
+            if index < grid.history_steps - 1
+            else np.zeros_like(candidate_mask)
+        )
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "raycast_candidate_visibility",
+        targeted,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        event_sampler_module,
+        "raycast_visibility",
+        lambda *_args, **_kwargs: pytest.fail(
+            "environment history must not raycast the full grid"
+        ),
+    )
+
+    history_visibility = event_sampler_module._target_visibility_history(
+        event_kind="environment",
+        static_occupancy=np.zeros((grid.height, grid.width), dtype=np.float32),
+        placement=placement,
+        grid=grid,
+        base_state=base,
+        oracle_context=oracle,
+        context_footprints={},
+        target=target,
+        target_footprint=target_footprint,
+        structural=None,
+    )
+
+    np.testing.assert_array_equal(
+        history_visibility,
+        np.asarray([True] * 7 + [False], dtype=np.bool_),
+    )
+    assert len(observed) == grid.history_steps
+    for index, (occupied, candidate_mask, sensor_pose) in enumerate(observed):
+        np.testing.assert_array_equal(occupied, placement_mask)
+        np.testing.assert_array_equal(
+            candidate_mask,
+            rasterize_footprint(
+                target_footprint, target.history_poses[index], grid
+            ),
+        )
+        np.testing.assert_array_equal(sensor_pose, base.robot_history[index])
+
+
+def test_history_stratified_generation_skips_unseen_for_requested_seen_mother(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, _ = _v5_mother_inputs()
+    raw_generator_config = _generator_config("environment")
+    raw_generator_config["conflict_time_range_s"] = [2.2, 2.2]
+    raw_generator_config["target_history_visibility"]["weights"] = {
+        SEEN_THEN_OCCLUDED: 1.0,
+        UNSEEN_IN_HISTORY_WINDOW: 0.0,
+    }
+    generator_config = normalize_generator_config(raw_generator_config)
+    histories = (
+        np.zeros(8, dtype=np.bool_),
+        np.asarray(
+            [False, True, True, True, True, True, False, False],
+            dtype=np.bool_,
+        ),
+    )
+    observed: list[np.ndarray] = []
+
+    def controlled_history(**_kwargs: object) -> np.ndarray:
+        index = min(len(observed), len(histories) - 1)
+        result = histories[index].copy()
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(
+        event_sampler_module,
+        "_target_visibility_history",
+        controlled_history,
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert len(observed) >= 2
+    assert len(report.events) == 1
+    np.testing.assert_array_equal(
+        report.events[0].target_visibility_history,
+        histories[1],
+    )
+    assert report.events[0].world.metadata[
+        "target_history_visibility_regime"
+    ] == SEEN_THEN_OCCLUDED
+
+
+def test_history_stratified_generation_accepts_requested_unseen_mother(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, base, oracle, trajectory, libraries, _ = _v5_mother_inputs()
+    raw_generator_config = _generator_config("environment")
+    raw_generator_config["conflict_time_range_s"] = [2.2, 2.2]
+    raw_generator_config["target_history_visibility"]["weights"] = {
+        SEEN_THEN_OCCLUDED: 0.0,
+        UNSEEN_IN_HISTORY_WINDOW: 1.0,
+    }
+    generator_config = normalize_generator_config(raw_generator_config)
+    unseen_history = np.zeros(8, dtype=np.bool_)
+    monkeypatch.setattr(
+        event_sampler_module,
+        "_target_visibility_history",
+        lambda **_kwargs: unseen_history.copy(),
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=20260716,
+        event_count=1,
+    )
+
+    assert len(report.events) == 1
+    np.testing.assert_array_equal(
+        report.events[0].target_visibility_history,
+        unseen_history,
+    )
+    assert report.events[0].world.metadata[
+        "target_history_visibility_regime"
+    ] == UNSEEN_IN_HISTORY_WINDOW
 
 
 @pytest.mark.parametrize("event_kind", ["structural", "mixed"])
@@ -2529,7 +2738,7 @@ def test_v5_summary_reconciles_each_candidate_layer() -> None:
     )
 
 
-def test_v3_quota_first_stops_after_requested_exact_acceptance() -> None:
+def test_history_quota_stops_after_requested_eligible_acceptance() -> None:
     config, _, base, oracle, trajectory, libraries, generator_config = (
         _v5_mother_inputs()
     )
@@ -2549,7 +2758,15 @@ def test_v3_quota_first_stops_after_requested_exact_acceptance() -> None:
     )
 
     assert len(report.events) == 1
-    assert report.summary["exact_validation_accepted_count"] == 1
+    assert report.summary["exact_validation_accepted_count"] >= 1
+    assert report.summary["accepted_history_visibility_counts"] == {
+        SEEN_THEN_OCCLUDED: 1,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
+    assert report.summary["history_visibility_deficits"] == {
+        SEEN_THEN_OCCLUDED: 0,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
     assert report.summary["obstacle_proposal_count"] < proposal_budget
     assert report.summary["attempt_index_stop_exclusive"] == (
         report.summary["attempt_index_start"]
@@ -3054,7 +3271,7 @@ def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
     assert exc_info.value.reason == "target_static_collision"
 
 
-def test_environment_generation_uses_blind_reachability_first_mother() -> None:
+def test_environment_generation_uses_history_stratified_mother() -> None:
     config, _, base, oracle, trajectory, libraries = _base_inputs()
     exact_safe = _exact_safe_curve_snippet()
     libraries = {
@@ -3075,7 +3292,7 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
 
     assert len(report.events) == 1
     assert report.summary["generator_algorithm_version"] == (
-        "blind_reachability_quota_first_v3"
+        "blind_reachability_history_stratified_v4"
     )
     assert report.summary["obstacle_proposal_count"] == (
         report.summary["obstacle_proposal_rejected_count"]
@@ -3094,8 +3311,13 @@ def test_environment_generation_uses_blind_reachability_first_mother() -> None:
     assert report.summary["exact_validation_accepted_count"] > 0
     event = report.events[0]
     assert event.world.metadata["generator_algorithm_version"] == (
-        "blind_reachability_quota_first_v3"
+        "blind_reachability_history_stratified_v4"
     )
+    assert event.world.metadata[
+        "target_history_visibility_regime"
+    ] == SEEN_THEN_OCCLUDED
+    assert bool(np.any(event.target_visibility_history))
+    assert not bool(np.any(event.target_visibility_history[-2:]))
     assert event.world.occluders[0]["placement_strategy"] == (
         "causal_free_space_schedule_v1"
     )
@@ -3236,16 +3458,14 @@ def test_generate_events_shared_robot_cache_fails_closed_on_identity_change() ->
 
 
 @pytest.mark.parametrize(
-    ("case", "inputs_factory", "seed", "expected_side"),
+    ("inputs_factory", "seed", "expected_side"),
     (
-        ("left", _v5_mother_inputs, 1, 1),
-        ("right", _mirrored_v5_mother_inputs, 2, -1),
-        ("oblique", _oblique_v5_mother_inputs, 1, 0),
+        (_v5_mother_inputs, 1, 1),
+        (_mirrored_v5_mother_inputs, 2, -1),
     ),
-    ids=("left", "right", "oblique"),
+    ids=("left", "right"),
 )
-def test_v5_real_entry_accepts_lateral_and_oblique_mothers(
-    case: str,
+def test_v5_real_entry_accepts_lateral_mothers(
     inputs_factory,
     seed: int,
     expected_side: int,
@@ -3267,16 +3487,39 @@ def test_v5_real_entry_accepts_lateral_and_oblique_mothers(
 
     assert len(report.events) == 1
     event = report.events[0]
-    if expected_side:
-        assert expected_side * float(event.target.current_pose[1]) > 0.5
-        assert expected_side * float(event.world.occluders[0]["pose"][1]) > 0.5
-    else:
-        assert case == "oblique"
-        assert abs(float(trajectory.poses[-1, 2])) > 1.0
-        assert float(np.ptp(trajectory.poses[:, 1])) > 0.5
+    assert expected_side * float(event.target.current_pose[1]) > 0.5
+    assert expected_side * float(event.world.occluders[0]["pose"][1]) > 0.5
 
 
-def test_environment_mother_collects_then_stably_selects_fixture_batch() -> None:
+def test_v5_real_entry_rejects_oblique_with_only_current_hidden() -> None:
+    config, _, base, oracle, trajectory, libraries, generator_config = (
+        _oblique_v5_mother_inputs()
+    )
+
+    report = generate_events(
+        base_state=base,
+        oracle_context=oracle,
+        trajectory=trajectory,
+        snippet_libraries=libraries,
+        base_config=config,
+        generator_config=generator_config,
+        seed=1,
+        event_count=1,
+    )
+
+    assert report.events == ()
+    assert report.summary["exact_history_visibility_counts"] == {
+        SEEN_THEN_OCCLUDED: 0,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+        INELIGIBLE_HISTORY_VISIBILITY: 1,
+    }
+    assert report.summary["history_visibility_deficits"] == {
+        SEEN_THEN_OCCLUDED: 1,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
+
+
+def test_environment_mother_does_not_backfill_ineligible_fixture_batch() -> None:
     config, _, base, oracle, trajectory, libraries, generator_config = (
         _v5_mother_inputs()
     )
@@ -3291,8 +3534,17 @@ def test_environment_mother_collects_then_stably_selects_fixture_batch() -> None
         event_count=4,
     )
 
-    assert len(report.events) == 4
+    assert len(report.events) == 2
     assert report.summary["exact_validation_accepted_count"] >= 4
+    assert report.summary["exact_history_visibility_counts"] == {
+        SEEN_THEN_OCCLUDED: 2,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+        INELIGIBLE_HISTORY_VISIBILITY: 2,
+    }
+    assert report.summary["history_visibility_deficits"] == {
+        SEEN_THEN_OCCLUDED: 2,
+        UNSEEN_IN_HISTORY_WINDOW: 0,
+    }
     assert all(event.conflict_time_s == 2.2 for event in report.events)
     selection_keys = [
         (

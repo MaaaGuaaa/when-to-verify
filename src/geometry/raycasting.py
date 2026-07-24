@@ -224,6 +224,67 @@ def _candidate_visibility(
     return visible
 
 
+def _filtered_candidates(
+    candidates: np.ndarray,
+    centers: np.ndarray,
+    sensor: np.ndarray,
+    *,
+    fov: float,
+    maximum_range: float | None,
+) -> np.ndarray:
+    selected = candidates.copy()
+    deltas = centers - sensor[:2]
+    distances = np.hypot(deltas[..., 0], deltas[..., 1])
+    if maximum_range is not None:
+        selected &= distances <= maximum_range
+    if fov < 2.0 * np.pi:
+        bearings = np.arctan2(deltas[..., 1], deltas[..., 0])
+        differences = np.abs(wrap_angle(bearings - sensor[2]))
+        selected &= differences <= 0.5 * fov
+    return selected
+
+
+def raycast_candidate_visibility(
+    occupancy,
+    candidate_mask,
+    grid: GridSpec,
+    *,
+    sensor_pose=(0.0, 0.0, 0.0),
+    fov_rad=2.0 * np.pi,
+    max_range_m=None,
+) -> np.ndarray:
+    """Raycast only selected cells with the exact full-map visibility semantics."""
+
+    _validate_grid(grid)
+    occupied = _occupancy_mask(occupancy, grid)
+    candidates = np.asarray(candidate_mask)
+    if candidates.shape != (grid.height, grid.width):
+        raise ValueError("candidate_mask must match the grid shape")
+    if candidates.dtype != np.bool_:
+        raise TypeError("candidate_mask must have boolean dtype")
+    sensor = _sensor_pose(sensor_pose, grid)
+    fov = _real_parameter(
+        fov_rad,
+        name="fov_rad",
+        minimum=0.0,
+        maximum=2.0 * np.pi,
+    )
+    maximum_range = (
+        None
+        if max_range_m is None
+        else _real_parameter(max_range_m, name="max_range_m", minimum=0.0)
+    )
+    centers = grid_cell_centers(grid)
+    selected = _filtered_candidates(
+        candidates,
+        centers,
+        sensor,
+        fov=fov,
+        maximum_range=maximum_range,
+    )
+    return _candidate_visibility(occupied, grid, sensor[:2], centers, selected)
+
+
 def raycast_visibility(
     occupancy,
     grid: GridSpec,
@@ -248,14 +309,11 @@ def raycast_visibility(
     )
 
     centers = grid_cell_centers(grid)
-    deltas = centers - sensor[:2]
-    distances = np.hypot(deltas[..., 0], deltas[..., 1])
-    candidates = np.ones((grid.height, grid.width), dtype=bool)
-    if maximum_range is not None:
-        candidates &= distances <= maximum_range
-    if fov < 2.0 * np.pi:
-        bearings = np.arctan2(deltas[..., 1], deltas[..., 0])
-        differences = np.abs(wrap_angle(bearings - sensor[2]))
-        candidates &= differences <= 0.5 * fov
-
+    candidates = _filtered_candidates(
+        np.ones((grid.height, grid.width), dtype=bool),
+        centers,
+        sensor,
+        fov=fov,
+        maximum_range=maximum_range,
+    )
     return _candidate_visibility(occupied, grid, sensor[:2], centers, candidates)

@@ -2,7 +2,10 @@ import numpy as np
 import pytest
 
 from src.contracts import GridSpec
-from src.geometry.raycasting import raycast_visibility
+from src.geometry.raycasting import (
+    raycast_candidate_visibility,
+    raycast_visibility,
+)
 
 
 @pytest.fixture
@@ -264,6 +267,63 @@ def test_visibility_is_deterministic_for_noncentral_sensor_pose(grid: GridSpec) 
     assert np.array_equal(first, second)
 
 
+def test_candidate_visibility_exactly_matches_full_raycast_on_selected_cells() -> None:
+    grid = GridSpec(
+        height=17,
+        width=17,
+        history_steps=8,
+        future_steps=15,
+        resolution_m=0.25,
+    )
+    rng = np.random.default_rng(20260723)
+    for _ in range(20):
+        occupancy = rng.random((17, 17)) < 0.12
+        candidates = rng.random((17, 17)) < 0.08
+        sensor_pose = np.asarray(
+            [
+                rng.uniform(-1.8, 1.8),
+                rng.uniform(-1.8, 1.8),
+                rng.uniform(-np.pi, np.pi),
+            ],
+            dtype=np.float64,
+        )
+        fov_rad = float(rng.uniform(0.3, 2.0 * np.pi))
+        max_range_m = float(rng.uniform(0.5, 3.0))
+
+        full = raycast_visibility(
+            occupancy,
+            grid,
+            sensor_pose=sensor_pose,
+            fov_rad=fov_rad,
+            max_range_m=max_range_m,
+        )
+        targeted = raycast_candidate_visibility(
+            occupancy,
+            candidates,
+            grid,
+            sensor_pose=sensor_pose,
+            fov_rad=fov_rad,
+            max_range_m=max_range_m,
+        )
+
+        np.testing.assert_array_equal(targeted, full & candidates)
+
+
+def test_candidate_visibility_rejects_nonboolean_or_wrong_shape_mask(
+    grid: GridSpec,
+) -> None:
+    occupancy = np.zeros((5, 5), dtype=bool)
+
+    with pytest.raises(TypeError, match="candidate_mask"):
+        raycast_candidate_visibility(
+            occupancy, np.zeros((5, 5), dtype=np.float32), grid
+        )
+    with pytest.raises(ValueError, match="candidate_mask"):
+        raycast_candidate_visibility(
+            occupancy, np.zeros((4, 5), dtype=bool), grid
+        )
+
+
 def test_geometry_package_has_stable_central_public_api() -> None:
     import src.geometry as geometry
 
@@ -290,6 +350,7 @@ def test_geometry_package_has_stable_central_public_api() -> None:
         "rasterize_footprint",
         "rasterize_footprint_sweep",
         "raycast_visibility",
+        "raycast_candidate_visibility",
         "signed_clearance",
         "intersects",
         "segments_intersect",

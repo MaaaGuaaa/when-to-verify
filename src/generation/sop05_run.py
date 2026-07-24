@@ -32,9 +32,18 @@ from src.generation.event_sampler import (
     EventGenerationReport,
     GeneratedEvent,
     SOP05_GENERATOR_ALGORITHM_VERSION,
+    SOP05_REACHABILITY_ALGORITHM_VERSION,
     _generator_digest,
     generate_events,
     load_generator_config,
+)
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    HISTORY_VISIBILITY_REGIMES,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    HistoryVisibilityPolicy,
+    allocate_history_visibility_counts,
+    classify_history_visibility,
 )
 from src.generation.event_target_motion_shard import (
     create_event_target_motion_record,
@@ -70,10 +79,10 @@ from src.utils.config import load_config
 
 
 SOP05_RUN_VERSION = SOP05_RUN_PRODUCER_VERSION
-SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v3"
-SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v3"
+SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v4"
+SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v4"
 SOP05_INPUT_LOCK_VERSION = "sop05_input_lock_v2"
-SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v3"
+SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v4"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_IDENTITY_VERSION = "sop05_producer_source_identity_v1"
 _EVENT_KIND_WEIGHTS = {"environment": 1.0}
@@ -123,6 +132,8 @@ class PreparedSop05Run:
     generator_config_semantic_digest: str
     target_type_policy: dict[str, object]
     target_type_policy_digest: str
+    target_history_visibility_policy: dict[str, object]
+    target_history_visibility_policy_digest: str
     grid: GridSpec
     sop03: Sop03SplitInputs
     sop04: Sop04TrajectoryBank
@@ -540,7 +551,7 @@ def _validate_generator_mix(generator_config: Mapping[str, object]) -> None:
         raise Sop05RunError("generator production_event_kind must be environment")
     blind = generator_config.get("blind_reachability")
     if not isinstance(blind, Mapping) or blind.get("algorithm_version") != (
-        SOP05_GENERATOR_ALGORITHM_VERSION
+        SOP05_REACHABILITY_ALGORITHM_VERSION
     ):
         raise Sop05RunError(
             "generator blind_reachability algorithm version mismatch"
@@ -566,6 +577,19 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
         raise Sop05RunError("normalized target_type_policy is missing")
     target_type_policy_payload = target_type_policy.as_dict()
     target_type_policy_digest = target_type_policy.digest
+    target_history_visibility_policy = generator_config.get(
+        "target_history_visibility"
+    )
+    if not isinstance(
+        target_history_visibility_policy, HistoryVisibilityPolicy
+    ):
+        raise Sop05RunError("normalized target history visibility policy is missing")
+    target_history_visibility_policy_payload = (
+        target_history_visibility_policy.as_dict()
+    )
+    target_history_visibility_policy_digest = (
+        target_history_visibility_policy.digest
+    )
     generator_config_semantic_digest = _generator_digest(generator_config)
     grid = build_grid_spec(base_config)
     sop03 = load_sop03_split_inputs(
@@ -671,6 +695,12 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
         "generator_config_semantic_digest": generator_config_semantic_digest,
         "target_type_policy": target_type_policy_payload,
         "target_type_policy_digest": target_type_policy_digest,
+        "target_history_visibility_policy": (
+            target_history_visibility_policy_payload
+        ),
+        "target_history_visibility_policy_digest": (
+            target_history_visibility_policy_digest
+        ),
         "accepted_quota": request.accepted_quota,
         "events_per_pair": request.events_per_pair,
     }
@@ -688,6 +718,12 @@ def prepare_sop05_run(request: Sop05RunRequest) -> PreparedSop05Run:
         generator_config_semantic_digest=generator_config_semantic_digest,
         target_type_policy=target_type_policy_payload,
         target_type_policy_digest=target_type_policy_digest,
+        target_history_visibility_policy=(
+            target_history_visibility_policy_payload
+        ),
+        target_history_visibility_policy_digest=(
+            target_history_visibility_policy_digest
+        ),
         grid=grid,
         sop03=sop03,
         sop04=sop04,
@@ -930,6 +966,17 @@ def _summary_digest(summary: Mapping[str, object], name: str) -> str:
     return value
 
 
+def _summary_sha256_digest(summary: Mapping[str, object], name: str) -> str:
+    value = summary.get(name)
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise Sop05RunError(f"report {name} must be a lowercase sha256 digest")
+    return value
+
+
 _PAIR_SUMMARY_KEYS = frozenset(
     {
         "schema_version",
@@ -958,6 +1005,12 @@ _PAIR_SUMMARY_KEYS = frozenset(
         "robot_sweep_cache",
         "target_type_policy",
         "target_type_policy_digest",
+        "target_history_visibility_policy",
+        "target_history_visibility_policy_digest",
+        "requested_history_visibility_counts",
+        "exact_history_visibility_counts",
+        "accepted_history_visibility_counts",
+        "history_visibility_deficits",
         "generator_config_digest",
         "generator_algorithm_version",
         "production_event_kind",
@@ -1093,6 +1146,11 @@ def _event_stage_row(
         "conflict_time_s"
     ) != event.conflict_time_s:
         raise Sop05RunError("event conflict metadata mismatch")
+    history_visibility_regime = metadata.get(
+        "target_history_visibility_regime"
+    )
+    if history_visibility_regime not in HISTORY_VISIBILITY_REGIMES:
+        raise Sop05RunError("event history visibility regime is invalid")
     return {
         "generated_event_id": event.generated_event_id,
         "event_kind": "environment",
@@ -1100,15 +1158,18 @@ def _event_stage_row(
         "occluder_type": occluder_type,
         "crossing_side": crossing_side,
         "conflict_index": conflict_index,
+        "history_visibility_regime": history_visibility_regime,
         **identifiers,
     }
 
 
 def _selection_candidate(
+    prepared: PreparedSop05Run,
     item: PairGenerationReport,
     event: GeneratedEvent,
 ) -> Sop05SelectionCandidate:
     row = _event_stage_row(item, event)
+    assessment = _event_history_visibility_assessment(prepared, event)
     return Sop05SelectionCandidate(
         base_state_id=item.state_id,
         trajectory_id=item.trajectory_id,
@@ -1117,7 +1178,45 @@ def _selection_candidate(
         occluder_type=str(row["occluder_type"]),
         crossing_side=int(row["crossing_side"]),
         conflict_index=int(row["conflict_index"]),
+        history_visibility_regime=assessment.regime,
     )
+
+
+def _event_history_visibility_assessment(
+    prepared: PreparedSop05Run,
+    event: GeneratedEvent,
+):
+    policy = prepared.generator_config.get("target_history_visibility")
+    if not isinstance(policy, HistoryVisibilityPolicy):
+        raise Sop05RunError("prepared history visibility policy is invalid")
+    try:
+        assessment = classify_history_visibility(
+            event.target_visibility_history,
+            policy,
+        )
+    except (TypeError, ValueError) as exc:
+        raise Sop05RunError(str(exc)) from exc
+    if assessment.regime not in HISTORY_VISIBILITY_REGIMES:
+        raise Sop05RunError("accepted event history visibility is ineligible")
+    metadata = event.world.metadata
+    expected = {
+        "target_history_visibility_regime": assessment.regime,
+        "target_history_last_visible_index": assessment.last_visible_index,
+        "target_history_trailing_hidden_frames": (
+            assessment.trailing_hidden_frames
+        ),
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": policy.as_dict(),
+        "target_history_visibility_policy_digest": policy.digest,
+    }
+    for name, expected_value in expected.items():
+        if metadata.get(name) != expected_value:
+            raise Sop05RunError(
+                f"event {name} differs from recomputed history visibility"
+            )
+    return assessment
 
 
 def _validate_pair_report(
@@ -1215,6 +1314,74 @@ def _validate_pair_report(
         raise Sop05RunError(
             "report target_type_policy does not match prepared config"
         )
+    report_history_policy_digest = _summary_sha256_digest(
+        summary, "target_history_visibility_policy_digest"
+    )
+    if report_history_policy_digest != (
+        prepared.target_history_visibility_policy_digest
+    ):
+        raise Sop05RunError(
+            "report target history visibility policy digest mismatch"
+        )
+    if summary.get("target_history_visibility_policy") != (
+        prepared.target_history_visibility_policy
+    ):
+        raise Sop05RunError(
+            "report target history visibility policy mismatch"
+        )
+    requested_history_counts = _summary_count_map(
+        summary, "requested_history_visibility_counts"
+    )
+    accepted_history_counts = _summary_count_map(
+        summary, "accepted_history_visibility_counts"
+    )
+    exact_history_counts = _summary_count_map(
+        summary, "exact_history_visibility_counts"
+    )
+    history_deficits = _summary_count_map(
+        summary, "history_visibility_deficits"
+    )
+    formal_regimes = set(HISTORY_VISIBILITY_REGIMES)
+    if (
+        set(requested_history_counts) != formal_regimes
+        or set(accepted_history_counts) != formal_regimes
+        or set(history_deficits) != formal_regimes
+        or set(exact_history_counts)
+        != formal_regimes | {INELIGIBLE_HISTORY_VISIBILITY}
+    ):
+        raise Sop05RunError("report history visibility count schema mismatch")
+    history_policy = prepared.generator_config["target_history_visibility"]
+    expected_requested_history_counts = allocate_history_visibility_counts(
+        requested,
+        history_policy,
+        seed=item.pair_seed,
+        namespace=f"{item.state_id}|{item.trajectory_id}",
+    )
+    if requested_history_counts != expected_requested_history_counts:
+        raise Sop05RunError("report requested history visibility counts mismatch")
+    if sum(requested_history_counts.values()) != requested:
+        raise Sop05RunError("report requested history visibility total mismatch")
+    if sum(accepted_history_counts.values()) != accepted:
+        raise Sop05RunError("report accepted history visibility total mismatch")
+    if sum(exact_history_counts.values()) != stage_counts[
+        "exact_validation_accepted_count"
+    ]:
+        raise Sop05RunError("report exact history visibility total mismatch")
+    expected_deficits = {
+        regime: max(
+            0,
+            requested_history_counts[regime]
+            - accepted_history_counts[regime],
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    if history_deficits != expected_deficits:
+        raise Sop05RunError("report history visibility deficits mismatch")
+    if any(
+        accepted_history_counts[regime] > exact_history_counts[regime]
+        for regime in HISTORY_VISIBILITY_REGIMES
+    ):
+        raise Sop05RunError("report accepted history count exceeds exact count")
     report_generator_digest = _summary_digest(
         summary, "generator_config_digest"
     )
@@ -1231,8 +1398,13 @@ def _validate_pair_report(
     if summary.get("production_event_kind") != "environment":
         raise Sop05RunError("report production_event_kind mismatch")
     event_order: list[tuple[str, str, str]] = []
+    recomputed_event_history_counts = {
+        regime: 0 for regime in HISTORY_VISIBILITY_REGIMES
+    }
     for event in report.events:
         row = _event_stage_row(item, event)
+        assessment = _event_history_visibility_assessment(prepared, event)
+        recomputed_event_history_counts[assessment.regime] += 1
         proposal_id = str(row["causal_occluder_proposal_id"])
         candidate_id = str(row["reachability_candidate_id"])
         transform_id = str(row["reachability_transform_id"])
@@ -1274,6 +1446,10 @@ def _validate_pair_report(
         validate_event_target_motion_world_join(record, event.world, prepared.grid)
     if event_order != sorted(event_order):
         raise Sop05RunError("accepted event candidate order mismatch")
+    if recomputed_event_history_counts != accepted_history_counts:
+        raise Sop05RunError(
+            "report accepted history counts differ from event payloads"
+        )
 
 
 def _initialize_pair_worker(
@@ -1410,6 +1586,7 @@ def _build_generation_summary(
             for name in (
                 "schema_version",
                 "target_type_policy_digest",
+                "target_history_visibility_policy_digest",
                 "generator_config_digest",
                 "generator_algorithm_version",
                 "production_event_kind",
@@ -1438,6 +1615,37 @@ def _build_generation_summary(
     selected_kind_counts = {
         kind: selected_counts[kind] for kind in _EVENT_KIND_WEIGHTS
     }
+    history_policy = prepared.generator_config["target_history_visibility"]
+    required_history_counts = allocate_history_visibility_counts(
+        prepared.request.accepted_quota,
+        history_policy,
+        seed=prepared.request.seed,
+        namespace="sop05-global-selection",
+    )
+    generated_history_counter = Counter(
+        _event_history_visibility_assessment(prepared, event).regime
+        for event in all_events
+    )
+    selected_history_counter = Counter(
+        _event_history_visibility_assessment(prepared, event).regime
+        for event in selected_events
+    )
+    generated_history_counts = {
+        regime: generated_history_counter[regime]
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    selected_history_counts = {
+        regime: selected_history_counter[regime]
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    history_visibility_deficits = {
+        regime: max(
+            0,
+            required_history_counts[regime]
+            - selected_history_counts[regime],
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
     canonical_candidate_order = [
         {
             "base_state_id": event.target_motion_record.base_state_id,
@@ -1455,7 +1663,23 @@ def _build_generation_summary(
         "quota_trimmed_count": len(all_events) - len(selected_events),
         "generated_event_kind_counts": generated_kind_counts,
         "selected_event_kind_counts": selected_kind_counts,
-        "quota_met": len(selected_events) == prepared.request.accepted_quota,
+        "target_history_visibility_policy": (
+            prepared.target_history_visibility_policy
+        ),
+        "target_history_visibility_policy_digest": (
+            prepared.target_history_visibility_policy_digest
+        ),
+        "required_history_visibility_counts": required_history_counts,
+        "generated_history_visibility_counts": generated_history_counts,
+        "selected_history_visibility_counts": selected_history_counts,
+        "history_visibility_deficits": history_visibility_deficits,
+        "quota_met": (
+            len(selected_events) == prepared.request.accepted_quota
+            and all(
+                deficit == 0
+                for deficit in history_visibility_deficits.values()
+            )
+        ),
         "production_event_kind": "environment",
         "canonical_candidate_order": canonical_candidate_order,
         "selected_event_ids": [
@@ -1517,7 +1741,7 @@ def collect_sop05_generation(
                     seen_world_ids.add(event.world.world_id)
                     all_events.append(event)
                     candidate_by_event_id[event.generated_event_id] = (
-                        _selection_candidate(item, event)
+                        _selection_candidate(prepared, item, event)
                     )
 
     all_events.sort(
@@ -1527,15 +1751,20 @@ def collect_sop05_generation(
             event.generated_event_id,
         )
     )
-    selected_ids = select_sop05_event_ids(
+    selection_result = select_sop05_event_ids(
         (candidate_by_event_id[event.generated_event_id] for event in all_events),
         seed=prepared.request.seed,
         accepted_quota=prepared.request.accepted_quota,
+        history_visibility_policy=prepared.generator_config[
+            "target_history_visibility"
+        ],
     )
     events_by_id = {
         event.generated_event_id: event for event in all_events
     }
-    selected = [events_by_id[event_id] for event_id in selected_ids]
+    selected = [
+        events_by_id[event_id] for event_id in selection_result.event_ids
+    ]
     summary = _build_generation_summary(
         prepared, pair_reports, all_events, selected
     )
@@ -1710,15 +1939,20 @@ def _validate_collection_for_publication(
             pair_item = pair_by_identity[identity]
         except KeyError as exc:
             raise Sop05RunError("event pair is absent from pair reports") from exc
-        selection_candidates.append(_selection_candidate(pair_item, event))
-    expected_selected_event_ids = select_sop05_event_ids(
+        selection_candidates.append(
+            _selection_candidate(prepared, pair_item, event)
+        )
+    expected_selection = select_sop05_event_ids(
         selection_candidates,
         seed=prepared.request.seed,
         accepted_quota=prepared.request.accepted_quota,
+        history_visibility_policy=prepared.generator_config[
+            "target_history_visibility"
+        ],
     )
-    if tuple(selected_event_ids) != expected_selected_event_ids:
+    if tuple(selected_event_ids) != expected_selection.event_ids:
         raise Sop05RunError(
-            "selection differs from the frozen diversity-total selection"
+            "selection differs from the frozen history-stratified selection"
         )
     for event in collection.selected_events:
         validate_event_target_motion_world_join(
@@ -1781,6 +2015,12 @@ def _run_manifest(
             ),
             "target_type_policy": prepared.target_type_policy,
             "target_type_policy_digest": prepared.target_type_policy_digest,
+            "target_history_visibility_policy": (
+                prepared.target_history_visibility_policy
+            ),
+            "target_history_visibility_policy_digest": (
+                prepared.target_history_visibility_policy_digest
+            ),
             "pair_schedule": schedule,
         },
         "runtime": prepared.runtime_provenance,

@@ -540,10 +540,12 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 - 只接受 `history8_current7_future15_v1`；固定使用
   `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，未来冲突锚点的
   source time 为 `1.4 + conflict_time_s`；
-- SOP05 正式生产算法固定为 `blind_reachability_quota_first_v3`，当前只发布
-  environment collision 母事件；历史 `joint_occluder_first_v4` 产物必须拒绝；
-- producer/report 固定为 `sop05_generation_run_v6` /
-  `sop05_pair_generation_report_v4`，并显式拒绝紧邻旧 v5/v3；pair process pool 的
+- SOP05 正式生成器语义固定为 `blind_reachability_history_stratified_v4`，低层
+  reachability 固定为 `blind_reachability_quota_first_v3`，当前只发布 environment
+  collision 母事件；历史 `joint_occluder_first_v4` 产物必须拒绝；
+- producer/report/selection 固定为 `sop05_generation_run_v7` /
+  `sop05_pair_generation_report_v5` / `sop05_history_stratified_selection_v2`，并显式
+  拒绝旧 v6/v4/total-selection-v1；pair process pool 的
   bounded window 同时计算 pending futures 与按 rank 待消费 reports，建议 Slurm
   `cpus-per-task == --workers`，不得用多个 `ntasks` 重复启动同一 producer；
 - candidate 变换固定为 `reachability_candidate_se2_v2`；`ReachabilityIdentity` /
@@ -568,6 +570,10 @@ footprint spec、source recording/session/object、完整布局和新 split dige
   `time_scale=1.0`，不外推、不逐帧扭曲；主分布默认 human target；
 - exact 验证必须同时覆盖真实 circle/rectangle footprint、静态和帧间连续净空、
   当前不可见、未来连续出现以及选定 future endpoint 的 collision；
+- exact-valid 候选按 8 帧历史分为 `seen_then_occluded`（至少一帧可见且末尾至少
+  连续 2 帧不可见）与 `unseen_in_history_window`（8 帧全不可见），默认硬配额为
+  `80% / 20%`；pair/run 任一层缺口都不得跨层回填。该比例是受控实验组成，不代表
+  自然场景频率；两层 mother 都必须与候选轨迹真实碰撞；
 - 几何版本栈固定为 `causal_occluder_schedule_v1` /
   `causal_occluder_proposal_v2` / `blind_region_causal_delta_v2` /
   `footprint_center_mask_causal_delta_v2` /
@@ -581,11 +587,15 @@ footprint spec、source recording/session/object、完整布局和新 split dige
   manifest；非人 target 只能由显式扩展配置启用；
 - 直接使用 snippet 冻结的 type/spec；生成的 target ID 必须确定且不与上下文 ID
   冲突，原 `source_object_id` 独立保留用于 provenance；
-- SOP06 固定 `independent_partial_pairs_v1`：collision 母事件可独立发布，五类
+- SOP06 固定 `independent_partial_pairs_v2`，group contract 固定为
+  `sop06_partial_pair_group_v2`：collision 母事件可独立发布，五类
   negative 分别尝试与保留，一类失败不使其他变体失效；
 - 所有带目标的 SOP06 variant（包括重建的 temporal-safe）必须保持母事件
   同一 `source_recording_id` + `source_session_id` lineage；禁止只比对 recording
   或从其他 session 替换 snippet；
+- 所有非空 variant 还必须使用 mother 的同一 history policy 并保持相同 regime；
+  漂移位记录 `target_history_visibility_regime_changed`。`empty_blind_spot` 仅是
+  target-removal negative，不对 `seen_then_occluded` mother 声称完全相同输入；
 - 每组输出固定六位 coverage mask 和逐位稳定 missing reason；训练不要求额外
   contrast，完整六位只是 conditional audit 资格；
 - 正式 v5 必须拒绝历史 `joint_environment_pair_v2`，禁止以联合多 LOS 搜索作为
@@ -694,7 +704,7 @@ empty_blind_spot: 0.10
   单 split，完整 loader 重读与 digest/leakage 验证后才原子发布，且不覆盖已有目录；
   v1 shard 一律 fail closed。
 - 正式 `scripts/04_generate_risk_dataset.py` 对一个 formal
-  `independent_partial_pairs_v1` group 中所有已成功 variants 做原子组装/发布；
+  `independent_partial_pairs_v2` group 中所有已成功 variants 做原子组装/发布；
   缺位保留 coverage + stable reason，不要求每个训练 group 凑齐 six-pack。
   只有 conditional complete audit 路径要求六位齐全；CLI 的 exact sample count
   是 shard 总边界，不是每组六类 quota。

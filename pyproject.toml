@@ -23,6 +23,10 @@ train = [
 verification = [
     "torch>=2.0,<3",
 ]
+visual-audit = [
+    "matplotlib==3.7.5",
+    "Pillow==12.3.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["src*"]

@@ -722,14 +722,42 @@ def _prepared_intersects_robot_sweep(
         or occluder_pose[1] > center_max[1] + expanded_radius_m
     ):
         return False
-    clearances = trajectory_signed_clearances(
-        occluder_footprint,
-        np.tile(occluder_pose, (dense_robot_poses.shape[0], 1)),
-        sweep.footprint,
-        dense_robot_poses,
+    center_distances_m = np.linalg.norm(
+        dense_robot_poses[:, :2] - occluder_pose[:2],
+        axis=1,
     )
-    if np.any(clearances <= 0.0):
-        return True
+    clearance_lower_bounds_m = center_distances_m - expanded_radius_m
+    if dense_robot_poses.shape[0] == 1:
+        if clearance_lower_bounds_m[0] > 0.0:
+            return False
+        return signed_clearance(
+            occluder_footprint,
+            occluder_pose,
+            sweep.footprint,
+            dense_robot_poses[0],
+        ) <= 0.0
+
+    unresolved_intervals = (
+        np.maximum(
+            clearance_lower_bounds_m[:-1],
+            clearance_lower_bounds_m[1:],
+        )
+        <= sweep.interval_motion_bounds_m
+    )
+    exact_endpoint_mask = clearance_lower_bounds_m <= 0.0
+    exact_endpoint_mask[:-1] |= unresolved_intervals
+    exact_endpoint_mask[1:] |= unresolved_intervals
+    clearances = clearance_lower_bounds_m.copy()
+    for index in np.flatnonzero(exact_endpoint_mask):
+        clearance = signed_clearance(
+            occluder_footprint,
+            occluder_pose,
+            sweep.footprint,
+            dense_robot_poses[index],
+        )
+        if clearance <= 0.0:
+            return True
+        clearances[index] = clearance
 
     robot_radius = _rotation_motion_radius(sweep.footprint)
 
@@ -790,7 +818,7 @@ def _prepared_intersects_robot_sweep(
             0,
             float(sweep.interval_motion_bounds_m[index]),
         )
-        for index in range(dense_robot_poses.shape[0] - 1)
+        for index in np.flatnonzero(unresolved_intervals)
     )
 
 

@@ -8,6 +8,13 @@ target_type_policy:
     carried_object: 0.0
     unknown_dynamic: 0.0
 
+target_history_visibility:
+  policy_version: target_history_visibility_policy_v1
+  min_trailing_hidden_frames: 2
+  weights:
+    seen_then_occluded: 0.8
+    unseen_in_history_window: 0.2
+
 conflict_time_range_s: [1.0, 2.2]
 max_local_curvature_per_m: 1.0
 crossing_angle_max_deg: 35.0

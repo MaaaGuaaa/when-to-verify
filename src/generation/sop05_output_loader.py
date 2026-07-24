@@ -37,10 +37,20 @@ from src.generation.blind_reachability import (
 from src.generation.event_sampler import (
     GeneratedEvent,
     SOP05_GENERATOR_ALGORITHM_VERSION,
+    SOP05_REACHABILITY_ALGORITHM_VERSION,
     _generator_digest,
     compute_generated_event_id,
     compute_generated_world_id,
     load_generator_config,
+)
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    HISTORY_VISIBILITY_REGIMES,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    HistoryVisibilityPolicy,
+    allocate_history_visibility_counts,
+    classify_history_visibility,
+    normalize_history_visibility_policy,
 )
 from src.generation.event_target_motion_shard import (
     EventTargetMotionRecord,
@@ -64,9 +74,9 @@ from src.generation.structural_blindspot import has_continuous_emergence
 from src.utils.config import load_config
 
 
-SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v3"
-SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v3"
-SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v3"
+SOP05_RUN_MANIFEST_VERSION = "sop05_run_manifest_v4"
+SOP05_GENERATION_SUMMARY_VERSION = "sop05_generation_summary_v4"
+SOP05_COMPLETION_MARKER_VERSION = "sop05_producer_complete_v4"
 
 _EVENT_KINDS = SOP05_EVENT_KIND_ORDER
 _VISIBILITY_HISTORY_LAYOUT = "target_visibility_history8_current7_v1"
@@ -206,6 +216,8 @@ _SCIENTIFIC_REQUEST_KEYS = frozenset(
         "generator_config_semantic_digest",
         "target_type_policy",
         "target_type_policy_digest",
+        "target_history_visibility_policy",
+        "target_history_visibility_policy_digest",
         "pair_schedule",
     }
 )
@@ -237,6 +249,7 @@ _ACCEPTED_EVENT_KEYS = frozenset(
         "occluder_type",
         "crossing_side",
         "conflict_index",
+        "history_visibility_regime",
         "causal_occluder_proposal_id",
         "blind_region_id",
         "reachability_candidate_id",
@@ -272,6 +285,12 @@ _PAIR_SUMMARY_KEYS = frozenset(
         "robot_sweep_cache",
         "target_type_policy",
         "target_type_policy_digest",
+        "target_history_visibility_policy",
+        "target_history_visibility_policy_digest",
+        "requested_history_visibility_counts",
+        "exact_history_visibility_counts",
+        "accepted_history_visibility_counts",
+        "history_visibility_deficits",
         "generator_config_digest",
         "generator_algorithm_version",
         "production_event_kind",
@@ -290,6 +309,12 @@ _GLOBAL_SUMMARY_KEYS = frozenset(
         "quota_trimmed_count",
         "generated_event_kind_counts",
         "selected_event_kind_counts",
+        "target_history_visibility_policy",
+        "target_history_visibility_policy_digest",
+        "required_history_visibility_counts",
+        "generated_history_visibility_counts",
+        "selected_history_visibility_counts",
+        "history_visibility_deficits",
         "quota_met",
         "production_event_kind",
         "canonical_candidate_order",
@@ -305,6 +330,7 @@ _GENERATOR_INVARIANT_KEYS = frozenset(
     {
         "schema_version",
         "target_type_policy_digest",
+        "target_history_visibility_policy_digest",
         "generator_config_digest",
         "generator_algorithm_version",
         "production_event_kind",
@@ -344,6 +370,8 @@ class _ValidatedRunContract:
     events_per_pair: int
     target_type_policy: dict[str, object]
     target_type_policy_digest: str
+    target_history_visibility_policy: HistoryVisibilityPolicy
+    target_history_visibility_policy_digest: str
     generator_config_semantic_digest: str
 
 
@@ -354,8 +382,12 @@ class _ValidatedPairReports:
     event_kind_by_id: Mapping[str, str]
     stage_row_by_id: Mapping[str, Mapping[str, object]]
     selected_event_ids: tuple[str, ...]
+    selected_history_visibility_counts: dict[str, int]
+    required_history_visibility_counts: dict[str, int]
+    history_visibility_deficits: dict[str, int]
     requested_event_count: int
     generated_event_kind_counts: dict[str, int]
+    generated_history_visibility_counts: dict[str, int]
     rejection_reasons: dict[str, int]
     stage_counts: dict[str, int]
     stage_ids: dict[str, list[str]]
@@ -978,6 +1010,39 @@ def restore_generated_event(
     )
 
 
+def _validate_event_history_visibility(
+    event: GeneratedEvent,
+    policy: HistoryVisibilityPolicy,
+):
+    assessment = classify_history_visibility(
+        event.target_visibility_history,
+        policy,
+    )
+    if assessment.regime not in HISTORY_VISIBILITY_REGIMES:
+        raise ValueError("accepted SOP05 event history visibility is ineligible")
+    metadata = _require_mapping(
+        event.world.metadata, label="SOP05 event world metadata"
+    )
+    expected = {
+        "target_history_visibility_regime": assessment.regime,
+        "target_history_last_visible_index": assessment.last_visible_index,
+        "target_history_trailing_hidden_frames": (
+            assessment.trailing_hidden_frames
+        ),
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": policy.as_dict(),
+        "target_history_visibility_policy_digest": policy.digest,
+    }
+    for name, expected_value in expected.items():
+        if metadata.get(name) != expected_value:
+            raise ValueError(
+                f"SOP05 event {name} differs from recomputed visibility"
+            )
+    return assessment
+
+
 def _sha256(path: Path) -> str:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1293,6 +1358,14 @@ def _validate_run_contract(
         size=32,
         label="SOP05 scientific_request target_type_policy_digest",
     )
+    history_policy_digest = _require_hex_digest(
+        scientific.get("target_history_visibility_policy_digest"),
+        size=64,
+        label=(
+            "SOP05 scientific_request "
+            "target_history_visibility_policy_digest"
+        ),
+    )
     base_config_path = root / "configs/base.yaml"
     generator_config_path = root / "configs/generator.yaml"
     if _sha256(base_config_path) != base_digest:
@@ -1323,9 +1396,9 @@ def _validate_run_contract(
         or generator_config.get("production_event_kind") != "environment"
         or not isinstance(blind_reachability, Mapping)
         or blind_reachability.get("algorithm_version")
-        != SOP05_GENERATOR_ALGORITHM_VERSION
+        != SOP05_REACHABILITY_ALGORITHM_VERSION
     ):
-        raise ValueError("SOP05 generator snapshot is not formal v5")
+        raise ValueError("SOP05 generator snapshot is not formal v4")
     raw_policy = _require_mapping(
         scientific.get("target_type_policy"),
         label="SOP05 scientific_request target_type_policy",
@@ -1344,6 +1417,41 @@ def _validate_run_contract(
         or getattr(generator_policy, "digest", None) != policy_digest
     ):
         raise ValueError("SOP05 target_type_policy differs from generator snapshot")
+    raw_history_policy = _require_mapping(
+        scientific.get("target_history_visibility_policy"),
+        label=(
+            "SOP05 scientific_request target_history_visibility_policy"
+        ),
+    )
+    history_policy_copy = _canonical_json_copy(
+        raw_history_policy,
+        label=(
+            "SOP05 scientific_request target_history_visibility_policy"
+        ),
+    )
+    normalized_history_policy = normalize_history_visibility_policy(
+        raw_history_policy
+    )
+    if history_policy_copy != normalized_history_policy.as_dict():
+        raise ValueError(
+            "SOP05 target_history_visibility_policy is not normalized"
+        )
+    if history_policy_digest != normalized_history_policy.digest:
+        raise ValueError(
+            "SOP05 target_history_visibility_policy_digest mismatch"
+        )
+    generator_history_policy = generator_config.get(
+        "target_history_visibility"
+    )
+    if (
+        getattr(generator_history_policy, "as_dict", lambda: None)()
+        != history_policy_copy
+        or getattr(generator_history_policy, "digest", None)
+        != history_policy_digest
+    ):
+        raise ValueError(
+            "SOP05 target history visibility policy differs from snapshot"
+        )
 
     _validate_runtime(run_manifest.get("runtime"))
     identity_payload = {
@@ -1358,6 +1466,8 @@ def _validate_run_contract(
         "generator_config_semantic_digest": generator_semantic_digest,
         "target_type_policy": policy_copy,
         "target_type_policy_digest": policy_digest,
+        "target_history_visibility_policy": history_policy_copy,
+        "target_history_visibility_policy_digest": history_policy_digest,
         "accepted_quota": scientific_ints["accepted_quota"],
         "events_per_pair": scientific_ints["events_per_pair"],
         "selection_version": SOP05_TOTAL_QUOTA_SELECTION_VERSION,
@@ -1377,6 +1487,8 @@ def _validate_run_contract(
         events_per_pair=scientific_ints["events_per_pair"],
         target_type_policy=policy_copy,
         target_type_policy_digest=policy_digest,
+        target_history_visibility_policy=normalized_history_policy,
+        target_history_visibility_policy_digest=history_policy_digest,
         generator_config_semantic_digest=generator_semantic_digest,
     )
 
@@ -1477,7 +1589,10 @@ def _validate_pair_summary(
     value: object,
     *,
     pair_seed: int,
+    base_state_id: str,
+    trajectory_id: str,
     accepted_id_count: int,
+    accepted_history_counts: Mapping[str, int],
     contract: _ValidatedRunContract,
 ) -> dict[str, object]:
     summary = _require_mapping(value, label="pair generation report summary")
@@ -1587,6 +1702,70 @@ def _validate_pair_summary(
         raise ValueError("pair generation report target_type_policy mismatch")
     if summary.get("target_type_policy_digest") != contract.target_type_policy_digest:
         raise ValueError("pair generation report target_type_policy_digest mismatch")
+    if summary.get("target_history_visibility_policy") != (
+        contract.target_history_visibility_policy.as_dict()
+    ):
+        raise ValueError(
+            "pair generation report target history visibility policy mismatch"
+        )
+    if summary.get("target_history_visibility_policy_digest") != (
+        contract.target_history_visibility_policy_digest
+    ):
+        raise ValueError(
+            "pair generation report target history visibility policy digest mismatch"
+        )
+    requested_history_counts = _require_count_map(
+        summary.get("requested_history_visibility_counts"),
+        label="pair requested history visibility counts",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    exact_history_counts = _require_count_map(
+        summary.get("exact_history_visibility_counts"),
+        label="pair exact history visibility counts",
+        exact_keys=frozenset(
+            (*HISTORY_VISIBILITY_REGIMES, INELIGIBLE_HISTORY_VISIBILITY)
+        ),
+    )
+    reported_accepted_history_counts = _require_count_map(
+        summary.get("accepted_history_visibility_counts"),
+        label="pair accepted history visibility counts",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    history_visibility_deficits = _require_count_map(
+        summary.get("history_visibility_deficits"),
+        label="pair history visibility deficits",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    expected_requested_history_counts = allocate_history_visibility_counts(
+        requested,
+        contract.target_history_visibility_policy,
+        seed=pair_seed,
+        namespace=f"{base_state_id}|{trajectory_id}",
+    )
+    if requested_history_counts != expected_requested_history_counts:
+        raise ValueError("pair requested history visibility counts mismatch")
+    if set(accepted_history_counts) - set(HISTORY_VISIBILITY_REGIMES):
+        raise ValueError("pair accepted history visibility keys mismatch")
+    normalized_accepted_history_counts = {
+        regime: int(accepted_history_counts.get(regime, 0))
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    if normalized_accepted_history_counts != reported_accepted_history_counts:
+        raise ValueError("pair accepted history visibility counts mismatch")
+    if sum(exact_history_counts.values()) != stage_counts[
+        "exact_validation_accepted_count"
+    ]:
+        raise ValueError("pair exact history visibility total mismatch")
+    expected_history_deficits = {
+        regime: max(
+            0,
+            requested_history_counts[regime]
+            - reported_accepted_history_counts[regime],
+        )
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    if history_visibility_deficits != expected_history_deficits:
+        raise ValueError("pair history visibility deficits mismatch")
     if summary.get("generator_config_digest") != (
         contract.generator_config_semantic_digest
     ):
@@ -1606,6 +1785,9 @@ def _validate_pair_summary(
         "invariants": {
             "schema_version": "3.0.0",
             "target_type_policy_digest": contract.target_type_policy_digest,
+            "target_history_visibility_policy_digest": (
+                contract.target_history_visibility_policy_digest
+            ),
             "generator_config_digest": contract.generator_config_semantic_digest,
             "generator_algorithm_version": SOP05_GENERATOR_ALGORITHM_VERSION,
             "production_event_kind": "environment",
@@ -1720,6 +1902,13 @@ def _load_pair_reports(
                 copied.get("conflict_index"),
                 label="accepted event conflict_index",
             )
+            history_visibility_regime = copied.get(
+                "history_visibility_regime"
+            )
+            if history_visibility_regime not in HISTORY_VISIBILITY_REGIMES:
+                raise ValueError(
+                    "accepted event history_visibility_regime is invalid"
+                )
             for name in (
                 "causal_occluder_proposal_id",
                 "blind_region_id",
@@ -1740,6 +1929,7 @@ def _load_pair_reports(
                     occluder_type=occluder_type,
                     crossing_side=crossing_side,
                     conflict_index=conflict_index,
+                    history_visibility_regime=history_visibility_regime,
                 )
             )
         pair_event_ids = [item.generated_event_id for item in pair_candidates]
@@ -1759,7 +1949,13 @@ def _load_pair_reports(
         checked = _validate_pair_summary(
             mapping.get("summary"),
             pair_seed=int(scheduled["pair_seed"]),
+            base_state_id=str(scheduled["state_id"]),
+            trajectory_id=str(scheduled["trajectory_id"]),
             accepted_id_count=len(pair_rows),
+            accepted_history_counts=Counter(
+                candidate.history_visibility_regime
+                for candidate in pair_candidates
+            ),
             contract=contract,
         )
         checked_ids = checked["stage_ids"]
@@ -1814,10 +2010,11 @@ def _load_pair_reports(
             candidate.generated_event_id,
         )
     )
-    selected_event_ids = select_sop05_event_ids(
+    selection_result = select_sop05_event_ids(
         candidates,
         seed=contract.selection_seed,
         accepted_quota=contract.accepted_quota,
+        history_visibility_policy=contract.target_history_visibility_policy,
     )
     canonical_candidate_order = [
         {
@@ -1832,9 +2029,19 @@ def _load_pair_reports(
         event_pair_identity=MappingProxyType(event_pair_identity),
         event_kind_by_id=MappingProxyType(event_kind_by_id),
         stage_row_by_id=MappingProxyType(stage_row_by_id),
-        selected_event_ids=selected_event_ids,
+        selected_event_ids=selection_result.event_ids,
+        selected_history_visibility_counts=selection_result.selected_counts,
+        required_history_visibility_counts=selection_result.required_counts,
+        history_visibility_deficits=selection_result.deficits,
         requested_event_count=requested_total,
         generated_event_kind_counts={"environment": len(candidates)},
+        generated_history_visibility_counts={
+            regime: sum(
+                candidate.history_visibility_regime == regime
+                for candidate in candidates
+            )
+            for regime in HISTORY_VISIBILITY_REGIMES
+        },
         rejection_reasons=dict(sorted(rejection_totals.items())),
         stage_counts=stage_counts,
         stage_ids=stage_ids,
@@ -1894,6 +2101,63 @@ def _validate_generation_summary(
         "environment": len(events)
     }:
         raise ValueError("SOP05 generation summary event-kind counts mismatch")
+    if summary.get("target_history_visibility_policy") != (
+        contract.target_history_visibility_policy.as_dict()
+    ):
+        raise ValueError(
+            "SOP05 generation summary history visibility policy mismatch"
+        )
+    if summary.get("target_history_visibility_policy_digest") != (
+        contract.target_history_visibility_policy_digest
+    ):
+        raise ValueError(
+            "SOP05 generation summary history visibility policy digest mismatch"
+        )
+    required_history_counts = _require_count_map(
+        summary.get("required_history_visibility_counts"),
+        label="SOP05 generation summary required history counts",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    generated_history_counts = _require_count_map(
+        summary.get("generated_history_visibility_counts"),
+        label="SOP05 generation summary generated history counts",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    selected_history_counts = _require_count_map(
+        summary.get("selected_history_visibility_counts"),
+        label="SOP05 generation summary selected history counts",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    history_visibility_deficits = _require_count_map(
+        summary.get("history_visibility_deficits"),
+        label="SOP05 generation summary history deficits",
+        exact_keys=frozenset(HISTORY_VISIBILITY_REGIMES),
+    )
+    event_history_counts = Counter(
+        _validate_event_history_visibility(
+            event,
+            contract.target_history_visibility_policy,
+        ).regime
+        for event in events
+    )
+    expected_selected_history_counts = {
+        regime: event_history_counts[regime]
+        for regime in HISTORY_VISIBILITY_REGIMES
+    }
+    if (
+        required_history_counts
+        != reports.required_history_visibility_counts
+        or generated_history_counts
+        != reports.generated_history_visibility_counts
+        or selected_history_counts
+        != reports.selected_history_visibility_counts
+        or selected_history_counts != expected_selected_history_counts
+        or history_visibility_deficits != reports.history_visibility_deficits
+        or any(history_visibility_deficits.values())
+    ):
+        raise ValueError(
+            "SOP05 generation summary history visibility composition mismatch"
+        )
     if summary.get("canonical_candidate_order") != (
         reports.canonical_candidate_order
     ):
@@ -2085,6 +2349,10 @@ def load_complete_sop05_events(
             run_contract.generator_config_semantic_digest
         ):
             raise ValueError("SOP05 event generator_config_digest differs from run")
+        _validate_event_history_visibility(
+            event,
+            run_contract.target_history_visibility_policy,
+        )
 
     reports = _load_pair_reports(
         root_path / "pair_generation_reports.jsonl", contract=run_contract
@@ -2131,6 +2399,12 @@ def load_complete_sop05_events(
             "occluder_type": occluder.get("type"),
             "crossing_side": provenance.get("crossing_side"),
             "conflict_index": event.conflict_index,
+            "history_visibility_regime": (
+                _validate_event_history_visibility(
+                    event,
+                    run_contract.target_history_visibility_policy,
+                ).regime
+            ),
             "causal_occluder_proposal_id": metadata.get(
                 "causal_occluder_proposal_id"
             ),

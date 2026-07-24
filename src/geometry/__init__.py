@@ -26,7 +26,7 @@ from .rasterization import (
     rasterize_footprint_sweep,
     world_to_grid,
 )
-from .raycasting import raycast_visibility
+from .raycasting import raycast_candidate_visibility, raycast_visibility
 from .transforms import (
     global_to_local,
     interpolate_poses,
@@ -60,6 +60,7 @@ __all__ = (
     "rasterize_footprint",
     "rasterize_footprint_sweep",
     "raycast_visibility",
+    "raycast_candidate_visibility",
     "signed_clearance",
     "intersects",
     "segments_intersect",

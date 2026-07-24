@@ -45,6 +45,7 @@ from .dynamic_object_transplant import (
 )
 from .event_sampler import (
     GeneratedEvent,
+    SOP05_GENERATOR_ALGORITHM_VERSION,
     generate_events,
     normalize_generator_config,
 )
@@ -53,6 +54,14 @@ from .event_target_motion_shard import (
     compute_motion_array_digest,
     create_event_target_motion_record,
     validate_event_target_motion_world_join,
+)
+from .history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    HISTORY_VISIBILITY_REGIMES,
+    HistoryVisibilityAssessment,
+    HistoryVisibilityPolicy,
+    classify_history_visibility,
+    normalize_history_visibility_policy,
 )
 from .occluder_sampler import (
     JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION,
@@ -81,8 +90,8 @@ VARIANT_ORDER = (
 )
 _TEMPORAL_OFFSETS = (0.8, -0.8, 1.0, -1.0, 1.2, -1.2, 1.5, -1.5)
 _MOTHER_REQUIRED_VARIANTS = ("collision",)
-PAIRED_GENERATOR_ALGORITHM_VERSION = "independent_partial_pairs_v1"
-PAIRED_GROUP_CONTRACT_VERSION = "sop06_partial_pair_group_v1"
+PAIRED_GENERATOR_ALGORITHM_VERSION = "independent_partial_pairs_v2"
+PAIRED_GROUP_CONTRACT_VERSION = "sop06_partial_pair_group_v2"
 # Historical identity retained only by the explicitly named legacy joint
 # search function.  Formal v5 producers/consumers use the two constants above.
 JOINT_ENVIRONMENT_PAIR_VERSION = "joint_environment_pair_v2"
@@ -121,6 +130,46 @@ class _CandidateRejected(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+def _mother_history_visibility_contract(
+    mother_event: GeneratedEvent,
+) -> tuple[HistoryVisibilityPolicy, HistoryVisibilityAssessment]:
+    metadata = mother_event.world.metadata
+    try:
+        policy = normalize_history_visibility_policy(
+            metadata.get("target_history_visibility_policy")
+        )
+        assessment = classify_history_visibility(
+            mother_event.target_visibility_history,
+            policy,
+        )
+    except (TypeError, ValueError) as exc:
+        raise PairGenerationError(
+            "mother_history_visibility_policy_invalid",
+            f"mother history visibility contract is invalid: {exc}",
+        ) from exc
+    if metadata.get("target_history_visibility_policy_digest") != policy.digest:
+        raise PairGenerationError(
+            "mother_history_visibility_policy_digest_mismatch"
+        )
+    if assessment.regime not in HISTORY_VISIBILITY_REGIMES:
+        raise PairGenerationError("mother_history_visibility_ineligible")
+    expected = {
+        "target_history_visibility_regime": assessment.regime,
+        "target_history_last_visible_index": assessment.last_visible_index,
+        "target_history_trailing_hidden_frames": (
+            assessment.trailing_hidden_frames
+        ),
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+    }
+    if any(metadata.get(name) != value for name, value in expected.items()):
+        raise PairGenerationError(
+            "mother_history_visibility_metadata_mismatch"
+        )
+    return policy, assessment
 
 
 @dataclass(frozen=True)
@@ -932,6 +981,7 @@ def _variant_world(
     min_clearance_m: float | None,
     time_to_min_clearance_s: float | None,
     paired_config: PairedVariantConfig,
+    history_visibility_policy: HistoryVisibilityPolicy,
     seed: int,
     transform_metadata: Mapping[str, object],
     environment: _PairEnvironment,
@@ -986,6 +1036,14 @@ def _variant_world(
         target_history_digest = None
         target_future_digest = None
         target_digest = "target-empty"
+    history_assessment = (
+        None
+        if target_visibility_history is None
+        else classify_history_visibility(
+            target_visibility_history,
+            history_visibility_policy,
+        )
+    )
     world_id = "world-" + stable_digest(
         pair_group_id,
         variant_kind,
@@ -1047,6 +1105,28 @@ def _variant_world(
             if target_visibility_history is None
             else [bool(value) for value in target_visibility_history]
         ),
+        "target_history_visibility_regime": (
+            None if history_assessment is None else history_assessment.regime
+        ),
+        "target_history_last_visible_index": (
+            None
+            if history_assessment is None
+            else history_assessment.last_visible_index
+        ),
+        "target_history_trailing_hidden_frames": (
+            None
+            if history_assessment is None
+            else history_assessment.trailing_hidden_frames
+        ),
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": (
+            history_visibility_policy.as_dict()
+        ),
+        "target_history_visibility_policy_digest": (
+            history_visibility_policy.digest
+        ),
         "min_clearance_m": min_clearance_m,
         "time_to_min_clearance_s": time_to_min_clearance_s,
         "paired_transform": dict(transform_metadata),
@@ -1076,6 +1156,7 @@ def _make_variant(
     trajectory: LocalTrajectory,
     pair_group_id: str,
     paired_config: PairedVariantConfig,
+    history_visibility_policy: HistoryVisibilityPolicy,
     seed: int,
     environment: _PairEnvironment,
     transform_metadata: Mapping[str, object],
@@ -1107,6 +1188,7 @@ def _make_variant(
         min_clearance_m=minimum,
         time_to_min_clearance_s=time_to_minimum,
         paired_config=paired_config,
+        history_visibility_policy=history_visibility_policy,
         seed=seed,
         transform_metadata=transform_metadata,
         environment=environment,
@@ -1308,6 +1390,8 @@ def _geometric_variant(
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
+    history_visibility_policy: HistoryVisibilityPolicy,
+    required_history_regime: str | None = None,
     pair_group_id: str,
     seed: int,
     environment: _PairEnvironment,
@@ -1340,6 +1424,12 @@ def _geometric_variant(
         except _CandidateRejected as exc:
             last_reason = exc.reason
             continue
+        if required_history_regime is not None and classify_history_visibility(
+            history_visibility,
+            history_visibility_policy,
+        ).regime != required_history_regime:
+            last_reason = "target_history_visibility_regime_changed"
+            continue
         angle = signed_arc / candidate_pool.pivot_radius_m
         transform_metadata = {
             "kind": "hidden_pose_pivot_v1",
@@ -1357,6 +1447,7 @@ def _geometric_variant(
                 trajectory=trajectory,
                 pair_group_id=pair_group_id,
                 paired_config=paired_config,
+                history_visibility_policy=history_visibility_policy,
                 seed=seed,
                 environment=environment,
                 transform_metadata=transform_metadata,
@@ -1397,6 +1488,8 @@ def _temporal_variant(
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
+    history_visibility_policy: HistoryVisibilityPolicy,
+    required_history_regime: str | None = None,
     pair_group_id: str,
     seed: int,
     environment: _PairEnvironment,
@@ -1481,6 +1574,12 @@ def _temporal_variant(
         except _CandidateRejected as exc:
             last_reason = exc.reason
             continue
+        if required_history_regime is not None and classify_history_visibility(
+            history_visibility,
+            history_visibility_policy,
+        ).regime != required_history_regime:
+            last_reason = "target_history_visibility_regime_changed"
+            continue
         transform_metadata = {
             "kind": "temporal_offset_v1",
             "temporal_offset_s": float(offset),
@@ -1497,6 +1596,7 @@ def _temporal_variant(
                 trajectory=trajectory,
                 pair_group_id=pair_group_id,
                 paired_config=paired_config,
+                history_visibility_policy=history_visibility_policy,
                 seed=seed,
                 environment=environment,
                 transform_metadata=transform_metadata,
@@ -1620,7 +1720,7 @@ def generate_paired_variants(
     mother_generator_version = mother_event.world.metadata.get(
         "generator_algorithm_version"
     )
-    if mother_generator_version != BLIND_REACHABILITY_ALGORITHM_VERSION:
+    if mother_generator_version != SOP05_GENERATOR_ALGORITHM_VERSION:
         reason = (
             "retired_mother_generator_version"
             if mother_generator_version == "blind_reachability_first_v1"
@@ -1629,7 +1729,7 @@ def generate_paired_variants(
         raise PairGenerationError(
             reason,
             "mother generator_algorithm_version must equal "
-            f"{BLIND_REACHABILITY_ALGORITHM_VERSION}",
+            f"{SOP05_GENERATOR_ALGORITHM_VERSION}",
         )
     joint_version = mother_event.world.metadata.get(
         "joint_pair_generator_algorithm_version"
@@ -1645,6 +1745,9 @@ def generate_paired_variants(
             "mother contains unsupported joint-pair identity",
         )
     normalized = _as_paired_config(paired_config)
+    history_visibility_policy, mother_history_assessment = (
+        _mother_history_visibility_contract(mother_event)
+    )
     _validate_source_snippet(mother_event, source_snippet)
     environment = _pair_environment(
         mother_event=mother_event,
@@ -1689,6 +1792,7 @@ def generate_paired_variants(
         trajectory=trajectory,
         pair_group_id=pair_id,
         paired_config=normalized,
+        history_visibility_policy=history_visibility_policy,
         seed=int(seed),
         environment=environment,
         transform_metadata={"kind": "collision_mother"},
@@ -1710,6 +1814,8 @@ def generate_paired_variants(
             oracle_context=oracle_context,
             base_config=base_config,
             paired_config=normalized,
+            history_visibility_policy=history_visibility_policy,
+            required_history_regime=mother_history_assessment.regime,
             pair_group_id=pair_id,
             seed=int(seed),
             environment=environment,
@@ -1717,6 +1823,11 @@ def generate_paired_variants(
         )
         if variant is None:
             missing[kind] = str(reason)
+        elif classify_history_visibility(
+            variant.target_visibility_history,
+            history_visibility_policy,
+        ).regime != mother_history_assessment.regime:
+            missing[kind] = "target_history_visibility_regime_changed"
         else:
             variants[kind] = variant
 
@@ -1728,12 +1839,21 @@ def generate_paired_variants(
         oracle_context=oracle_context,
         base_config=base_config,
         paired_config=normalized,
+        history_visibility_policy=history_visibility_policy,
+        required_history_regime=mother_history_assessment.regime,
         pair_group_id=pair_id,
         seed=int(seed),
         environment=environment,
     )
     if temporal is None:
         missing["temporal_safe"] = str(reason)
+    elif classify_history_visibility(
+        temporal.target_visibility_history,
+        history_visibility_policy,
+    ).regime != mother_history_assessment.regime:
+        missing["temporal_safe"] = (
+            "target_history_visibility_regime_changed"
+        )
     else:
         variants["temporal_safe"] = temporal
 
@@ -1746,6 +1866,7 @@ def generate_paired_variants(
         trajectory=trajectory,
         pair_group_id=pair_id,
         paired_config=normalized,
+        history_visibility_policy=history_visibility_policy,
         seed=int(seed),
         environment=environment,
         transform_metadata={

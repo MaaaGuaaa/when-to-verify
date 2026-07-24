@@ -19,6 +19,17 @@ from src.generation.event_target_motion_shard import (
     create_event_target_motion_record,
     write_event_target_motion_shard,
 )
+from src.generation.history_visibility import (
+    HISTORY_VISIBILITY_POLICY_VERSION,
+    INELIGIBLE_HISTORY_VISIBILITY,
+    SEEN_THEN_OCCLUDED,
+    UNSEEN_IN_HISTORY_WINDOW,
+    allocate_history_visibility_counts,
+)
+from src.generation.sop05_selection import (
+    Sop05SelectionCandidate,
+    select_sop05_event_ids,
+)
 
 
 _FIXTURE_PAIRS_BY_EVENT_ID: dict[str, tuple[object, OracleWorld]] = {}
@@ -34,20 +45,32 @@ def _grid() -> GridSpec:
     )
 
 
-def _generator_contract() -> tuple[dict[str, object], str, str]:
+def _generator_contract() -> tuple[
+    dict[str, object], str, object, str, str
+]:
     from src.generation.event_sampler import _generator_digest, load_generator_config
 
     config_path = Path(__file__).resolve().parents[1] / "configs/generator_test.yaml"
     config = load_generator_config(config_path)
     policy = config["target_type_policy"]
-    return policy.as_dict(), policy.digest, _generator_digest(config)
+    history_policy = config["target_history_visibility"]
+    return (
+        policy.as_dict(),
+        policy.digest,
+        history_policy,
+        history_policy.digest,
+        _generator_digest(config),
+    )
 
 
 def _record_and_world(
     event_index: int = 0,
     event_kind: str = "environment",
     *,
-    generator_algorithm_version: str = "blind_reachability_quota_first_v3",
+    generator_algorithm_version: str = (
+        "blind_reachability_history_stratified_v4"
+    ),
+    history_visibility_regime: str | None = None,
 ):
     from src.generation.dynamic_object_transplant import (
         MOTION_SNIPPET_LAYOUT_VERSION,
@@ -66,9 +89,13 @@ def _record_and_world(
         "object_type": "human",
         "footprint": {"kind": "circle", "radius_m": 0.3},
     }
-    target_type_policy, target_type_policy_digest, generator_config_digest = (
-        _generator_contract()
-    )
+    (
+        target_type_policy,
+        target_type_policy_digest,
+        history_policy,
+        history_policy_digest,
+        generator_config_digest,
+    ) = _generator_contract()
     assert (
         normalize_target_type_policy(target_type_policy).digest
         == target_type_policy_digest
@@ -204,6 +231,30 @@ def _record_and_world(
             "height_m": 2.0,
         },
     )
+    resolved_history_regime = history_visibility_regime or (
+        UNSEEN_IN_HISTORY_WINDOW
+        if event_index % 5 == 4
+        else SEEN_THEN_OCCLUDED
+    )
+    if resolved_history_regime == SEEN_THEN_OCCLUDED:
+        target_visibility_history = [
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+            False,
+        ]
+        last_visible_index = 5
+        trailing_hidden_frames = 2
+    elif resolved_history_regime == UNSEEN_IN_HISTORY_WINDOW:
+        target_visibility_history = [False] * 8
+        last_visible_index = None
+        trailing_hidden_frames = 8
+    else:
+        raise ValueError("invalid fixture history visibility regime")
     metadata = {
         **build_event_target_motion_world_metadata(record),
         "schema_version": "3.0.0",
@@ -218,10 +269,18 @@ def _record_and_world(
         "attempt_index": event_index,
         "target_provenance": provenance,
         "visibility_sequence": visibility,
-        "target_visibility_history": [False] * 8,
+        "target_visibility_history": target_visibility_history,
         "target_visibility_history_layout": (
             "target_visibility_history8_current7_v1"
         ),
+        "target_history_visibility_regime": resolved_history_regime,
+        "target_history_last_visible_index": last_visible_index,
+        "target_history_trailing_hidden_frames": trailing_hidden_frames,
+        "target_history_visibility_policy_version": (
+            HISTORY_VISIBILITY_POLICY_VERSION
+        ),
+        "target_history_visibility_policy": history_policy.as_dict(),
+        "target_history_visibility_policy_digest": history_policy_digest,
         "context_dynamic_object_ids": [],
         "causal_occluder_proposal_id": proposal_id,
         "blind_region_id": blind_region_id,
@@ -309,6 +368,12 @@ def _run_id(manifest: dict[str, object]) -> str:
         "target_type_policy_digest": scientific[
             "target_type_policy_digest"
         ],
+        "target_history_visibility_policy": scientific[
+            "target_history_visibility_policy"
+        ],
+        "target_history_visibility_policy_digest": scientific[
+            "target_history_visibility_policy_digest"
+        ],
         "accepted_quota": scientific["accepted_quota"],
         "events_per_pair": scientific["events_per_pair"],
         "selection_version": scientific["selection_version"],
@@ -343,7 +408,7 @@ def _reseal_publication(root: Path) -> None:
     marker_path = root / ".producer-complete"
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     manifest = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
-    marker["marker_version"] = "sop05_producer_complete_v3"
+    marker["marker_version"] = "sop05_producer_complete_v4"
     marker["publication_identity_version"] = (
         SOP05_PUBLICATION_IDENTITY_VERSION
     )
@@ -417,7 +482,7 @@ def _event_kind_bucket(
 def _selection_key_for_id(seed: int, event_id: str) -> tuple[str, ...]:
     payload = _canonical_json_bytes(
         [
-            "sop05_diversity_total_selection_v1",
+            "sop05_history_stratified_selection_v2",
             seed,
             "base-loader-fixture",
             "trajectory-loader-fixture",
@@ -442,6 +507,9 @@ def _accepted_event_row(record: object, world: OracleWorld) -> dict[str, object]
         "occluder_type": world.occluders[0]["type"],
         "crossing_side": provenance["crossing_side"],
         "conflict_index": metadata["conflict_index"],
+        "history_visibility_regime": metadata[
+            "target_history_visibility_regime"
+        ],
         "causal_occluder_proposal_id": metadata[
             "causal_occluder_proposal_id"
         ],
@@ -468,16 +536,42 @@ def _write_complete_publication(
         _record_and_world(event_index, selected_kind)
         for event_index in range(accepted_quota + 1)
     ]
-    selected_pairs = sorted(
-        primary_pairs,
-        key=lambda pair: _selection_key_for_id(
-            23, pair[0].generated_event_id
-        ),
-    )[:accepted_quota]
     pairs = primary_pairs
     records = [record for record, _ in pairs]
     event_kinds = [world.metadata["event_kind"] for _, world in pairs]
     generated_counts = {"environment": len(event_kinds)}
+    (
+        target_type_policy,
+        target_type_policy_digest,
+        history_policy,
+        history_policy_digest,
+        generator_config_digest,
+    ) = _generator_contract()
+    selection_candidates = tuple(
+        Sop05SelectionCandidate(
+            base_state_id=item.base_state_id,
+            trajectory_id=item.trajectory_id,
+            generated_event_id=item.generated_event_id,
+            object_type=item.object_type,
+            occluder_type=item_world.occluders[0]["type"],
+            crossing_side=item_world.metadata["target_provenance"][
+                "crossing_side"
+            ],
+            conflict_index=item_world.metadata["conflict_index"],
+            history_visibility_regime=item_world.metadata[
+                "target_history_visibility_regime"
+            ],
+        )
+        for item, item_world in pairs
+    )
+    selection_result = select_sop05_event_ids(
+        selection_candidates,
+        seed=23,
+        accepted_quota=accepted_quota,
+        history_visibility_policy=history_policy,
+    )
+    pair_by_id = {item.generated_event_id: (item, item_world) for item, item_world in pairs}
+    selected_pairs = [pair_by_id[event_id] for event_id in selection_result.event_ids]
     selected_records = [record for record, _ in selected_pairs]
     selected_worlds = [world for _, world in selected_pairs]
     record, world = selected_pairs[0]
@@ -505,9 +599,6 @@ def _write_complete_publication(
         Path(__file__).resolve().parents[1] / "configs/generator_test.yaml"
     )
     (configs / "generator.yaml").write_bytes(generator_source.read_bytes())
-    target_type_policy, target_type_policy_digest, generator_config_digest = (
-        _generator_contract()
-    )
     rejected_count = requested_count - generated_count
     rejection_reason = "fixture_visibility_rejection"
     rejection_reasons = {rejection_reason: rejected_count}
@@ -528,6 +619,27 @@ def _write_complete_publication(
         f"proposal-rejected-{index:08d}"
         for index in range(requested_count - generated_count)
     ]
+    accepted_history_counts = {
+        regime: sum(
+            item_world.metadata["target_history_visibility_regime"] == regime
+            for _, item_world in pairs
+        )
+        for regime in (SEEN_THEN_OCCLUDED, UNSEEN_IN_HISTORY_WINDOW)
+    }
+    requested_history_counts = allocate_history_visibility_counts(
+        requested_count,
+        history_policy,
+        seed=17,
+        namespace=f"{record.base_state_id}|{record.trajectory_id}",
+    )
+    pair_history_deficits = {
+        regime: max(
+            0,
+            requested_history_counts[regime]
+            - accepted_history_counts[regime],
+        )
+        for regime in (SEEN_THEN_OCCLUDED, UNSEEN_IN_HISTORY_WINDOW)
+    }
     pair_summary = {
         "schema_version": "3.0.0",
         "seed": 17,
@@ -566,15 +678,28 @@ def _write_complete_publication(
         },
         "target_type_policy": target_type_policy,
         "target_type_policy_digest": target_type_policy_digest,
+        "target_history_visibility_policy": history_policy.as_dict(),
+        "target_history_visibility_policy_digest": history_policy_digest,
+        "requested_history_visibility_counts": requested_history_counts,
+        "exact_history_visibility_counts": {
+            **accepted_history_counts,
+            INELIGIBLE_HISTORY_VISIBILITY: 0,
+        },
+        "accepted_history_visibility_counts": accepted_history_counts,
+        "history_visibility_deficits": pair_history_deficits,
         "generator_config_digest": generator_config_digest,
-        "generator_algorithm_version": "blind_reachability_quota_first_v3",
+        "generator_algorithm_version": (
+            "blind_reachability_history_stratified_v4"
+        ),
         "production_event_kind": "environment",
     }
     (root / "pair_generation_reports.jsonl").write_text(
         json.dumps(
             {
-                "report_version": "sop05_pair_generation_report_v4",
-                "selection_version": "sop05_diversity_total_selection_v1",
+                "report_version": "sop05_pair_generation_report_v5",
+                "selection_version": (
+                    "sop05_history_stratified_selection_v2"
+                ),
                 "rank": 0,
                 "state_id": record.base_state_id,
                 "trajectory_id": record.trajectory_id,
@@ -605,8 +730,9 @@ def _write_complete_publication(
         )
     ]
     selected_event_ids = [item.generated_event_id for item in selected_records]
+    selected_history_counts = selection_result.selected_counts
     summary = {
-        "summary_version": "sop05_generation_summary_v3",
+        "summary_version": "sop05_generation_summary_v4",
         "run_id": None,
         "run_state": "complete",
         "processed_pair_count": 1,
@@ -617,6 +743,14 @@ def _write_complete_publication(
         "quota_trimmed_count": generated_count - accepted_quota,
         "generated_event_kind_counts": generated_counts,
         "selected_event_kind_counts": selected_counts,
+        "target_history_visibility_policy": history_policy.as_dict(),
+        "target_history_visibility_policy_digest": history_policy_digest,
+        "required_history_visibility_counts": (
+            selection_result.required_counts
+        ),
+        "generated_history_visibility_counts": accepted_history_counts,
+        "selected_history_visibility_counts": selected_history_counts,
+        "history_visibility_deficits": selection_result.deficits,
         "quota_met": True,
         "production_event_kind": "environment",
         "canonical_candidate_order": canonical_candidate_order,
@@ -650,8 +784,13 @@ def _write_complete_publication(
         "generator_invariants": {
             "schema_version": "3.0.0",
             "target_type_policy_digest": target_type_policy_digest,
+            "target_history_visibility_policy_digest": (
+                history_policy_digest
+            ),
             "generator_config_digest": generator_config_digest,
-            "generator_algorithm_version": "blind_reachability_quota_first_v3",
+            "generator_algorithm_version": (
+                "blind_reachability_history_stratified_v4"
+            ),
             "production_event_kind": "environment",
         },
     }
@@ -710,17 +849,19 @@ def _write_complete_publication(
         "max_base_states": 1,
         "trajectory_count": 1,
         "max_pairs": 1,
-        "selection_version": "sop05_diversity_total_selection_v1",
+        "selection_version": "sop05_history_stratified_selection_v2",
         "base_config_sha256": _sha256(configs / "base.yaml"),
         "generator_config_sha256": _sha256(configs / "generator.yaml"),
         "generator_config_semantic_digest": generator_config_digest,
         "target_type_policy": target_type_policy,
         "target_type_policy_digest": target_type_policy_digest,
+        "target_history_visibility_policy": history_policy.as_dict(),
+        "target_history_visibility_policy_digest": history_policy_digest,
         "pair_schedule": schedule,
     }
     manifest = {
-        "manifest_version": "sop05_run_manifest_v3",
-        "producer_version": "sop05_generation_run_v6",
+        "manifest_version": "sop05_run_manifest_v4",
+        "producer_version": "sop05_generation_run_v7",
         "producer_source_identity": {
             "version": "sop05_producer_source_identity_v1",
             "git_commit": "3" * 40,
@@ -769,7 +910,7 @@ def _write_complete_publication(
 
     loaded_shard = load_event_target_motion_shard(shard, grid=_grid())
     marker = {
-        "marker_version": "sop05_producer_complete_v3",
+        "marker_version": "sop05_producer_complete_v4",
         "run_id": manifest["run_id"],
         "run_manifest_sha256": _sha256(root / "run_manifest.json"),
         "checksums_sha256": _sha256(root / "checksums.sha256"),
@@ -1228,39 +1369,93 @@ def test_load_complete_sop05_events_validates_evidence_and_restores(
     assert loaded.shard.summary["record_count"] == 10
     assert {event.event_kind for event in loaded.events} == {"environment"}
 
-    report = json.loads(
-        (root / "pair_generation_reports.jsonl").read_text(encoding="utf-8")
+    summary = json.loads(
+        (root / "generation_summary.json").read_text(encoding="utf-8")
     )
-    expected_ids = tuple(
-        sorted(
-            (
-                item["generated_event_id"]
-                for item in report["accepted_events"]
-            ),
-            key=lambda event_id: _selection_key_for_id(23, event_id),
-        )[:10]
-    )
+    expected_ids = tuple(summary["selected_event_ids"])
     assert tuple(
         sorted(event.generated_event_id for event in loaded.events)
     ) == tuple(sorted(expected_ids))
 
 
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    [
+        ("target_history_visibility_regime", UNSEEN_IN_HISTORY_WINDOW),
+        ("target_history_last_visible_index", 4),
+        ("target_history_trailing_hidden_frames", 3),
+        (
+            "target_history_visibility_policy",
+            {
+                "policy_version": HISTORY_VISIBILITY_POLICY_VERSION,
+                "min_trailing_hidden_frames": 3,
+                "weights": {
+                    SEEN_THEN_OCCLUDED: 0.8,
+                    UNSEEN_IN_HISTORY_WINDOW: 0.2,
+                },
+            },
+        ),
+        ("target_history_visibility_policy_digest", "0" * 64),
+    ],
+)
+def test_load_complete_rejects_resealed_history_visibility_metadata_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    tampered_value: object,
+) -> None:
+    from src.generation.sop05_output_loader import load_complete_sop05_events
+
+    root = tmp_path / "run"
+    _write_complete_publication(root)
+    summary = json.loads(
+        (root / "generation_summary.json").read_text(encoding="utf-8")
+    )
+    selected_ids = list(summary["selected_event_ids"])
+    selected_id = next(
+        event_id
+        for event_id in selected_ids
+        if _fixture_pair_from_event_id(event_id)[1].metadata[
+            "target_history_visibility_regime"
+        ]
+        == SEEN_THEN_OCCLUDED
+    )
+    record, world = _fixture_pair_from_event_id(selected_id)
+    metadata = dict(world.metadata)
+    metadata[field] = tampered_value
+    monkeypatch.setitem(
+        _FIXTURE_PAIRS_BY_EVENT_ID,
+        selected_id,
+        (record, replace(world, metadata=metadata)),
+    )
+    _rewrite_selected_shard(root, selected_ids)
+
+    with pytest.raises(ValueError, match=field):
+        load_complete_sop05_events(
+            root,
+            grid=_grid(),
+            expected_publication_semantic_digest=(
+                _fixture_publication_digest(root)
+            ),
+        )
+
+
 def test_loader_formal_versions_are_exact() -> None:
     from src.generation import sop05_output_loader as loader
 
-    assert loader.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v3"
+    assert loader.SOP05_RUN_MANIFEST_VERSION == "sop05_run_manifest_v4"
     assert loader.SOP05_GENERATION_SUMMARY_VERSION == (
-        "sop05_generation_summary_v3"
+        "sop05_generation_summary_v4"
     )
     assert loader.SOP05_COMPLETION_MARKER_VERSION == (
-        "sop05_producer_complete_v3"
+        "sop05_producer_complete_v4"
     )
-    assert loader.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v6"
+    assert loader.SOP05_RUN_PRODUCER_VERSION == "sop05_generation_run_v7"
     assert loader.SOP05_PAIR_REPORT_VERSION == (
-        "sop05_pair_generation_report_v4"
+        "sop05_pair_generation_report_v5"
     )
     assert loader.SOP05_TOTAL_QUOTA_SELECTION_VERSION == (
-        "sop05_diversity_total_selection_v1"
+        "sop05_history_stratified_selection_v2"
     )
 
 

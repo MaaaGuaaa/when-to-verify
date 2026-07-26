@@ -27,7 +27,7 @@ def _grid() -> GridSpec:
         height=8,
         width=8,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.1,
     )
 
@@ -43,9 +43,9 @@ def _motion(offset: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     current = history[7].copy()
     future = np.column_stack(
         (
-            current[0] + np.arange(1, 16, dtype=np.float32) * np.float32(0.2),
-            current[1] + np.arange(1, 16, dtype=np.float32) * np.float32(0.05),
-            current[2] + np.arange(1, 16, dtype=np.float32) * np.float32(0.01),
+            current[0] + np.arange(1, 33, dtype=np.float32) * np.float32(0.2),
+            current[1] + np.arange(1, 33, dtype=np.float32) * np.float32(0.05),
+            current[2] + np.arange(1, 33, dtype=np.float32) * np.float32(0.01),
         )
     ).astype(np.float32)
     return history, current, future
@@ -181,10 +181,10 @@ def test_factory_freezes_contract_and_owns_c_contiguous_float32_copies() -> None
     future[:] = -99.0
 
     assert record.schema_version == SCHEMA_VERSION
-    assert record.layout_version == "event_target_motion_history8_future15_v1"
+    assert record.layout_version == "event_target_motion_history8_future32_v2"
     assert record.history_poses.shape == (8, 3)
     assert record.current_pose.shape == (3,)
-    assert record.future_poses.shape == (15, 3)
+    assert record.future_poses.shape == (32, 3)
     for array in (record.history_poses, record.current_pose, record.future_poses):
         assert array.dtype == np.float32
         assert array.flags.c_contiguous
@@ -335,10 +335,10 @@ def test_validator_and_writer_reject_writeable_record_arrays(
     [
         ("history", np.zeros((7, 3), dtype=np.float32), "history_poses shape"),
         ("current", np.zeros((4,), dtype=np.float32), "current_pose shape"),
-        ("future", np.zeros((14, 3), dtype=np.float32), "future_poses shape"),
+        ("future", np.zeros((31, 3), dtype=np.float32), "future_poses shape"),
         ("history", np.zeros((8, 3), dtype=np.float64), "history_poses dtype"),
         ("current", np.zeros((3,), dtype=np.float64), "current_pose dtype"),
-        ("future", np.zeros((15, 3), dtype=np.float64), "future_poses dtype"),
+        ("future", np.zeros((32, 3), dtype=np.float64), "future_poses dtype"),
     ],
 )
 def test_factory_rejects_wrong_shape_or_dtype_without_casting(
@@ -456,7 +456,7 @@ def test_writer_and_loader_round_trip_exact_single_version_contract(tmp_path: Pa
 
     assert set(paths) == {"directory", "manifest", "payload", "summary", "worlds"}
     assert sorted(path.name for path in output.iterdir()) == [
-        "event_target_motion_history8_future15_v1.npz",
+        "event_target_motion_history8_future32_v2.npz",
         "generated_event_manifest.jsonl",
         "oracle_worlds",
         "shard_summary.json",
@@ -470,7 +470,7 @@ def test_writer_and_loader_round_trip_exact_single_version_contract(tmp_path: Pa
         }
         assert payload["history_poses"].shape == (1, 8, 3)
         assert payload["current_poses"].shape == (1, 3)
-        assert payload["future_poses"].shape == (1, 15, 3)
+        assert payload["future_poses"].shape == (1, 32, 3)
         assert payload["history_poses"].dtype == np.float32
         assert payload["current_poses"].dtype == np.float32
         assert payload["future_poses"].dtype == np.float32
@@ -479,7 +479,7 @@ def test_writer_and_loader_round_trip_exact_single_version_contract(tmp_path: Pa
         [-1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0]
     )
     assert meta["future_time_offsets_s"] == pytest.approx(
-        [0.2 * index for index in range(1, 16)]
+        [0.2 * index for index in range(1, 33)]
     )
     manifest_row = json.loads(paths["manifest"].read_text(encoding="utf-8"))
     assert manifest_row["world_semantic_digest"] == (
@@ -716,7 +716,7 @@ def test_loader_rejects_npz_payload_tampering(tmp_path: Path, tamper: str) -> No
     record = _record(module)
     output = tmp_path / tamper
     _write(module, output, [record], [_world(record, _grid())])
-    payload_path = output / "event_target_motion_history8_future15_v1.npz"
+    payload_path = output / "event_target_motion_history8_future32_v2.npz"
 
     def mutate(payload):
         if tamper == "extra_key":
@@ -922,7 +922,7 @@ def test_build_renderer_scene_copies_all_context_and_target_and_rejects_collisio
     module = _sut()
     record = _record(module)
     context_history = np.zeros((8, 3), dtype=np.float32)
-    context_future = np.ones((15, 3), dtype=np.float32)
+    context_future = np.ones((32, 3), dtype=np.float32)
     context_spec = {
         "object_type": "human",
         "footprint": {"kind": "circle", "radius_m": 0.25},
@@ -960,7 +960,7 @@ def test_build_renderer_scene_copies_all_context_and_target_and_rejects_collisio
     collision = OracleContext(
         base_state_id=record.base_state_id,
         dynamic_object_history={record.target_dynamic_object_id: np.zeros((8, 3), dtype=np.float32)},
-        dynamic_object_future={record.target_dynamic_object_id: np.zeros((15, 3), dtype=np.float32)},
+        dynamic_object_future={record.target_dynamic_object_id: np.zeros((32, 3), dtype=np.float32)},
         dynamic_object_specs={record.target_dynamic_object_id: context_spec},
         metadata={},
     )

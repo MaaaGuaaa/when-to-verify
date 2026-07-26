@@ -32,10 +32,10 @@ from src.contracts import (
 from src.utils.seeding import stable_digest
 
 
-EVENT_TARGET_MOTION_LAYOUT_VERSION = "event_target_motion_history8_future15_v1"
+EVENT_TARGET_MOTION_LAYOUT_VERSION = "event_target_motion_history8_future32_v2"
 HISTORY_STEPS = 8
 CURRENT_INDEX = 7
-FUTURE_STEPS = 15
+FUTURE_STEPS = 32
 SAMPLE_DT_S = 0.2
 CURRENT_TIME_OFFSET_S = 0.0
 HISTORY_TIME_OFFSETS_S = tuple(
@@ -164,6 +164,9 @@ class _FrozenDict(dict[str, object]):
     def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
         memo[id(self)] = self
         return self
+
+    def __reduce__(self) -> tuple[object, tuple[dict[str, object]]]:
+        return type(self), (dict(self),)
 
 
 @dataclass(frozen=True)

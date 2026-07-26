@@ -44,8 +44,7 @@ def _readonly_vector(value: object, *, name: str, length: int) -> np.ndarray:
     result = np.asarray(array, dtype=np.float64).copy()
     if not np.isfinite(result).all():
         raise ValueError(f"{name} must contain only finite values")
-    result.setflags(write=False)
-    return result
+    return np.frombuffer(result.tobytes(), dtype=np.float64)
 
 
 def _text(value: object, *, name: str) -> str:

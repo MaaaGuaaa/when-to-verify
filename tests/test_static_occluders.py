@@ -67,6 +67,36 @@ def test_occluders_are_immutable_and_have_stable_payloads() -> None:
         rectangle.pose[0] = 0.0
 
 
+@pytest.mark.parametrize(
+    ("factory", "attribute_name", "source"),
+    [
+        (
+            lambda value: RectangleOccluder("wall-1", "wall", value, 4.0, 2.0),
+            "pose",
+            np.asarray([1.0, -2.0, np.pi / 2.0], dtype=np.float64),
+        ),
+        (
+            lambda value: CircleOccluder("tree-1", "tree_trunk", value, 0.3),
+            "center_xy",
+            np.asarray([0.5, 0.25], dtype=np.float64),
+        ),
+    ],
+    ids=("rectangle-pose", "circle-center"),
+)
+def test_occluder_geometry_arrays_have_irreversible_readonly_backing(
+    factory, attribute_name: str, source: np.ndarray
+) -> None:
+    expected = source.copy()
+    occluder = factory(source)
+    source[:] = 99.0
+    stored = getattr(occluder, attribute_name)
+
+    np.testing.assert_array_equal(stored, expected)
+    with pytest.raises(ValueError, match="WRITEABLE"):
+        stored.setflags(write=True)
+    np.testing.assert_array_equal(stored, expected)
+
+
 def test_bounds_inflation_and_signed_distances_are_analytic() -> None:
     rectangle = RectangleOccluder(
         "wall-1",

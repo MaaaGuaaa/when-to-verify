@@ -64,14 +64,14 @@ def test_grid_spec_from_default_config():
     grid = build_grid_spec(load_config())
     assert (grid.height, grid.width) == (160, 160)
     assert grid.history_steps == 8
-    assert grid.future_steps == 15
+    assert grid.future_steps == 32
     assert grid.n_history_channels == 2
     assert grid.n_state_channels == 9
     assert grid.n_trajectory_channels == 4
 
 
 def test_future_endpoint_time_contract_is_central_and_breaking():
-    assert contracts.SCHEMA_VERSION == "3.0.0"
+    assert contracts.SCHEMA_VERSION == "4.0.0"
     assert POSE_TIME_LAYOUT_VERSION == "future_endpoints_dt_to_horizon_v1"
 
 
@@ -477,7 +477,7 @@ def test_sample_id_stable_regardless_of_call_order():
 def test_base_config_loads_and_validates():
     cfg = load_config(_ROOT / "configs" / "base.yaml")
     assert cfg["schema_version"] == contracts.SCHEMA_VERSION
-    assert contracts.SCHEMA_VERSION == "3.0.0"
+    assert contracts.SCHEMA_VERSION == "4.0.0"
     assert cfg["bev"]["size"] == 160
     assert cfg["scenario_bank"]["reject_cost"] == 0.20
     assert "pedestrian" not in cfg

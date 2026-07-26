@@ -1,11 +1,12 @@
-# SOP05R lightweight TEB acceptance gates
+# SOP05R long-horizon lightweight TEB acceptance gates
 
-_Test commands, quantitative thresholds, integrity requirements, and release ladder for SOP05R v2._
+_Test commands, quantitative thresholds, integrity requirements, and release ladder for SOP05R v3 long40._
 
 ---
 
 ## 📚 Document set
 
+- [Long40 system contract](../../../long40_system_contract.md)
 - [Full specification](./full-spec.md)
 - [Contracts](./contracts.md)
 - [Milestones](./milestones.md)
@@ -17,11 +18,11 @@ not evidence until its exit code and structured output have been inspected.
 
 ## ✅ Definition of done
 
-SOP05R v2 is complete only when:
+SOP05R v3 is complete only when:
 
 - every contract in [contracts.md](./contracts.md) has code and test evidence
 - all focused unit and integration suites pass
-- legacy and SOP05R v1 focused regressions still pass
+- current production loaders reject Schema `3.0.0`, 23-sample, and 15-step artifacts
 - the 10-template deterministic gate passes
 - the user-approved 100-event visual audit passes
 - the user-approved 1,000-event statistical smoke passes every numeric threshold
@@ -53,21 +54,26 @@ $PY -m pytest -q \
 Required result:
 
 - all tests pass
-- planner version is exactly `lightweight_teb_planner_v2`
-- normalized planner config freezes 20 band nodes, `0.25 s` initial interval,
-  `[0.1, 0.4] s` interval bounds, `5.0 s` maximum route time, and `0.2 s`
+- planner version is exactly `lightweight_teb_planner_v3`
+- normalized planner config freezes 21 band nodes, `0.25 s` initial interval,
+  `[0.1, 0.4] s` interval bounds, `8.0 s` maximum route time, and `0.2 s`
   route sampling
 - normalized planner config freezes a `0.15 m` minimum represented-obstacle
   clearance and `0.08 m` bypass tracking allowance
-- normalized planner config freezes `initialization_ids = [straight]`
+- normalized planner config freezes
+  `initialization_ids = [straight, bypass_left, bypass_right]`
 - normalized template config freezes `rectangle=0.4`, `l_shape=0.4`, and
   `circle=0.2`; an L shape is represented as two rectangle components
-- maximum route time is representable by the interval bounds and produces exactly 25
+- maximum route time is representable by the interval bounds and produces exactly 40
   sampled future endpoints
-- normalized generation config freezes direct-corridor intrusion to `[0.05, 0.15] m`
-- base/model horizon remains exactly 15 steps over `3.0 s`; Schema remains `3.0.0`
-- `obstacle_first_teb` rejects missing or v1 config versions
-- `legacy` and `obstacle_first` argument behavior remains unchanged
+- normalized generation config freezes minimum direct-corridor intrusion to `0.15 m`
+- normalized generation config freezes goal distance to `[4.0, 4.5] m` and collision
+  route path fraction to `[0.20, 0.95]`
+- v3 model horizon is exactly 32 steps over `6.4 s`; Schema is exactly `4.0.0`;
+  layout is exactly `history8_current7_future32_v1`
+- v3 rejects the removed absolute `conflict_time_range_s` key
+- `obstacle_first_teb` rejects missing, v1, or pre-long40 v2 config versions
+- archival modes cannot feed current long40 output collections
 
 ### M2 — Static occluders
 
@@ -99,11 +105,11 @@ $PY -m pytest -q \
 
 Required result for every accepted route:
 
-- band has exactly 20 immutable poses and 19 bounded interval durations
+- band has exactly 21 immutable poses and 20 bounded interval durations
 - exact request start is the implicit `t=0` state and first band pose
-- uniform route has exactly 25 endpoint poses/controls at `[0.2, ..., 5.0] s`
+- uniform route has exactly 40 endpoint poses/controls at `[0.2, ..., 8.0] s`
 - terminal goal error is within frozen tolerance
-- goal arrival is no later than `5.0 s`
+- goal arrival is no later than `8.0 s`
 - first control is continuous with request initial control
 - velocity, acceleration, angular-rate, curvature, and nonholonomic limits pass
 - represented-occluder clearance lies in the configured band
@@ -130,7 +136,8 @@ Required result:
 - every rectangle and L shape has a deterministic signed orientation within
   `±[15°, 45°]` of the start-goal direction
 - every occluder has a nonzero signed lateral offset from the direct start-goal line
-- direct-corridor intrusion is in the frozen `[0.05, 0.15] m` range
+- direct-corridor intrusion is at least the frozen `0.15 m` minimum
+- at least one static primitive analytically intersects the direct start-goal centerline
 - accepted TEB route reaches the same goal without static collision
 - source BaseState and OracleContext digests do not change
 
@@ -148,9 +155,13 @@ Required result:
 - spatial scale is exactly `1.0`
 - rigid pairwise distances, speed magnitudes, and acceleration magnitudes are preserved
 - headings and velocity vectors rotate by the same angle
-- initial-visible fixture has no centerline intersection at start
-- it has at least one synchronized blocked sample before collision
-- one blocked sample is sufficient
+- primary fixture has at least four visible samples in its eight-frame decision history
+- it has at least one synchronized blocked history sample; the decision frame may be visible
+- source layout has exactly 40 samples: indices `0..7` history/current and `8..39`
+  future
+- every future anchor index `8..39` enters collision search; geometry and the `1.2 s`
+  lower-margin gate may still reject a concrete placement
+- the visible-to-hidden transition frame is not fixed
 - non-synchronized cross-time point pairs cannot satisfy the predicate
 - rectangle and circle fixtures both pass
 
@@ -165,14 +176,18 @@ $PY -m pytest -q \
 
 Required result:
 
-- selected decision time equals a persisted centerline-occlusion witness
-- action, braking, and replanning margin remains before collision
-- continuous first collision exists and is not endpoint-only
-- full route reaches the exact shared goal within `5.0 s`
-- decision-relative nominal suffix has exactly 15 endpoints at `0.2 s` spacing
-- suffix query maps recompute exactly under the existing Schema `3.0.0` authority
-- continuous first collision occurs after the decision and within the three-second suffix
-- suffix may end before goal arrival without invalidating full-route reachability
+- decision time is index 7; a separate persisted centerline-occlusion witness
+  occurs in the eight-frame history
+- the frozen `1.2 s` verification-action plus braking margin remains before collision
+- replanning completion is not required inside that acceptance margin
+- continuous first collision exists and is not a discrete-only sample coincidence
+- full route reaches the exact shared goal within `8.0 s`
+- decision-relative nominal suffix has exactly 32 endpoints at `0.2 s` spacing
+- suffix query maps recompute exactly under the Schema `4.0.0` authority
+- `1.2 s <= t_collision - t_decision <= 6.4 s`
+- a first collision in the final `6.2–6.4 s` interval is accepted when continuous
+  swept-footprint interpolation proves it
+- goal arrival does not gate the 6.4-second suffix
 - event has exactly one full route, one nominal suffix, and no alternative-route requirement
 - event, world, target, route, anchor, witness, and source IDs round-trip
 - event identity is deterministic
@@ -191,10 +206,10 @@ Required result:
 
 - canonical JSON and deterministic NPZ round-trip
 - unknown, missing, extra, or tampered arrays fail closed
-- full-route band arrays, uniform five-second arrays, and three-second suffix arrays have
+- full-route band arrays, uniform eight-second arrays, and 6.4-second suffix arrays have
   distinct authenticated shape/dtype metadata
 - outer checksums and semantic digests are verified
-- v1/v2 mixed artifacts are rejected
+- any Schema `3.0.0`/v1/v2 artifact in a current collection is rejected
 - partial quota output has no completion marker
 - complete output self-reloads before publication
 - one-worker and multi-worker semantic digests match
@@ -214,9 +229,10 @@ Required result:
 - target-hidden actions use static-only replanning
 - target-revealed actions use only observation-derived dynamic state
 - hidden Oracle future never enters planner requests
-- every replan uses the exact same world-frame goal, five-second route bound, and
+- every replan uses the exact same world-frame goal, eight-second route bound, and
   task-cost authority
-- verification risk remains evaluated over the unchanged three-second post-action window
+- verification risk remains evaluated on the original decision-relative 6.4-second
+  window; action duration reduces the remaining target support
 - at least one deterministic fixture has a moving action that beats matched wait
 - stop is never counted as an active moving action
 
@@ -230,11 +246,11 @@ $PY -m pytest -q \
 
 Required result:
 
-- v2 target-present and target-removed variants share source, decision, static scene,
+- v3 target-present and target-removed variants share source, decision, static scene,
   full route, nominal suffix, and goal
 - only target semantics change across the pair
-- no alternative trajectory lookup occurs in the v2 branch
-- legacy and v1 focused fixtures remain unchanged
+- no alternative trajectory lookup occurs in the v3 branch
+- v1, pre-long40 v2, and 15-step stores are rejected by the current SOP06 handoff
 
 ### M10 — Audit producers
 
@@ -250,15 +266,15 @@ Required result:
 
 - audit metrics recompute source evidence
 - figures are deterministic, fixed-scale, and nonblank
-- visual layers include goal, occluder shape, full route, three-second nominal suffix,
-  human motion, collision anchor, occlusion witness, decision pose, and verification
-  traces
+- visual layers include goal, occluder shape, eight-second full route, 6.4-second nominal
+  suffix, all 40 human samples, collision anchor, occlusion witness, decision pose, and
+  verification traces
 - audit completion fails for incomplete or tampered source collections
 
 ## 🔬 Deterministic 10-template gate
 
-The release-gate test uses production v2 APIs with deterministic synthetic BaseState,
-rectangle/circle occluders, and real `MotionSnippet` contracts:
+The release-gate test uses production v3 APIs with deterministic synthetic BaseState,
+rectangle/circle occluders, and real long40 human trajectory contracts:
 
 ```bash
 $PY -m pytest -q \
@@ -272,20 +288,24 @@ source start unchanged                         10/10
 direct path blocked by represented occluder   10/10
 TEB route dynamically valid                   10/10
 route reaches exact shared goal               10/10
-decision suffix has 15 future endpoints       10/10
+decision suffix has 32 future endpoints       10/10
 suffix query maps reproduce exactly            10/10
 human anchor invariant                        10/10
 required start-visibility stratum valid        10/10
 centerline occlusion witness exists            10/10
 continuous non-endpoint collision              10/10
-collision lies inside 3-second suffix          10/10
+collision lies inside 6.4-second suffix        10/10
+collision margin is within [1.2, 6.4] s        10/10
+goal arrival does not gate suffix length          10/10
+collision anchor is before goal arrival         10/10
 single nominal trajectory record               10/10
 strict serialization reload                    10/10
 ```
 
-At least four fixtures use circles and at least four use rectangles. At least one fixture
-must fail before the rotation solver and pass after anchored rotation, proving that the
-solver—not a hard-coded target—is responsible for placement.
+Exactly four fixtures use rectangles, four use L shapes, and two use circles, matching
+the frozen `0.4/0.4/0.2` family mix. At least one fixture must fail before the rotation
+solver and pass after anchored rotation, proving that the solver—not a hard-coded
+target—is responsible for placement.
 
 Any failure requires a minimal RED regression test before implementation changes.
 
@@ -296,13 +316,15 @@ Use authenticated SOP03 outputs, not direct reads from `data/`.
 
 ```bash
 PY=.conda-envs/sop4-risk/bin/python
-SOP03_ROOT=outputs/sop03_thor_motion_snippet_v2_schema3_47b3acd_v1
-OUT=outputs/sop05r_teb_train_visual_audit_100_v1
-AUDIT=outputs/sop05r_teb_train_visual_audit_100_v1_audit
+SOP03_ROOT=outputs/sop03_thor_full_schema4_v1
+LONG40_HUMAN_ARTIFACT=outputs/sop03_thor_motion_snippet_long40_human_schema4_v1/train/human
+OUT=outputs/sop05r_teb_long40_train_visual_audit_100_v1
+AUDIT=outputs/sop05r_teb_long40_train_visual_audit_100_v1_audit
 
 $PY scripts/05_generate_events.py \
   --generator-mode obstacle_first_teb \
   --sop03-root "$SOP03_ROOT" \
+  --long40-human-artifact "$LONG40_HUMAN_ARTIFACT" \
   --split train \
   --generator-config configs/generator_obstacle_first_teb_train.yaml \
   --verification-action-config configs/verification_actions.yaml \
@@ -328,17 +350,18 @@ Required review:
 - every event is included in the visual bundle; no failed sample is skipped
 - occluder shape and raster agree visually
 - full route is smooth, reaches the goal, and has no static clipping
-- decision-relative three-second suffix agrees with the full route or deterministic goal
-  hold
+- decision-relative 6.4-second suffix agrees with the full route and contains no
+  stationary goal padding
 - anchored human trajectory does not pass through the occluder
 - collision anchor is internal to both motions
 - initial-visible and initially-hidden strata match metadata
-- selected decision pose is at the persisted centerline witness
+- decision pose is at index 7; the persisted centerline witness is separately
+  rendered and auditable
 - verification-action traces are physically plausible
 - every unexplained artifact creates a regression test and a new versioned audit output
 
 Centerline/footprint-raycast disagreements are counted and visualized. They are not an
-automatic rejection because centerline intersection is the frozen v2 authority, but any
+automatic rejection because centerline intersection is the frozen v3 authority, but any
 systematic disagreement must be reported before the 1,000-event gate.
 
 ## 📊 Real 1,000-event statistical smoke
@@ -347,12 +370,14 @@ This stage also requires user approval.
 
 ```bash
 PY=.conda-envs/sop4-risk/bin/python
-SOP03_ROOT=outputs/sop03_thor_motion_snippet_v2_schema3_47b3acd_v1
-OUT=outputs/sop05r_teb_train_1k_v1
+SOP03_ROOT=outputs/sop03_thor_full_schema4_v1
+LONG40_HUMAN_ARTIFACT=outputs/sop03_thor_motion_snippet_long40_human_schema4_v1/train/human
+OUT=outputs/sop05r_teb_long40_train_1k_v1
 
 $PY scripts/05_generate_events.py \
   --generator-mode obstacle_first_teb \
   --sop03-root "$SOP03_ROOT" \
+  --long40-human-artifact "$LONG40_HUMAN_ARTIFACT" \
   --split train \
   --generator-config configs/generator_obstacle_first_teb_train.yaml \
   --verification-action-config configs/verification_actions.yaml \
@@ -373,14 +398,19 @@ The summary must define and expose every denominator used below.
 source BaseState mutation count                         == 0
 initial planner target/oracle input count               == 0
 published events with route count != 1                  == 0
-published full routes with sample count != 25           == 0
-published nominal suffixes with future steps != 15      == 0
-published nominal suffixes with horizon != 3.0 s        == 0
+published full routes with sample count != 40           == 0
+published nominal suffixes with future steps != 32      == 0
+published nominal suffixes with horizon != 6.4 s        == 0
+published target trajectories with sample count != 40   == 0
+published target trajectories with current index != 7   == 0
 published collisions outside nominal suffix             == 0
+published collisions with decision margin < 1.2 s       == 0
+published events rejected solely for suffix/goal timing  == 0
+published collision anchors at/after goal arrival        == 0
 published events with changed world-frame goal          == 0
 published events without an occlusion witness           == 0
 published events without continuous collision           == 0
-published endpoint-only collisions                      == 0
+published discrete-only collision coincidences          == 0
 published spatial scales != 1.0                         == 0
 NaN/Inf count in structured artifacts                   == 0
 strict-reload failures                                  == 0
@@ -398,7 +428,6 @@ TEB-success-to-continuous-collision-mother rate        >= 0.50
 end-to-end selected quota                              == 1000
 training active-revealable fraction                    >= 0.70
 median goal-occluder templates per accepted mother     <= 8
-median refined rotations per accepted mother           <= 8
 ```
 
 Definitions:
@@ -415,7 +444,7 @@ training active-revealable fraction =
 ```
 
 The centerline/footprint-raycast disagreement rate is mandatory audit output but has no
-release threshold in v2 because the user explicitly accepts small centerline
+release threshold in v3 because the user explicitly accepts small centerline
 approximation error. It must not be omitted or redefined after seeing the result.
 
 ### Deterministic prefix rerun

@@ -90,7 +90,7 @@ def _policy() -> dict:
 def _snippet(
     *, object_type: str = "human", footprint: dict | None = None
 ) -> MotionSnippet:
-    times = np.arange(23, dtype=np.float32) * np.float32(0.2)
+    times = np.arange(40, dtype=np.float32) * np.float32(0.2)
     positions = np.column_stack((times, 0.08 * times**2)).astype(np.float32)
     velocities = np.column_stack(
         (np.ones_like(times), 0.16 * times)
@@ -109,7 +109,7 @@ def _snippet(
         positions=positions,
         velocities=velocities,
         headings=headings,
-        duration_s=4.4,
+        duration_s=7.8,
         mean_speed_mps=1.02,
         max_acceleration_mps2=0.16,
         mean_abs_curvature_per_m=0.10,
@@ -125,10 +125,10 @@ def _snippet(
 
 
 def _exact_safe_curve_snippet() -> MotionSnippet:
-    """Real 23-sample curve whose future bends around a blocked chord."""
+    """Real 40-sample curve whose future bends around a blocked chord."""
 
     snippet = _snippet()
-    relative_times = (np.arange(23, dtype=np.float64) - 7.0) * 0.2
+    relative_times = (np.arange(40, dtype=np.float64) - 7.0) * 0.2
     conflict_time_s = 2.2
     lateral_acceleration = 0.8
     initial_lateral_velocity = lateral_acceleration * conflict_time_s
@@ -159,7 +159,7 @@ def _exact_safe_curve_snippet() -> MotionSnippet:
     positions = np.column_stack((0.8 * relative_times, lateral))
     positions -= positions[0]
     velocities = np.column_stack(
-        (np.full(23, 0.8, dtype=np.float64), lateral_velocity)
+        (np.full(40, 0.8, dtype=np.float64), lateral_velocity)
     )
     headings = np.arctan2(velocities[:, 1], velocities[:, 0])
     return replace(
@@ -184,7 +184,7 @@ def _reachability_candidate(
     base_state_id: str = "train-base-reachability",
     trajectory_id: str = "trajectory-reachability",
 ) -> ReachabilityCandidate:
-    anchor_index = min(22, 7 + conflict_index + 1)
+    anchor_index = min(39, 7 + conflict_index + 1)
     identity = ReachabilityIdentity(
         base_state_id=base_state_id,
         trajectory_id=trajectory_id,
@@ -217,7 +217,7 @@ def _reachability_transplant_kwargs(
     kwargs: dict[str, object] = {
         "candidate": base_candidate,
         "future_dt_s": 0.2,
-        "future_steps": 15,
+        "future_steps": 32,
         "target_type_policy_digest": "reachability-policy-digest",
         "seed": 23,
         "context_object_ids": ("context-b", "context-a"),
@@ -317,7 +317,7 @@ def test_reachability_transplant_has_frozen_output_and_json_provenance() -> None
     assert TRANSFORM_ALGORITHM_VERSION == "reachability_candidate_se2_v2"
     assert result.history_poses.shape == (8, 3)
     assert result.current_pose.shape == (3,)
-    assert result.future_poses.shape == (15, 3)
+    assert result.future_poses.shape == (32, 3)
     assert result.history_poses.dtype == np.float32
     assert result.current_pose.dtype == np.float32
     assert result.future_poses.dtype == np.float32
@@ -353,7 +353,7 @@ def test_reachability_transplant_has_frozen_output_and_json_provenance() -> None
     assert result.provenance["conflict_time_s"] == pytest.approx(1.0)
     assert result.provenance["time_scale"] == 1.0
     assert result.provenance["motion_snippet_layout_version"] == (
-        "history8_current7_future15_v1"
+        "history8_current7_future32_v1"
     )
     assert result.provenance["source_recording_id"] == snippet.source_recording_id
     assert result.provenance["source_session_id"] == snippet.source_session_id
@@ -427,7 +427,7 @@ def test_reachability_transplant_ids_bind_candidate_seed_context_and_arrays() ->
 def test_reachability_transplant_preserves_unwrapped_headings() -> None:
     snippet = _snippet()
     headings = snippet.headings.copy()
-    headings[:] = np.linspace(2.9, 3.5, 23, dtype=np.float32)
+    headings[:] = np.linspace(2.9, 3.5, 40, dtype=np.float32)
     snippet = replace(snippet, headings=headings)
     candidate = _reachability_candidate(
         snippet, desired_crossing_direction=(-1.0, 0.0)
@@ -472,7 +472,7 @@ def test_reachability_transplant_rejects_candidate_identity_mismatches() -> None
             **_reachability_transplant_kwargs(bad_time),
         )
 
-    bad_index = _reachability_candidate(snippet, conflict_index=15)
+    bad_index = _reachability_candidate(snippet, conflict_index=32)
     with pytest.raises(ValueError, match="source_anchor_index"):
         transplant_reachability_candidate(
             snippet,
@@ -494,7 +494,7 @@ def test_reachability_transplant_requires_byte_exact_source_delta() -> None:
     straight_positions[:, 1] = np.float32(0.0)
     straight_velocities = snippet.velocities.copy()
     straight_velocities[:, 1] = np.float32(0.0)
-    straight_headings = np.zeros(23, dtype=np.float32)
+    straight_headings = np.zeros(40, dtype=np.float32)
     snippet = replace(
         snippet,
         positions=straight_positions,
@@ -523,8 +523,8 @@ def test_reachability_transplant_requires_byte_exact_source_delta() -> None:
         ({"candidate": object()}, TypeError, "ReachabilityCandidate"),
         ({"future_dt_s": 0.1}, ValueError, "future_dt_s"),
         ({"future_dt_s": np.nan}, ValueError, "future_dt_s"),
-        ({"future_steps": 14}, ValueError, "future_steps"),
-        ({"future_steps": 15.0}, TypeError, "future_steps"),
+        ({"future_steps": 31}, ValueError, "future_steps"),
+        ({"future_steps": 32.0}, TypeError, "future_steps"),
         ({"seed": np.nan}, TypeError, "seed"),
         ({"context_object_ids": "context-a"}, TypeError, "context_object_ids"),
     ],
@@ -836,19 +836,19 @@ def _valid_physics_target():
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-event-fixture",
         trajectory_id="physics-fixture",
         target_type_policy_digest="policy-digest",
         seed=71,
         context_object_ids=(),
     )
-    times = np.arange(23, dtype=np.float32) * np.float32(0.2)
+    times = np.arange(40, dtype=np.float32) * np.float32(0.2)
     full_poses = np.column_stack(
         (
             np.float32(2.0) + np.float32(0.5) * times,
-            np.full(23, 3.0, dtype=np.float32),
-            np.zeros(23, dtype=np.float32),
+            np.full(40, 3.0, dtype=np.float32),
+            np.zeros(40, dtype=np.float32),
         )
     ).astype(np.float32)
     return replace(
@@ -956,7 +956,7 @@ def test_transplant_preserves_frozen_type_footprint_and_full_rigid_motion(
         crossing_direction=np.asarray([0.0, 1.0], dtype=np.float32),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest=policy.digest,
@@ -994,7 +994,7 @@ def test_transplant_preserves_frozen_type_footprint_and_full_rigid_motion(
     assert result.future_poses.dtype == np.float32
     assert result.history_poses.shape == (8, 3)
     assert result.current_pose.shape == (3,)
-    assert result.future_poses.shape == (15, 3)
+    assert result.future_poses.shape == (32, 3)
     assert np.isfinite(full_poses).all()
     np.testing.assert_array_equal(result.current_pose, result.history_poses[-1])
     np.testing.assert_allclose(full_poses[:, :2], expected_positions, atol=1e-6)
@@ -1007,7 +1007,7 @@ def test_transplant_preserves_frozen_type_footprint_and_full_rigid_motion(
     result_yaw_delta = np.unwrap(full_poses[:, 2]) - float(full_poses[0, 2])
     np.testing.assert_allclose(result_yaw_delta, source_yaw_delta, atol=1e-6)
     assert result.provenance["motion_snippet_layout_version"] == (
-        "history8_current7_future15_v1"
+        "history8_current7_future32_v1"
     )
     assert result.provenance["source_current_index"] == 7
     assert result.provenance["source_current_time_s"] == pytest.approx(1.4)
@@ -1041,7 +1041,7 @@ def test_transplant_rejects_noncanonical_snippet_layout(
             crossing_direction=(0.0, 1.0),
             time_scale=1.0,
             future_dt_s=0.2,
-            future_steps=15,
+            future_steps=32,
             base_state_id="train-base-1",
             trajectory_id="traj-1",
             target_type_policy_digest="policy-digest",
@@ -1058,8 +1058,8 @@ def test_transplant_rejects_noncanonical_snippet_layout(
         ({"time_scale": 0.8}, "time_scale must equal 1.0"),
         ({"time_scale": 1.2}, "time_scale must equal 1.0"),
         ({"future_dt_s": 0.1}, "future_dt_s must equal 0.2"),
-        ({"future_steps": 14}, "future_steps must equal 15"),
-        ({"future_steps": 16}, "future_steps must equal 15"),
+        ({"future_steps": 31}, "future_steps must equal 32"),
+        ({"future_steps": 33}, "future_steps must equal 32"),
     ],
 )
 def test_transplant_rejects_noncanonical_time_or_output_grid(
@@ -1071,7 +1071,7 @@ def test_transplant_rejects_noncanonical_time_or_output_grid(
         "crossing_direction": (0.0, 1.0),
         "time_scale": 1.0,
         "future_dt_s": 0.2,
-        "future_steps": 15,
+        "future_steps": 32,
         "base_state_id": "train-base-1",
         "trajectory_id": "traj-1",
         "target_type_policy_digest": "policy-digest",
@@ -1092,7 +1092,7 @@ def test_transplant_accepts_float32_canonical_future_dt() -> None:
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=np.float32(0.2),
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest="policy-digest",
@@ -1100,7 +1100,7 @@ def test_transplant_accepts_float32_canonical_future_dt() -> None:
         context_object_ids=(),
     )
 
-    assert result.future_poses.shape == (15, 3)
+    assert result.future_poses.shape == (32, 3)
 
 
 def test_transplant_outputs_are_independently_owned_c_contiguous_arrays() -> None:
@@ -1111,7 +1111,7 @@ def test_transplant_outputs_are_independently_owned_c_contiguous_arrays() -> Non
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest="policy-digest",
@@ -1142,7 +1142,7 @@ def test_target_id_is_deterministic_and_resolves_context_collision() -> None:
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest=policy.digest,
@@ -1171,7 +1171,7 @@ def test_legacy_transplant_identity_and_provenance_bind_source_session() -> None
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest=policy.digest,
@@ -1213,7 +1213,7 @@ def test_legacy_transplant_identity_frames_recording_session_boundaries() -> Non
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest=policy.digest,
@@ -1251,7 +1251,7 @@ def test_legacy_transplant_identity_v2_does_not_reuse_prior_identities() -> None
         crossing_direction=(0.0, 1.0),
         time_scale=1.0,
         future_dt_s=0.2,
-        future_steps=15,
+        future_steps=32,
         base_state_id="train-base-1",
         trajectory_id="traj-1",
         target_type_policy_digest=policy.digest,
@@ -1328,7 +1328,7 @@ def _canonical_event_identity_inputs() -> dict[str, object]:
             target_motion_shard_module.compute_footprint_spec_digest(spec)
         ),
         "target_type_policy_digest": "3" * 32,
-        "layout_version": "event_target_motion_history8_future15_v1",
+        "layout_version": "event_target_motion_history8_future32_v2",
     }
 
 
@@ -1501,7 +1501,7 @@ def test_mother_event_lineage_is_motion_invariant_while_world_and_record_identit
 
     history = np.zeros((8, 3), dtype=np.float32)
     current = history[7].copy()
-    future = np.zeros((15, 3), dtype=np.float32)
+    future = np.zeros((32, 3), dtype=np.float32)
     variant_history = history.copy()
     variant_history[0, 0] = np.float32(0.25)
     variant_future = future.copy()
@@ -2026,9 +2026,9 @@ def test_generate_event_preserves_context_and_is_elementwise_deterministic() -> 
     assert event.target_visibility_history.dtype == np.bool_
     assert repeated.target_visibility_history.shape == (8,)
     assert repeated.target_visibility_history.dtype == np.bool_
-    assert event.visibility_sequence.shape == (16,)
+    assert event.visibility_sequence.shape == (33,)
     assert event.visibility_sequence.dtype == np.bool_
-    assert repeated.visibility_sequence.shape == (16,)
+    assert repeated.visibility_sequence.shape == (33,)
     assert repeated.visibility_sequence.dtype == np.bool_
     assert not bool(event.target_visibility_history[7])
     assert not bool(event.visibility_sequence[0])
@@ -2482,7 +2482,7 @@ def test_environment_occluder_receives_complete_robot_and_context_sweeps(
             )
         ),
     )
-    assert captured[0][3].poses.shape == (23, 3)
+    assert captured[0][3].poses.shape == (40, 3)
 
 
 def test_generate_events_aborts_on_unexpected_orchestration_exception(
@@ -2559,7 +2559,7 @@ def test_target_physics_rejects_collision_only_in_context_history() -> None:
     context_history[3] = target.history_poses[3]
     context_future = np.tile(
         np.asarray([-6.0, -6.0, 0.0], dtype=np.float32),
-        (15, 1),
+        (32, 1),
     )
     history_only_collision = replace(
         oracle,
@@ -3208,7 +3208,7 @@ def test_rectangle_target_uses_yaw_when_checking_static_collision() -> None:
     end_pose = np.asarray(
         [*target_center, contact_yaw + np.deg2rad(6.75)], dtype=np.float32
     )
-    poses = np.tile(end_pose, (23, 1)).astype(np.float32)
+    poses = np.tile(end_pose, (40, 1)).astype(np.float32)
     poses[0] = start_pose
     target = replace(
         _valid_physics_target(),

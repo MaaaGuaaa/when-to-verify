@@ -1,11 +1,19 @@
-# SOP05R lightweight TEB implementation state
+# SOP05R long-horizon lightweight TEB implementation state
 
-_Current status, frozen decisions, evidence, risks, and next action as of 2026-07-25._
+_Current status, frozen decisions, evidence, risks, and next action as of 2026-07-26._
 
 ---
 
+> ⚠️ **Historical status snapshot:** This file records the documentation-only boundary
+> before the later M1–M6 Long40 implementation work. For the current operational handoff,
+> actual test results, artifacts, and remaining M7–M9 gaps, read
+> [HANDOFF.md](./HANDOFF.md). The shared time authority remains
+> [Long40 system contract](../../../long40_system_contract.md).
+
 ## 📚 Document set
 
+- [Current operational handoff](./HANDOFF.md)
+- [Long40 system contract](../../../long40_system_contract.md)
 - [Full specification](./full-spec.md)
 - [Contracts](./contracts.md)
 - [Milestones](./milestones.md)
@@ -19,17 +27,18 @@ test, or artifact evidence.
 
 | Area | Status | Evidence |
 | --- | --- | --- |
-| v2 method decisions | complete | dual-horizon correction in this document set |
-| v2 immutable contracts | M1 corrected | 80 focused contract/CLI tests pass; digests recorded below |
-| v2 code | M2 complete; M3 in progress | one straight-band candidate, fixed updates, full objective-cost diagnostics, and focused M3 suite pass; broader integration remains pending |
-| current SOP05R v1 code | substantial uncommitted implementation | current working tree |
-| v1 focused tests | not re-run in this documentation task | prior implementation files only |
-| v1 real smoke | failed scientific gate | 12-base diagnostic below |
-| v2 10-template gate | not run | depends on M1–M6 |
-| v2 100-event audit | not run | requires user approval after fixture gate |
-| v2 1,000-event smoke | not run | requires user approval after visual gate |
+| cross-SOP long40 time contract | documentation frozen | `docs/long40_system_contract.md` |
+| v3 long40 method decisions | documentation frozen | B2 contract correction in this document set |
+| implementation conformance | not assessed by this documentation task | no implementation-complete claim |
+| pre-long40 code/artifacts | archival only | cannot feed current production collections |
+| focused tests | not run for this documentation-only change | no new test evidence claimed |
+| historical v1 real smoke | failed scientific gate | 12-base diagnostic below |
+| v3 10-template gate | not run | depends on long40 M1–M6 migration |
+| v3 100-event audit | not run | requires user approval after fixture gate |
+| v3 1,000-event smoke | not run | requires user approval after visual gate |
 
-No v2 completion claim is valid at this state.
+No implementation-completion claim is valid at this state. Earlier 15-step tests do not
+satisfy the long40 contracts, and this documentation update does not modify code.
 
 ## 🔍 Existing v1 implementation
 
@@ -88,7 +97,7 @@ The evidence is stored in the temporary diagnostic:
 .tmp/agent/outputs/20260725-1252-sop05r-revealability-debug.json
 ```
 
-It may be deleted after the v2 implementation has permanent regression coverage. It is
+It may be deleted after the v3 implementation has permanent regression coverage. It is
 not a formal artifact and must not become an implementation dependency.
 
 ## ✅ Frozen decisions
@@ -111,29 +120,31 @@ The following decisions came from the user discussion and must not be silently r
     when anchor times otherwise cannot align.
 11. Define fast visibility using synchronized robot-human centerline intersection with
     rectangle/circle occluders.
-12. Initial visibility means the start centerline is clear.
-13. One intermediate blocked synchronized sample is sufficient to establish occlusion;
-    consecutive hidden frames are not required.
+12. The primary eight-frame decision history contains at least four centerline-visible
+    samples; the first frame and transition index are not fixed.
+13. The decision frame itself is a synchronized blocked sample; consecutive hidden
+    frames are not required.
 14. Small centerline-versus-footprint visibility disagreement is acceptable but must be
     measured.
-15. A verification decision must use a blocked witness with enough pre-collision action,
-    braking, and replanning margin.
+15. A verification decision must use a blocked witness with the frozen `1.2 s`
+    verification-action plus braking margin. Replanning completion is not required
+    inside that margin.
 16. Verification actions re-use the same lightweight TEB and the same world-frame goal.
 17. Post-action replanning may use a target only when that target has become
     deployment-observable; Oracle future remains forbidden.
 18. Active revealability must arise from geometry and executable actions, not relaxed
     label thresholds.
-19. Use a dual horizon: a bounded five-second full planner route for reachability,
-    collision anchoring, and provenance, while retaining the existing three-second,
-    15-step model/data/label horizon.
+19. Use the B2 dual timeline: a bounded eight-second full planner route for reachability,
+    collision anchoring, and provenance, and a decision-relative 6.4-second,
+    32-step model/data/label horizon.
 20. M3 returns `PlannedTebRoute`; M6 alone derives the decision-relative
     `LocalTrajectory` and query maps.
-21. The three-second decision suffix is not required to reach the goal. Goal reachability
-    is an invariant of the full route. A post-arrival stationary hold is allowed but is
-    not a separately required M3 acceptance condition.
-22. The accepted first collision must remain inside the decision-relative three-second
-    suffix. The longer route extends task completion after collision; it does not extend
-    the model or collision-label horizon.
+21. Goal arrival does not gate the 6.4-second decision suffix; M6 samples the same frozen
+    route throughout that suffix.
+22. The collision authority scans the complete 32-step future rather than truncating at
+    three seconds. Accepted first collisions satisfy
+    `1.2 s <= t_collision - t_decision <= 6.4 s`; the final `6.2–6.4 s` interval is
+    eligible when continuous swept-footprint interpolation proves contact.
 23. Static occluders use a nonzero left/right lateral offset and only shallowly intrude
     into the straight-driving safety corridor. The frozen direct-corridor intrusion range
     is `[0.05, 0.15] m`; a centerline-centered obstruction is not the default template.
@@ -155,19 +166,35 @@ The following decisions came from the user discussion and must not be silently r
     `±[15°, 45°]` relative to the start-goal direction. It recalculates the lateral
     placement after rotation with fixed-iteration bisection, preserving the frozen
     shallow direct-corridor intrusion; circles remain unoriented.
+29. M5 uses a seed-derived finite first-fit order over route anchors, temporal scales,
+    and coarse rotations. It accepts the first candidate that satisfies every gate;
+    it does not score, refine, or continue searching after acceptance.
+30. Long40 sample index `7` is the decision time, not the route start. Indices `0..7`
+    form the eight-frame history/current layout; robot history is formed by joining the
+    source `BaseState` history to the M4 route prefix. M6 publishes the complete
+    40-sample target record and the `LocalTrajectory`/query-map future for indices
+    `8..39`, exactly 32 endpoints.
+31. Pre-long40 Schema `3.0.0` artifacts remain version-isolated. The v3 branch uses
+    Schema `4.0.0` and layout `history8_current7_future32_v1`; implicit conversion is
+    forbidden.
+32. M4 goal distances move to `[4.0, 4.5] m`, M3 uses 21 band poses and 20 bounded
+    intervals, and the uniform route has 40 endpoints through `8.0 s`.
+33. Absolute encounter-time collision bounds are removed. Collision timing is
+    decision-relative, and all 32 future intervals are eligible.
+34. Verification actions consume time inside the same decision-relative 6.4-second
+    target horizon; they do not create an additional 6.4 seconds of hidden target future.
 
 ## 🔁 Supersession boundary
 
-After M1 is approved:
+Under the unified long40 documentation authority:
 
-- `docs/superpowers/plans/2026-07-24-sop05r-obstacle-first.md` remains historical v1
-  implementation context
-- `docs/sop05r_obstacle_first_event_generation.md` remains the earlier complete SOP05R
-  design record
-- this five-file directory becomes the v2 implementation authority
-- legacy SOP05 behavior remains governed by its existing documents and code
+- dated v1/v2 plans remain historical implementation context only
+- any earlier SOP05R design record using 23 samples or 15 future steps is superseded
+- this five-file directory becomes the v3 implementation authority
+- `docs/long40_system_contract.md` governs the shared SOP-03–16 time layout
 
-No old document should be deleted as part of v2 implementation.
+Historical documents need not be deleted, but they must carry an archival notice and
+cannot override the current contract.
 
 ## ⚠️ Known implementation risks
 
@@ -188,16 +215,16 @@ initializations.
 ### Dual-horizon seam
 
 The full route is expressed in the source world timeline, while model inputs and labels
-are expressed in a decision-relative three-second timeline. M6 must sample exactly 15
-future endpoints after the selected witness, transform them into the decision frame, and
-authenticate their relationship to the full route. The first collision must be inside
-this suffix, but requiring the suffix also to reach the goal would recreate the original
-reachability conflict.
+are expressed in a decision-relative 6.4-second timeline. M6 must sample exactly 32
+future endpoints from the fixed index-7 decision time, transform them into the decision
+frame, and authenticate their relationship to the 40-endpoint full route. The first
+collision may occur in any future interval subject to the lower margin. Goal arrival does
+not add a suffix-horizon rejection.
 
 ### Circle visibility approximation
 
 A centerline can intersect a tree trunk while part of the human footprint remains
-visible. This disagreement is accepted by the v2 generation contract, but M10 must expose
+visible. This disagreement is accepted by the v3 generation contract, but M10 must expose
 its rate and examples.
 
 ### Current dirty working tree
@@ -212,11 +239,15 @@ plus unrelated documentation changes/deletions. Implementation must:
 
 ## ▶️ Next action
 
-Continue with M5 anchored human placement. M4 now produces target-blind, deterministic
-goal/occluder templates and valid nominal routes; downstream placement must consume only
-those accepted templates and may not alter their frozen goal or static geometry.
+Stop at the documentation boundary. Before any implementation work resumes, obtain an
+explicit user request to audit code against the unified contract. A later implementation
+task must begin with a gap report; it must not infer completion from these documents or
+silently continue the interrupted M7–M10 work.
 
-## 📝 Decision update: dual horizon
+## 📝 Superseded decision: five-second/three-second dual horizon
+
+This record is retained as history. It is superseded by the B2 long40 decision below and
+must not guide new implementation.
 
 ```text
 decision: separate planner and model horizons
@@ -235,6 +266,40 @@ reason: a three-second task route cannot reliably both bypass the represented oc
   and reach the configured goal under the frozen kinematic limits
 publication status: no v2 artifacts published; pre-publication correction is allowed
 required follow-up: rerun M1 before M3
+```
+
+## 📝 Decision update: B2 long40 horizon
+
+```text
+decision: extend both robot and human futures; keep distinct source and decision timelines
+date: 2026-07-25
+planner domain:
+  band poses: 21
+  interval durations: 20, each in [0.1, 0.4] s
+  initial interval: 0.25 s
+  maximum route time: 8.0 s
+  uniform route endpoints: 40 at 0.2 s
+  post-goal suffix: sampled from the same frozen route; no M6 horizon gate
+human/model/data/label domain:
+  total samples: 40
+  history/current: indices 0..7; current index 7
+  future endpoints: indices 8..39, 32 at 0.2 s
+  future horizon: 6.4 s
+  schema: 4.0.0
+collision domain:
+  1.2 s <= t_collision - t_decision <= 6.4 s
+  all 32 future intervals scanned, including the final interval
+  positive mothers retain the 1.2 s lower margin
+  absolute encounter-time collision range removed
+goal/template domain:
+  goal distance: [4.0, 4.5] m
+  collision route path fraction: [0.20, 0.95]
+  goal arrival: collision anchor < t_goal <= 8.0 s
+verification domain:
+  actions consume time within the same decision-relative 6.4 s horizon
+  no second post-action 6.4 s target future is synthesized
+publication status: no completed v2 collection published; semantic version bump required
+required follow-up: migrate M1-M8 code/tests before M9-M10 and release gates
 ```
 
 ## 📝 Decision update: shallow one-sided obstruction
@@ -327,7 +392,7 @@ test config digest: 5c96c0725511c4f4e8d0a4940868724ed7d19b56f8f4673512780e2a65b0
 semantic decisions changed:
   - direct-corridor intrusion is frozen to [0.05, 0.15] m
   - template occluders use nonzero lateral offsets, not centered placements
-  - initialization_ids is frozen to [straight]
+  - initialization_ids is frozen to [straight, bypass_left, bypass_right]
 remaining blocker: M3 full optimizer acceptance is incomplete
 next milestone: M3
 ```
@@ -381,6 +446,39 @@ semantic decisions changed:
   - rectangle and circle templates are enlarged
 remaining blocker: M3 broader route and integration evidence is incomplete
 next milestone: M3
+```
+
+## 🧾 Historical evidence: pre-long40 M4–M6 decision-local mother construction
+
+```text
+milestones: M4, M5, M6 focused implementation
+date: 2026-07-25
+changed files:
+  - src/generation/sop05r_teb_templates.py
+  - src/generation/anchored_human_placement.py
+  - src/generation/history_visibility.py
+  - src/generation/sop05r_teb_decision_state.py
+  - src/generation/sop05r_teb_event_sampler.py
+  - tests/test_{sop05r_teb_templates,anchored_human_placement,sop05r_history_visibility,sop05r_teb_decision_state,sop05r_teb_event_sampler}.py
+focused commands:
+  .conda-envs/sop4-risk/bin/python -m pytest -q
+  tests/test_sop05r_teb_contracts.py tests/test_sop05r_teb_templates.py
+  tests/test_sop05r_history_visibility.py tests/test_anchored_human_placement.py
+  tests/test_sop05r_teb_decision_state.py tests/test_sop05r_teb_event_sampler.py
+  .conda-envs/sop4-risk/bin/python -m pytest -q
+  tests/test_collision.py tests/test_query_maps.py
+result: 43 passed; 51 passed
+train config digest: 0afb2f0da4e9343fe181b4afd3b2410ba036d8164b6f9a26df19b7c9d02410a7
+test config digest: 5d35ba76f103e17aa9efdaf623f9adb0aec27fdcbab3d351757341f583d265ca
+semantic decisions changed:
+  - human snippet index 7 is the hidden decision frame
+  - at least four of eight history frames are visible; transition index is not fixed
+  - collision margin is 1.2 s for verification action plus braking, excluding replanning
+  - source history and route prefix are joined, then all event products are rebased into
+    one decision-local frame
+  - M6 published one full route and one exact 15-step suffix with no alternative route
+remaining blocker: this evidence is superseded by v3 long40 contracts and must be rerun
+next milestone: migrate M1-M8 to v3 before any release gate
 ```
 
 ## 📝 State update format

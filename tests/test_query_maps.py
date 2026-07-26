@@ -17,7 +17,7 @@ from src.planning.query_maps import (
     build_local_trajectory,
     build_trajectory_query_maps,
 )
-from src.planning.differential_drive import rollout_constant_control
+from src.planning.differential_drive import integrate_twist, rollout_constant_control
 from src.planning.trajectory_sampler import sample_candidate_rollouts
 from src.utils.config import load_config
 
@@ -205,6 +205,40 @@ def test_full_rotation_sweep_is_not_lost_to_wrapped_endpoint_yaw() -> None:
     assert maps.swept_mask[rotated_tip[0], rotated_tip[1]] == 1.0
 
 
+def test_query_maps_accepts_a_wrapped_differential_drive_endpoint_yaw() -> None:
+    grid = GridSpec(
+        height=41,
+        width=41,
+        history_steps=1,
+        future_steps=1,
+        resolution_m=0.05,
+    )
+    dt_s = 0.2
+    controls = np.asarray([[0.0, 3.0 * np.pi / dt_s]], dtype=ARRAY_DTYPE)
+    poses = np.asarray(
+        [
+            integrate_twist(
+                np.zeros(3, dtype=ARRAY_DTYPE),
+                v=float(controls[0, 0]),
+                omega=float(controls[0, 1]),
+                dt_s=dt_s,
+            )
+        ],
+        dtype=ARRAY_DTYPE,
+    )
+
+    maps = build_trajectory_query_maps(
+        poses,
+        controls,
+        grid=grid,
+        footprint=RectangleFootprint(0.4, 0.05),
+        dt_s=dt_s,
+        braking_deceleration_mps2=1.0,
+    )
+
+    assert maps.swept_mask.any()
+
+
 def test_query_map_future_endpoint_arrivals_span_dt_through_horizon() -> None:
     grid = GridSpec(
         height=81,
@@ -372,8 +406,8 @@ def test_candidate_is_materialized_as_frozen_local_trajectory_contract() -> None
 
     assert isinstance(trajectory, LocalTrajectory)
     assert trajectory.trajectory_id == candidate.trajectory_id
-    assert trajectory.poses.shape == (15, 3)
-    assert trajectory.controls.shape == (15, 2)
+    assert trajectory.poses.shape == (32, 3)
+    assert trajectory.controls.shape == (32, 2)
     for array in (
         trajectory.swept_mask,
         trajectory.tta_map,
@@ -391,9 +425,9 @@ def test_candidate_is_materialized_as_frozen_local_trajectory_contract() -> None
         == "future_endpoints_dt_to_horizon_v1"
     )
     assert trajectory.metadata["first_pose_time_s"] == pytest.approx(0.2)
-    assert trajectory.metadata["last_pose_time_s"] == pytest.approx(3.0)
+    assert trajectory.metadata["last_pose_time_s"] == pytest.approx(6.4)
     assert trajectory.metadata["dt_s"] == pytest.approx(0.2)
-    assert trajectory.metadata["trajectory_steps"] == 15
+    assert trajectory.metadata["trajectory_steps"] == 32
 
 
 def test_tta_is_nondecreasing_along_straight_centerline_direction() -> None:

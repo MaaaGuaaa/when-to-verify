@@ -93,7 +93,7 @@ def test_schema_audit_rejects_conflicting_direct_and_nested_split_digest() -> No
     with pytest.raises(Sop03PublicationError, match="direct split digest"):
         _schema_and_digest(
             {
-                "schema_version": "3.0.0",
+                    "schema_version": "4.0.0",
                 "split_manifest_digest": "wrong",
                 "split_provenance": {"split_manifest_digest": "accepted"},
             },

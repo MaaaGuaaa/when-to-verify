@@ -1,6 +1,6 @@
-# SOP05R lightweight TEB implementation milestones
+# SOP05R long-horizon lightweight TEB implementation milestones
 
-_File-level execution plan for replacing the unapproved SOP05R v1 generator with the v2 lightweight-TEB path._
+_File-level execution plan for replacing the unpublished pre-long40 path with SOP05R v3._
 
 > **For agentic workers:** Use `superpowers:subagent-driven-development` or
 > `superpowers:executing-plans` milestone by milestone. Use TDD, stop at each gate, and
@@ -10,6 +10,7 @@ _File-level execution plan for replacing the unapproved SOP05R v1 generator with
 
 ## 📚 Document set
 
+- [Long40 system contract](../../../long40_system_contract.md)
 - [Full specification](./full-spec.md)
 - [Contracts](./contracts.md)
 - [Milestones](./milestones.md)
@@ -60,26 +61,25 @@ flowchart LR
 
 | Milestone | Deliverable | Depends on | Completion evidence |
 | --- | --- | --- | --- |
-| M1 | immutable v2 versions and config | none | strict config tests |
+| M1 | immutable v3 long40 versions and config | none | strict config tests |
 | M2 | rectangle/circle primitive occluder authority | M1 | analytic/raster geometry tests |
 | M3 | deterministic target-blind full-route TEB | M1, M2 | planner dynamics and oracle-isolation tests |
 | M4 | fixed-start goal/occluder templates | M2, M3 | deterministic template fixture |
 | M5 | anchored human rotation and centerline witness | M2, M4 | placement and visibility tests |
-| M6 | decision binding, 3-second suffix, and one-route mother | M3, M5 | continuous collision mother fixture |
+| M6 | decision binding, 6.4-second suffix, and one-route mother | M3, M5 | continuous collision mother fixture |
 | M7 | trajectory store, run producer, loader, CLI | M6 | strict round-trip and tamper tests |
 | M8 | same-goal post-action TEB replanning | M7 | revealability tests with observed/hidden branches |
-| M9 | explicit SOP06 v2 handoff | M7 | paired-variant and pipeline tests |
+| M9 | explicit SOP06 v3 handoff | M7 | paired-variant and pipeline tests |
 | M10 | visual/statistical gates and completion audit | M8, M9 | 10/100/1,000 evidence ladder |
 
 ## 🏷️ M1 — Freeze versions and configuration
 
 ### Objective
 
-Create an explicit `obstacle_first_teb` contract without changing `legacy` or current
-`obstacle_first` dispatch. Freeze every scientific and bounded-search parameter into one
-canonical digest. Before M3, apply the pre-publication dual-horizon correction: the TEB
-planner returns a bounded full route while Schema `3.0.0` retains its three-second model
-horizon.
+Create the canonical `obstacle_first_teb` long40 contract and make it the only current
+production trajectory layout. Freeze every scientific and bounded-search parameter into
+one canonical digest. The TEB planner returns an eight-second moving route while Schema
+`4.0.0` consumes 32 future endpoints over `6.4 s`.
 
 ### Files
 
@@ -94,49 +94,53 @@ horizon.
 ### Inputs
 
 - [contracts.md](./contracts.md)
-- existing schema `3.0.0`
+- Schema `3.0.0` fixtures used only to prove current-loader rejection
 - existing `configs/base.yaml`
 - existing `configs/verification_actions.yaml`
 
 ### Required implementation
 
-- add the exact v2 version constants from [contracts.md](./contracts.md)
+- add the exact v3 version constants from [contracts.md](./contracts.md)
 - add strict immutable config sections for:
   - typed rectangle, composite L-shape, and circle template families, frozen to
     `0.4/0.4/0.2` weights
   - goal bearings and distances
-  - 20-node TEB band, 19 bounded interval durations, fixed iteration count,
+  - 21-node TEB band, 20 bounded interval durations, fixed iteration count,
     initialization policy, and objective weights
   - `initial_band_dt_s=0.25`, `band_dt_range_s=[0.1, 0.4]`,
-    `maximum_route_time_s=5.0`, and `route_sample_dt_s=0.2`
+    `maximum_route_time_s=8.0`, `route_sample_dt_s=0.2`, and 40 route endpoints
   - kinematic limits, `[0.15, 0.75] m` clearance range, and `0.08 m` bypass
     tracking allowance
-  - anchor path/time ranges
-  - coarse/refined rotation schedule
+  - goal distance range `[4.0, 4.5] m`, collision route path-fraction range
+    `[0.20, 0.95]`, and decision-relative time constraints
+  - finite coarse-angle schedule and seed-derived first-fit traversal
   - finite temporal scales with spatial scale fixed to `1.0`
   - centerline intersection epsilon
   - initial-visible/initially-hidden mixture
   - decision, braking, and replanning margins
   - run/publication versions and finite rejection vocabulary
 - require strict key equality, finite numeric values, ordered ranges, and canonical JSON
-- make `--generator-mode obstacle_first_teb` require the v2 config and verification-action config
-- reject v1 config versions in the new mode and v2 versions in old modes
-- advance the pre-publication planner component identity to `lightweight_teb_planner_v2`
-- leave `configs/base.yaml`, `future_steps=15`, `future_dt_s=0.2`, and Schema `3.0.0`
-  unchanged
+- make `--generator-mode obstacle_first_teb` require the v3 config and
+  verification-action config
+- reject v1/v2 config versions and every 23-sample/15-step artifact in current modes
+- advance all unpublished v2 semantic identities to the exact v3 identities in
+  [contracts.md](./contracts.md)
+- freeze `history_steps=8`, `current_index=7`, `future_steps=32`,
+  `future_dt_s=0.2`, `future_horizon_s=6.4`, and Schema `4.0.0` in the v3 branch
+- keep historical loaders outside current dispatch; do not use them for compatibility
 
 ### Outputs
 
 - normalized immutable `Sop05rTebConfig`
 - config semantic digest
 - mode-specific CLI request with no generation side effect during preflight
-- explicit five-second route and three-second model-horizon contract
+- explicit eight-second route and 6.4-second model-horizon contract
 
 ### TDD checkpoint
 
 1. Add tests for every new required/unknown key and semantic version.
 2. Add semantic tests for interval bounds, initial interval membership, maximum route
-   support, and an integral 25-endpoint route grid.
+   support, and integral 40-route/32-suffix endpoint grids.
 3. Observe focused RED failures.
 4. Implement strict normalization.
 5. Run M1 commands from [acceptance.md](./acceptance.md).
@@ -161,7 +165,7 @@ trunks/columns.
 
 - `GridSpec`
 - existing `RectangleFootprint` and `CircleFootprint`
-- v2 occluder config nodes
+- v3 occluder config nodes
 
 ### Required implementation
 
@@ -193,7 +197,7 @@ trunks/columns.
 ### Objective
 
 Return one deterministic, target-blind, dynamically feasible route from the fixed source
-state to the fixed goal within the five-second planning domain.
+state to the fixed goal within the eight-second planning domain.
 
 ### Files
 
@@ -214,9 +218,9 @@ state to the fixed goal within the five-second planning domain.
 
 ### Required implementation
 
-- build one deterministic straight initialization band; use the nonzero occluder lateral
-  offset to provide the unique obstacle-repulsion direction
-- optimize 20-pose internal bands and 19 bounded interval durations with fixed-iteration
+- build deterministic straight, single-waypoint left-bypass, and single-waypoint
+  right-bypass initialization bands; optimize all three and select by frozen task cost
+- optimize 21-pose internal bands and 20 bounded interval durations with fixed-iteration
   NumPy updates
 - include path-length, time, smoothness, obstacle hinge, nonholonomic, velocity,
   acceleration, goal-heading, and initial-control terms
@@ -225,7 +229,7 @@ state to the fixed goal within the five-second planning domain.
 - perform deterministic dense sampled static-collision validation after optimization;
   the frozen clearance margin is the conservative safety mechanism, not analytic
   continuous-time collision solving
-- resample the accepted continuous route at `[0.2, ..., 5.0] s` into 25 endpoint poses
+- resample the accepted continuous route at `[0.2, ..., 8.0] s` into 40 endpoint poses
   and controls
 - reach the exact goal within the configured pose and heading tolerances; a separately
   verified stationary hold after arrival is not an M3 acceptance requirement
@@ -237,7 +241,7 @@ state to the fixed goal within the five-second planning domain.
 
 - `LightweightTebResult`
 - zero or one public `PlannedTebRoute`
-- 20 band poses, 19 interval durations, and 25 uniformly sampled endpoint states
+- 21 band poses, 20 interval durations, and 40 uniformly sampled endpoint states
 - per-initialization cost and rejection diagnostics
 
 ### TDD checkpoint
@@ -245,8 +249,8 @@ state to the fixed goal within the five-second planning domain.
 1. Assert request fields contain no target/oracle/collision/label channel.
 2. Cover unobstructed, rectangle bypass, composite L-shape bypass, circle bypass,
    infeasible, and symmetric cases.
-3. Assert exact implicit start, fixed goal, bounded interval durations, and deterministic
-   goal hold.
+3. Assert exact implicit start, fixed goal, bounded interval durations, and a finite,
+   deterministic `goal_arrival_time_s` for later M6 binding.
 4. Assert initial-control continuity, dynamics, represented clearance, and continuous
    static-collision freedom on the full route.
 5. Assert repeated calls are byte-identical.
@@ -262,7 +266,7 @@ Generate high-yield static planning tasks without placing a provisional human ta
 
 - Create `src/generation/sop05r_teb_templates.py`
 - Create `tests/test_sop05r_teb_templates.py`
-- Leave `src/generation/obstacle_first_templates.py` as the v1 implementation
+- Treat `src/generation/obstacle_first_templates.py` as archival v1 code, outside current dispatch
 
 ### Inputs
 
@@ -282,8 +286,10 @@ Generate high-yield static planning tasks without placing a provisional human ta
   start-goal direction from the frozen `±[15°, 45°]` range, then recompute lateral
   offset so rotation preserves the direct-corridor intrusion requirement
 - require the straight-driving safety-corridor intrusion
-  `minimum_clearance - direct_line_clearance_m` to lie in the frozen
-  `[0.05, 0.15] m` range
+  `minimum_clearance - direct_line_clearance_m` to be at least the frozen
+  `0.15 m` minimum
+- require at least one static primitive to analytically intersect the direct start-goal
+  centerline, then retain the largest nonzero lateral offset satisfying both conditions
 - reject source-static, robot-history, protected-context, and bounds overlaps
 - invoke M3 without snippets or target data
 - retain only templates with one valid route in the configured clearance and length ranges
@@ -311,20 +317,21 @@ Generate high-yield static planning tasks without placing a provisional human ta
 
 ### Objective
 
-Map one internal human snippet sample to one full-route collision point, rotate the full
-trajectory around that fixed point, and find a valid centerline-occlusion witness.
+Map one of the 32 future samples from a long40 human trajectory to one full-route
+collision point, rotate the complete 8-history-plus-32-future trajectory around that
+fixed point, and find a valid centerline-occlusion witness.
 
 ### Files
 
 - Create `src/generation/anchored_human_placement.py`
 - Create `tests/test_anchored_human_placement.py`
-- Modify `src/generation/history_visibility.py` only to add a separate v2 assessment
+- Modify `src/generation/history_visibility.py` only to add a separate v3 assessment
 - Modify `tests/test_sop05r_history_visibility.py`
 
 ### Inputs
 
 - M4 task template and nominal full route
-- split-local human MotionSnippets
+- split-local `history8_current7_future32_v1` human trajectories
 - source context motion for collision rejection
 - route-anchor ranges
 - rotation and temporal-scale schedule
@@ -332,8 +339,11 @@ trajectory around that fixed point, and find a valid centerline-occlusion witnes
 
 ### Required implementation
 
-- shortlist internal route samples by collision time, path fraction, and remaining margin
-- shortlist internal snippet anchors by time support, displacement, speed, and acceleration
+- shortlist route samples by path fraction and support through
+  `t_decision + 6.4 s`; do not use the old absolute encounter-time range
+- derive each human anchor from the route endpoint's shared Long40 index `8..39`;
+  all 32 future samples, including index `39`, enter collision search, after which the
+  `1.2 s` decision-margin gate rejects too-early first collisions
 - compute translation from the anchor equality
 - vectorize all coarse rigid rotations as `[angle, sample, xy]`
 - keep `spatial_scale == 1.0`
@@ -342,15 +352,17 @@ trajectory around that fixed point, and find a valid centerline-occlusion witnes
 - compute synchronized centerline intersection for all candidate times
 - accept one blocked witness for the primary relaxed occlusion rule
 - preserve a distinct initially-hidden stratum when requested
-- refine the best configured number of coarse angles and select by stable visibility,
-  clearance, crossing-angle, and minimal temporal-transform score
+- enumerate route anchors, temporal scales, and coarse angles in a seed-derived finite
+  order; accept the first candidate that passes every frozen gate, without ranking,
+  local refinement, or continued search
 - return complete candidate and rejection evidence
 
 ### Outputs
 
 - `AnchoredHumanPlacement`
 - `CenterlineOcclusionWitness`
-- start-visibility evidence
+- eight-frame visibility evidence with at least four visible samples
+- a 40-sample transformed target trajectory with current index `7` and 32 future samples
 - requested/observed visibility stratum
 - bounded-search counters
 
@@ -377,32 +389,42 @@ valid hidden witness and whose single nominal plan collides continuously with th
 - Create `tests/test_sop05r_teb_decision_state.py`
 - Reuse collision authority from `src/generation/sop05r_event_sampler.py` only after its
   behavior is covered by regression tests
-- Reuse `src/planning/query_maps.py` without changing its three-second semantics
+- Modify `src/planning/query_maps.py` to emit the canonical 32-step Schema `4.0.0` maps;
+  current production behavior must not retain a 15-step branch
 
 ### Inputs
 
 - M4 task template and full nominal `PlannedTebRoute`
 - M5 anchored placement and witness
 - source BaseState and OracleContext
-- base and v2 generator configs
+- base and v3 generator configs
 - seed
 
 ### Required implementation
 
-- choose a witness that leaves action, braking, and replanning margin
-- derive the decision pose/control and observed history ending at that witness
+- choose a hidden witness whose eight-frame history contains at least four visible frames
+- leave the frozen `1.2 s` verification-action plus braking margin before collision;
+  replanning completion is not an acceptance requirement
+- bind human snippet index `7` to the decision witness
+- derive the decision pose/control and observed history by joining source `BaseState`
+  history to the M4 route prefix
+- rebase robot, target, source context, static occupancy, and occluders into the
+  decision-local frame and emit the concrete decision `BaseState`
 - retain source-to-decision route-prefix provenance and source base identity
-- sample exactly 15 future endpoints at `0.2 s` after the decision witness
-- deterministically hold the goal when a suffix sample is after full-route arrival
-- transform the suffix into the decision frame and build the existing query maps
+- sample exactly 32 future endpoints at `0.2 s` after the decision witness
+- require a pre-goal collision anchor but do not apply a goal-arrival suffix horizon gate
+  padding
+- transform the suffix into the decision frame and build Schema `4.0.0` query maps
 - bind the nominal `LocalTrajectory` suffix to the exact same world-frame goal and
   full-route task cost
-- require the continuous first collision to occur inside that three-second suffix
+- require `1.2 s <= t_collision - t_decision <= 6.4 s`
+- accept collision in the final `6.2–6.4 s` future interval when continuous
+  swept-footprint interpolation proves it; reject discrete-only endpoint equality
 - compute continuous robot-human collision and reject discrete-only/endpoint-only contact
 - reject target-static, target-occluder, target-context, and premature robot contact
-- remove the v1 same-goal-alternative gate from this v2 path
+- remove the v1 same-goal-alternative gate from this v3 path
 - construct `GeneratedEvent`, `OracleWorld`, target-motion record, and one-plan
-  two-horizon trajectory record with complete v2 metadata
+  dual-timeline trajectory record with complete v3 metadata
 - bind event/world identities to versions, goal, occluders, route, anchor, rotation,
   witness, collision, source identity, split, config digest, and seed
 
@@ -410,7 +432,7 @@ valid hidden witness and whose single nominal plan collides continuously with th
 
 - `Sop05rTebMotherCandidate`
 - one verification-ready `GeneratedEvent`
-- one `Sop05rTebTrajectoryRecord` containing the full route and three-second suffix
+- one `Sop05rTebTrajectoryRecord` containing the full route and 6.4-second suffix
 - continuous collision and decision-state evidence
 
 ### TDD checkpoint
@@ -419,17 +441,18 @@ valid hidden witness and whose single nominal plan collides continuously with th
 2. Assert decision time equals a persisted blocked witness.
 3. Assert the full route reaches the same goal and has continuous collision after
    decision.
-4. Assert the suffix has exactly 15 endpoints, exact query maps, and contains the first
-   collision; do not require the suffix itself to reach the goal.
+4. Assert the suffix has exactly 32 endpoints, exact Schema `4.0.0` query maps, and
+   contains the first collision; include a regression for the final `6.2–6.4 s`
+   future interval.
 5. Assert no alternative route is required or serialized.
 6. Assert deterministic event/world IDs and complete provenance.
 
-## 📦 M7 — Publish, reload, and dispatch v2 collections
+## 📦 M7 — Publish, reload, and dispatch v3 collections
 
 ### Objective
 
-Publish v2 mother events and single-plan trajectory records atomically with strict
-independent identity and no v1 ambiguity.
+Publish v3 mother events and single-plan trajectory records atomically with strict
+independent identity and no v1/v2 ambiguity.
 
 ### Files
 
@@ -446,7 +469,7 @@ independent identity and no v1 ambiguity.
 
 - M6 accepted candidates
 - authenticated SOP03 source evidence
-- v2 configs and verification-action snapshot
+- v3 configs and verification-action snapshot
 - run quota, split, seed, worker count, and output directory
 
 ### Required implementation
@@ -456,17 +479,17 @@ independent identity and no v1 ambiguity.
   deficits
 - publish canonical JSON and deterministic NPZ without pickle
 - persist every M4–M6 denominator and stable rejection reason
-- persist the variable-time band, five-second uniform full route, and three-second
-  decision-relative suffix as distinct authenticated arrays
+- persist the 21-pose variable-time band, eight-second/40-endpoint uniform full route,
+  and 6.4-second/32-endpoint decision-relative suffix as distinct authenticated arrays
 - bind array dtype, shape, bytes, semantic digests, and outer checksums
 - strict self-reload before atomic no-overwrite rename
 - write a completion marker only when every requested quota is met
-- reject v1 stores/manifests in the v2 loader
-- preserve old CLI modes byte-for-byte outside explicit dispatch
+- reject v1 and pre-long40 v2 stores/manifests in the v3 loader
+- prevent archival CLI modes from writing or joining current long40 collections
 
 ### Outputs
 
-- versioned v2 output directory
+- versioned v3 output directory
 - manifest, generation summary, event rows, worlds, target motion, full routes, nominal
   suffix trajectories, checksums, and conditional completion marker
 
@@ -482,7 +505,7 @@ independent identity and no v1 ambiguity.
 ### Objective
 
 Evaluate moving actions and matched waits from the hidden decision state, then call the
-same five-second full-route TEB engine with only deployment-observed dynamic information.
+same eight-second full-route TEB engine with only deployment-observed dynamic information.
 
 ### Files
 
@@ -509,7 +532,8 @@ same five-second full-route TEB engine with only deployment-observed dynamic inf
 - use `ObservedTebRequest` only when the target has actually been revealed
 - call `StaticTebRequest` semantics when it remains hidden
 - retain the exact same goal, route horizon, and task-cost normalization
-- keep model/risk evaluation on the unchanged three-second post-action window
+- keep model/risk evaluation on the original decision-relative 6.4-second window; an
+  action consumes part of this window and does not create target motion beyond sample 39
 - compute realized hidden-world loss only after route generation
 - keep stop out of active moving-action counts
 - persist per-action visibility, replanning, feasibility, and value evidence
@@ -531,8 +555,8 @@ same five-second full-route TEB engine with only deployment-observed dynamic inf
 
 ### Objective
 
-Allow SOP06 consumers to use v2 single-route events without changing legacy or v1
-pair semantics.
+Allow SOP06 consumers to use v3 long40 single-route events and reject every v1,
+pre-long40 v2, or 15-step handoff in the current production path.
 
 ### Files
 
@@ -543,30 +567,31 @@ pair semantics.
 
 ### Inputs
 
-- strict M7 v2 loader output
-- v2 nominal trajectory store
+- strict M7 v3 loader output
+- v3 nominal trajectory store
 - paired-variant config
 
 ### Required implementation
 
-- dispatch on exact v2 generator and collection versions
+- dispatch on exact v3 generator, schema, layout, and collection versions
 - require exactly one nominal plan and exact goal binding
-- require both the authenticated full route and its decision-relative nominal suffix
+- require both the authenticated 40-endpoint full route and its decision-relative
+  32-endpoint nominal suffix
 - preserve source/decision identities and target motion provenance
 - create target-present and target-removed variants without changing static geometry,
   route, goal, source context, or observed prefix
-- reject requests for v1 alternative route IDs in the v2 branch
-- keep legacy and v1 branches unchanged
+- reject requests for v1 alternative route IDs in the v3 branch
+- keep archival branches outside current dispatch and fail closed on mixed artifacts
 
 ### Outputs
 
-- authenticated paired variants and SOP06 reports for v2 events
+- authenticated paired variants and SOP06 reports for v3 events
 - explicit compatibility errors for mixed artifacts
 
 ### TDD checkpoint
 
-1. Cover one-route v2 pair construction and target-only removal.
-2. Cover v1/v2 mixed-store rejection.
+1. Cover one-route v3 pair construction and target-only removal.
+2. Cover v1/v2/v3 mixed-store rejection.
 3. Run all paired and SOP06 focused tests.
 
 ## 🧪 M10 — Add audits and execute release gates
@@ -597,9 +622,9 @@ collision, revealability, efficiency, and reproducibility.
 ### Required implementation
 
 - recompute every denominator rather than trusting summary values
-- render fixed-scale layers for source start, goal, shape, full route, three-second
-  decision suffix, human trajectory, anchor, occlusion witness, decision point, action
-  traces, and first visibility
+- render fixed-scale layers for source start, goal, shape, eight-second full route,
+  6.4-second decision suffix, 40-sample human trajectory, anchor, occlusion witness,
+  decision point, action traces, and first visibility
 - compare centerline visibility with footprint raycast as an audit-only disagreement metric
 - bind source run IDs, checksums, config digest, and sample IDs
 - refuse audit completion when source collection is incomplete or tampered

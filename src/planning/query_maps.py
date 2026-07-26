@@ -19,6 +19,7 @@ from src.geometry import (
     RectangleFootprint,
     inflate_footprint,
     rasterize_footprint,
+    wrap_angle,
     world_to_grid,
 )
 
@@ -39,6 +40,10 @@ class TrajectoryQueryMaps:
     tta_map: np.ndarray
     braking_map: np.ndarray
     centerline_map: np.ndarray
+
+
+class TrajectoryDynamicsError(ValueError):
+    """Raised when trajectory endpoints disagree with their controls."""
 
 
 def _footprint_sweep_radius(footprint: Footprint) -> float:
@@ -107,10 +112,12 @@ def _densify_trajectory(
             )
             speeds.append(speed)
         cumulative_distance += interval_path_distance
-        if not np.allclose(
-            dense_poses[-1], end, rtol=0.0, atol=1e-5
+        endpoint = dense_poses[-1]
+        if (
+            not np.allclose(endpoint[:2], end[:2], rtol=0.0, atol=1e-5)
+            or abs(float(wrap_angle(endpoint[2] - end[2]))) > 1e-5
         ):
-            raise ValueError(
+            raise TrajectoryDynamicsError(
                 "poses and controls violate differential-drive interval dynamics"
             )
     return (

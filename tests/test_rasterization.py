@@ -15,6 +15,7 @@ from src.geometry.rasterization import (
     rasterize_footprint_sweep,
     world_to_grid,
 )
+from src.geometry.static_occluders import CircleOccluder, rasterize_occluder
 from src.geometry.footprints import (
     CircleFootprint,
     RectangleFootprint,
@@ -172,6 +173,24 @@ def test_circle_rasterization_conservatively_includes_cells_touched_away_from_ce
     np.testing.assert_array_equal(mask, expected)
     assert mask.shape == (square_grid.height, square_grid.width)
     assert mask.dtype == np.bool_
+
+
+def test_typed_circle_occluder_rasterization_matches_shared_grid_authority(
+    square_grid: GridSpec,
+) -> None:
+    occluder = CircleOccluder(
+        "tree-1",
+        "tree_trunk",
+        np.asarray([0.0, 0.0], dtype=np.float64),
+        0.5,
+    )
+
+    np.testing.assert_array_equal(
+        rasterize_occluder(occluder, square_grid),
+        rasterize_footprint(
+            CircleFootprint(0.5), [0.0, 0.0, 0.0], square_grid
+        ),
+    )
 
 
 def test_rotated_rectangle_rasterization_uses_closed_cell_square_intersection(

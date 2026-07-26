@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = "3.0.0"
+SCHEMA_VERSION = "4.0.0"
 
 # Every serialized future pose uses endpoint semantics.  The current pose q0 is
 # an integration seed only; array index k stores q_(k+1) at (k+1) * future_dt.

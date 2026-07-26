@@ -11,6 +11,10 @@ from src.geometry.collision import (
     trajectory_signed_clearances,
 )
 from src.geometry.footprints import CircleFootprint, RectangleFootprint
+from src.geometry.static_occluders import (
+    CircleOccluder,
+    segment_intersects_occluder,
+)
 
 
 def test_circle_circle_clearance_matches_analytic_toy_result_and_is_symmetric():
@@ -160,6 +164,22 @@ def test_segments_intersect_covers_crossing_touch_collinear_parallel_and_degener
     start_a, end_a, start_b, end_b, expected
 ):
     assert segments_intersect(start_a, end_a, start_b, end_b) is expected
+
+
+def test_centerline_circle_intersection_is_independent_of_footprint_collisions():
+    circle = CircleOccluder(
+        "tree-1",
+        "tree_trunk",
+        np.asarray([0.0, 0.0], dtype=np.float64),
+        0.5,
+    )
+    starts = np.asarray([[-1.0, 0.0], [-1.0, 1.0]], dtype=np.float64)
+    ends = np.asarray([[1.0, 0.0], [1.0, 1.0]], dtype=np.float64)
+
+    np.testing.assert_array_equal(
+        segment_intersects_occluder(circle, starts, ends, epsilon_m=0.0),
+        [True, False],
+    )
 
 
 def test_segments_intersect_is_stable_at_large_and_small_finite_scales():

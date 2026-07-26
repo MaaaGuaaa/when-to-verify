@@ -1,8 +1,16 @@
-schema_version: "3.0.0"
-generator_algorithm_version: obstacle_first_lightweight_teb_v2
+schema_version: "4.0.0"
+generator_algorithm_version: obstacle_first_lightweight_teb_v8
+
+trajectory:
+  layout_version: history8_current7_future32_v1
+  history_steps: 8
+  current_index: 7
+  future_steps: 32
+  future_dt_s: 0.2
+  future_horizon_s: 6.4
 
 template:
-  version: goal_occluder_template_schedule_v2
+  version: goal_occluder_template_schedule_v3
   occluders:
     - template_id: wall_small
       shape: rectangle
@@ -34,18 +42,18 @@ template:
     circle: 0.2
   relative_yaw_abs_range_deg: [15.0, 45.0]
   goal_bearings_deg: [-30.0, 0.0, 30.0]
-  goal_distances_m: [2.4, 2.8]
+  goal_distances_m: [4.0, 4.5]
 
 planner:
-  version: lightweight_teb_planner_v2
-  band_node_count: 20
+  version: lightweight_teb_planner_v3
+  band_node_count: 21
   max_iterations: 40
-  initialization_ids: [straight]
+  initialization_ids: [straight, bypass_left, bypass_right]
   initial_band_dt_s: 0.25
   band_dt_range_s: [0.1, 0.4]
-  maximum_route_time_s: 5.0
+  maximum_route_time_s: 8.0
   route_sample_dt_s: 0.2
-  goal_position_tolerance_m: 0.25
+  goal_position_tolerance_m: 0.5
   goal_yaw_tolerance_rad: 0.35
   max_linear_acceleration_mps2: 1.0
   max_angular_acceleration_radps2: 2.0
@@ -64,20 +72,17 @@ planner:
     initial_control: 1.0
 
 placement:
-  version: anchored_human_rotation_v1
+  version: anchored_human_half_plane_step_long40_v8
   temporal_scales: [0.9, 1.0, 1.1]
   spatial_scale: 1.0
-  coarse_rotation_step_deg: 10.0
-  refinement_radius_deg: 10.0
-  refinement_step_deg: 2.0
-  refined_candidate_count: 2
-  internal_snippet_anchor_margin_frames: 2
+  occluder_angular_margin_step_deg: 5.0
+  internal_snippet_anchor_margin_frames: 0
 
 occlusion:
-  version: synchronized_centerline_occlusion_v1
+  version: seen_then_occlude_prefix4_v4
   centerline_intersection_epsilon_m: 0.01
-  initial_visible_weight: 0.8
-  initially_hidden_weight: 0.2
+  minimum_visible_history_frames: 4
+  minimum_occluded_history_frames: 1
   minimum_decision_to_collision_margin_s: 1.2
   braking_margin_s: 0.4
   replanning_margin_s: 0.3
@@ -86,9 +91,8 @@ generation:
   max_templates_per_base: 32
   max_target_snippets_per_template: 10
   max_route_anchor_candidates: 8
-  conflict_path_fraction_range: [0.4, 0.7]
-  conflict_time_range_s: [1.0, 2.2]
-  direct_corridor_intrusion_range_m: [0.05, 0.15]
+  collision_route_path_fraction_range: [0.20, 0.95]
+  minimum_direct_corridor_intrusion_m: 0.15
 
 revealability:
   minimum_visibility_lead_s: 0.2
@@ -97,11 +101,11 @@ revealability:
   selection_filtering: true
 
 publication:
-  trajectory_collection_version: sop05r_nominal_trajectory_collection_v2
-  run_producer_version: sop05r_lightweight_teb_generation_run_v1
-  manifest_version: sop05r_lightweight_teb_manifest_v1
-  summary_version: sop05r_lightweight_teb_summary_v1
-  completion_marker_version: sop05r_lightweight_teb_producer_complete_v1
+  trajectory_collection_version: sop05r_nominal_trajectory_collection_v8
+  run_producer_version: sop05r_lightweight_teb_generation_run_v7
+  manifest_version: sop05r_lightweight_teb_manifest_v7
+  summary_version: sop05r_lightweight_teb_summary_v8
+  completion_marker_version: sop05r_lightweight_teb_producer_complete_v7
 
 rejection_reasons:
   - occluder_out_of_bounds
@@ -119,7 +123,8 @@ rejection_reasons:
   - target_context_collision
   - target_speed_limit
   - target_acceleration_limit
-  - initial_visibility_missing
+  - guide_ray_degenerate
+  - half_plane_margin_missing
   - occlusion_witness_missing
   - decision_margin_insufficient
   - no_continuous_collision

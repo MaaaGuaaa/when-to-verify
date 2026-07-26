@@ -29,7 +29,7 @@ from src.generation.sop05_input_adapter import (
 SPLIT_DIGEST = "0123456789abcdef0123456789abcdef"
 SOP03_COMMIT = "1" * 40
 SOP04_COMMIT = "2" * 40
-LAYOUT_VERSION = "history8_current7_future15_v1"
+LAYOUT_VERSION = "history8_current7_future32_v1"
 SOP04_BANK_VERSION = "sop04_audited_bank_v2"
 SOP04_POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
@@ -121,9 +121,9 @@ def _snippet_summary(
         "sample_dt_s": 0.2,
         "history_steps": 8,
         "current_index": 7,
-        "future_steps": 15,
+        "future_steps": 32,
         "motion_snippet_layout_version": (
-            LAYOUT_VERSION if sample_count == 23 else "legacy16_current7_v0"
+            LAYOUT_VERSION if sample_count == 40 else "legacy16_current7_v0"
         ),
         "split_manifest_digest": SPLIT_DIGEST,
         "split_provenance": _split_provenance(),
@@ -141,7 +141,7 @@ def _write_snippet_library(
     directory = root / "snippets" / "train" / object_type
     directory.mkdir(parents=True, exist_ok=True)
     declared = sample_count if declared_sample_count is None else declared_sample_count
-    duration_s = 4.4 if declared == 23 else 3.0
+    duration_s = 7.8 if declared == 40 else 3.0
     count = 0 if object_type == "unknown_dynamic" else 1
     summary = _snippet_summary(
         object_type=object_type,
@@ -149,9 +149,9 @@ def _write_snippet_library(
         sample_count=declared,
         duration_s=duration_s,
     )
-    if declared_sample_count == 23:
+    if declared_sample_count == 40:
         summary["motion_snippet_layout_version"] = LAYOUT_VERSION
-        summary["duration_s"] = 4.4
+        summary["duration_s"] = 7.8
 
     if count:
         positions = np.zeros((1, sample_count, 2), dtype=np.float32)
@@ -202,7 +202,7 @@ def _write_snippet_library(
                 "sample_dt_s": 0.2,
                 "history_steps": 8,
                 "current_index": 7,
-                "future_steps": 15,
+                "future_steps": 32,
                 "motion_snippet_layout_version": summary[
                     "motion_snippet_layout_version"
                 ],
@@ -327,7 +327,7 @@ def _write_sop03_bundle(
     root: Path,
     grid: GridSpec,
     *,
-    snippet_steps: int = 23,
+    snippet_steps: int = 40,
     declared_snippet_steps: int | None = None,
 ) -> Path:
     root.mkdir(parents=True)
@@ -374,7 +374,7 @@ def _write_sop03_bundle(
             "candidate_count": len(state_ids),
             "rejected_count": 0,
             "history_steps": 8,
-            "future_steps": 15,
+            "future_steps": 32,
             "dt_s": 0.2,
             "split_provenance": _split_provenance(),
         },
@@ -440,10 +440,10 @@ def _trajectory_summary(grid: GridSpec) -> dict[str, object]:
         "rejected_count": 0,
         "acceptance_rate": 1.0,
         "array_dtype": "float32",
-        "trajectory_steps": 15,
+        "trajectory_steps": 32,
         "dt_s": 0.2,
         "first_pose_time_s": 0.2,
-        "last_pose_time_s": 3.0,
+        "last_pose_time_s": 6.4,
         "grid_height": grid.height,
         "grid_width": grid.width,
         "grid_resolution_m": grid.resolution_m,
@@ -510,8 +510,8 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
     root.mkdir(parents=True)
     count = 21
     ids = [f"trajectory-{index:02d}" for index in range(count - 1)] + ["stop"]
-    poses = np.zeros((count, 15, 3), dtype=np.float32)
-    controls = np.zeros((count, 15, 2), dtype=np.float32)
+    poses = np.zeros((count, 32, 3), dtype=np.float32)
+    controls = np.zeros((count, 32, 2), dtype=np.float32)
     swept = np.zeros((count, grid.height, grid.width), dtype=np.float32)
     swept[:, 0, 0] = 1.0
     tta = np.full_like(swept, -1.0)
@@ -528,7 +528,7 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
         omega = 0.4 if index == 0 else 0.0
         controls[index, :, 0] = np.float32(velocity)
         controls[index, :, 1] = np.float32(omega)
-        times = np.arange(1, 16, dtype=np.float64) * 0.2
+        times = np.arange(1, 33, dtype=np.float64) * 0.2
         if omega == 0.0:
             poses[index, :, 0] = (velocity * times).astype(np.float32)
         else:
@@ -543,8 +543,8 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
         metadata = {
             "dt_s": 0.2,
             "first_pose_time_s": 0.2,
-            "last_pose_time_s": 3.0,
-            "trajectory_steps": 15,
+            "last_pose_time_s": 6.4,
+            "trajectory_steps": 32,
             "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
             "v": velocity,
             "omega": omega,
@@ -558,12 +558,12 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
                 "schema_version": SCHEMA_VERSION,
                 "array_index": index,
                 "trajectory_id": trajectory_id,
-                "trajectory_steps": 15,
+                "trajectory_steps": 32,
                 "trajectory_bank_version": SOP04_BANK_VERSION,
                 "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
                 "dt_s": 0.2,
                 "first_pose_time_s": 0.2,
-                "last_pose_time_s": 3.0,
+                "last_pose_time_s": 6.4,
                 "query_map_shape": [grid.height, grid.width],
                 "v_mps": velocity,
                 "omega_radps": omega,
@@ -607,10 +607,10 @@ def _write_sop04_bundle(root: Path, grid: GridSpec) -> Path:
             "trajectory_bank_version": SOP04_BANK_VERSION,
             "pose_time_layout_version": SOP04_POSE_TIME_LAYOUT_VERSION,
             "trajectory_count": count,
-            "trajectory_steps": 15,
+            "trajectory_steps": 32,
             "dt_s": 0.2,
             "first_pose_time_s": 0.2,
-            "last_pose_time_s": 3.0,
+            "last_pose_time_s": 6.4,
             "artifact_reload_validation": "passed",
             "shape_dtype_finite_validation": "passed_all",
             "future_endpoint_kinematics": "passed_all",
@@ -639,7 +639,7 @@ def grid() -> GridSpec:
         height=4,
         width=5,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.2,
     )
 
@@ -652,7 +652,7 @@ def producer_roots(tmp_path: Path, grid: GridSpec) -> tuple[Path, Path]:
     )
 
 
-def test_sop03_adapter_accepts_history8_current7_future15_bundle(
+def test_sop03_adapter_accepts_history8_current7_future32_bundle(
     producer_roots: tuple[Path, Path], grid: GridSpec
 ) -> None:
     sop03_root, _ = producer_roots
@@ -691,7 +691,7 @@ def test_sop03_adapter_rejects_array_layout_when_summary_claims_v1(
         tmp_path / "forged-layout",
         grid,
         snippet_steps=16,
-        declared_snippet_steps=23,
+        declared_snippet_steps=40,
     )
 
     with pytest.raises(Sop05InputError, match="array shape"):
@@ -883,7 +883,7 @@ def test_sop04_adapter_builds_local_trajectories_by_manifest_index(
     assert bank.pose_time_layout_version == SOP04_POSE_TIME_LAYOUT_VERSION
     np.testing.assert_array_equal(
         bank.pose_time_offsets_s,
-        (np.arange(15, dtype=np.float64) + 1.0) * 0.2,
+        (np.arange(32, dtype=np.float64) + 1.0) * 0.2,
     )
     for trajectory in bank.trajectories:
         assert trajectory.poses.flags.owndata

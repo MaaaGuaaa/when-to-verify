@@ -529,8 +529,8 @@ def _normalize_planner(value: object) -> PlannerConfig:
     if node["version"] != SOP05R_PLANNER_VERSION:
         raise Sop05rConfigError(f"planner.version must equal {SOP05R_PLANNER_VERSION}")
     rollout_steps = _integer(node["rollout_steps"], name="planner.rollout_steps")
-    if rollout_steps != 15:
-        raise Sop05rConfigError("planner.rollout_steps must equal 15")
+    if rollout_steps != 32:
+        raise Sop05rConfigError("planner.rollout_steps must equal 32")
     dt_s = _positive_real(node["dt_s"], name="planner.dt_s")
     if dt_s != 0.2:
         raise Sop05rConfigError("planner.dt_s must equal 0.2")
@@ -767,10 +767,16 @@ def _normalize_publication(value: object) -> PublicationVersions:
 def normalize_sop05r_config(config: Mapping[str, Any]) -> Sop05rConfig:
     """Validate and normalize the exact SOP05R configuration schema."""
 
-    if config.get("generator_algorithm_version") == SOP05R_TEB_GENERATOR_VERSION:
+    generator_version = config.get("generator_algorithm_version")
+    if generator_version == SOP05R_TEB_GENERATOR_VERSION:
         raise Sop05rConfigError(
-            "generator_algorithm_version "
-            f"{SOP05R_TEB_GENERATOR_VERSION} requires obstacle_first_teb mode"
+                "generator_algorithm_version identifies long40 v4 and "
+            "requires obstacle_first_teb mode"
+        )
+    if generator_version == SOP05R_PRE_LONG40_TEB_GENERATOR_VERSION:
+        raise Sop05rConfigError(
+            "generator_algorithm_version identifies pre-long40 v2, which is "
+            "not accepted by the SOP05R v1 normalizer"
         )
     node = _strict_mapping(
         config,
@@ -844,23 +850,27 @@ def load_sop05r_config(path: str | Path) -> Sop05rConfig:
     return normalize_sop05r_config(raw)
 
 
-# SOP05R v2: lightweight TEB scene-generation contract.  This is intentionally
-# separate from the v1 obstacle-first contract above: v1 artifacts must retain
-# their normalization and semantic identities unchanged.
-SOP05R_TEB_GENERATOR_VERSION = "obstacle_first_lightweight_teb_v2"
-SOP05R_TEB_TEMPLATE_VERSION = "goal_occluder_template_schedule_v2"
-SOP05R_TEB_PLANNER_VERSION = "lightweight_teb_planner_v2"
-SOP05R_TEB_PLACEMENT_VERSION = "anchored_human_rotation_v1"
-SOP05R_TEB_OCCLUSION_VERSION = "synchronized_centerline_occlusion_v1"
+# SOP05R v8 long40: lightweight TEB scene-generation contract. This remains
+# separate from the v1 obstacle-first contract above, whose Schema 3.0.0
+# normalization and semantic identities must not change.
+SOP05R_LONG40_SCHEMA_VERSION = "4.0.0"
+SOP05R_LONG40_LAYOUT_VERSION = "history8_current7_future32_v1"
+SOP05R_PRE_LONG40_TEB_GENERATOR_VERSION = "obstacle_first_lightweight_teb_v2"
+SOP05R_TEB_GENERATOR_VERSION = "obstacle_first_lightweight_teb_v8"
+SOP05R_TEB_TEMPLATE_VERSION = "goal_occluder_template_schedule_v3"
+SOP05R_TEB_PLANNER_VERSION = "lightweight_teb_planner_v3"
+SOP05R_TEB_PLACEMENT_VERSION = "anchored_human_half_plane_step_long40_v8"
+SOP05R_TEB_OCCLUSION_VERSION = "seen_then_occlude_prefix4_v4"
 SOP05R_TEB_TRAJECTORY_COLLECTION_VERSION = (
-    "sop05r_nominal_trajectory_collection_v2"
+    "sop05r_nominal_trajectory_collection_v8"
 )
-SOP05R_TEB_RUN_VERSION = "sop05r_lightweight_teb_generation_run_v1"
-SOP05R_TEB_MANIFEST_VERSION = "sop05r_lightweight_teb_manifest_v1"
-SOP05R_TEB_SUMMARY_VERSION = "sop05r_lightweight_teb_summary_v1"
+SOP05R_TEB_RUN_VERSION = "sop05r_lightweight_teb_generation_run_v7"
+SOP05R_TEB_MANIFEST_VERSION = "sop05r_lightweight_teb_manifest_v7"
+SOP05R_TEB_SUMMARY_VERSION = "sop05r_lightweight_teb_summary_v8"
 SOP05R_TEB_COMPLETION_MARKER_VERSION = (
-    "sop05r_lightweight_teb_producer_complete_v1"
+    "sop05r_lightweight_teb_producer_complete_v7"
 )
+SOP05R_TEB_OCCLUDER_ANGULAR_MARGIN_STEP_DEG = 5.0
 
 SOP05R_TEB_OCCLUDER_SHAPES = ("rectangle", "l_shape", "circle")
 SOP05R_TEB_OCCLUDER_FAMILY_WEIGHTS = (
@@ -870,7 +880,11 @@ SOP05R_TEB_OCCLUDER_FAMILY_WEIGHTS = (
 )
 SOP05R_TEB_RECTANGLE_SEMANTIC_TYPES = ("wall", "shelf", "cabinet")
 SOP05R_TEB_CIRCLE_SEMANTIC_TYPES = ("tree_trunk", "column")
-SOP05R_TEB_INITIALIZATION_IDS = ("straight",)
+SOP05R_TEB_INITIALIZATION_IDS = (
+    "straight",
+    "bypass_left",
+    "bypass_right",
+)
 SOP05R_TEB_WEIGHT_NAMES = (
     "length",
     "time",
@@ -898,7 +912,8 @@ SOP05R_TEB_REJECTION_REASONS = (
     "target_context_collision",
     "target_speed_limit",
     "target_acceleration_limit",
-    "initial_visibility_missing",
+    "guide_ray_degenerate",
+    "half_plane_margin_missing",
     "occlusion_witness_missing",
     "decision_margin_insufficient",
     "no_continuous_collision",
@@ -961,6 +976,26 @@ class TebTemplateConfig:
 
 
 @dataclass(frozen=True)
+class Long40TrajectoryConfig:
+    layout_version: str
+    history_steps: int
+    current_index: int
+    future_steps: int
+    future_dt_s: float
+    future_horizon_s: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "layout_version": self.layout_version,
+            "history_steps": self.history_steps,
+            "current_index": self.current_index,
+            "future_steps": self.future_steps,
+            "future_dt_s": self.future_dt_s,
+            "future_horizon_s": self.future_horizon_s,
+        }
+
+
+@dataclass(frozen=True)
 class LightweightTebConfig:
     version: str
     band_node_count: int
@@ -1007,10 +1042,7 @@ class AnchoredPlacementConfig:
     version: str
     temporal_scales: tuple[float, ...]
     spatial_scale: float
-    coarse_rotation_step_deg: float
-    refinement_radius_deg: float
-    refinement_step_deg: float
-    refined_candidate_count: int
+    occluder_angular_margin_step_deg: float
     internal_snippet_anchor_margin_frames: int
 
     def as_dict(self) -> dict[str, object]:
@@ -1018,10 +1050,9 @@ class AnchoredPlacementConfig:
             "version": self.version,
             "temporal_scales": list(self.temporal_scales),
             "spatial_scale": self.spatial_scale,
-            "coarse_rotation_step_deg": self.coarse_rotation_step_deg,
-            "refinement_radius_deg": self.refinement_radius_deg,
-            "refinement_step_deg": self.refinement_step_deg,
-            "refined_candidate_count": self.refined_candidate_count,
+            "occluder_angular_margin_step_deg": (
+                self.occluder_angular_margin_step_deg
+            ),
             "internal_snippet_anchor_margin_frames": (
                 self.internal_snippet_anchor_margin_frames
             ),
@@ -1032,8 +1063,8 @@ class AnchoredPlacementConfig:
 class CenterlineOcclusionConfig:
     version: str
     centerline_intersection_epsilon_m: float
-    initial_visible_weight: float
-    initially_hidden_weight: float
+    minimum_visible_history_frames: int
+    minimum_occluded_history_frames: int
     minimum_decision_to_collision_margin_s: float
     braking_margin_s: float
     replanning_margin_s: float
@@ -1042,8 +1073,8 @@ class CenterlineOcclusionConfig:
         return {
             "version": self.version,
             "centerline_intersection_epsilon_m": self.centerline_intersection_epsilon_m,
-            "initial_visible_weight": self.initial_visible_weight,
-            "initially_hidden_weight": self.initially_hidden_weight,
+            "minimum_visible_history_frames": self.minimum_visible_history_frames,
+            "minimum_occluded_history_frames": self.minimum_occluded_history_frames,
             "minimum_decision_to_collision_margin_s": (
                 self.minimum_decision_to_collision_margin_s
             ),
@@ -1057,19 +1088,19 @@ class TebGenerationLimits:
     max_templates_per_base: int
     max_target_snippets_per_template: int
     max_route_anchor_candidates: int
-    conflict_path_fraction_range: tuple[float, float]
-    conflict_time_range_s: tuple[float, float]
-    direct_corridor_intrusion_range_m: tuple[float, float]
+    collision_route_path_fraction_range: tuple[float, float]
+    minimum_direct_corridor_intrusion_m: float
 
     def as_dict(self) -> dict[str, object]:
         return {
             "max_templates_per_base": self.max_templates_per_base,
             "max_target_snippets_per_template": self.max_target_snippets_per_template,
             "max_route_anchor_candidates": self.max_route_anchor_candidates,
-            "conflict_path_fraction_range": list(self.conflict_path_fraction_range),
-            "conflict_time_range_s": list(self.conflict_time_range_s),
-            "direct_corridor_intrusion_range_m": list(
-                self.direct_corridor_intrusion_range_m
+            "collision_route_path_fraction_range": list(
+                self.collision_route_path_fraction_range
+            ),
+            "minimum_direct_corridor_intrusion_m": (
+                self.minimum_direct_corridor_intrusion_m
             ),
         }
 
@@ -1114,6 +1145,7 @@ class TebPublicationVersions:
 class Sop05rTebConfig:
     schema_version: str
     generator_algorithm_version: str
+    trajectory: Long40TrajectoryConfig
     template: TebTemplateConfig
     planner: LightweightTebConfig
     placement: AnchoredPlacementConfig
@@ -1128,6 +1160,7 @@ class Sop05rTebConfig:
         return {
             "schema_version": self.schema_version,
             "generator_algorithm_version": self.generator_algorithm_version,
+            "trajectory": self.trajectory.as_dict(),
             "template": self.template.as_dict(),
             "planner": self.planner.as_dict(),
             "placement": self.placement.as_dict(),
@@ -1281,6 +1314,77 @@ def _normalize_teb_occluders(value: object) -> tuple[TebOccluderTemplate, ...]:
     return tuple(result)
 
 
+def _normalize_long40_trajectory(value: object) -> Long40TrajectoryConfig:
+    node = _strict_mapping(
+        value,
+        name="trajectory",
+        expected_keys={
+            "layout_version",
+            "history_steps",
+            "current_index",
+            "future_steps",
+            "future_dt_s",
+            "future_horizon_s",
+        },
+    )
+    if node["layout_version"] != SOP05R_LONG40_LAYOUT_VERSION:
+        raise Sop05rConfigError(
+            "trajectory.layout_version must equal "
+            f"{SOP05R_LONG40_LAYOUT_VERSION}"
+        )
+    history_steps = _integer(
+        node["history_steps"],
+        name="trajectory.history_steps",
+    )
+    current_index = _integer(
+        node["current_index"],
+        name="trajectory.current_index",
+        minimum=0,
+    )
+    future_steps = _integer(
+        node["future_steps"],
+        name="trajectory.future_steps",
+    )
+    future_dt_s = _positive_real(
+        node["future_dt_s"],
+        name="trajectory.future_dt_s",
+    )
+    future_horizon_s = _positive_real(
+        node["future_horizon_s"],
+        name="trajectory.future_horizon_s",
+    )
+    if history_steps != 8:
+        raise Sop05rConfigError("trajectory.history_steps must equal 8")
+    if current_index != 7 or current_index != history_steps - 1:
+        raise Sop05rConfigError(
+            "trajectory.current_index must equal 7 and terminate history"
+        )
+    if future_steps != 32:
+        raise Sop05rConfigError("trajectory.future_steps must equal 32")
+    if future_dt_s != 0.2:
+        raise Sop05rConfigError("trajectory.future_dt_s must equal 0.2")
+    if not np.isclose(
+        future_steps * future_dt_s,
+        future_horizon_s,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise Sop05rConfigError(
+            "trajectory.future_steps * trajectory.future_dt_s must equal "
+            "trajectory.future_horizon_s"
+        )
+    if future_horizon_s != 6.4:
+        raise Sop05rConfigError("trajectory.future_horizon_s must equal 6.4")
+    return Long40TrajectoryConfig(
+        layout_version=SOP05R_LONG40_LAYOUT_VERSION,
+        history_steps=history_steps,
+        current_index=current_index,
+        future_steps=future_steps,
+        future_dt_s=future_dt_s,
+        future_horizon_s=future_horizon_s,
+    )
+
+
 def _normalize_teb_template(value: object) -> TebTemplateConfig:
     node = _strict_mapping(
         value,
@@ -1335,18 +1439,23 @@ def _normalize_teb_template(value: object) -> TebTemplateConfig:
         raise Sop05rConfigError(
             "template.relative_yaw_abs_range_deg must equal [15.0, 45.0]"
         )
+    goal_distances_m = _teb_axis(
+        node["goal_distances_m"],
+        name="template.goal_distances_m",
+        minimum_length=1,
+        positive=True,
+    )
+    if goal_distances_m != (4.0, 4.5):
+        raise Sop05rConfigError(
+            "template.goal_distances_m must equal [4.0, 4.5]"
+        )
     return TebTemplateConfig(
         version=SOP05R_TEB_TEMPLATE_VERSION,
         occluders=_normalize_teb_occluders(node["occluders"]),
         family_weights=normalized_family_weights,
         relative_yaw_abs_range_deg=relative_yaw_abs_range_deg,
         goal_bearings_deg=bearings,
-        goal_distances_m=_teb_axis(
-            node["goal_distances_m"],
-            name="template.goal_distances_m",
-            minimum_length=1,
-            positive=True,
-        ),
+        goal_distances_m=goal_distances_m,
     )
 
 
@@ -1389,8 +1498,8 @@ def _normalize_teb_planner(value: object) -> LightweightTebConfig:
     band_node_count = _integer(
         node["band_node_count"], name="planner.band_node_count", minimum=3
     )
-    if band_node_count != 20:
-        raise Sop05rConfigError("planner.band_node_count must equal 20")
+    if band_node_count != 21:
+        raise Sop05rConfigError("planner.band_node_count must equal 21")
     interval_bounds = _ordered_range(
         node["band_dt_range_s"],
         name="planner.band_dt_range_s",
@@ -1412,8 +1521,8 @@ def _normalize_teb_planner(value: object) -> LightweightTebConfig:
     maximum_route_time_s = _positive_real(
         node["maximum_route_time_s"], name="planner.maximum_route_time_s"
     )
-    if maximum_route_time_s != 5.0:
-        raise Sop05rConfigError("planner.maximum_route_time_s must equal 5.0")
+    if maximum_route_time_s != 8.0:
+        raise Sop05rConfigError("planner.maximum_route_time_s must equal 8.0")
     interval_count = band_node_count - 1
     if interval_count * interval_bounds[1] < maximum_route_time_s:
         raise Sop05rConfigError(
@@ -1433,9 +1542,9 @@ def _normalize_teb_planner(value: object) -> LightweightTebConfig:
         raise Sop05rConfigError(
             "planner.maximum_route_time_s / planner.route_sample_dt_s must be integral"
         )
-    if int(round(sample_count)) != 25:
+    if int(round(sample_count)) != 40:
         raise Sop05rConfigError(
-            "planner route sample grid must contain exactly 25 future endpoints"
+            "planner route sample grid must contain exactly 40 future endpoints"
         )
     bypass_tracking_allowance_m = _positive_real(
         node["bypass_tracking_allowance_m"],
@@ -1444,6 +1553,16 @@ def _normalize_teb_planner(value: object) -> LightweightTebConfig:
     if bypass_tracking_allowance_m != 0.08:
         raise Sop05rConfigError(
             "planner.bypass_tracking_allowance_m must equal 0.08"
+        )
+    represented_clearance_range_m = _ordered_range(
+        node["represented_occluder_clearance_range_m"],
+        name="planner.represented_occluder_clearance_range_m",
+        positive=True,
+    )
+    if represented_clearance_range_m != (0.15, 0.75):
+        raise Sop05rConfigError(
+            "planner.represented_occluder_clearance_range_m must equal "
+            "[0.15, 0.75]"
         )
     return LightweightTebConfig(
         version=SOP05R_TEB_PLANNER_VERSION,
@@ -1479,11 +1598,7 @@ def _normalize_teb_planner(value: object) -> LightweightTebConfig:
         max_curvature_per_m=_positive_real(
             node["max_curvature_per_m"], name="planner.max_curvature_per_m"
         ),
-        represented_occluder_clearance_range_m=_ordered_range(
-            node["represented_occluder_clearance_range_m"],
-            name="planner.represented_occluder_clearance_range_m",
-            positive=True,
-        ),
+        represented_occluder_clearance_range_m=represented_clearance_range_m,
         bypass_tracking_allowance_m=bypass_tracking_allowance_m,
         weights=normalized_weights,
     )
@@ -1497,10 +1612,7 @@ def _normalize_teb_placement(value: object) -> AnchoredPlacementConfig:
             "version",
             "temporal_scales",
             "spatial_scale",
-            "coarse_rotation_step_deg",
-            "refinement_radius_deg",
-            "refinement_step_deg",
-            "refined_candidate_count",
+            "occluder_angular_margin_step_deg",
             "internal_snippet_anchor_margin_frames",
         },
     )
@@ -1513,23 +1625,22 @@ def _normalize_teb_placement(value: object) -> AnchoredPlacementConfig:
     )
     if spatial_scale != 1.0:
         raise Sop05rConfigError("placement.spatial_scale must equal 1.0")
-    coarse_step = _positive_real(
-        node["coarse_rotation_step_deg"],
-        name="placement.coarse_rotation_step_deg",
+    angular_margin_step_deg = _positive_real(
+        node["occluder_angular_margin_step_deg"],
+        name="placement.occluder_angular_margin_step_deg",
     )
-    if not np.isclose(360.0 / coarse_step, round(360.0 / coarse_step)):
+    if angular_margin_step_deg != SOP05R_TEB_OCCLUDER_ANGULAR_MARGIN_STEP_DEG:
         raise Sop05rConfigError(
-            "placement.coarse_rotation_step_deg must divide 360 exactly"
+            "placement.occluder_angular_margin_step_deg must equal 5.0"
         )
-    refinement_radius = _positive_real(
-        node["refinement_radius_deg"], name="placement.refinement_radius_deg"
+    anchor_margin_frames = _integer(
+        node["internal_snippet_anchor_margin_frames"],
+        name="placement.internal_snippet_anchor_margin_frames",
+        minimum=0,
     )
-    refinement_step = _positive_real(
-        node["refinement_step_deg"], name="placement.refinement_step_deg"
-    )
-    if refinement_step > refinement_radius:
+    if anchor_margin_frames != 0:
         raise Sop05rConfigError(
-            "placement.refinement_step_deg must not exceed refinement_radius_deg"
+            "placement.internal_snippet_anchor_margin_frames must equal 0"
         )
     return AnchoredPlacementConfig(
         version=SOP05R_TEB_PLACEMENT_VERSION,
@@ -1540,17 +1651,8 @@ def _normalize_teb_placement(value: object) -> AnchoredPlacementConfig:
             positive=True,
         ),
         spatial_scale=spatial_scale,
-        coarse_rotation_step_deg=coarse_step,
-        refinement_radius_deg=refinement_radius,
-        refinement_step_deg=refinement_step,
-        refined_candidate_count=_integer(
-            node["refined_candidate_count"],
-            name="placement.refined_candidate_count",
-        ),
-        internal_snippet_anchor_margin_frames=_integer(
-            node["internal_snippet_anchor_margin_frames"],
-            name="placement.internal_snippet_anchor_margin_frames",
-        ),
+        occluder_angular_margin_step_deg=angular_margin_step_deg,
+        internal_snippet_anchor_margin_frames=anchor_margin_frames,
     )
 
 
@@ -1561,8 +1663,8 @@ def _normalize_teb_occlusion(value: object) -> CenterlineOcclusionConfig:
         expected_keys={
             "version",
             "centerline_intersection_epsilon_m",
-            "initial_visible_weight",
-            "initially_hidden_weight",
+            "minimum_visible_history_frames",
+            "minimum_occluded_history_frames",
             "minimum_decision_to_collision_margin_s",
             "braking_margin_s",
             "replanning_margin_s",
@@ -1572,15 +1674,31 @@ def _normalize_teb_occlusion(value: object) -> CenterlineOcclusionConfig:
         raise Sop05rConfigError(
             f"occlusion.version must equal {SOP05R_TEB_OCCLUSION_VERSION}"
         )
-    initial_visible_weight = _fraction(
-        node["initial_visible_weight"], name="occlusion.initial_visible_weight"
+    minimum_visible_history_frames = _integer(
+        node["minimum_visible_history_frames"],
+        name="occlusion.minimum_visible_history_frames",
+        minimum=1,
     )
-    initially_hidden_weight = _fraction(
-        node["initially_hidden_weight"], name="occlusion.initially_hidden_weight"
-    )
-    if initial_visible_weight != 0.8 or initially_hidden_weight != 0.2:
+    if minimum_visible_history_frames != 4:
         raise Sop05rConfigError(
-            "occlusion weights must equal 0.8 and 0.2"
+            "occlusion.minimum_visible_history_frames must equal 4"
+        )
+    minimum_occluded_history_frames = _integer(
+        node["minimum_occluded_history_frames"],
+        name="occlusion.minimum_occluded_history_frames",
+        minimum=1,
+    )
+    if minimum_occluded_history_frames != 1:
+        raise Sop05rConfigError(
+            "occlusion.minimum_occluded_history_frames must equal 1"
+        )
+    minimum_decision_to_collision_margin_s = _positive_real(
+        node["minimum_decision_to_collision_margin_s"],
+        name="occlusion.minimum_decision_to_collision_margin_s",
+    )
+    if minimum_decision_to_collision_margin_s != 1.2:
+        raise Sop05rConfigError(
+            "occlusion.minimum_decision_to_collision_margin_s must equal 1.2"
         )
     return CenterlineOcclusionConfig(
         version=SOP05R_TEB_OCCLUSION_VERSION,
@@ -1588,12 +1706,9 @@ def _normalize_teb_occlusion(value: object) -> CenterlineOcclusionConfig:
             node["centerline_intersection_epsilon_m"],
             name="occlusion.centerline_intersection_epsilon_m",
         ),
-        initial_visible_weight=initial_visible_weight,
-        initially_hidden_weight=initially_hidden_weight,
-        minimum_decision_to_collision_margin_s=_positive_real(
-            node["minimum_decision_to_collision_margin_s"],
-            name="occlusion.minimum_decision_to_collision_margin_s",
-        ),
+        minimum_visible_history_frames=minimum_visible_history_frames,
+        minimum_occluded_history_frames=minimum_occluded_history_frames,
+        minimum_decision_to_collision_margin_s=minimum_decision_to_collision_margin_s,
         braking_margin_s=_positive_real(
             node["braking_margin_s"], name="occlusion.braking_margin_s"
         ),
@@ -1611,19 +1726,27 @@ def _normalize_teb_generation(value: object) -> TebGenerationLimits:
             "max_templates_per_base",
             "max_target_snippets_per_template",
             "max_route_anchor_candidates",
-            "conflict_path_fraction_range",
-            "conflict_time_range_s",
-            "direct_corridor_intrusion_range_m",
+            "collision_route_path_fraction_range",
+            "minimum_direct_corridor_intrusion_m",
         },
     )
-    direct_corridor_intrusion_range_m = _ordered_range(
-        node["direct_corridor_intrusion_range_m"],
-        name="generation.direct_corridor_intrusion_range_m",
-        positive=True,
+    minimum_direct_corridor_intrusion_m = _positive_real(
+        node["minimum_direct_corridor_intrusion_m"],
+        name="generation.minimum_direct_corridor_intrusion_m",
     )
-    if direct_corridor_intrusion_range_m != (0.05, 0.15):
+    if minimum_direct_corridor_intrusion_m != 0.15:
         raise Sop05rConfigError(
-            "generation.direct_corridor_intrusion_range_m must equal [0.05, 0.15]"
+            "generation.minimum_direct_corridor_intrusion_m must equal 0.15"
+        )
+    collision_route_path_fraction_range = _ordered_range(
+        node["collision_route_path_fraction_range"],
+        name="generation.collision_route_path_fraction_range",
+        unit_interval=True,
+    )
+    if collision_route_path_fraction_range != (0.2, 0.95):
+        raise Sop05rConfigError(
+            "generation.collision_route_path_fraction_range must equal "
+            "[0.20, 0.95]"
         )
     return TebGenerationLimits(
         max_templates_per_base=_integer(
@@ -1638,17 +1761,10 @@ def _normalize_teb_generation(value: object) -> TebGenerationLimits:
             node["max_route_anchor_candidates"],
             name="generation.max_route_anchor_candidates",
         ),
-        conflict_path_fraction_range=_ordered_range(
-            node["conflict_path_fraction_range"],
-            name="generation.conflict_path_fraction_range",
-            unit_interval=True,
+        collision_route_path_fraction_range=(
+            collision_route_path_fraction_range
         ),
-        conflict_time_range_s=_ordered_range(
-            node["conflict_time_range_s"],
-            name="generation.conflict_time_range_s",
-            positive=True,
-        ),
-        direct_corridor_intrusion_range_m=direct_corridor_intrusion_range_m,
+        minimum_direct_corridor_intrusion_m=minimum_direct_corridor_intrusion_m,
     )
 
 
@@ -1709,12 +1825,23 @@ def _normalize_teb_publication(value: object) -> TebPublicationVersions:
 
 
 def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
-    """Validate one immutable v2 lightweight-TEB generation configuration."""
+    """Validate one immutable v3 long40 lightweight-TEB configuration."""
 
-    if config.get("generator_algorithm_version") != SOP05R_TEB_GENERATOR_VERSION:
+    generator_version = config.get("generator_algorithm_version")
+    if generator_version == SOP05R_GENERATOR_VERSION:
+        raise Sop05rConfigError(
+            "generator_algorithm_version identifies SOP05R v1; "
+            "use obstacle_first mode"
+        )
+    if generator_version == SOP05R_PRE_LONG40_TEB_GENERATOR_VERSION:
+        raise Sop05rConfigError(
+            "generator_algorithm_version identifies pre-long40 v2, which is "
+            "not accepted by the long40 v4 normalizer"
+        )
+    if generator_version != SOP05R_TEB_GENERATOR_VERSION:
         raise Sop05rConfigError(
             "generator_algorithm_version must equal "
-            f"{SOP05R_TEB_GENERATOR_VERSION}; v1 configs require obstacle_first mode"
+            f"{SOP05R_TEB_GENERATOR_VERSION} for obstacle_first_teb mode"
         )
     node = _strict_mapping(
         config,
@@ -1722,6 +1849,7 @@ def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
         expected_keys={
             "schema_version",
             "generator_algorithm_version",
+            "trajectory",
             "template",
             "planner",
             "placement",
@@ -1732,13 +1860,17 @@ def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
             "rejection_reasons",
         },
     )
-    if node["schema_version"] != SCHEMA_VERSION:
-        raise Sop05rConfigError(f"schema_version must equal {SCHEMA_VERSION}")
+    if node["schema_version"] != SOP05R_LONG40_SCHEMA_VERSION:
+        raise Sop05rConfigError(
+            "schema_version must equal "
+            f"{SOP05R_LONG40_SCHEMA_VERSION} for obstacle_first_teb"
+        )
     if node["generator_algorithm_version"] != SOP05R_TEB_GENERATOR_VERSION:
         raise Sop05rConfigError(
             "generator_algorithm_version must equal "
             f"{SOP05R_TEB_GENERATOR_VERSION}"
         )
+    trajectory = _normalize_long40_trajectory(node["trajectory"])
     rejection_reasons = _exact_string_sequence(
         node["rejection_reasons"],
         name="rejection_reasons",
@@ -1752,8 +1884,9 @@ def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
     revealability = _normalize_teb_revealability(node["revealability"])
     publication = _normalize_teb_publication(node["publication"])
     normalized = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SOP05R_LONG40_SCHEMA_VERSION,
         "generator_algorithm_version": SOP05R_TEB_GENERATOR_VERSION,
+        "trajectory": trajectory.as_dict(),
         "template": template.as_dict(),
         "planner": planner.as_dict(),
         "placement": placement.as_dict(),
@@ -1764,8 +1897,9 @@ def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
         "rejection_reasons": list(rejection_reasons),
     }
     return Sop05rTebConfig(
-        schema_version=SCHEMA_VERSION,
+        schema_version=SOP05R_LONG40_SCHEMA_VERSION,
         generator_algorithm_version=SOP05R_TEB_GENERATOR_VERSION,
+        trajectory=trajectory,
         template=template,
         planner=planner,
         placement=placement,
@@ -1779,7 +1913,7 @@ def normalize_sop05r_teb_config(config: Mapping[str, Any]) -> Sop05rTebConfig:
 
 
 def load_sop05r_teb_config(path: str | Path) -> Sop05rTebConfig:
-    """Load a standalone v2 config without v1 defaults or merging."""
+    """Load a standalone v3 long40 config without legacy defaults or merging."""
 
     config_path = Path(path)
     try:

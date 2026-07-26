@@ -19,26 +19,32 @@ from src.geometry import (
     signed_clearance,
     wrap_angle,
 )
+from src.planning.differential_drive import (
+    DEFAULT_ANGULAR_DECELERATION_RADPS2,
+    integrate_twist,
+)
 
 
-ACTION_LIBRARY_VERSION = "verification_actions_v1"
+ACTION_LIBRARY_VERSION = "verification_actions_v2"
 CANONICAL_ACTION_IDS = (
-    "yaw_left_10",
-    "yaw_right_10",
-    "yaw_left_20",
-    "yaw_right_20",
+    "arc_left_10",
+    "arc_right_10",
+    "arc_left_20",
+    "arc_right_20",
     "forward_peek",
     "stop_scan",
 )
 _EXPECTED_DELTAS = {
-    "yaw_left_10": (0.0, 10.0),
-    "yaw_right_10": (0.0, -10.0),
-    "yaw_left_20": (0.0, 20.0),
-    "yaw_right_20": (0.0, -20.0),
+    "arc_left_10": (0.25, 10.0),
+    "arc_right_10": (0.25, -10.0),
+    "arc_left_20": (0.40, 20.0),
+    "arc_right_20": (0.40, -20.0),
     "forward_peek": (0.30, 0.0),
     "stop_scan": (0.0, 0.0),
 }
-_TOP_LEVEL_KEYS = frozenset({"schema_version", "library_version", "actions"})
+_TOP_LEVEL_KEYS = frozenset(
+    {"schema_version", "library_version", "sensor_fov_deg", "actions"}
+)
 _ACTION_KEYS = frozenset(
     {"action_id", "duration_s", "delta_forward_m", "delta_yaw_deg"}
 )
@@ -103,7 +109,14 @@ class VerificationAction:
 class VerificationActionLibrary:
     schema_version: str
     library_version: str
+    sensor_fov_rad: float
     actions: tuple[VerificationAction, ...]
+
+    def __post_init__(self) -> None:
+        fov = _finite_real(self.sensor_fov_rad, name="sensor_fov_rad")
+        if fov <= 0.0 or fov > 2.0 * np.pi:
+            raise ValueError("sensor_fov_rad must be in (0, 2*pi]")
+        object.__setattr__(self, "sensor_fov_rad", fov)
 
     @property
     def by_id(self) -> Mapping[str, VerificationAction]:
@@ -116,6 +129,34 @@ class ActionTrace:
 
     poses: np.ndarray
     times_s: np.ndarray
+    linear_velocities_mps: np.ndarray
+    angular_velocities_radps: np.ndarray
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.poses, np.ndarray)
+            or self.poses.dtype != ARRAY_DTYPE
+            or self.poses.ndim != 2
+            or self.poses.shape[1:] != (3,)
+            or not np.isfinite(self.poses).all()
+        ):
+            raise ValueError("action trace poses must be finite float32 [N,3]")
+        count = self.poses.shape[0]
+        for name in (
+            "times_s",
+            "linear_velocities_mps",
+            "angular_velocities_radps",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, np.ndarray)
+                or value.dtype != np.float64
+                or value.shape != (count,)
+                or not np.isfinite(value).all()
+            ):
+                raise ValueError(f"action trace {name} must be finite float64 [N]")
+        if count < 2 or self.times_s[0] != 0.0 or np.any(np.diff(self.times_s) <= 0.0):
+            raise ValueError("action trace times must start at zero and increase")
 
 
 @dataclass(frozen=True)
@@ -139,6 +180,11 @@ def load_verification_actions(path: str | Path) -> VerificationActionLibrary:
         raise ValueError(f"verification action schema must be {SCHEMA_VERSION}")
     if raw["library_version"] != ACTION_LIBRARY_VERSION:
         raise ValueError("unsupported verification action library version")
+    sensor_fov_deg = _finite_real(raw["sensor_fov_deg"], name="sensor_fov_deg")
+    if sensor_fov_deg <= 0.0 or sensor_fov_deg > 360.0:
+        raise ValueError("sensor_fov_deg must be in (0, 360]")
+    if not np.isclose(sensor_fov_deg, 360.0, rtol=0.0, atol=1e-12):
+        raise ValueError("verification_actions_v2 requires sensor_fov_deg=360")
     rows = raw["actions"]
     if not isinstance(rows, list) or any(
         not isinstance(row, dict) or set(row) != _ACTION_KEYS for row in rows
@@ -171,6 +217,7 @@ def load_verification_actions(path: str | Path) -> VerificationActionLibrary:
     return VerificationActionLibrary(
         schema_version=SCHEMA_VERSION,
         library_version=ACTION_LIBRARY_VERSION,
+        sensor_fov_rad=float(np.deg2rad(sensor_fov_deg)),
         actions=tuple(actions),
     )
 
@@ -240,7 +287,160 @@ def sample_action_trace(
         axis=0,
     ).astype(ARRAY_DTYPE)
     times = np.linspace(0.0, action.duration_s, intervals + 1, dtype=np.float64)
-    return ActionTrace(poses=poses, times_s=times)
+    linear = np.full(
+        intervals + 1,
+        action.delta_forward_m / action.duration_s,
+        dtype=np.float64,
+    )
+    angular = np.full(
+        intervals + 1,
+        action.delta_yaw_rad / action.duration_s,
+        dtype=np.float64,
+    )
+    linear[-1] = 0.0
+    angular[-1] = 0.0
+    return ActionTrace(
+        poses=poses,
+        times_s=times,
+        linear_velocities_mps=linear,
+        angular_velocities_radps=angular,
+    )
+
+
+def _robot_state(value: Any) -> np.ndarray:
+    if not isinstance(value, np.ndarray):
+        raise TypeError("robot_state must be an np.ndarray")
+    if value.dtype != ARRAY_DTYPE or value.shape != (2,):
+        raise ValueError("robot_state must be float32 with shape (2,)")
+    if not np.isfinite(value).all():
+        raise ValueError("robot_state must be finite")
+    return value.astype(np.float64)
+
+
+def sample_state_aware_action_trace(
+    start_pose: Any,
+    action: VerificationAction,
+    *,
+    robot_state: np.ndarray,
+    braking_deceleration_mps2: float,
+    angular_deceleration_radps2: float = DEFAULT_ANGULAR_DECELERATION_RADPS2,
+    max_time_step_s: float = 0.05,
+    max_translation_step_m: float = 0.025,
+    max_yaw_step_rad: float = float(np.deg2rad(2.0)),
+) -> ActionTrace:
+    """Brake the current twist to rest before sampling the sensing primitive."""
+
+    if not isinstance(action, VerificationAction):
+        raise TypeError("action must be a VerificationAction")
+    start = _pose(start_pose, name="start_pose")
+    state = _robot_state(robot_state)
+    linear_deceleration = _finite_real(
+        braking_deceleration_mps2, name="braking_deceleration_mps2"
+    )
+    angular_deceleration = _finite_real(
+        angular_deceleration_radps2,
+        name="angular_deceleration_radps2",
+    )
+    time_step = _finite_real(max_time_step_s, name="max_time_step_s")
+    translation_step = _finite_real(
+        max_translation_step_m, name="max_translation_step_m"
+    )
+    yaw_step = _finite_real(max_yaw_step_rad, name="max_yaw_step_rad")
+    if min(
+        linear_deceleration,
+        angular_deceleration,
+        time_step,
+        translation_step,
+        yaw_step,
+    ) <= 0.0:
+        raise ValueError("decelerations and action trace sampling steps must be positive")
+
+    initial_linear = float(state[0])
+    initial_angular = float(state[1])
+    linear_stop_s = abs(initial_linear) / linear_deceleration
+    angular_stop_s = abs(initial_angular) / angular_deceleration
+    braking_duration_s = max(linear_stop_s, angular_stop_s)
+    if braking_duration_s == 0.0:
+        primitive = sample_action_trace(
+            start,
+            action,
+            max_time_step_s=time_step,
+            max_translation_step_m=translation_step,
+            max_yaw_step_rad=yaw_step,
+        )
+        linear = primitive.linear_velocities_mps.copy()
+        angular = primitive.angular_velocities_radps.copy()
+        linear[0] = initial_linear
+        angular[0] = initial_angular
+        return ActionTrace(
+            poses=primitive.poses,
+            times_s=primitive.times_s,
+            linear_velocities_mps=linear,
+            angular_velocities_radps=angular,
+        )
+
+    braking_distance_m = 0.5 * abs(initial_linear) * linear_stop_s
+    braking_yaw_rad = 0.5 * abs(initial_angular) * angular_stop_s
+    intervals = max(
+        1,
+        int(np.ceil(braking_duration_s / time_step)),
+        int(np.ceil(braking_distance_m / translation_step)),
+        int(np.ceil(braking_yaw_rad / yaw_step)),
+    )
+    regular_times = np.linspace(
+        0.0, braking_duration_s, intervals + 1, dtype=np.float64
+    )
+    braking_times = np.unique(
+        np.concatenate(
+            (
+                regular_times,
+                np.asarray([linear_stop_s, angular_stop_s], dtype=np.float64),
+            )
+        )
+    )
+    braking_linear = np.sign(initial_linear) * np.maximum(
+        abs(initial_linear) - linear_deceleration * braking_times,
+        0.0,
+    )
+    braking_angular = np.sign(initial_angular) * np.maximum(
+        abs(initial_angular) - angular_deceleration * braking_times,
+        0.0,
+    )
+    braking_poses = np.empty((braking_times.size, 3), dtype=ARRAY_DTYPE)
+    braking_poses[0] = start.astype(ARRAY_DTYPE)
+    current_pose = start
+    for index in range(1, braking_times.size):
+        dt_s = float(braking_times[index] - braking_times[index - 1])
+        current_pose = integrate_twist(
+            current_pose,
+            v=0.5 * float(braking_linear[index - 1] + braking_linear[index]),
+            omega=0.5
+            * float(braking_angular[index - 1] + braking_angular[index]),
+            dt_s=dt_s,
+        )
+        braking_poses[index] = current_pose.astype(ARRAY_DTYPE)
+
+    primitive = sample_action_trace(
+        braking_poses[-1],
+        action,
+        max_time_step_s=time_step,
+        max_translation_step_m=translation_step,
+        max_yaw_step_rad=yaw_step,
+    )
+    return ActionTrace(
+        poses=np.concatenate((braking_poses, primitive.poses[1:]), axis=0).astype(
+            ARRAY_DTYPE, copy=False
+        ),
+        times_s=np.concatenate(
+            (braking_times, braking_duration_s + primitive.times_s[1:])
+        ).astype(np.float64, copy=False),
+        linear_velocities_mps=np.concatenate(
+            (braking_linear, primitive.linear_velocities_mps[1:])
+        ).astype(np.float64, copy=False),
+        angular_velocities_radps=np.concatenate(
+            (braking_angular, primitive.angular_velocities_radps[1:])
+        ).astype(np.float64, copy=False),
+    )
 
 
 def action_cost(action: VerificationAction, cost_config: Mapping[str, Any]) -> float:
@@ -298,9 +498,8 @@ def _interpolated_dynamic_pose(
     return result
 
 
-def check_action_feasibility(
-    start_pose: Any,
-    action: VerificationAction,
+def check_action_trace_feasibility(
+    action_trace: ActionTrace,
     *,
     robot_footprint: Footprint,
     static_occupancy: np.ndarray,
@@ -309,13 +508,15 @@ def check_action_feasibility(
     dynamic_object_footprints: Mapping[str, Footprint],
     dynamic_dt_s: float,
 ) -> ActionFeasibility:
-    """Check sampled robot motion against static and typed dynamic geometry.
+    """Check a sampled robot trace against static and typed dynamic geometry.
 
     Dynamic arrays include the current pose at index 0 followed by future
     endpoints. Counterfactual label code is responsible for constructing that
     explicit seam; no oracle data is inferred here.
     """
 
+    if not isinstance(action_trace, ActionTrace):
+        raise TypeError("action_trace must be an ActionTrace")
     if not isinstance(grid, GridSpec):
         raise TypeError("grid must be a GridSpec")
     if (
@@ -337,13 +538,12 @@ def check_action_feasibility(
     if dt_s <= 0.0:
         raise ValueError("dynamic_dt_s must be positive")
 
-    trace = sample_action_trace(start_pose, action)
     finite_sentinel = float(
         np.hypot(grid.height * grid.resolution_m, grid.width * grid.resolution_m)
     )
     minimum = finite_sentinel
     critical: str | None = None
-    for robot_pose, time_s in zip(trace.poses, trace.times_s, strict=True):
+    for robot_pose, time_s in zip(action_trace.poses, action_trace.times_s):
         robot_mask = rasterize_footprint(robot_footprint, robot_pose, grid)
         if np.any(static_occupancy[robot_mask] > 0.5):
             return ActionFeasibility(
@@ -383,9 +583,34 @@ def check_action_feasibility(
     )
 
 
+def check_action_feasibility(
+    start_pose: Any,
+    action: VerificationAction,
+    *,
+    robot_footprint: Footprint,
+    static_occupancy: np.ndarray,
+    grid: GridSpec,
+    dynamic_object_poses: Mapping[str, np.ndarray],
+    dynamic_object_footprints: Mapping[str, Footprint],
+    dynamic_dt_s: float,
+) -> ActionFeasibility:
+    """Check the legacy analytic primitive trace for motion feasibility."""
+
+    return check_action_trace_feasibility(
+        sample_action_trace(start_pose, action),
+        robot_footprint=robot_footprint,
+        static_occupancy=static_occupancy,
+        grid=grid,
+        dynamic_object_poses=dynamic_object_poses,
+        dynamic_object_footprints=dynamic_object_footprints,
+        dynamic_dt_s=dynamic_dt_s,
+    )
+
+
 __all__ = (
     "ACTION_LIBRARY_VERSION",
     "CANONICAL_ACTION_IDS",
+    "DEFAULT_ANGULAR_DECELERATION_RADPS2",
     "ActionFeasibility",
     "ActionTrace",
     "VerificationAction",
@@ -393,6 +618,8 @@ __all__ = (
     "action_cost",
     "action_endpoint",
     "check_action_feasibility",
+    "check_action_trace_feasibility",
     "load_verification_actions",
     "sample_action_trace",
+    "sample_state_aware_action_trace",
 )

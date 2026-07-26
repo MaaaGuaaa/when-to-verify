@@ -47,7 +47,7 @@ def test_replanned_candidates_start_at_post_pose_and_use_fresh_sampler(
     result = generate_replanned_candidates(
         post_action_pose=post_pose,
         nominal_trajectory=nominal,
-        action_id="yaw_left_20",
+        action_id="arc_left_20",
         config=base_config,
         static_occupancy=static,
         braking_deceleration_mps2=1.0,

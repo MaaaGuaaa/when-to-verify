@@ -69,7 +69,7 @@ def _track(
 
 
 def _recording(recording_id: str = "toy-recording") -> RecordingIndex:
-    timestamps = np.arange(0.0, 6.0 + 1e-9, 0.2, dtype=np.float64)
+    timestamps = np.arange(0.0, 9.0 + 1e-9, 0.2, dtype=np.float64)
     human = _track(
         recording_id=recording_id,
         body_name="Helmet_1",
@@ -149,31 +149,31 @@ def test_build_motion_snippets_normalizes_pose_and_preserves_type_geometry():
     assert snippet.source_session_id == "toy-session"
     assert snippet.object_type == "human"
     assert snippet.footprint == {"kind": "circle", "radius_m": 0.30}
-    assert snippet.positions.shape == (23, 2)
+    assert snippet.positions.shape == (40, 2)
     assert snippet.positions.dtype == np.float32
     assert snippet.velocities.dtype == np.float32
-    assert snippet.headings.shape == (23,)
+    assert snippet.headings.shape == (40,)
     assert snippet.headings.dtype == np.float32
     assert np.allclose(snippet.positions[0], 0.0, atol=1e-7)
     assert np.allclose(snippet.positions[:, 1], 0.0, atol=1e-6)
     assert np.allclose(snippet.headings, 0.0, atol=1e-6)
     assert snippet.positions[7, 0] == pytest.approx(1.4, abs=1e-6)
-    assert snippet.positions[-1, 0] == pytest.approx(4.4, abs=1e-6)
+    assert snippet.positions[-1, 0] == pytest.approx(7.8, abs=1e-6)
     assert snippet.positions[-1, 0] - snippet.positions[7, 0] == pytest.approx(
-        3.0, abs=1e-6
+        6.4, abs=1e-6
     )
     assert snippet.mean_speed_mps == pytest.approx(1.0, abs=1e-6)
     assert np.isfinite(snippet.positions).all()
     assert library.summary["accepted_count"] == 2
     assert library.summary["motion_snippet_layout_version"] == (
-        "history8_current7_future15_v1"
+        "history8_current7_future32_v1"
     )
-    assert library.summary["sample_count"] == 23
+    assert library.summary["sample_count"] == 40
     assert library.summary["history_steps"] == 8
-    assert library.summary["future_steps"] == 15
+    assert library.summary["future_steps"] == 32
     assert library.summary["current_index"] == 7
     assert library.summary["sample_dt_s"] == pytest.approx(0.2)
-    assert library.summary["duration_s"] == pytest.approx(4.4)
+    assert library.summary["duration_s"] == pytest.approx(7.8)
     assert library.summary["candidate_count"] == (
         library.summary["accepted_count"] + library.summary["rejected_count"]
     )
@@ -336,13 +336,13 @@ def test_snippet_library_round_trip_uses_numeric_npz(tmp_path):
     assert restored.snippets[0].provenance == source.snippets[0].provenance
     assert len(source.summary["array_sha256"]) == 64
     for key, expected in {
-        "motion_snippet_layout_version": "history8_current7_future15_v1",
-        "sample_count": 23,
+        "motion_snippet_layout_version": "history8_current7_future32_v1",
+        "sample_count": 40,
         "history_steps": 8,
-        "future_steps": 15,
+        "future_steps": 32,
         "current_index": 7,
         "sample_dt_s": 0.2,
-        "duration_s": 4.4,
+        "duration_s": 7.8,
     }.items():
         assert metadata[key] == expected
 
@@ -440,9 +440,9 @@ def test_empty_library_keeps_frozen_numeric_array_shapes(tmp_path):
     path = save_snippet_library(library, tmp_path / "empty.npz")
 
     with np.load(path, allow_pickle=False) as payload:
-        assert payload["positions"].shape == (0, 23, 2)
-        assert payload["velocities"].shape == (0, 23, 2)
-        assert payload["headings"].shape == (0, 23)
+        assert payload["positions"].shape == (0, 40, 2)
+        assert payload["velocities"].shape == (0, 40, 2)
+        assert payload["headings"].shape == (0, 40)
         assert payload["positions"].dtype == np.float32
 
 
@@ -702,13 +702,13 @@ def test_build_snippet_library_cli_writes_type_scoped_artifacts(tmp_path):
             row["split_provenance"] == _split_provenance() for row in rows
         )
         expected_layout = {
-            "motion_snippet_layout_version": "history8_current7_future15_v1",
-            "sample_count": 23,
+            "motion_snippet_layout_version": "history8_current7_future32_v1",
+            "sample_count": 40,
             "history_steps": 8,
-            "future_steps": 15,
+            "future_steps": 32,
             "current_index": 7,
             "sample_dt_s": 0.2,
-            "duration_s": 4.4,
+            "duration_s": 7.8,
         }
         assert all(summary[key] == value for key, value in expected_layout.items())
         assert all(

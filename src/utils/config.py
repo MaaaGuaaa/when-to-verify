@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "size": 160,
         "history_steps": 8,
         "history_dt_s": 0.2,
-        "future_steps": 15,
+        "future_steps": 32,
         "future_dt_s": 0.2,
     },
     "robot": {
@@ -82,7 +82,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "angular_velocities": [-0.8, -0.4, 0.0, 0.4, 0.8],
         "reverse_velocities": [-0.2, -0.4],
         "reverse_probability": 0.2,
-        "horizon_s": 3.0,
+        "horizon_s": 6.4,
         "dt_s": 0.2,
     },
     "risk_gt": {

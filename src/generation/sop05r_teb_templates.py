@@ -28,9 +28,14 @@ from src.geometry import (
     intersects,
     point_signed_distance,
     rasterize_occluder,
+    segment_intersects_occluder,
     wrap_angle,
 )
-from src.planning import PlannedTebRoute, StaticTebRequest, plan_lightweight_teb
+from src.planning import (
+    PlannedTebRoute,
+    StaticTebRequest,
+    plan_static_lightweight_teb,
+)
 from src.utils.seeding import derive_seed
 
 from .dynamic_object_transplant import footprint_from_spec
@@ -41,6 +46,7 @@ from .sop05r_contracts import Sop05rTebConfig, TebOccluderTemplate
 _DIRECT_LINE_SAMPLES = 1001
 _OFFSET_BISECTION_ITERATIONS = 40
 _MAX_LATERAL_OFFSET_M = 3.0
+_DIRECT_SEGMENT_EPSILON_M = 1e-9
 _PLANNER_CACHE: dict[str, Any] = {}
 
 
@@ -225,6 +231,27 @@ def _direct_clearance(
     )
 
 
+def _direct_segment_intersects(
+    components: tuple[StaticOccluder, ...],
+    *,
+    start_xy: np.ndarray,
+    goal_xy: np.ndarray,
+) -> bool:
+    starts = np.asarray(start_xy, dtype=np.float64)[None, :]
+    ends = np.asarray(goal_xy, dtype=np.float64)[None, :]
+    return any(
+        bool(
+            segment_intersects_occluder(
+                component,
+                starts,
+                ends,
+                epsilon_m=_DIRECT_SEGMENT_EPSILON_M,
+            )[0]
+        )
+        for component in components
+    )
+
+
 def _make_components(
     *,
     template: TebOccluderTemplate,
@@ -350,7 +377,33 @@ def _place_components(
             lower = midpoint
         else:
             upper = midpoint
-    components = at_offset(upper)
+    # ``lower`` is the greatest offset still satisfying the minimum
+    # direct-corridor intrusion; ``upper`` is the first offset that misses it.
+    components = at_offset(lower)
+    if not _direct_segment_intersects(
+        components,
+        start_xy=start_xy,
+        goal_xy=goal_xy,
+    ):
+        if not _direct_segment_intersects(
+            at_offset(0.0),
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+        ):
+            raise Sop05rTebTemplateError("direct_path_clear")
+        intersection_lower = 0.0
+        intersection_upper = lower
+        for _ in range(_OFFSET_BISECTION_ITERATIONS):
+            midpoint = 0.5 * (intersection_lower + intersection_upper)
+            if _direct_segment_intersects(
+                at_offset(midpoint),
+                start_xy=start_xy,
+                goal_xy=goal_xy,
+            ):
+                intersection_lower = midpoint
+            else:
+                intersection_upper = midpoint
+        components = at_offset(intersection_lower)
     return (
         components,
         _direct_clearance(
@@ -370,7 +423,12 @@ def _validate_static_geometry(
     base_config: Mapping[str, object],
 ) -> tuple[np.ndarray, np.ndarray]:
     grid = build_grid_spec(dict(base_config))
-    component_masks = tuple(rasterize_occluder(component, grid) for component in components)
+    try:
+        component_masks = tuple(
+            rasterize_occluder(component, grid) for component in components
+        )
+    except ValueError as exc:
+        raise Sop05rTebTemplateError("occluder_out_of_bounds") from exc
     occluder_mask = np.logical_or.reduce(component_masks)
     source_static = (
         np.zeros((grid.height, grid.width), dtype=bool)
@@ -495,7 +553,7 @@ def iter_sop05r_teb_task_templates(
             dtype=ARRAY_DTYPE,
         )
         fraction = float(
-            rng.uniform(*teb_config.generation.conflict_path_fraction_range)
+            rng.uniform(*teb_config.generation.collision_route_path_fraction_range)
         )
         anchor_xy = start_xy + fraction * (goal_pose[:2] - start_xy)
         side = float(rng.choice((-1.0, 1.0)))
@@ -506,10 +564,10 @@ def iter_sop05r_teb_task_templates(
                 rng.choice((-1.0, 1.0))
                 * np.deg2rad(rng.uniform(yaw_min_deg, yaw_max_deg))
             )
-        intrusion_m = float(
-            rng.uniform(*teb_config.generation.direct_corridor_intrusion_range_m)
+        minimum_intrusion_m = (
+            teb_config.generation.minimum_direct_corridor_intrusion_m
         )
-        required_direct_clearance_m = min_clearance - intrusion_m
+        required_direct_clearance_m = min_clearance - minimum_intrusion_m
         evidence: dict[str, object] = {
             "config_digest": teb_config.digest,
             "base_state_id": base_state.state_id,
@@ -519,7 +577,7 @@ def iter_sop05r_teb_task_templates(
             "seed": int(seed),
             "family": template.shape,
             "relative_yaw_rad": relative_yaw_rad,
-            "direct_corridor_intrusion_m": intrusion_m,
+            "minimum_direct_corridor_intrusion_m": minimum_intrusion_m,
         }
         try:
             components, direct_clearance_m = _place_components(
@@ -558,7 +616,7 @@ def iter_sop05r_teb_task_templates(
             )
             result = _PLANNER_CACHE.get(cache_key)
             if result is None:
-                result = plan_lightweight_teb(request)
+                result = plan_static_lightweight_teb(request)
                 _PLANNER_CACHE[cache_key] = result
             if result.route is None:
                 raise Sop05rTebTemplateError(result.rejection_reason or "teb_no_route")

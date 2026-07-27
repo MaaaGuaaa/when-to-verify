@@ -23,7 +23,7 @@ from src.geometry import (
     world_to_grid,
 )
 
-from .trajectory_sampler import CandidateRollout
+from .trajectory_contracts import CandidateRollout
 
 
 @dataclass(frozen=True)
@@ -220,7 +220,7 @@ def build_local_trajectory(
         RectangleFootprint(robot["length_m"], robot["width_m"]),
         robot["inflation_m"],
     )
-    dt_s = float(config["trajectories"]["dt_s"])
+    dt_s = float(config["bev"]["future_dt_s"])
     maps = build_trajectory_query_maps(
         candidate.poses,
         candidate.controls,

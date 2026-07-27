@@ -22,7 +22,7 @@ from src.geometry import (
 )
 from src.utils.seeding import derive_seed
 
-from .dynamic_object_transplant import footprint_from_spec
+from .event_contracts import footprint_from_spec
 from .history_visibility import (
     SeenThenOccludedHistoryAssessment,
     classify_sop05r_seen_then_occluded_history,

@@ -13,8 +13,7 @@ import numpy as np
 
 from src.contracts import BaseState, build_grid_spec, load_dataclass, validate_base_state
 
-from .dynamic_object_transplant import TransplantedDynamicObject
-from .event_sampler import GeneratedEvent
+from .event_contracts import GeneratedEvent, TransplantedDynamicObject
 from .event_target_motion_shard import (
     LoadedEventTargetMotionShard,
     load_event_target_motion_shard,

@@ -14,7 +14,11 @@ from typing import Mapping
 import numpy as np
 
 from src.contracts import DYNAMIC_OBJECT_TYPES, SCHEMA_VERSION, validate_dynamic_object_spec
-from src.datasets.snippet_library import _motion_statistics, _normalize_motion, _overlaps_robot
+from src.datasets.motion_snippet_utils import (
+    motion_statistics,
+    normalize_motion,
+    overlaps_robot,
+)
 from src.datasets.split_manager import validate_split_provenance
 from src.datasets.thor_adapter import RecordingIndex, ThorDataError, validate_recording_index
 from src.utils.seeding import stable_digest
@@ -349,9 +353,9 @@ def build_long_snippet_library(
                         continue
                     object_poses = track.poses[indices].astype(np.float64)
                     velocities, mean_speed, max_acceleration, curvature = (
-                        _motion_statistics(object_poses[:, :2], timestamps)
+                        motion_statistics(object_poses[:, :2], timestamps)
                     )
-                    normalized = _normalize_motion(
+                    normalized = normalize_motion(
                         object_poses[:, :2], velocities, object_poses[:, 2]
                     )
                     if normalized is None:
@@ -363,7 +367,7 @@ def build_long_snippet_library(
                     if max_acceleration > max_acceleration_mps2 + 1e-6:
                         rejections["acceleration"] += 1
                         continue
-                    if _overlaps_robot(
+                    if overlaps_robot(
                         recording, timestamps, object_poses, track.footprint
                     ):
                         rejections["robot_overlap"] += 1

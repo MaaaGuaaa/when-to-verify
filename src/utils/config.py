@@ -23,7 +23,7 @@ class ConfigError(ValueError):
     """Raised when a config file contains unknown keys or an invalid shape."""
 
 
-# Frozen default configuration (spec §29 plus SOP-00 frozen contracts).
+# Frozen default configuration for the active SOP-01 through SOP-06 surface.
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     "schema_version": SCHEMA_VERSION,
@@ -71,38 +71,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "min_extent_m": 0.05,
             "max_extent_m": 3.00,
         },
-    },
-    "age_map": {
-        "a_max_s": 5.0,
-        "never_seen_value": 1.0,
-        "visible_value": 0.0,
-    },
-    "trajectories": {
-        "linear_velocities": [0.2, 0.4, 0.6, 0.8],
-        "angular_velocities": [-0.8, -0.4, 0.0, 0.4, 0.8],
-        "reverse_velocities": [-0.2, -0.4],
-        "reverse_probability": 0.2,
-        "horizon_s": 6.4,
-        "dt_s": 0.2,
-    },
-    "risk_gt": {
-        "sigma_distance_m": 0.5,
-        "sigma_time_s": 2.0,
-        "near_miss_distance_m": 0.35,
-    },
-    "scenario_bank": {
-        "size": 16,
-        "posterior_temperature": 0.2,
-        "reject_cost": 0.20,
-    },
-    "verification": {
-        "useful_margin": 0.0,
-        "decision_margin": 0.01,
-    },
-    "verification_cost": {
-        "lambda_time": 0.04,
-        "lambda_distance": 0.05,
-        "lambda_yaw_per_deg": 0.0015,
     },
 }
 

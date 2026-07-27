@@ -28,7 +28,7 @@ def _grid() -> GridSpec:
         height=40,
         width=40,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.1,
     )
 
@@ -36,7 +36,7 @@ def _grid() -> GridSpec:
 def _future_pose(x: float, y: float, yaw: float) -> np.ndarray:
     return np.tile(
         np.asarray([x, y, yaw], dtype=np.float32),
-        (16, 1),
+        (33, 1),
     )
 
 
@@ -46,10 +46,10 @@ def test_canonical_action_order_vectors_and_analytic_endpoints():
 
     assert tuple(action.action_id for action in actions) == CANONICAL_ACTION_IDS
     assert CANONICAL_ACTION_IDS == (
-        "yaw_left_10",
-        "yaw_right_10",
-        "yaw_left_20",
-        "yaw_right_20",
+        "arc_left_10",
+        "arc_right_10",
+        "arc_left_20",
+        "arc_right_20",
         "forward_peek",
         "stop_scan",
     )
@@ -59,13 +59,13 @@ def test_canonical_action_order_vectors_and_analytic_endpoints():
     start = np.asarray([1.0, 2.0, np.pi / 2.0], dtype=np.float32)
     by_id = library.by_id
     np.testing.assert_allclose(
-        action_endpoint(start, by_id["yaw_left_10"]),
-        np.asarray([1.0, 2.0, np.pi / 2.0 + np.deg2rad(10.0)]),
+        action_endpoint(start, by_id["arc_left_10"]),
+        np.asarray([0.978239, 2.248734, np.pi / 2.0 + np.deg2rad(10.0)]),
         atol=1e-6,
     )
     np.testing.assert_allclose(
-        action_endpoint(start, by_id["yaw_right_20"]),
-        np.asarray([1.0, 2.0, np.pi / 2.0 - np.deg2rad(20.0)]),
+        action_endpoint(start, by_id["arc_right_20"]),
+        np.asarray([1.069107, 2.391926, np.pi / 2.0 - np.deg2rad(20.0)]),
         atol=1e-6,
     )
     np.testing.assert_allclose(
@@ -75,15 +75,19 @@ def test_canonical_action_order_vectors_and_analytic_endpoints():
     )
     np.testing.assert_allclose(action_endpoint(start, by_id["stop_scan"]), start)
 
-    yaw_trace = sample_action_trace(start, by_id["yaw_left_20"])
-    assert np.all(yaw_trace.poses[:, :2] == start[:2])
-    np.testing.assert_allclose(yaw_trace.poses[-1], action_endpoint(start, by_id["yaw_left_20"]))
-    assert yaw_trace.times_s[0] == 0.0
-    assert yaw_trace.times_s[-1] == by_id["yaw_left_20"].duration_s
+    arc_trace = sample_action_trace(start, by_id["arc_left_20"])
+    np.testing.assert_allclose(arc_trace.poses[0], start)
+    np.testing.assert_allclose(
+        arc_trace.poses[-1],
+        action_endpoint(start, by_id["arc_left_20"]),
+    )
+    assert np.any(np.linalg.norm(arc_trace.poses[:, :2] - start[:2], axis=1) > 0.0)
+    assert arc_trace.times_s[0] == 0.0
+    assert arc_trace.times_s[-1] == by_id["arc_left_20"].duration_s
 
 
 def test_action_cost_uses_duration_distance_and_yaw_once():
-    action = load_verification_actions(CONFIG).by_id["yaw_left_20"]
+    action = load_verification_actions(CONFIG).by_id["arc_left_20"]
     cost = action_cost(
         action,
         {
@@ -92,7 +96,7 @@ def test_action_cost_uses_duration_distance_and_yaw_once():
             "lambda_yaw_per_deg": 0.0015,
         },
     )
-    assert cost == pytest.approx(0.04 * 0.75 + 0.0015 * 20.0)
+    assert cost == pytest.approx(0.04 * 0.75 + 0.05 * 0.40 + 0.0015 * 20.0)
 
 
 def test_static_and_typed_dynamic_feasibility_cover_rotated_rectangles():
@@ -154,11 +158,12 @@ def test_loader_rejects_duplicate_or_noncanonical_action_ids(tmp_path: Path):
     bad = tmp_path / "bad.yaml"
     bad.write_text(
         """
-schema_version: "3.0.0"
-library_version: verification_actions_v1
+schema_version: "4.0.0"
+library_version: verification_actions_v2
+sensor_fov_deg: 360.0
 actions:
-  - {action_id: yaw_left_10, duration_s: 0.5, delta_forward_m: 0.0, delta_yaw_deg: 10.0}
-  - {action_id: yaw_left_10, duration_s: 0.5, delta_forward_m: 0.0, delta_yaw_deg: -10.0}
+  - {action_id: arc_left_10, duration_s: 0.5, delta_forward_m: 0.25, delta_yaw_deg: 10.0}
+  - {action_id: arc_left_10, duration_s: 0.5, delta_forward_m: 0.25, delta_yaw_deg: 10.0}
 """.lstrip(),
         encoding="utf-8",
     )

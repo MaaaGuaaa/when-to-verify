@@ -30,7 +30,7 @@ def _split_provenance() -> dict[str, object]:
 
 
 def _recording(
-    duration_s: float = 6.0,
+    duration_s: float = 9.0,
     *,
     recording_id: str = "toy-recording",
 ) -> RecordingIndex:

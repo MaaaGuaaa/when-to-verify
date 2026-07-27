@@ -28,7 +28,7 @@ from src.planning.query_maps import (
     build_local_trajectory,
     build_trajectory_query_maps,
 )
-from src.planning.trajectory_sampler import CandidateRollout
+from src.planning.trajectory_contracts import CandidateRollout
 from src.utils.seeding import stable_digest
 
 from .anchored_human_placement import (

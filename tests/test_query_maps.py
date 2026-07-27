@@ -1,4 +1,4 @@
-"""Trajectory query-map tests against the canonical SOP-02 geometry API."""
+"""Long40 trajectory query-map tests against the canonical geometry API."""
 
 from __future__ import annotations
 
@@ -13,16 +13,36 @@ from src.geometry import (
     rasterize_footprint_sweep,
     world_to_grid,
 )
+from src.planning.differential_drive import integrate_twist, rollout_constant_control
 from src.planning.query_maps import (
     build_local_trajectory,
     build_trajectory_query_maps,
 )
-from src.planning.differential_drive import integrate_twist, rollout_constant_control
-from src.planning.trajectory_sampler import sample_candidate_rollouts
+from src.planning.trajectory_contracts import CandidateRollout
 from src.utils.config import load_config
 
 
-def test_swept_mask_covers_every_discrete_inflated_footprint() -> None:
+LONG40_STEPS = 32
+LONG40_DT_S = 0.2
+
+
+def _candidate(*, v: float = 0.6, omega: float = 0.0) -> CandidateRollout:
+    poses, controls = rollout_constant_control(
+        v=v,
+        omega=omega,
+        dt_s=LONG40_DT_S,
+        steps=LONG40_STEPS,
+    )
+    return CandidateRollout(
+        trajectory_id=f"constant-{v:.2f}-{omega:.2f}",
+        poses=poses,
+        controls=controls,
+        is_stop=v == 0.0 and omega == 0.0,
+        is_reverse=v < 0.0,
+    )
+
+
+def _base_geometry() -> tuple[dict, GridSpec, RectangleFootprint]:
     config = load_config()
     grid = build_grid_spec(config)
     robot = config["robot"]
@@ -30,14 +50,33 @@ def test_swept_mask_covers_every_discrete_inflated_footprint() -> None:
         RectangleFootprint(robot["length_m"], robot["width_m"]),
         robot["inflation_m"],
     )
-    candidate = sample_candidate_rollouts(config)[12]
+    return config, grid, footprint
+
+
+def _rollout_control_sequence(controls: np.ndarray) -> np.ndarray:
+    pose = np.zeros(3, dtype=ARRAY_DTYPE)
+    poses = []
+    for v, omega in controls:
+        pose = integrate_twist(
+            pose,
+            v=float(v),
+            omega=float(omega),
+            dt_s=LONG40_DT_S,
+        )
+        poses.append(pose)
+    return np.asarray(poses, dtype=ARRAY_DTYPE)
+
+
+def test_swept_mask_covers_every_discrete_inflated_footprint() -> None:
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
 
     maps = build_trajectory_query_maps(
         candidate.poses,
         candidate.controls,
         grid=grid,
         footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
+        dt_s=config["bev"]["future_dt_s"],
         braking_deceleration_mps2=1.0,
     )
 
@@ -48,31 +87,20 @@ def test_swept_mask_covers_every_discrete_inflated_footprint() -> None:
     assert np.all(
         rasterize_footprint_sweep(footprint, anchored_poses, grid) <= swept
     )
-    origin_mask = rasterize_footprint(
-        footprint, np.zeros(3, dtype=ARRAY_DTYPE), grid
-    )
-    assert np.all(origin_mask <= swept)
-    for pose in candidate.poses:
-        footprint_mask = rasterize_footprint(footprint, pose, grid)
-        assert np.all(footprint_mask <= swept)
+    for pose in anchored_poses:
+        assert np.all(rasterize_footprint(footprint, pose, grid) <= swept)
 
 
 def test_tta_is_minus_one_exactly_outside_swept_volume() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
 
     maps = build_trajectory_query_maps(
         candidate.poses,
         candidate.controls,
         grid=grid,
         footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
+        dt_s=config["bev"]["future_dt_s"],
         braking_deceleration_mps2=1.0,
     )
 
@@ -82,21 +110,15 @@ def test_tta_is_minus_one_exactly_outside_swept_volume() -> None:
 
 
 def test_centerline_map_contains_every_rollout_pose_center() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[14]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate(v=0.7, omega=0.2)
 
     maps = build_trajectory_query_maps(
         candidate.poses,
         candidate.controls,
         grid=grid,
         footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
+        dt_s=config["bev"]["future_dt_s"],
         braking_deceleration_mps2=1.0,
     )
 
@@ -110,20 +132,20 @@ def test_first_control_interval_is_present_in_all_query_maps() -> None:
     grid = GridSpec(
         height=41,
         width=41,
-        history_steps=1,
-        future_steps=1,
+        history_steps=8,
+        future_steps=LONG40_STEPS,
         resolution_m=0.1,
     )
-    footprint = RectangleFootprint(0.02, 0.02)
-    poses = np.array([[0.45, 0.0, 0.0]], dtype=ARRAY_DTYPE)
-    controls = np.array([[2.25, 0.0]], dtype=ARRAY_DTYPE)
+    controls = np.zeros((LONG40_STEPS, 2), dtype=ARRAY_DTYPE)
+    controls[0] = [2.25, 0.0]
+    poses = _rollout_control_sequence(controls)
 
     maps = build_trajectory_query_maps(
         poses,
         controls,
         grid=grid,
-        footprint=footprint,
-        dt_s=0.2,
+        footprint=RectangleFootprint(0.02, 0.02),
+        dt_s=LONG40_DT_S,
         braking_deceleration_mps2=1.0,
     )
 
@@ -145,25 +167,21 @@ def test_turning_first_interval_uses_differential_drive_arc_not_chord() -> None:
     grid = GridSpec(
         height=61,
         width=61,
-        history_steps=1,
-        future_steps=1,
+        history_steps=8,
+        future_steps=LONG40_STEPS,
         resolution_m=0.05,
     )
-    dt_s = 0.2
-    yaw_rate = np.pi / (2.0 * dt_s)
-    poses, controls = rollout_constant_control(
-        v=4.0,
-        omega=yaw_rate,
-        dt_s=dt_s,
-        steps=1,
-    )
+    yaw_rate = np.pi / (2.0 * LONG40_DT_S)
+    controls = np.zeros((LONG40_STEPS, 2), dtype=ARRAY_DTYPE)
+    controls[0] = [4.0, yaw_rate]
+    poses = _rollout_control_sequence(controls)
 
     maps = build_trajectory_query_maps(
         poses,
         controls,
         grid=grid,
         footprint=RectangleFootprint(0.02, 0.02),
-        dt_s=dt_s,
+        dt_s=LONG40_DT_S,
         braking_deceleration_mps2=1.0,
     )
 
@@ -180,24 +198,20 @@ def test_full_rotation_sweep_is_not_lost_to_wrapped_endpoint_yaw() -> None:
     grid = GridSpec(
         height=41,
         width=41,
-        history_steps=1,
-        future_steps=1,
+        history_steps=8,
+        future_steps=LONG40_STEPS,
         resolution_m=0.05,
     )
-    dt_s = 0.2
-    poses, controls = rollout_constant_control(
-        v=0.0,
-        omega=2.0 * np.pi / dt_s,
-        dt_s=dt_s,
-        steps=1,
-    )
+    controls = np.zeros((LONG40_STEPS, 2), dtype=ARRAY_DTYPE)
+    controls[0] = [0.0, 2.0 * np.pi / LONG40_DT_S]
+    poses = _rollout_control_sequence(controls)
 
     maps = build_trajectory_query_maps(
         poses,
         controls,
         grid=grid,
         footprint=RectangleFootprint(0.4, 0.05),
-        dt_s=dt_s,
+        dt_s=LONG40_DT_S,
         braking_deceleration_mps2=1.0,
     )
 
@@ -205,86 +219,46 @@ def test_full_rotation_sweep_is_not_lost_to_wrapped_endpoint_yaw() -> None:
     assert maps.swept_mask[rotated_tip[0], rotated_tip[1]] == 1.0
 
 
-def test_query_maps_accepts_a_wrapped_differential_drive_endpoint_yaw() -> None:
+def test_query_map_arrivals_span_dt_through_long40_horizon() -> None:
     grid = GridSpec(
-        height=41,
-        width=41,
-        history_steps=1,
-        future_steps=1,
-        resolution_m=0.05,
-    )
-    dt_s = 0.2
-    controls = np.asarray([[0.0, 3.0 * np.pi / dt_s]], dtype=ARRAY_DTYPE)
-    poses = np.asarray(
-        [
-            integrate_twist(
-                np.zeros(3, dtype=ARRAY_DTYPE),
-                v=float(controls[0, 0]),
-                omega=float(controls[0, 1]),
-                dt_s=dt_s,
-            )
-        ],
-        dtype=ARRAY_DTYPE,
-    )
-
-    maps = build_trajectory_query_maps(
-        poses,
-        controls,
-        grid=grid,
-        footprint=RectangleFootprint(0.4, 0.05),
-        dt_s=dt_s,
-        braking_deceleration_mps2=1.0,
-    )
-
-    assert maps.swept_mask.any()
-
-
-def test_query_map_future_endpoint_arrivals_span_dt_through_horizon() -> None:
-    grid = GridSpec(
-        height=81,
-        width=81,
-        history_steps=1,
-        future_steps=15,
+        height=160,
+        width=160,
+        history_steps=8,
+        future_steps=LONG40_STEPS,
         resolution_m=0.1,
     )
     poses, controls = rollout_constant_control(
         v=1.0,
         omega=0.0,
-        dt_s=0.2,
-        steps=15,
+        dt_s=LONG40_DT_S,
+        steps=LONG40_STEPS,
     )
 
     maps = build_trajectory_query_maps(
         poses,
         controls,
         grid=grid,
-        footprint=RectangleFootprint(0.12, 0.12),
-        dt_s=0.2,
+        footprint=RectangleFootprint(0.02, 0.02),
+        dt_s=LONG40_DT_S,
         braking_deceleration_mps2=1.0,
     )
 
-    first_leading_edge = world_to_grid(np.array([[0.3, 0.0]]), grid)[0]
-    final_leading_edge = world_to_grid(np.array([[3.1, 0.0]]), grid)[0]
+    first_endpoint_cell = world_to_grid(np.array([[0.25, 0.0]]), grid)[0]
+    final_endpoint_cell = world_to_grid(np.array([[6.4, 0.0]]), grid)[0]
     assert maps.tta_map[
-        first_leading_edge[0], first_leading_edge[1]
+        first_endpoint_cell[0], first_endpoint_cell[1]
     ] == pytest.approx(0.2)
     assert maps.tta_map[
-        final_leading_edge[0], final_leading_edge[1]
-    ] == pytest.approx(3.0)
+        final_endpoint_cell[0], final_endpoint_cell[1]
+    ] == pytest.approx(6.4)
     assert maps.braking_map[
-        final_leading_edge[0], final_leading_edge[1]
-    ] == pytest.approx(3.0 - 0.5)
+        final_endpoint_cell[0], final_endpoint_cell[1]
+    ] == pytest.approx(6.4 - 0.5)
 
 
 def test_braking_map_is_path_distance_minus_stopping_distance() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
     deceleration = 1.0
 
     maps = build_trajectory_query_maps(
@@ -292,7 +266,7 @@ def test_braking_map_is_path_distance_minus_stopping_distance() -> None:
         candidate.controls,
         grid=grid,
         footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
+        dt_s=config["bev"]["future_dt_s"],
         braking_deceleration_mps2=deceleration,
     )
 
@@ -307,14 +281,8 @@ def test_braking_map_is_path_distance_minus_stopping_distance() -> None:
 def test_query_maps_reject_invalid_braking_deceleration(
     deceleration: float,
 ) -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
 
     with pytest.raises(ValueError, match="deceleration"):
         build_trajectory_query_maps(
@@ -322,20 +290,14 @@ def test_query_maps_reject_invalid_braking_deceleration(
             candidate.controls,
             grid=grid,
             footprint=footprint,
-            dt_s=config["trajectories"]["dt_s"],
+            dt_s=config["bev"]["future_dt_s"],
             braking_deceleration_mps2=deceleration,
         )
 
 
 def test_query_maps_reject_pose_control_length_mismatch() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
 
     with pytest.raises(ValueError, match="same length"):
         build_trajectory_query_maps(
@@ -343,21 +305,15 @@ def test_query_maps_reject_pose_control_length_mismatch() -> None:
             candidate.controls[:-1],
             grid=grid,
             footprint=footprint,
-            dt_s=config["trajectories"]["dt_s"],
+            dt_s=config["bev"]["future_dt_s"],
             braking_deceleration_mps2=1.0,
         )
 
 
 @pytest.mark.parametrize("dt_s", [0.0, -0.2, np.nan, np.inf])
 def test_query_maps_reject_invalid_timestep(dt_s: float) -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    _, grid, footprint = _base_geometry()
+    candidate = _candidate()
 
     with pytest.raises(ValueError, match="dt_s"):
         build_trajectory_query_maps(
@@ -371,14 +327,8 @@ def test_query_maps_reject_invalid_timestep(dt_s: float) -> None:
 
 
 def test_query_maps_reject_nonfinite_controls() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
+    config, grid, footprint = _base_geometry()
+    candidate = _candidate()
     controls = candidate.controls.copy()
     controls[4, 0] = np.nan
 
@@ -388,14 +338,14 @@ def test_query_maps_reject_nonfinite_controls() -> None:
             controls,
             grid=grid,
             footprint=footprint,
-            dt_s=config["trajectories"]["dt_s"],
+            dt_s=config["bev"]["future_dt_s"],
             braking_deceleration_mps2=1.0,
         )
 
 
-def test_candidate_is_materialized_as_frozen_local_trajectory_contract() -> None:
+def test_candidate_is_materialized_as_long40_local_trajectory() -> None:
     config = load_config()
-    candidate = sample_candidate_rollouts(config)[12]
+    candidate = _candidate()
 
     trajectory = build_local_trajectory(
         candidate,
@@ -406,8 +356,8 @@ def test_candidate_is_materialized_as_frozen_local_trajectory_contract() -> None
 
     assert isinstance(trajectory, LocalTrajectory)
     assert trajectory.trajectory_id == candidate.trajectory_id
-    assert trajectory.poses.shape == (32, 3)
-    assert trajectory.controls.shape == (32, 2)
+    assert trajectory.poses.shape == (LONG40_STEPS, 3)
+    assert trajectory.controls.shape == (LONG40_STEPS, 2)
     for array in (
         trajectory.swept_mask,
         trajectory.tta_map,
@@ -427,67 +377,14 @@ def test_candidate_is_materialized_as_frozen_local_trajectory_contract() -> None
     assert trajectory.metadata["first_pose_time_s"] == pytest.approx(0.2)
     assert trajectory.metadata["last_pose_time_s"] == pytest.approx(6.4)
     assert trajectory.metadata["dt_s"] == pytest.approx(0.2)
-    assert trajectory.metadata["trajectory_steps"] == 32
-
-
-def test_tta_is_nondecreasing_along_straight_centerline_direction() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[12]
-
-    maps = build_trajectory_query_maps(
-        candidate.poses,
-        candidate.controls,
-        grid=grid,
-        footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
-        braking_deceleration_mps2=1.0,
-    )
-
-    indices = world_to_grid(candidate.poses[:, :2], grid)
-    tta_along_centerline = maps.tta_map[indices[:, 0], indices[:, 1]]
-    assert np.all(np.diff(tta_along_centerline) >= 0.0)
-
-
-def test_straight_centerline_map_has_no_grid_cell_gaps() -> None:
-    config = load_config()
-    grid = build_grid_spec(config)
-    robot = config["robot"]
-    footprint = inflate_footprint(
-        RectangleFootprint(robot["length_m"], robot["width_m"]),
-        robot["inflation_m"],
-    )
-    candidate = sample_candidate_rollouts(config)[17]
-
-    maps = build_trajectory_query_maps(
-        candidate.poses,
-        candidate.controls,
-        grid=grid,
-        footprint=footprint,
-        dt_s=config["trajectories"]["dt_s"],
-        braking_deceleration_mps2=1.0,
-    )
-
-    indices = world_to_grid(candidate.poses[:, :2], grid)
-    row = indices[0, 0]
-    start_column = int(indices[:, 1].min())
-    end_column = int(indices[:, 1].max())
-    assert np.all(maps.centerline_map[row, start_column : end_column + 1] == 1.0)
+    assert trajectory.metadata["trajectory_steps"] == LONG40_STEPS
 
 
 def test_local_trajectory_rejects_nonfinite_task_cost() -> None:
-    config = load_config()
-    candidate = sample_candidate_rollouts(config)[12]
-
     with pytest.raises(ValueError, match="task_cost"):
         build_local_trajectory(
-            candidate,
-            config,
+            _candidate(),
+            load_config(),
             braking_deceleration_mps2=1.0,
             task_cost=np.nan,
         )

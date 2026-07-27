@@ -47,7 +47,7 @@ def sample_id(
     variant: str,
     seed: int,
 ) -> str:
-    """Stable id for a risk/verification sample; independent of call order."""
+    """Stable id for a trajectory-conditioned sample; independent of call order."""
     short = stable_digest(
         split, recording_id, base_state_id, trajectory_id, variant, seed, size=12
     )

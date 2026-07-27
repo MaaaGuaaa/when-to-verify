@@ -38,7 +38,7 @@ from src.planning import (
 )
 from src.utils.seeding import derive_seed
 
-from .dynamic_object_transplant import footprint_from_spec
+from .event_contracts import footprint_from_spec
 from .occluder_sampler import swept_footprint_intersects_occupancy
 from .sop05r_contracts import Sop05rTebConfig, TebOccluderTemplate
 

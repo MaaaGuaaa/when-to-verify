@@ -158,44 +158,17 @@ def test_teb_cli_rejects_wrong_typed_current_config(
     assert "Traceback" not in captured.err
 
 
-def test_teb_cli_rejects_retired_v1_config_without_fixture_file(
+def test_teb_cli_rejects_unknown_generator_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    retired = _config_variant(
+    invalid = _config_variant(
         tmp_path,
-        "retired-v1.yaml",
+        "unknown-version.yaml",
         "generator_algorithm_version: obstacle_first_lightweight_teb_v8",
-        "generator_algorithm_version: obstacle_first_event_generation_v1",
+        "generator_algorithm_version: unsupported_generator",
     )
-    argv = _argv(tmp_path, "--preflight-only")
-    argv[argv.index("--generator-config") + 1] = str(retired)
-    monkeypatch.setattr(sys, "argv", argv)
-
-    assert _load_cli().main() == 2
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "generator_algorithm_version" in captured.err
-    assert "SOP05R v1" in captured.err
-    assert "obstacle_first mode" in captured.err
-    assert "Traceback" not in captured.err
-
-
-def test_teb_cli_rejects_pre_long40_v2_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = ROOT / "configs/generator_obstacle_first_teb_train.yaml"
-    payload = source.read_text(encoding="utf-8")
-    payload = payload.replace('schema_version: "4.0.0"', 'schema_version: "3.0.0"')
-    payload = payload.replace(
-        "generator_algorithm_version: obstacle_first_lightweight_teb_v8",
-        "generator_algorithm_version: obstacle_first_lightweight_teb_v2",
-    )
-    invalid = tmp_path / "pre-long40-v2.yaml"
-    invalid.write_text(payload, encoding="utf-8")
     argv = _argv(tmp_path, "--preflight-only")
     argv[argv.index("--generator-config") + 1] = str(invalid)
     monkeypatch.setattr(sys, "argv", argv)
@@ -203,8 +176,7 @@ def test_teb_cli_rejects_pre_long40_v2_config(
     assert _load_cli().main() == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "pre-long40 v2" in captured.err
-    assert "not accepted by the long40 v4 normalizer" in captured.err
+    assert "generator_algorithm_version" in captured.err
     assert "Traceback" not in captured.err
 
 

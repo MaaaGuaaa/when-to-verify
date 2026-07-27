@@ -33,6 +33,7 @@ from src.generation.sop05_selection import (
 
 
 _FIXTURE_PAIRS_BY_EVENT_ID: dict[str, tuple[object, OracleWorld]] = {}
+_LEGACY_CONFIG_ROOT = Path(__file__).resolve().parent / "fixtures/legacy_sop05"
 
 
 def _grid() -> GridSpec:
@@ -50,7 +51,7 @@ def _generator_contract() -> tuple[
 ]:
     from src.generation.event_sampler import _generator_digest, load_generator_config
 
-    config_path = Path(__file__).resolve().parents[1] / "configs/generator_test.yaml"
+    config_path = _LEGACY_CONFIG_ROOT / "generator_test.yaml"
     config = load_generator_config(config_path)
     policy = config["target_type_policy"]
     history_policy = config["target_history_visibility"]
@@ -595,9 +596,7 @@ def _write_complete_publication(
         "  future_dt_s: 0.2\n",
         encoding="utf-8",
     )
-    generator_source = (
-        Path(__file__).resolve().parents[1] / "configs/generator_test.yaml"
-    )
+    generator_source = _LEGACY_CONFIG_ROOT / "generator_test.yaml"
     (configs / "generator.yaml").write_bytes(generator_source.read_bytes())
     rejected_count = requested_count - generated_count
     rejection_reason = "fixture_visibility_rejection"

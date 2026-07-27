@@ -56,6 +56,7 @@ from src.geometry import RectangleFootprint, inflate_footprint
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_CONFIG_ROOT = ROOT / "tests/fixtures/legacy_sop05"
 _REAL_GIT_EXECUTABLE = Path(
     "/home/home/ccnt_zq/zq_zhouyiqun/.local/git/bin/git"
 )
@@ -235,7 +236,7 @@ def _request(module, tmp_path: Path, **overrides):
         "sop04_external_handoff_digest_sha256": _SOP04_HANDOFF_DIGEST,
         "split": "train",
         "base_config_path": ROOT / "configs/base.yaml",
-        "generator_config_path": ROOT / "configs/generator_train.yaml",
+        "generator_config_path": LEGACY_CONFIG_ROOT / "generator_train.yaml",
         "output_dir": tmp_path / "run",
         "seed": 23,
         "accepted_quota": 10,

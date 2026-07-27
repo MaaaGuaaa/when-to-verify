@@ -66,6 +66,7 @@ from src.utils.config import load_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_CONFIG_ROOT = ROOT / "tests/fixtures/legacy_sop05"
 
 
 def _snippet() -> MotionSnippet:
@@ -229,7 +230,7 @@ def _mother_inputs():
         libraries,
     ) = _paired_source_inputs()
     generator_config = load_generator_config(
-        ROOT / "configs" / "generator_test.yaml"
+        LEGACY_CONFIG_ROOT / "generator_test.yaml"
     )
     generator_config["conflict_time_range_s"] = (2.2, 2.2)
     generator_config["occluders"] = {
@@ -476,7 +477,7 @@ def test_formal_v5_config_rejects_retired_joint_sixpack_producer() -> None:
         ROOT / "configs" / "paired_variants.yaml"
     )
     generator_config = load_generator_config(
-        ROOT / "configs" / "generator_train.yaml"
+        LEGACY_CONFIG_ROOT / "generator_train.yaml"
     )
 
     with pytest.raises(

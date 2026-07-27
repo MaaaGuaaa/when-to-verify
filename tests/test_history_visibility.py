@@ -17,6 +17,9 @@ from src.generation.history_visibility import (
 )
 
 
+LEGACY_CONFIG_ROOT = Path(__file__).resolve().parent / "fixtures/legacy_sop05"
+
+
 def _policy() -> dict[str, object]:
     return {
         "policy_version": HISTORY_VISIBILITY_POLICY_VERSION,
@@ -132,12 +135,9 @@ def test_stratified_allocation_is_exact_for_ten_event_eighty_twenty_mix() -> Non
     )
 
 
-def test_production_generator_configs_freeze_eighty_twenty_history_policy() -> None:
-    for relative_path in (
-        "configs/generator_train.yaml",
-        "configs/generator_test.yaml",
-    ):
-        config = load_generator_config(Path(relative_path))
+def test_legacy_generator_fixtures_freeze_eighty_twenty_history_policy() -> None:
+    for filename in ("generator_train.yaml", "generator_test.yaml"):
+        config = load_generator_config(LEGACY_CONFIG_ROOT / filename)
         policy = config["target_history_visibility"]
 
         assert policy.as_dict() == _policy()

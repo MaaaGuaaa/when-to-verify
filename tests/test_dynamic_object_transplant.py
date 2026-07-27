@@ -74,6 +74,7 @@ from src.utils.seeding import stable_digest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_CONFIG_ROOT = ROOT / "tests/fixtures/legacy_sop05"
 
 
 def _policy() -> dict:
@@ -1581,7 +1582,7 @@ def test_generator_configs_freeze_v5_environment_mother_contract() -> None:
         "blind_reachability",
     }
     for filename in ("generator_train.yaml", "generator_test.yaml"):
-        config = load_generator_config(ROOT / "configs" / filename)
+        config = load_generator_config(LEGACY_CONFIG_ROOT / filename)
         assert set(config) == expected_keys
         assert config["schema_version"] == "3.0.0"
         assert config["production_event_kind"] == "environment"

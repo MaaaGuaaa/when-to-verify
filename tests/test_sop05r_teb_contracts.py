@@ -505,17 +505,17 @@ def test_teb_config_is_immutable_and_production_configs_only_differ_by_selection
     assert train_payload == test.as_dict()
 
 
-def test_v1_generator_config_uses_canonical_schema_four() -> None:
-    legacy = load_sop05r_config(Path("configs/generator_obstacle_first_train.yaml"))
-    assert legacy.schema_version == "4.0.0"
+def test_retired_v1_generator_config_is_not_shipped() -> None:
+    assert not Path("configs/generator_obstacle_first_train.yaml").exists()
 
 
 def test_v4_normalizer_identifies_v1_config_boundary() -> None:
-    legacy = load_sop05r_config(
-        Path("configs/generator_obstacle_first_train.yaml")
-    )
+    retired = {
+        "schema_version": "4.0.0",
+        "generator_algorithm_version": "obstacle_first_event_generation_v1",
+    }
     with pytest.raises(ValueError, match="SOP05R v1.*obstacle_first mode"):
-        normalize_sop05r_teb_config(legacy.as_dict())
+        normalize_sop05r_teb_config(retired)
 
 
 def test_v4_normalizer_identifies_pre_long40_v2_without_misrouting() -> None:

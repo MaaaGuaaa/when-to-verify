@@ -4,13 +4,14 @@ Decision-calibrated hidden-risk learning for robot local planning under occlusio
 
 ## Current Status
 
-The working repository surface is SOP-01 through SOP-06 on the Schema 4
-Long40 contract. The executable path is current through SOP05R; the SOP06
-handoff must be rebuilt directly on Long40 rather than reviving its retired
-short-horizon implementation.
+The working repository surface includes the Schema 4 Long40 path through the
+SOP08 occupancy baselines. Event generation is current through SOP05R; the
+SOP06/SOP07 producers must still be rebuilt directly on Long40. SOP08 consumes
+authenticated Long40 risk shards, seals, and sidecars without reviving their
+retired short-horizon producers.
 
-SOP-07 through SOP-13 and the superseded short-horizon generation, training,
-risk, calibration, and verification pipelines are retired from the active tree.
+The SOP09-SOP13 risk-model, calibration CLI, verification, and closed-loop
+pipelines remain retired, as do all superseded short-horizon implementations.
 
 ## Supported Entry Points
 
@@ -20,14 +21,17 @@ risk, calibration, and verification pipelines are retired from the active tree.
 - scripts/01_index_recordings.py
 - scripts/02_build_long_snippet_library.py
 - scripts/03_extract_base_states.py
+- scripts/04_backfill_risk_sidecars.py
+- scripts/04_seal_risk_dataset.py
+- scripts/05_audit_risk_collection.py
 - scripts/05_generate_events.py --generator-mode obstacle_first_teb
+- scripts/05_train_occupancy_baseline.py
 
 ## Setup
 
 Python 3.10 is the verified interpreter line.
 
-    python -m pip install numpy==1.24.4 PyYAML==6.0.1 pytest==8.3.5
-    python -m pip install -e . --no-deps
+    python -m pip install -e '.[test,train]'
     python scripts/00_validate_contracts.py --config configs/base.yaml
 
 Compute-heavy validation and tests must run through Slurm in this workspace.
@@ -41,5 +45,6 @@ Compute-heavy validation and tests must run through Slurm in this workspace.
 
 The active implementation covers recording splits, THOR indexing, Long40 motion
 snippets, base-state extraction, lightweight-TEB event construction, visibility,
-and continuous swept-footprint collision evidence. It does not claim a completed
-training, calibration, closed-loop, or paper-results pipeline.
+continuous swept-footprint collision evidence, authenticated risk-dataset input,
+and SOP08 occupancy baselines. It does not claim a completed SOP09 risk model,
+calibration CLI, verification, closed-loop, or paper-results pipeline.

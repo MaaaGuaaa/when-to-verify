@@ -1,4 +1,4 @@
-"""Repository guards for retired short-horizon and downstream contracts."""
+"""Repository guards for retired short-horizon and post-SOP08 contracts."""
 
 from __future__ import annotations
 
@@ -9,14 +9,27 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 RETIRED_PATHS = (
-    "src/calibration",
-    "src/evaluation",
-    "src/models",
-    "src/training",
+    "src/calibration/grouped_calibration.py",
+    "src/evaluation/prediction_tables.py",
+    "src/evaluation/risk_metrics.py",
+    "src/evaluation/verification_baselines.py",
+    "src/evaluation/verification_metrics.py",
+    "src/models/bev_encoder.py",
+    "src/models/losses.py",
+    "src/models/risk_model.py",
+    "src/models/verification_model.py",
+    "src/models/verification_training.py",
+    "src/training/risk_ddp_trainer.py",
+    "src/training/risk_trainer.py",
     "docs/superpowers/plans/2026-07-25-sop05r-lightweight-teb",
-    "tests/fixtures",
     "src/datasets/snippet_library.py",
+    "src/datasets/risk_dataset.py",
+    "src/datasets/risk_evaluation_store.py",
     "src/datasets/sop03_publication.py",
+    "src/datasets/verification_collection.py",
+    "src/datasets/verification_dataloader.py",
+    "src/datasets/verification_dataset.py",
+    "src/datasets/verification_sources.py",
     "src/generation/dynamic_object_transplant.py",
     "src/generation/event_sampler.py",
     "src/generation/paired_variants.py",
@@ -30,7 +43,6 @@ RETIRED_PATHS = (
     "src/generation/sop05r_trajectory_store.py",
     "src/generation/sop06_pipeline.py",
     "scripts/04_generate_risk_dataset.py",
-    "scripts/05_train_occupancy_baseline.py",
     "scripts/06_train_risk_model.py",
     "scripts/07_calibrate_risk.py",
     "scripts/08_generate_verification_dataset.py",
@@ -41,18 +53,8 @@ RETIRED_PATHS = (
 )
 
 RETIRED_CONTRACT_SYMBOLS = (
-    "HISTORY_CHANNELS",
-    "STATE_CHANNELS",
-    "TRAJECTORY_CHANNELS",
-    "INPUT_CHANNELS",
-    "N_HISTORY_CHANNELS",
-    "N_STATE_CHANNELS",
-    "N_TRAJECTORY_CHANNELS",
     "QUANTILE_LEVELS",
-    "RiskSample",
     "VerificationSample",
-    "MODEL_INPUT_CLASSES",
-    "validate_risk_sample",
     "validate_verification_sample",
 )
 
@@ -80,7 +82,7 @@ def test_retired_paths_are_absent() -> None:
     assert remaining == []
 
 
-def test_retired_downstream_contract_symbols_are_absent() -> None:
+def test_retired_post_sop08_contract_symbols_are_absent() -> None:
     from src import contracts
 
     remaining = [
@@ -89,7 +91,7 @@ def test_retired_downstream_contract_symbols_are_absent() -> None:
     assert remaining == []
 
 
-def test_base_config_contains_only_current_sop01_to_sop06_sections() -> None:
+def test_base_config_contains_only_current_long40_sections() -> None:
     from src.utils.config import load_config
 
     assert set(load_config(ROOT / "configs/base.yaml")) == CURRENT_BASE_CONFIG_KEYS

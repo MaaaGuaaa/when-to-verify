@@ -1,14 +1,16 @@
-"""Frozen data contracts for the current Long40 generation pipeline.
+"""Frozen data contracts for the event-centered blind-spot risk project.
 
 This module is owned exclusively by SOP-00. Every other workflow imports from
-here and must not redefine schemas, tensor dimensions, or input/oracle
-isolation rules.
+here and must not redefine schemas, channel ordering, tensor dimensions, or the
+input/oracle isolation rules.
 
 Key guarantees enforced here:
 
 - A single ``SCHEMA_VERSION`` string stamps every serialized artifact.
 - Observed state, oracle context, and oracle world are three distinct types so
-  that future/hidden information cannot leak into an observable state object.
+  that future/hidden information can never leak into a model input object.
+- ``RiskSample`` carries only deployment-available inputs, supervision labels,
+  and provenance metadata.
 - Serialization uses ``.npz`` with numeric arrays plus an embedded JSON metadata
   string. ``allow_pickle`` is never used, so no Python object arrays are stored.
 """
@@ -28,6 +30,47 @@ SCHEMA_VERSION = "4.0.0"
 # an integration seed only; array index k stores q_(k+1) at (k+1) * future_dt.
 POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
+# Frozen Schema 4 Long40 temporal contract shared by production boundaries.
+LONG40_HISTORY_STEPS = 8
+LONG40_CURRENT_INDEX = 7
+LONG40_FUTURE_STEPS = 32
+LONG40_SAMPLE_COUNT = 40
+LONG40_SAMPLE_DT_S = 0.2
+LONG40_SNIPPET_DURATION_S = 7.8
+LONG40_FUTURE_HORIZON_S = 6.4
+
+# --- Channel layout (order is a frozen contract; see spec §11.3 and §2.5) ------
+# Two per-timestep history channels, stacked over K history steps.
+HISTORY_CHANNELS: tuple[str, ...] = (
+    "past_dynamic_occupancy",
+    "past_visible_mask",
+)
+# Nine single-frame current-state channels.
+STATE_CHANNELS: tuple[str, ...] = (
+    "current_visible_free",
+    "current_visible_occupied",
+    "current_unobservable_mask",
+    "last_seen_occupancy",
+    "occlusion_age_map",
+    "static_obstacle_map",
+    "robot_footprint",
+    "robot_velocity_channel",
+    "robot_yaw_rate_channel",
+)
+# Four trajectory-query channels.
+TRAJECTORY_CHANNELS: tuple[str, ...] = (
+    "swept_volume_mask",
+    "time_to_arrival_map",
+    "braking_margin_map",
+    "centerline_map",
+)
+# Full ordered listing used for documentation and checkpoint stamping.
+INPUT_CHANNELS: tuple[str, ...] = HISTORY_CHANNELS + STATE_CHANNELS + TRAJECTORY_CHANNELS
+
+N_HISTORY_CHANNELS = len(HISTORY_CHANNELS)  # 2
+N_STATE_CHANNELS = len(STATE_CHANNELS)  # 9
+N_TRAJECTORY_CHANNELS = len(TRAJECTORY_CHANNELS)  # 4
+
 # Fixed vector dimensions (frozen; changing them is a schema change).
 ROBOT_STATE_DIM = 2  # (v, omega)
 ACTION_VECTOR_DIM = 3  # (duration_s, delta_forward_m, delta_yaw_rad)
@@ -37,7 +80,7 @@ DYNAMIC_OBJECT_TYPES: tuple[str, ...] = (
     "unknown_dynamic",
 )
 
-# Tokens that must never appear in an observable-state dataclass field name.
+# Tokens that must never appear in a model-input dataclass field name.
 FORBIDDEN_INPUT_TOKENS: tuple[str, ...] = (
     "oracle",
     "hidden_future",
@@ -46,6 +89,8 @@ FORBIDDEN_INPUT_TOKENS: tuple[str, ...] = (
     "dynamic_object_future",
     "object_future",
     "future_occupancy",
+    "post_verification_occupancy",
+    "post_verify_occupancy",
     "world",
     "ground_truth",
 )
@@ -67,6 +112,9 @@ class GridSpec:
     history_steps: int
     future_steps: int
     resolution_m: float
+    n_history_channels: int = N_HISTORY_CHANNELS
+    n_state_channels: int = N_STATE_CHANNELS
+    n_trajectory_channels: int = N_TRAJECTORY_CHANNELS
 
 
 def build_grid_spec(config: dict) -> GridSpec:
@@ -140,6 +188,26 @@ class LocalTrajectory:
     metadata: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RiskSample:
+    """Trajectory-conditioned hidden-risk training sample (inputs + labels)."""
+
+    sample_id: str
+    split: str
+    base_state_id: str
+    pair_group_id: str
+    event_type: str
+    bev_history: np.ndarray  # [K, N_HISTORY_CHANNELS, H, W]
+    state_channels: np.ndarray  # [N_STATE_CHANNELS, H, W]
+    trajectory_channels: np.ndarray  # [N_TRAJECTORY_CHANNELS, H, W]
+    robot_state: np.ndarray  # [ROBOT_STATE_DIM]
+    collision_label: int
+    risk_severity: float
+    min_clearance: float
+    near_miss: int
+    first_collision_time: float | None
+    metadata: dict = field(default_factory=dict)
+
 
 _CLASS_REGISTRY: dict[str, type] = {
     cls.__name__: cls
@@ -148,13 +216,17 @@ _CLASS_REGISTRY: dict[str, type] = {
         OracleContext,
         OracleWorld,
         LocalTrajectory,
+        RiskSample,
     )
 }
+
+# Dataclasses that represent model inputs and must pass the oracle-leakage guard.
+MODEL_INPUT_CLASSES: tuple[type, ...] = (BaseState, RiskSample)
 
 
 # --- Oracle-leakage guard ------------------------------------------------------
 def assert_no_oracle_leakage(cls: type) -> None:
-    """Fail if an observable-state dataclass exposes a forbidden field name.
+    """Fail if a model-input dataclass exposes a forbidden field name.
 
     Only structural field names are checked. ``metadata`` is permitted because it
     is provenance, but no top-level field may reference oracle/future/world data.
@@ -319,6 +391,32 @@ def validate_oracle_world(world: OracleWorld, grid: GridSpec) -> None:
         "random_seed must be an int",
     )
 
+
+def validate_risk_sample(sample: RiskSample, grid: GridSpec) -> None:
+    """Raise :class:`ContractError` if a :class:`RiskSample` is malformed."""
+    h, w, k = grid.height, grid.width, grid.history_steps
+    _check_float_array(
+        sample.bev_history, (k, grid.n_history_channels, h, w), "bev_history"
+    )
+    _check_float_array(
+        sample.state_channels, (grid.n_state_channels, h, w), "state_channels"
+    )
+    _check_float_array(
+        sample.trajectory_channels,
+        (grid.n_trajectory_channels, h, w),
+        "trajectory_channels",
+    )
+    _check_float_array(sample.robot_state, (ROBOT_STATE_DIM,), "robot_state")
+    _require(sample.collision_label in (0, 1), "collision_label must be 0/1")
+    _require(sample.near_miss in (0, 1), "near_miss must be 0/1")
+    _require(0.0 <= sample.risk_severity <= 1.0, "risk_severity must be in [0, 1]")
+    _require(
+        sample.first_collision_time is None
+        or isinstance(sample.first_collision_time, float),
+        "first_collision_time must be None or float",
+    )
+    if sample.collision_label == 1:
+        _require(sample.near_miss == 0, "collision implies near_miss == 0")
 
 
 # --- Serialization (npz + embedded JSON metadata; no object arrays) ------------

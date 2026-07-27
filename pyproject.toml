@@ -17,6 +17,9 @@ dependencies = [
 test = [
     "pytest==8.3.5",
 ]
+train = [
+    "torch==2.0.1",
+]
 
 [tool.setuptools.packages.find]
 include = ["src*"]
@@ -26,7 +29,11 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.learning-when-to-verify.verified-environment]
-status = "sop01-06-long40-active"
+status = "sop01-08-long40-occupancy-active"
 python = "3.10.14"
 pip = "24.2"
 setuptools = "82.0.1"
+torch = "2.0.1+cu118"
+torch-index-url = "https://download.pytorch.org/whl/cu118"
+cuda-runtime = "11.8"
+cudnn = "8.7.0"

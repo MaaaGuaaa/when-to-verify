@@ -9,14 +9,20 @@ import numpy as np
 import torch
 from torch import nn
 
-from src.contracts import HISTORY_CHANNELS, STATE_CHANNELS
+from src.contracts import (
+    HISTORY_CHANNELS,
+    LONG40_FUTURE_STEPS,
+    LONG40_HISTORY_STEPS,
+    LONG40_SAMPLE_DT_S,
+    STATE_CHANNELS,
+)
 
 from .occupancy_aggregation import future_endpoint_times
 
 
-FUTURE_STEPS = 15
-FUTURE_DT_S = 0.2
-HISTORY_STEPS = 8
+FUTURE_STEPS = LONG40_FUTURE_STEPS
+FUTURE_DT_S = LONG40_SAMPLE_DT_S
+HISTORY_STEPS = LONG40_HISTORY_STEPS
 
 
 def _positive_integer(name: str, value: int) -> int:
@@ -177,7 +183,7 @@ class ConvGRUCell(nn.Module):
 
 
 class ConvGRUOccupancyPredictor(nn.Module):
-    """Encode eight observed BEV frames and autoregress 15 occupancy logits."""
+    """Encode eight observed BEV frames and autoregress future occupancy logits."""
 
     def __init__(
         self,

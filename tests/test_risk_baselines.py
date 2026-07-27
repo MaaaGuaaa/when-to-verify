@@ -35,9 +35,9 @@ def test_last_observation_hold_uses_frozen_dynamic_history_channel() -> None:
     history[:, -1, dynamic_index] = 0.25
     history[:, -1, visible_index] = 0.99
 
-    prediction = LastObservationHold(future_steps=15)(history)
+    prediction = LastObservationHold()(history)
 
-    assert prediction.shape == (2, 15, 3, 4)
+    assert prediction.shape == (2, 32, 3, 4)
     assert prediction.dtype == np.float32
     np.testing.assert_array_equal(prediction, np.full_like(prediction, 0.25))
 
@@ -121,8 +121,8 @@ def _toy_manifest() -> dict:
 
 
 def _toy_checkpoint() -> dict:
-    model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=15)
-    aggregator = LearnedOccupancyRiskAggregator(future_steps=15, hidden_dim=8)
+    model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=32)
+    aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=8)
     return build_occupancy_checkpoint(
         model=model,
         learned_aggregator=aggregator,
@@ -377,10 +377,10 @@ def test_checkpoint_round_trip_reproduces_identical_predictions(tmp_path) -> Non
     import torch
 
     torch.manual_seed(31)
-    model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=15)
-    aggregator = LearnedOccupancyRiskAggregator(future_steps=15, hidden_dim=8)
+    model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=32)
+    aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=8)
     history = torch.rand(2, 8, len(HISTORY_CHANNELS), 5, 5, dtype=torch.float32)
-    footprint = torch.ones(2, 15, 5, 5, dtype=torch.float32)
+    footprint = torch.ones(2, 32, 5, 5, dtype=torch.float32)
     with torch.no_grad():
         expected_occupancy = model(history)
         expected_risk = aggregator(expected_occupancy, footprint)
@@ -394,8 +394,8 @@ def test_checkpoint_round_trip_reproduces_identical_predictions(tmp_path) -> Non
     checkpoint_path = tmp_path / "occupancy.pt"
     save_occupancy_checkpoint(checkpoint_path, checkpoint)
 
-    reloaded_model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=15)
-    reloaded_aggregator = LearnedOccupancyRiskAggregator(future_steps=15, hidden_dim=8)
+    reloaded_model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=32)
+    reloaded_aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=8)
     load_occupancy_checkpoint(
         checkpoint_path,
         model=reloaded_model,

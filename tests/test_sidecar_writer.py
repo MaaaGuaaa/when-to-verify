@@ -29,7 +29,7 @@ def _grid() -> GridSpec:
         height=5,
         width=7,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.25,
     )
 
@@ -107,8 +107,8 @@ def test_sidecar_shard_round_trip_binds_ids_grid_endpoints_and_source(tmp_path: 
     assert loaded.shard_index == 7
     assert loaded.source_risk_shard_semantic_digest == SOURCE_DIGEST
     assert len(loaded.semantic_digest) == 64
-    assert loaded.hidden_risk_occupancy.shape == (2, 15, 5, 7)
-    assert loaded.robot_future_footprints.shape == (2, 15, 5, 7)
+    assert loaded.hidden_risk_occupancy.shape == (2, 32, 5, 7)
+    assert loaded.robot_future_footprints.shape == (2, 32, 5, 7)
     assert loaded.hidden_risk_occupancy.dtype == np.float32
     assert loaded.robot_future_footprints.dtype == np.float32
     assert loaded.future_endpoint_times_s.dtype == np.float32
@@ -117,23 +117,23 @@ def test_sidecar_shard_round_trip_binds_ids_grid_endpoints_and_source(tmp_path: 
     assert not loaded.future_endpoint_times_s.flags.writeable
     np.testing.assert_array_equal(
         loaded.future_endpoint_times_s,
-        np.arange(1, 16, dtype=np.float32) * np.float32(0.2),
+        np.arange(1, 33, dtype=np.float32) * np.float32(0.2),
     )
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert summary["layout_version"] == RISK_SIDECAR_SHARD_LAYOUT_VERSION
     assert summary["sample_ids"] == ["sample-a", "sample-b"]
     assert summary["source_risk_shard_semantic_digest"] == SOURCE_DIGEST
     assert summary["grid"] == {
-        "future_steps": 15,
+        "future_steps": 32,
         "height": 5,
         "resolution_m": 0.25,
         "width": 7,
     }
     assert summary["array_layout"]["hidden_risk_occupancy"] == {
         "dtype": "|u1",
-        "nbytes": 1050,
+        "nbytes": 2240,
         "order": "C",
-        "shape": [2, 15, 5, 7],
+        "shape": [2, 32, 5, 7],
     }
 
     with np.load(root / "sidecars.npz", allow_pickle=False) as archive:
@@ -199,7 +199,7 @@ def test_sidecar_semantic_digest_binds_identity_source_split_index_grid_and_byte
         height=6,
         width=7,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.25,
     )
     cases = (

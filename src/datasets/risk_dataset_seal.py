@@ -1,4 +1,4 @@
-"""Immutable dataset-level seal for accepted schema-3 SOP07 risk shards.
+"""Immutable dataset-level seal for accepted Schema 4 Long40 SOP07 risk shards.
 
 The shard writer remains the only parser for shard payloads.  This module
 authenticates one complete SOP07 collection, binds its ordered shards and
@@ -23,6 +23,8 @@ from typing import Callable, Mapping, Sequence
 from src.contracts import (
     HISTORY_CHANNELS,
     INPUT_CHANNELS,
+    LONG40_FUTURE_STEPS,
+    LONG40_SAMPLE_DT_S,
     SCHEMA_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
@@ -1156,10 +1158,19 @@ def _query_geometry_from_config(
     dt_s = _require_positive_finite_float(
         bev.get("future_dt_s"), field="base config bev.future_dt_s"
     )
-    if not math.isclose(dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12):
-        raise RiskDataContractError("SOP08 future_dt_s must equal 0.2")
-    if grid.future_steps != 15:
-        raise RiskDataContractError("SOP08 future_steps must equal 15")
+    if not math.isclose(
+        dt_s,
+        LONG40_SAMPLE_DT_S,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RiskDataContractError(
+            f"SOP08 future_dt_s must equal {LONG40_SAMPLE_DT_S}"
+        )
+    if grid.future_steps != LONG40_FUTURE_STEPS:
+        raise RiskDataContractError(
+            f"SOP08 future_steps must equal {LONG40_FUTURE_STEPS}"
+        )
     length = _require_positive_finite_float(
         robot.get("length_m"), field="base config robot.length_m"
     )
@@ -1246,8 +1257,15 @@ def _validate_query_geometry(value: object, *, grid: GridSpec) -> dict[str, obje
     dt_s = _require_positive_finite_float(
         value.get("future_dt_s"), field="query_geometry.future_dt_s"
     )
-    if steps != grid.future_steps or steps != 15 or not math.isclose(
-        dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12
+    if (
+        steps != grid.future_steps
+        or steps != LONG40_FUTURE_STEPS
+        or not math.isclose(
+            dt_s,
+            LONG40_SAMPLE_DT_S,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ):
         raise RiskDataContractError("occupancy query time grid mismatch")
     return {

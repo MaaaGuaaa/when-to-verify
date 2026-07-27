@@ -61,7 +61,7 @@ def _publication(
     risk = create_formal_risk_publication(
         root / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         risk,
@@ -119,7 +119,7 @@ def _expected_robot_masks(
         v=v,
         omega=omega,
         dt_s=0.2,
-        steps=15,
+        steps=grid.future_steps,
     )
     return np.stack(
         [
@@ -225,7 +225,7 @@ def test_query_footprints_reconstruct_stop_straight_turn_and_reverse_exactly(
         omega=omega,
     )
     assert actual.dtype == np.float32
-    assert actual.shape == (15, dataset.grid.height, dataset.grid.width)
+    assert actual.shape == (32, dataset.grid.height, dataset.grid.width)
     assert np.array_equal(actual, expected)
 
 
@@ -364,13 +364,13 @@ def test_occupancy_batch_namespaces_are_disjoint_and_resume_is_exact(
     assert not hasattr(batch, "label_sidecars")
     assert batch.query_inputs["robot_endpoint_footprints"].shape == (
         4,
-        15,
+        32,
         dataset.grid.height,
         dataset.grid.width,
     )
     assert batch.occupancy_targets["hidden_risk_occupancy"].shape == (
         4,
-        15,
+        32,
         dataset.grid.height,
         dataset.grid.width,
     )
@@ -388,7 +388,7 @@ def test_occupancy_batch_namespaces_are_disjoint_and_resume_is_exact(
     )
     assert torch.equal(
         batch.query_inputs["endpoint_times_s"],
-        torch.arange(1, 16, dtype=torch.float32) * 0.2,
+        torch.arange(1, 33, dtype=torch.float32) * 0.2,
     )
     resumed = list(iter_production_occupancy_batches(
         dataset,
@@ -515,10 +515,10 @@ def test_query_endpoint_times_are_independently_derived_and_sidecar_checked(
     geometry = _query_geometry(dataset)
     expected = production_endpoint_times_from_query_geometry(geometry)
     assert expected.dtype == np.float32
-    assert expected.shape == (15,)
+    assert expected.shape == (32,)
     assert np.array_equal(
         expected,
-        np.arange(1, 16, dtype=np.float32) * np.float32(0.2),
+        np.arange(1, 33, dtype=np.float32) * np.float32(0.2),
     )
 
     subset = select_production_risk_subset(dataset, max_samples=12, seed=42)

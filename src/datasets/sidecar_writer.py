@@ -18,14 +18,19 @@ from typing import Any, BinaryIO, Mapping, Sequence
 
 import numpy as np
 
-from src.contracts import SCHEMA_VERSION, GridSpec
+from src.contracts import (
+    LONG40_FUTURE_STEPS,
+    LONG40_SAMPLE_DT_S,
+    SCHEMA_VERSION,
+    GridSpec,
+)
 from src.datasets.split_manager import SPLIT_NAMES
 from src.generation.risk_sidecars import RiskLabelSidecar
 from src.utils.atomic_publish import atomic_rename_noreplace
 
 
 RISK_SIDECAR_SHARD_LAYOUT_VERSION = "risk_label_sidecar_shard_v1"
-RISK_SIDECAR_FUTURE_DT_S = 0.2
+RISK_SIDECAR_FUTURE_DT_S = LONG40_SAMPLE_DT_S
 RISK_SIDECAR_PAIR_COMPLETION_MARKER_VERSION = (
     "risk_sidecar_pair_completion_v1"
 )
@@ -338,8 +343,11 @@ def _validate_grid(grid: Any) -> GridSpec:
         raise TypeError("grid.resolution_m must be a positive finite real")
     if not np.isfinite(resolution) or float(resolution) <= 0.0:
         raise ValueError("grid.resolution_m must be a positive finite real")
-    if grid.future_steps != 15:
-        raise ValueError("SOP08 sidecars require exactly 15 future endpoints")
+    if grid.future_steps != LONG40_FUTURE_STEPS:
+        raise ValueError(
+            "SOP08 sidecars require exactly "
+            f"{LONG40_FUTURE_STEPS} future endpoints"
+        )
     return grid
 
 

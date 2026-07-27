@@ -1,4 +1,4 @@
-"""Schema-v3 hidden-object risk ground truth for one candidate trajectory."""
+"""Current-schema hidden-object risk ground truth for one candidate trajectory."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 
 from src.contracts import (
+    LONG40_FUTURE_STEPS,
+    LONG40_SAMPLE_DT_S,
     POSE_TIME_LAYOUT_VERSION,
     SCHEMA_VERSION,
     GridSpec,
@@ -27,8 +29,7 @@ from src.geometry import (
 from .dynamic_object_transplant import footprint_from_spec
 
 
-RISK_GT_VERSION = "hidden_risk_gt_schema3_v1"
-_SCHEMA3_VERSION = "3.0.0"
+RISK_GT_VERSION = "hidden_risk_gt_schema4_v2"
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,7 @@ def _validate_trajectory(
         raise ValueError("trajectory.poses must contain only finite values")
     if trajectory.metadata.get("pose_time_layout_version") != POSE_TIME_LAYOUT_VERSION:
         raise ValueError(
-            "trajectory pose_time_layout_version must use schema3 future endpoints"
+            "trajectory pose_time_layout_version must use endpoint semantics"
         )
     return poses
 
@@ -165,14 +166,16 @@ def compute_hidden_risk_gt(
 ) -> RiskGroundTruth:
     """Compute risk using only caller-declared currently hidden dynamic objects.
 
-    Future pose index ``k`` is the schema-v3 endpoint at
+    Future pose index ``k`` is the current-schema endpoint at
     ``tau = (k + 1) * future_dt_s``.  Objects present in ``world`` but absent
     from ``hidden_object_ids`` cannot affect any returned label.
     """
 
-    if SCHEMA_VERSION != _SCHEMA3_VERSION:
-        raise RuntimeError(f"risk GT requires schema {_SCHEMA3_VERSION}")
     validated_grid = _validate_grid(grid)
+    if validated_grid.future_steps != LONG40_FUTURE_STEPS:
+        raise ValueError(
+            f"SOP7 risk GT requires exactly {LONG40_FUTURE_STEPS} future endpoints"
+        )
     robot_poses = _validate_trajectory(trajectory, grid=validated_grid)
     if not isinstance(world, OracleWorld):
         raise TypeError("world must be an OracleWorld")
@@ -185,6 +188,8 @@ def compute_hidden_risk_gt(
         )
 
     dt_s = _positive_real(future_dt_s, name="future_dt_s")
+    if dt_s != LONG40_SAMPLE_DT_S:
+        raise ValueError(f"future_dt_s must equal {LONG40_SAMPLE_DT_S}")
     sigma_distance = _positive_real(
         sigma_distance_m, name="sigma_distance_m"
     )
@@ -196,7 +201,7 @@ def compute_hidden_risk_gt(
         np.arange(1, validated_grid.future_steps + 1, dtype=np.float64) * dt_s
     )
     if not np.isfinite(endpoint_times).all():
-        raise ValueError("schema3 future endpoint times must be finite")
+        raise ValueError("future endpoint times must be finite")
 
     ordered_ids = _ordered_hidden_ids(hidden_object_ids, world=world)
     sentinel = resolve_no_object_clearance_sentinel(validated_grid)

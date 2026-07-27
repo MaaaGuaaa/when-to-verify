@@ -30,6 +30,15 @@ SCHEMA_VERSION = "4.0.0"
 # an integration seed only; array index k stores q_(k+1) at (k+1) * future_dt.
 POSE_TIME_LAYOUT_VERSION = "future_endpoints_dt_to_horizon_v1"
 
+# Frozen Schema 4 Long40 temporal contract shared by production boundaries.
+LONG40_HISTORY_STEPS = 8
+LONG40_CURRENT_INDEX = 7
+LONG40_FUTURE_STEPS = 32
+LONG40_SAMPLE_COUNT = 40
+LONG40_SAMPLE_DT_S = 0.2
+LONG40_SNIPPET_DURATION_S = 7.8
+LONG40_FUTURE_HORIZON_S = 6.4
+
 # --- Channel layout (order is a frozen contract; see spec §11.3 and §2.5) ------
 # Two per-timestep history channels, stacked over K history steps.
 HISTORY_CHANNELS: tuple[str, ...] = (

@@ -1557,15 +1557,25 @@ def _open_occupancy_snapshot(
     expected_paths = {
         "query_inputs/robot_endpoint_footprints.npy": (
             query_root / _ROBOT_ENDPOINT_FOOTPRINTS_NAME,
-            (dataset.sample_count, 15, dataset.grid.height, dataset.grid.width),
+            (
+                dataset.sample_count,
+                dataset.grid.future_steps,
+                dataset.grid.height,
+                dataset.grid.width,
+            ),
         ),
         "query_inputs/endpoint_times_s.npy": (
             query_root / _ENDPOINT_TIMES_NAME,
-            (15,),
+            (dataset.grid.future_steps,),
         ),
         "targets/hidden_risk_occupancy.npy": (
             target_root / _HIDDEN_RISK_OCCUPANCY_NAME,
-            (dataset.sample_count, 15, dataset.grid.height, dataset.grid.width),
+            (
+                dataset.sample_count,
+                dataset.grid.future_steps,
+                dataset.grid.height,
+                dataset.grid.width,
+            ),
         ),
     }
     if not isinstance(array_entries, Mapping) or set(array_entries) != set(
@@ -1730,7 +1740,7 @@ class _OccupancySnapshotMaterializer:
         target_root.mkdir()
         mask_shape = (
             pair.total_sample_count,
-            15,
+            pair.grid.future_steps,
             pair.grid.height,
             pair.grid.width,
         )
@@ -1744,7 +1754,7 @@ class _OccupancySnapshotMaterializer:
             query_root / _ENDPOINT_TIMES_NAME,
             mode="w+",
             dtype=np.float32,
-            shape=(15,),
+            shape=(pair.grid.future_steps,),
         )
         self.endpoint_times[:] = (
             risk_dataloader_module.production_endpoint_times_from_query_geometry(
@@ -1822,7 +1832,12 @@ class _OccupancySnapshotMaterializer:
             )
         if (
             reconstructed.shape
-            != (count, 15, pair.grid.height, pair.grid.width)
+            != (
+                count,
+                pair.grid.future_steps,
+                pair.grid.height,
+                pair.grid.width,
+            )
             or hidden.shape != reconstructed.shape
             or not np.isfinite(reconstructed).all()
             or not np.isfinite(hidden).all()

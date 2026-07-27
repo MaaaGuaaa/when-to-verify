@@ -43,6 +43,7 @@ from src.datasets.risk_training_store import AuthenticatedOccupancySnapshot
 from src.evaluation.risk_baselines import score_production_occupancy_baseline
 from src.models.occupancy_baseline import (
     ConvGRUOccupancyPredictor,
+    FUTURE_STEPS,
     LearnedOccupancyRiskAggregator,
 )
 from src.utils.atomic_publish import atomic_rename_noreplace
@@ -98,6 +99,7 @@ _CONFIG_SNAPSHOT_KEYS = frozenset(
         "stage",
         "seed",
         "device",
+        "future_steps",
         "hidden_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
@@ -222,6 +224,7 @@ class ProductionOccupancyTrainingConfig:
     stage: str
     seed: int
     device: str
+    future_steps: int
     hidden_channels: int
     convgru_kernel_size: int
     learned_aggregator_hidden_dim: int
@@ -248,6 +251,8 @@ class ProductionOccupancyTrainingConfig:
             raise ValueError("seed must be a nonnegative integer")
         if self.device not in {"cpu", "cuda"} and not self.device.startswith("cuda:"):
             raise ValueError("device must be cpu or an allocated cuda device")
+        if type(self.future_steps) is not int or self.future_steps != FUTURE_STEPS:
+            raise ValueError(f"future_steps must be {FUTURE_STEPS}")
         for name in (
             "hidden_channels",
             "convgru_kernel_size",
@@ -588,12 +593,15 @@ def _validate_config_snapshot(value: Mapping[str, object]) -> None:
         raise ValueError("config scientific_claim_eligible must be false")
     _require_exact_int(value["seed"], "config seed")
     for name in (
+        "future_steps",
         "hidden_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
         "batch_size",
     ):
         _require_exact_int(value[name], f"config {name}", minimum=1)
+    if value["future_steps"] != FUTURE_STEPS:
+        raise ValueError(f"config future_steps must equal {FUTURE_STEPS}")
     if value["convgru_kernel_size"] % 2 == 0:
         raise ValueError("config convgru_kernel_size must be odd")
     for name in (
@@ -787,7 +795,7 @@ def load_production_occupancy_checkpoint(
         raise ValueError(
             "production occupancy checkpoint model_spec.convgru_kernel_size must be odd"
         )
-    if model_spec["future_steps"] != 15:
+    if model_spec["future_steps"] != FUTURE_STEPS:
         raise ValueError("production occupancy checkpoint future_steps mismatch")
     states: list[Mapping[str, torch.Tensor]] = []
     for key in ("b3_model_state_dict", "b4_aggregator_state_dict"):
@@ -807,11 +815,11 @@ def load_production_occupancy_checkpoint(
     try:
         model = ConvGRUOccupancyPredictor(
             hidden_channels=model_spec["hidden_channels"],
-            future_steps=15,
+            future_steps=model_spec["future_steps"],
             kernel_size=model_spec["convgru_kernel_size"],
         )
         aggregator = LearnedOccupancyRiskAggregator(
-            future_steps=15,
+            future_steps=model_spec["future_steps"],
             hidden_dim=model_spec["learned_aggregator_hidden_dim"],
         )
         model.load_state_dict(states[0], strict=True)
@@ -1288,7 +1296,7 @@ def _build_formal_checkpoint(
             "hidden_channels": config.hidden_channels,
             "convgru_kernel_size": config.convgru_kernel_size,
             "learned_aggregator_hidden_dim": config.learned_aggregator_hidden_dim,
-            "future_steps": 15,
+            "future_steps": config.future_steps,
         },
         "b3_model_state_dict": copy.deepcopy(dict(b3_state)),
         "b4_aggregator_state_dict": copy.deepcopy(dict(b4_state)),
@@ -1355,7 +1363,7 @@ def load_formal_production_occupancy_checkpoint(
         "future_steps",
     }:
         raise ValueError("formal occupancy checkpoint model spec mismatch")
-    if model_spec["future_steps"] != 15:
+    if model_spec["future_steps"] != FUTURE_STEPS:
         raise ValueError("formal occupancy checkpoint future_steps mismatch")
     states = (
         value["b3_model_state_dict"],
@@ -1386,11 +1394,11 @@ def load_formal_production_occupancy_checkpoint(
     try:
         model = ConvGRUOccupancyPredictor(
             hidden_channels=int(model_spec["hidden_channels"]),
-            future_steps=15,
+            future_steps=int(model_spec["future_steps"]),
             kernel_size=int(model_spec["convgru_kernel_size"]),
         )
         aggregator = LearnedOccupancyRiskAggregator(
-            future_steps=15,
+            future_steps=int(model_spec["future_steps"]),
             hidden_dim=int(model_spec["learned_aggregator_hidden_dim"]),
         )
         model.load_state_dict(states[0], strict=True)
@@ -1551,11 +1559,11 @@ def _train_formal_occupancy_baselines(
     torch.use_deterministic_algorithms(True)
     model = ConvGRUOccupancyPredictor(
         hidden_channels=config.hidden_channels,
-        future_steps=15,
+        future_steps=config.future_steps,
         kernel_size=config.convgru_kernel_size,
     ).to(device)
     aggregator = LearnedOccupancyRiskAggregator(
-        future_steps=15,
+        future_steps=config.future_steps,
         hidden_dim=config.learned_aggregator_hidden_dim,
     ).to(device)
     occupancy_optimizer = torch.optim.AdamW(
@@ -2016,8 +2024,8 @@ def train_production_occupancy_baselines(
         raise TypeError("train_dataset must be an authenticated LoadedRiskDataset")
     if train_dataset.split != "train" or train_dataset.grid.history_steps != 8:
         raise ValueError("SOP08 smoke requires authenticated train history_steps=8")
-    if train_dataset.grid.future_steps != 15:
-        raise ValueError("SOP08 smoke requires future_steps=15")
+    if train_dataset.grid.future_steps != config.future_steps:
+        raise ValueError(f"SOP08 smoke requires future_steps={FUTURE_STEPS}")
     grid = train_dataset.manifest.get("grid")
     if not isinstance(grid, Mapping) or not math.isclose(
         float(grid.get("sample_dt_s", math.nan)), 0.2, rel_tol=0.0, abs_tol=1e-12
@@ -2104,11 +2112,11 @@ def train_production_occupancy_baselines(
     batch = _move_batch(first_batch, device)
     model = ConvGRUOccupancyPredictor(
         hidden_channels=config.hidden_channels,
-        future_steps=15,
+        future_steps=config.future_steps,
         kernel_size=config.convgru_kernel_size,
     ).to(device)
     aggregator = LearnedOccupancyRiskAggregator(
-        future_steps=15,
+        future_steps=config.future_steps,
         hidden_dim=config.learned_aggregator_hidden_dim,
     ).to(device)
     occupancy_optimizer = torch.optim.AdamW(
@@ -2212,7 +2220,7 @@ def train_production_occupancy_baselines(
             "hidden_channels": config.hidden_channels,
             "convgru_kernel_size": config.convgru_kernel_size,
             "learned_aggregator_hidden_dim": config.learned_aggregator_hidden_dim,
-            "future_steps": 15,
+            "future_steps": config.future_steps,
         },
         "b3_model_state_dict": b3_state,
         "b4_aggregator_state_dict": b4_state,

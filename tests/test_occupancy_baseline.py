@@ -30,14 +30,15 @@ def _history(batch_size: int = 3, grid_size: int = 8) -> torch.Tensor:
 
 def test_convgru_predictor_has_frozen_future_contract_and_is_deterministic() -> None:
     torch.manual_seed(11)
-    model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=15)
+    model = ConvGRUOccupancyPredictor(hidden_channels=4)
     history = _history()
 
     probability = model(history)
     repeated = model(history)
     logits = model.predict_logits(history)
 
-    assert probability.shape == (3, 15, 8, 8)
+    assert model.future_steps == 32
+    assert probability.shape == (3, 32, 8, 8)
     assert probability.dtype == torch.float32
     assert torch.isfinite(probability).all()
     assert torch.all((probability >= 0.0) & (probability <= 1.0))

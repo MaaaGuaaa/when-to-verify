@@ -61,6 +61,7 @@ from src.evaluation.risk_baselines import (  # noqa: E402
 from src.models.occupancy_baseline import (  # noqa: E402
     AgeDecay,
     ConvGRUOccupancyPredictor,
+    FUTURE_STEPS,
     LastObservationHold,
     LearnedOccupancyRiskAggregator,
 )
@@ -114,6 +115,7 @@ _PRODUCTION_CONFIG_KEYS = frozenset(
         "stage",
         "seed",
         "device",
+        "future_steps",
         "hidden_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
@@ -198,8 +200,8 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise ValueError("data.split must be 'train'")
     if value["data"]["history_steps"] != 8:
         raise ValueError("data.history_steps must be 8")
-    if value["data"]["future_steps"] != 15:
-        raise ValueError("data.future_steps must be 15")
+    if value["data"]["future_steps"] != FUTURE_STEPS:
+        raise ValueError(f"data.future_steps must be {FUTURE_STEPS}")
     if not math.isclose(float(value["data"]["future_dt_s"]), 0.2, abs_tol=1e-9):
         raise ValueError("data.future_dt_s must be 0.2")
     if value["artifact"]["checkpoint_layout_version"] != OCCUPANCY_CHECKPOINT_LAYOUT_VERSION:
@@ -479,9 +481,12 @@ def _baseline_scores_for_dataset(
     history = np.asarray(model_inputs["bev_history"], dtype=np.float32)
     state = np.asarray(model_inputs["state_channels"], dtype=np.float32)
     footprints = np.asarray(sidecars["robot_future_footprints"], dtype=np.float32)
-    b1_occupancy = LastObservationHold(future_steps=15)(history)
+    future_steps = model.future_steps
+    if learned_aggregator.future_steps != future_steps:
+        raise ValueError("occupancy model and aggregator future_steps mismatch")
+    b1_occupancy = LastObservationHold(future_steps=future_steps)(history)
     b2_occupancy = AgeDecay(
-        future_steps=15,
+        future_steps=future_steps,
         dt_s=0.2,
         tau_s=b2_tau_s,
         a_max_s=b2_a_max_s,
@@ -645,14 +650,15 @@ def _publish_toy_artifact(
     target = torch.from_numpy(target_np)
     footprints = torch.from_numpy(footprints_np)
     collision = torch.from_numpy(collision_np)
+    future_steps = int(config["data"]["future_steps"])
 
     model = ConvGRUOccupancyPredictor(
         hidden_channels=int(config["model"]["hidden_channels"]),
-        future_steps=15,
+        future_steps=future_steps,
         kernel_size=int(config["model"]["convgru_kernel_size"]),
     )
     aggregator = LearnedOccupancyRiskAggregator(
-        future_steps=15,
+        future_steps=future_steps,
         hidden_dim=int(config["model"]["learned_aggregator_hidden_dim"]),
     )
     occupancy_training = fit_toy_occupancy_model(
@@ -673,11 +679,11 @@ def _publish_toy_artifact(
         learning_rate=float(config["training"]["aggregator_learning_rate"]),
     )
 
-    last_observation = LastObservationHold(future_steps=15)(history_np)
+    last_observation = LastObservationHold(future_steps=future_steps)(history_np)
     b2_tau_s = float(config["aggregation"]["b2_tau_s"])
     b2_a_max_s = float(config["aggregation"]["b2_a_max_s"])
     age_decay = AgeDecay(
-        future_steps=15,
+        future_steps=future_steps,
         dt_s=0.2,
         tau_s=b2_tau_s,
         a_max_s=b2_a_max_s,
@@ -832,10 +838,12 @@ def _publish_toy_artifact(
         "sample_count": int(history_np.shape[0]),
         "split": dataset.split,
         "seed": seed,
-        "future_steps": 15,
+        "future_steps": future_steps,
         "future_dt_s": 0.2,
         "future_time_layout": "endpoint_dt_to_horizon",
-        "future_endpoint_times_s": [round(step * 0.2, 7) for step in range(1, 16)],
+        "future_endpoint_times_s": [
+            round(step * 0.2, 7) for step in range(1, future_steps + 1)
+        ],
         "baseline_hyperparameters": {
             "b2_tau_s": b2_tau_s,
             "b2_a_max_s": b2_a_max_s,

@@ -102,7 +102,7 @@ def test_formal_occupancy_requires_family_val_and_exact_50k(tmp_path: Path) -> N
     publication = create_formal_risk_publication(
         tmp_path / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         publication,
@@ -150,7 +150,7 @@ def _family_with_occupancy(root: Path):
             split=split,
             handoff_dialect="legacy" if split == "train" else "heldout",
             history_steps=8,
-            future_steps=15,
+            future_steps=32,
         )
         sidecar_root = None
         if split in {"train", "val"}:

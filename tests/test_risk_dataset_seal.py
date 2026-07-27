@@ -982,7 +982,7 @@ def test_cli_can_seal_an_authenticated_occupancy_sidecar_collection(
     publication = create_formal_risk_publication(
         tmp_path / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         publication,
@@ -1035,7 +1035,7 @@ def test_sidecar_seal_rejects_missing_extra_and_reordered_evidence(
     publication = create_formal_risk_publication(
         tmp_path / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         publication,

@@ -169,7 +169,7 @@ def test_production_cli_uses_distinct_trainer_and_never_calls_toy_publisher(
     publication = create_formal_risk_publication(
         tmp_path / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         publication,
@@ -369,7 +369,7 @@ def test_training_cli_writes_deterministic_toy_artifact_without_oracle_inputs(
     assert "hidden_risk_occupancy" not in left_manifest["model_input_keys"]
     assert "robot_future_footprints" not in left_manifest["model_input_keys"]
     assert left_manifest["future_endpoint_times_s"] == pytest.approx(
-        [step * 0.2 for step in range(1, 16)]
+        [step * 0.2 for step in range(1, 33)]
     )
     checkpoint_digest = left_manifest["checkpoint_semantic_digest_sha256"]
     assert checkpoint["checkpoint_semantic_digest_sha256"] == checkpoint_digest

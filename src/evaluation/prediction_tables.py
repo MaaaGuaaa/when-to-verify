@@ -197,7 +197,7 @@ def baseline_spec_digest(
             "method_id": method_id,
             "implementation": BASELINE_SPECS[method_id],
             "history_steps": 8,
-            "future_steps": 15,
+            "future_steps": 32,
             "future_dt_s": 0.2,
             "parameters": parameters,
         },

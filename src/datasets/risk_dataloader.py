@@ -100,6 +100,7 @@ _SUBSET_DIGEST_DOMAIN = "risk-production-subset-v1"
 _SHARD_ORDER_DOMAIN = "risk-production-shard-order-v1"
 _ROW_ORDER_DOMAIN = "risk-production-row-order-v1"
 _PRODUCTION_TARGET_CHANNELS = (*TARGET_KEYS, "first_collision_time")
+_PRODUCTION_FUTURE_STEPS = 32
 _FROZEN_LINEAR_PRIMITIVES = (-0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8)
 _FROZEN_ANGULAR_PRIMITIVES = (-0.8, -0.4, 0.0, 0.4, 0.8)
 
@@ -117,6 +118,7 @@ class RiskBatch:
     sample_ids: tuple[str, ...]
     split: str
     provenance: dict[str, object]
+    occupancy_targets: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -174,16 +176,21 @@ class ProductionOccupancyBatch:
             raise RiskDataContractError(
                 "occupancy/query masks must share [B,T,H,W] shape"
             )
-        if int(hidden.shape[0]) != batch_size or int(hidden.shape[1]) != 15:
-            raise RiskDataContractError("occupancy masks must have shape [B,15,H,W]")
-        if endpoints.shape != (15,):
-            raise RiskDataContractError("endpoint_times_s must have shape [15]")
+        future_steps = int(hidden.shape[1])
+        if int(hidden.shape[0]) != batch_size or future_steps != _PRODUCTION_FUTURE_STEPS:
+            raise RiskDataContractError(
+                "occupancy masks must have shape [B,32,H,W]"
+            )
+        if endpoints.shape != (future_steps,):
+            raise RiskDataContractError(
+                "endpoint_times_s must match the occupancy horizon"
+            )
         expected_endpoints = torch.arange(
-            1, 16, dtype=torch.float32, device=endpoints.device
+            1, future_steps + 1, dtype=torch.float32, device=endpoints.device
         ) * 0.2
         if not torch.equal(endpoints, expected_endpoints):
             raise RiskDataContractError(
-                "endpoint_times_s must equal exact endpoints 0.2..3.0"
+                "endpoint_times_s must equal exact 0.2-second endpoints"
             )
         for name, tensor in (("hidden", hidden), ("query", query)):
             if bool(((tensor != 0.0) & (tensor != 1.0)).any()):
@@ -699,8 +706,8 @@ def production_endpoint_times_from_query_geometry(
     if not isinstance(query_geometry, Mapping):
         raise RiskDataContractError("occupancy query_geometry must be a mapping")
     future_steps = query_geometry.get("future_steps")
-    if type(future_steps) is not int or future_steps != 15:
-        raise RiskDataContractError("occupancy query future_steps must equal 15")
+    if type(future_steps) is not int or future_steps != _PRODUCTION_FUTURE_STEPS:
+        raise RiskDataContractError("occupancy query future_steps must equal 32")
     dt_value = query_geometry.get("future_dt_s")
     if type(dt_value) not in {int, float} or not math.isclose(
         float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
@@ -710,7 +717,7 @@ def production_endpoint_times_from_query_geometry(
         np.arange(1, future_steps + 1, dtype=np.float32)
         * np.float32(dt_value)
     )
-    if endpoint_times.shape != (15,) or not np.isfinite(endpoint_times).all():
+    if endpoint_times.shape != (future_steps,) or not np.isfinite(endpoint_times).all():
         raise RiskDataContractError("derived occupancy endpoint times are invalid")
     return np.ascontiguousarray(endpoint_times, dtype=np.float32)
 
@@ -766,8 +773,15 @@ def reconstruct_production_robot_endpoint_footprints(
     base_config_digest = _require_blake2b128(
         query_geometry.get("base_config_digest"), "query_geometry.base_config_digest"
     )
-    if query_geometry.get("future_steps") != 15 or grid.future_steps != 15:
-        raise RiskDataContractError("occupancy query future_steps must equal 15")
+    future_steps = query_geometry.get("future_steps")
+    if (
+        type(future_steps) is not int
+        or future_steps != _PRODUCTION_FUTURE_STEPS
+        or grid.future_steps != future_steps
+    ):
+        raise RiskDataContractError(
+            "occupancy query future_steps must match the 32-step grid horizon"
+        )
     dt_value = query_geometry.get("future_dt_s")
     if type(dt_value) not in {int, float} or not math.isclose(
         float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
@@ -827,7 +841,7 @@ def reconstruct_production_robot_endpoint_footprints(
         grid.height,
         grid.width,
         grid.resolution_m,
-        15,
+        future_steps,
         0.2,
         length,
         width,
@@ -837,7 +851,9 @@ def reconstruct_production_robot_endpoint_footprints(
     if cached is not None:
         _ROBOT_ENDPOINT_MASK_CACHE.move_to_end(cache_key)
         return np.array(cached, dtype=np.float32, order="C", copy=True)
-    poses, _ = rollout_constant_control(v=v, omega=omega, dt_s=0.2, steps=15)
+    poses, _ = rollout_constant_control(
+        v=v, omega=omega, dt_s=0.2, steps=future_steps
+    )
     footprint = inflate_footprint(RectangleFootprint(length, width), inflation)
     masks = np.ascontiguousarray(
         np.stack(
@@ -851,7 +867,7 @@ def reconstruct_production_robot_endpoint_footprints(
         ),
         dtype=np.float32,
     )
-    if masks.shape != (15, grid.height, grid.width) or not np.isin(
+    if masks.shape != (future_steps, grid.height, grid.width) or not np.isin(
         masks, (0.0, 1.0)
     ).all():
         raise RiskDataContractError("reconstructed endpoint masks are invalid")
@@ -1616,8 +1632,8 @@ def iter_production_occupancy_batches(
     loaded_dataset = _validate_loaded_risk_dataset(dataset)
     if loaded_dataset.grid.history_steps != 8:
         raise RiskDataContractError("SOP08 production requires history_steps=8")
-    if loaded_dataset.grid.future_steps != 15:
-        raise RiskDataContractError("SOP08 production requires future_steps=15")
+    if loaded_dataset.grid.future_steps != _PRODUCTION_FUTURE_STEPS:
+        raise RiskDataContractError("SOP08 production requires future_steps=32")
     grid_manifest = loaded_dataset.manifest.get("grid")
     if not isinstance(grid_manifest, Mapping) or not math.isclose(
         float(grid_manifest.get("sample_dt_s", math.nan)),

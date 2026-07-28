@@ -49,7 +49,7 @@ from src.training.risk_trainer import (
     ProductionRiskTrainingResult,
     train_production_risk_model as _train_production_risk_model,
 )
-from src.utils.config import load_config
+from src.utils.config import config_digest, load_config
 from tests.fixtures.formal_risk_publication import (
     FormalRiskPublication,
     canonical_json,
@@ -146,12 +146,13 @@ def _model_compatible_publication(
         publication.base_config_path.read_text(encoding="utf-8")
     )
     base_config["bev"]["history_steps"] = 8
-    base_config["bev"]["future_steps"] = 15
+    base_config["bev"]["future_steps"] = 32
     publication.base_config_path.write_text(
         yaml.safe_dump(base_config, sort_keys=True), encoding="utf-8"
     )
     loaded_config = load_config(publication.base_config_path)
     grid = build_grid_spec(loaded_config)
+    rebuilt_base_config_digest = config_digest(loaded_config)
     run_manifest = json.loads(
         publication.split_provenance_path.read_text(encoding="utf-8")
     )
@@ -175,6 +176,13 @@ def _model_compatible_publication(
             bev_history=np.repeat(sample.bev_history, repeats=4, axis=0).astype(
                 np.float32, copy=False
             ),
+            metadata={
+                **sample.metadata,
+                "provenance": {
+                    **sample.metadata["provenance"],
+                    "base_config_digest": rebuilt_base_config_digest,
+                },
+            },
         )
         for sample in old_samples
     )
@@ -351,6 +359,16 @@ def test_public_contract_config_and_loss_are_exact(tmp_path: Path) -> None:
         "weight_decay",
         "lambda_collision",
         "checkpoint_interval_steps",
+        "occupancy_aux_enabled",
+        "lambda_occupancy_aux",
+        "occupancy_future_steps",
+        "r2_d_model",
+        "r2_nhead",
+        "r2_num_decoder_layers",
+        "r2_dim_feedforward",
+        "r2_dropout",
+        "r2_query_bins",
+        "r2_fusion_mode",
     ]
     assert [field.name for field in fields(ProductionRiskTrainingResult)] == [
         "output_dir",
@@ -365,8 +383,9 @@ def test_public_contract_config_and_loss_are_exact(tmp_path: Path) -> None:
         _config().epochs = 9  # type: ignore[misc]
     with pytest.raises(RiskDataContractError, match="stage"):
         replace(_config(), stage="real_1k")
+    assert replace(_config(), variant="r2", hidden_channels=None).variant == "r2"
     with pytest.raises(RiskDataContractError, match="variant"):
-        replace(_config(), variant="r2")
+        replace(_config(), variant="r3")
     with pytest.raises(RiskDataContractError, match="learning_rate"):
         replace(_config(), learning_rate=0.0)
     assert trainer_module._training_data_scale(_config(), 999) == (

@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from src.contracts import SCHEMA_VERSION
 from src.datasets.risk_dataloader import RiskDataContractError
 from src.datasets.risk_evaluation_metadata import (
     RISK_EVALUATION_RECORD_FIELDS,
@@ -515,8 +516,10 @@ def validate_prediction_table(
         dataset_family,
         mode=mode,
     )
-    if result.get("schema_version") != "3.0.0":
-        raise CalibrationContractError("prediction table schema_version must be '3.0.0'")
+    if result.get("schema_version") != SCHEMA_VERSION:
+        raise CalibrationContractError(
+            f"prediction table schema_version must be {SCHEMA_VERSION!r}"
+        )
     split = result.get("split")
     if not isinstance(split, str) or not split:
         raise CalibrationContractError("prediction table split must be a non-empty string")
@@ -850,8 +853,10 @@ def validate_calibration_artifact(
         dataset_family,
         mode=mode,
     )
-    if result.get("schema_version") != "3.0.0":
-        raise CalibrationContractError("calibration artifact schema_version must be '3.0.0'")
+    if result.get("schema_version") != SCHEMA_VERSION:
+        raise CalibrationContractError(
+            f"calibration artifact schema_version must be {SCHEMA_VERSION!r}"
+        )
     if result.get("fit_split") != "calibration":
         raise CalibrationContractError("artifact fit_split must be calibration")
     checkpoint_layout_version = result.get("checkpoint_layout_version")

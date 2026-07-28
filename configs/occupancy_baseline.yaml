@@ -1,4 +1,4 @@
-schema_version: "3.0.0"
+schema_version: "4.0.0"
 mode: toy
 seed: 42
 
@@ -10,7 +10,7 @@ data:
   test_count: 28
   grid_size: 16
   history_steps: 8
-  future_steps: 15
+  future_steps: 32
   future_dt_s: 0.2
 
 model:

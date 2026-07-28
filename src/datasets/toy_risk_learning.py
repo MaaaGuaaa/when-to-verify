@@ -33,9 +33,9 @@ from src.contracts import (
     validate_risk_sample,
 )
 
-TOY_DATASET_LAYOUT_VERSION = "toy_risk_dataset_v3"
+TOY_DATASET_LAYOUT_VERSION = "toy_risk_dataset_v4"
 TOY_HISTORY_STEPS = 8
-TOY_FUTURE_STEPS = 15
+TOY_FUTURE_STEPS = 32
 TOY_DT_S = 0.2
 TOY_FOOTPRINT_PROXY_KIND = "single_grid_cell_square"
 TOY_FOOTPRINT_CONTACT_POLICY = "positive_area_overlap"

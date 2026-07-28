@@ -24,10 +24,13 @@ import torch
 
 from src.contracts import SCHEMA_VERSION
 from src.datasets.risk_dataloader import (
+    OccupancyStreamCursor,
+    ProductionOccupancyBatch,
     ProductionRiskSubset,
     RiskBatch,
     RiskDataContractError,
     RiskStreamCursor,
+    iter_production_occupancy_batches,
     iter_production_risk_batches,
     select_production_risk_subset,
 )
@@ -38,11 +41,18 @@ from src.datasets.risk_dataset_seal import (
 )
 from src.datasets.toy_risk_learning import frozen_channel_spec
 from src.models.risk_model import (
+    R2_DECODER_LAYERS,
+    R2_DIM_FEEDFORWARD,
+    R2_D_MODEL,
+    R2_DROPOUT,
+    R2_NUM_HEADS,
+    R2_QUERY_BINS,
     RiskModel,
     compute_risk_batch_loss,
     load_risk_checkpoint,
     save_risk_checkpoint,
 )
+from src.training.occupancy_trainer import compute_global_binary_pos_weight
 from src.utils.atomic_publish import atomic_rename_noreplace
 
 
@@ -51,7 +61,7 @@ PRODUCTION_RISK_TRAINING_STATE_LAYOUT_VERSION = "sop09_training_state_v2"
 _TRAINING_STAGES = frozenset(
     {"one_shard_smoke", "real_1k_overfit", "formal_50k"}
 )
-_MODEL_VARIANTS = frozenset({"r0", "r1"})
+_MODEL_VARIANTS = frozenset({"r0", "r1", "r2"})
 _TRAINING_MANIFEST_KEYS = frozenset(
     {
         "training_layout_version",
@@ -121,10 +131,10 @@ class ProductionRiskTrainingConfig:
     """Frozen optimizer and publication configuration for one production run."""
 
     stage: Literal["one_shard_smoke", "real_1k_overfit", "formal_50k"]
-    variant: Literal["r0", "r1"]
+    variant: Literal["r0", "r1", "r2"]
     seed: int
     device: str
-    hidden_channels: int
+    hidden_channels: int | None
     batch_size: int
     epochs: int
     gradient_accumulation_steps: int
@@ -132,6 +142,16 @@ class ProductionRiskTrainingConfig:
     weight_decay: float
     lambda_collision: float
     checkpoint_interval_steps: int
+    occupancy_aux_enabled: bool = False
+    lambda_occupancy_aux: float = 0.0
+    occupancy_future_steps: int = 32
+    r2_d_model: int = R2_D_MODEL
+    r2_nhead: int = R2_NUM_HEADS
+    r2_num_decoder_layers: int = R2_DECODER_LAYERS
+    r2_dim_feedforward: int = R2_DIM_FEEDFORWARD
+    r2_dropout: float = R2_DROPOUT
+    r2_query_bins: int = R2_QUERY_BINS
+    r2_fusion_mode: str = "cross_attention"
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, str) or self.stage not in _TRAINING_STAGES:
@@ -153,7 +173,6 @@ class ProductionRiskTrainingConfig:
         if self.device.startswith("cuda:") and not self.device[5:].isdigit():
             raise RiskDataContractError("CUDA device index must be a non-negative integer")
         for field in (
-            "hidden_channels",
             "batch_size",
             "epochs",
             "gradient_accumulation_steps",
@@ -162,7 +181,17 @@ class ProductionRiskTrainingConfig:
             value = getattr(self, field)
             if type(value) is not int or value < 1:
                 raise RiskDataContractError(f"{field} must be a positive integer")
-        for field in ("learning_rate", "weight_decay", "lambda_collision"):
+        if self.variant == "r2":
+            if self.hidden_channels is not None:
+                raise RiskDataContractError("r2 hidden_channels must be null")
+        elif type(self.hidden_channels) is not int or self.hidden_channels < 1:
+            raise RiskDataContractError("r0/r1 hidden_channels must be a positive integer")
+        for field in (
+            "learning_rate",
+            "weight_decay",
+            "lambda_collision",
+            "lambda_occupancy_aux",
+        ):
             value = getattr(self, field)
             if (
                 type(value) not in {int, float}
@@ -172,6 +201,37 @@ class ProductionRiskTrainingConfig:
                 raise RiskDataContractError(f"{field} must be finite and non-negative")
         if float(self.learning_rate) <= 0.0:
             raise RiskDataContractError("learning_rate must be positive")
+        if type(self.occupancy_aux_enabled) is not bool:
+            raise RiskDataContractError("occupancy_aux_enabled must be boolean")
+        if self.occupancy_aux_enabled:
+            if self.variant != "r2":
+                raise RiskDataContractError(
+                    "occupancy_aux_enabled requires the r2 model variant"
+                )
+            if float(self.lambda_occupancy_aux) <= 0.0:
+                raise RiskDataContractError(
+                    "enabled occupancy auxiliary loss requires positive lambda_occupancy_aux"
+                )
+        elif float(self.lambda_occupancy_aux) != 0.0:
+            raise RiskDataContractError(
+                "lambda_occupancy_aux must be zero when occupancy_aux_enabled is false"
+            )
+        try:
+            RiskModel(
+                variant="r2",
+                hidden_channels=None,
+                r2_d_model=self.r2_d_model,
+                r2_nhead=self.r2_nhead,
+                r2_num_decoder_layers=self.r2_num_decoder_layers,
+                r2_dim_feedforward=self.r2_dim_feedforward,
+                r2_dropout=self.r2_dropout,
+                r2_query_bins=self.r2_query_bins,
+                r2_fusion_mode=self.r2_fusion_mode,
+                occupancy_aux_enabled=False,
+                occupancy_future_steps=self.occupancy_future_steps,
+            )
+        except ValueError as error:
+            raise RiskDataContractError(f"invalid R2 configuration: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -185,6 +245,15 @@ class ProductionRiskTrainingResult:
     metrics_path: Path
     manifest_path: Path
     semantic_digest_sha256: str
+
+
+@dataclass(frozen=True)
+class _AuxiliaryOccupancyStatistics:
+    sidecar_collection_digest_sha256: str
+    positive_count: int
+    negative_count: int
+    pos_weight: float
+    future_steps: int
 
 
 @dataclass(frozen=True)
@@ -345,18 +414,37 @@ def _config_digest(config: ProductionRiskTrainingConfig) -> str:
     return _sha256_bytes(_canonical_json_bytes(_config_snapshot(config)))
 
 
-def _cursor_to_mapping(cursor: RiskStreamCursor | None) -> dict[str, object] | None:
+def _cursor_to_mapping(
+    cursor: RiskStreamCursor | OccupancyStreamCursor | None,
+) -> dict[str, object] | None:
     return None if cursor is None else asdict(cursor)
 
 
-def _cursor_from_mapping(value: object) -> RiskStreamCursor | None:
+def _cursor_from_mapping(
+    value: object,
+) -> RiskStreamCursor | OccupancyStreamCursor | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
         raise RiskDataContractError("training state next_cursor must be a mapping or None")
     try:
+        if set(value) == {
+            "risk_cursor",
+            "sidecar_collection_digest_sha256",
+            "query_layout_version",
+        }:
+            risk_cursor = value["risk_cursor"]
+            if not isinstance(risk_cursor, Mapping):
+                raise RiskDataContractError("occupancy cursor risk_cursor must be a mapping")
+            return OccupancyStreamCursor(
+                risk_cursor=RiskStreamCursor(**dict(risk_cursor)),
+                sidecar_collection_digest_sha256=str(
+                    value["sidecar_collection_digest_sha256"]
+                ),
+                query_layout_version=str(value["query_layout_version"]),
+            )
         return RiskStreamCursor(**dict(value))
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:
         raise RiskDataContractError("training state next_cursor fields mismatch") from exc
 
 
@@ -566,11 +654,157 @@ def _atomic_rename_directory_noreplace(source: Path, destination: Path) -> None:
 
 def _move_batch(batch: RiskBatch, device: torch.device) -> RiskBatch:
     return RiskBatch(
-        model_inputs={key: value.to(device=device) for key, value in batch.model_inputs.items()},
+        model_inputs={
+            key: value.to(device=device) for key, value in batch.model_inputs.items()
+        },
         targets={key: value.to(device=device) for key, value in batch.targets.items()},
         sample_ids=batch.sample_ids,
         split=batch.split,
         provenance=batch.provenance,
+        occupancy_targets=(
+            None
+            if batch.occupancy_targets is None
+            else {
+                key: value.to(device=device)
+                for key, value in batch.occupancy_targets.items()
+            }
+        ),
+    )
+
+
+def _risk_batch_from_occupancy(batch: ProductionOccupancyBatch) -> RiskBatch:
+    """Expose sidecar targets to loss code without adding them to model inputs."""
+
+    return RiskBatch(
+        model_inputs=dict(batch.model_inputs),
+        targets=dict(batch.targets),
+        sample_ids=batch.sample_ids,
+        split=batch.split,
+        provenance=dict(batch.provenance),
+        occupancy_targets=dict(batch.occupancy_targets),
+    )
+
+
+def _risk_stream_cursor(
+    cursor: RiskStreamCursor | OccupancyStreamCursor,
+) -> RiskStreamCursor:
+    return cursor.risk_cursor if isinstance(cursor, OccupancyStreamCursor) else cursor
+
+
+def _iter_training_batches(
+    *,
+    dataset: LoadedRiskDataset,
+    subset: ProductionRiskSubset,
+    config: ProductionRiskTrainingConfig,
+    sidecar_root: str | Path | None,
+    epoch: int,
+    start_cursor: RiskStreamCursor | OccupancyStreamCursor | None = None,
+):
+    """Yield risk batches, adding sidecar labels only for an enabled R2 head."""
+
+    if config.occupancy_aux_enabled:
+        if sidecar_root is None:
+            raise RiskDataContractError(
+                "occupancy auxiliary training requires an occupancy sidecar root"
+            )
+        if start_cursor is not None and not isinstance(
+            start_cursor, OccupancyStreamCursor
+        ):
+            raise RiskDataContractError(
+                "auxiliary training resume cursor must bind the occupancy sidecar"
+            )
+        for occupancy_batch, cursor in iter_production_occupancy_batches(
+            dataset,
+            sidecar_root=sidecar_root,
+            subset=subset,
+            batch_size=config.batch_size,
+            seed=config.seed,
+            epoch=epoch,
+            start_cursor=start_cursor,
+        ):
+            yield _risk_batch_from_occupancy(occupancy_batch), cursor
+        return
+    if sidecar_root is not None:
+        raise RiskDataContractError(
+            "occupancy sidecar roots require occupancy_aux_enabled=true"
+        )
+    if start_cursor is not None and not isinstance(start_cursor, RiskStreamCursor):
+        raise RiskDataContractError("risk-only resume cursor must be a RiskStreamCursor")
+    yield from iter_production_risk_batches(
+        dataset,
+        subset=subset,
+        batch_size=config.batch_size,
+        seed=config.seed,
+        epoch=epoch,
+        start_cursor=start_cursor,
+    )
+
+
+def _auxiliary_occupancy_statistics(
+    *,
+    dataset: LoadedRiskDataset,
+    subset: ProductionRiskSubset,
+    config: ProductionRiskTrainingConfig,
+    sidecar_root: str | Path,
+) -> _AuxiliaryOccupancyStatistics:
+    """Fit the BCE positive weight from authenticated training targets only."""
+
+    positive_count = 0
+    total_count = 0
+    sidecar_digests: set[str] = set()
+    future_steps: int | None = None
+    for batch, _ in _iter_training_batches(
+        dataset=dataset,
+        subset=subset,
+        config=config,
+        sidecar_root=sidecar_root,
+        epoch=0,
+    ):
+        targets = batch.occupancy_targets
+        if targets is None:
+            raise RiskDataContractError("auxiliary batch lacks occupancy targets")
+        target = targets.get("hidden_risk_occupancy")
+        if target is None:
+            raise RiskDataContractError("auxiliary batch target key is missing")
+        positive_count += int(torch.count_nonzero(target).item())
+        total_count += int(target.numel())
+        future_steps = int(target.shape[1])
+        digest = batch.provenance.get("occupancy_sidecar_collection_digest_sha256")
+        if not isinstance(digest, str):
+            raise RiskDataContractError("auxiliary batch sidecar provenance is missing")
+        sidecar_digests.add(digest)
+    negative_count = total_count - positive_count
+    if len(sidecar_digests) != 1 or future_steps is None:
+        raise RiskDataContractError("auxiliary sidecar provenance is inconsistent")
+    pos_weight = compute_global_binary_pos_weight(
+        positive_count=positive_count,
+        negative_count=negative_count,
+        name="risk occupancy",
+    )
+    return _AuxiliaryOccupancyStatistics(
+        sidecar_collection_digest_sha256=next(iter(sidecar_digests)),
+        positive_count=positive_count,
+        negative_count=negative_count,
+        pos_weight=pos_weight,
+        future_steps=future_steps,
+    )
+
+
+def _build_risk_model(config: ProductionRiskTrainingConfig) -> RiskModel:
+    """Construct one checkpoint-bound R0/R1/R2 model from training config."""
+
+    return RiskModel(
+        variant=config.variant,
+        hidden_channels=config.hidden_channels,
+        r2_d_model=config.r2_d_model,
+        r2_nhead=config.r2_nhead,
+        r2_num_decoder_layers=config.r2_num_decoder_layers,
+        r2_dim_feedforward=config.r2_dim_feedforward,
+        r2_dropout=config.r2_dropout,
+        r2_query_bins=config.r2_query_bins,
+        r2_fusion_mode=config.r2_fusion_mode,
+        occupancy_aux_enabled=config.occupancy_aux_enabled,
+        occupancy_future_steps=config.occupancy_future_steps,
     )
 
 
@@ -598,9 +832,9 @@ def _dataset_provenance(dataset: LoadedRiskDataset) -> dict[str, str]:
         raise RiskDataContractError(
             "SOP09 production training requires frozen history_steps=8"
         )
-    if dataset.grid.future_steps != 15 or grid.get("future_steps") != 15:
+    if dataset.grid.future_steps != 32 or grid.get("future_steps") != 32:
         raise RiskDataContractError(
-            "SOP09 production training requires frozen future_steps=15"
+            "SOP09 production training requires frozen future_steps=32"
         )
     sample_dt_s = grid.get("sample_dt_s")
     if (
@@ -724,8 +958,9 @@ def _checkpoint_provenance(
     training_data_scale: str,
     scientific_claim_eligible: bool,
     consumed_sample_ids: tuple[str, ...],
+    auxiliary_statistics: _AuxiliaryOccupancyStatistics | None,
 ) -> dict[str, object]:
-    return {
+    provenance: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "channel_spec": frozen_channel_spec(),
         "model_variant": config.variant,
@@ -747,6 +982,20 @@ def _checkpoint_provenance(
             consumed_sample_ids
         ),
     }
+    if auxiliary_statistics is not None:
+        provenance.update(
+            {
+                "occupancy_auxiliary_enabled": True,
+                "occupancy_sidecar_collection_digest_sha256": (
+                    auxiliary_statistics.sidecar_collection_digest_sha256
+                ),
+                "occupancy_global_positive_count": auxiliary_statistics.positive_count,
+                "occupancy_global_negative_count": auxiliary_statistics.negative_count,
+                "occupancy_global_pos_weight": auxiliary_statistics.pos_weight,
+                "occupancy_future_steps": auxiliary_statistics.future_steps,
+            }
+        )
+    return provenance
 
 
 def _evaluate_loss(
@@ -757,6 +1006,8 @@ def _evaluate_loss(
     config: ProductionRiskTrainingConfig,
     device: torch.device,
     epoch: int,
+    occupancy_sidecar_root: str | Path | None,
+    occupancy_pos_weight: float,
 ) -> tuple[float, float]:
     model.eval()
     weighted_loss = 0.0
@@ -764,16 +1015,20 @@ def _evaluate_loss(
     crossings = 0
     quantile_comparisons = 0
     with torch.no_grad():
-        for raw_batch, _ in iter_production_risk_batches(
-            dataset,
+        for raw_batch, _ in _iter_training_batches(
+            dataset=dataset,
             subset=subset,
-            batch_size=config.batch_size,
-            seed=config.seed,
+            config=config,
+            sidecar_root=occupancy_sidecar_root,
             epoch=epoch,
         ):
             batch = _move_batch(raw_batch, device)
             output, losses = compute_risk_batch_loss(
-                model, batch, lambda_collision=config.lambda_collision
+                model,
+                batch,
+                lambda_collision=config.lambda_collision,
+                lambda_occupancy_aux=config.lambda_occupancy_aux,
+                occupancy_pos_weight=occupancy_pos_weight,
             )
             batch_size = len(batch.sample_ids)
             value = losses["total"]
@@ -808,7 +1063,7 @@ def _make_training_state(
     optimizer_steps: int,
     completed_epochs: int,
     next_epoch: int,
-    next_cursor: RiskStreamCursor | None,
+    next_cursor: RiskStreamCursor | OccupancyStreamCursor | None,
     loss_history: list[float],
     optimizer_step_loss_history: list[float],
     validation_loss_history: list[float],
@@ -1083,11 +1338,7 @@ def _validate_state_against_publication(
         raise RiskDataContractError(f"{label} config digest mismatch")
     if state.get("provenance") != provenance:
         raise RiskDataContractError(f"{label} provenance mismatch")
-    expected_model_config = {
-        "variant": config.variant,
-        "hidden_channels": config.hidden_channels,
-        "history_steps": 8,
-    }
+    expected_model_config = _build_risk_model(config).export_config()
     if state.get("model_config") != expected_model_config:
         raise RiskDataContractError(f"{label} model configuration mismatch")
     optimizer_steps = state.get("optimizer_steps")
@@ -1284,6 +1535,37 @@ def _validate_published_resume_state(
         != provenance.get("consumed_sample_count")
     ):
         raise RiskDataContractError("training metrics/provenance identity mismatch")
+    auxiliary_metric_keys = {
+        "occupancy_sidecar_collection_digest_sha256",
+        "occupancy_global_positive_count",
+        "occupancy_global_negative_count",
+        "occupancy_global_pos_weight",
+        "occupancy_future_steps",
+    }
+    if provenance.get("occupancy_auxiliary_enabled") is True:
+        expected_auxiliary_metrics = {
+            "occupancy_sidecar_collection_digest_sha256": provenance[
+                "occupancy_sidecar_collection_digest_sha256"
+            ],
+            "occupancy_global_positive_count": provenance[
+                "occupancy_global_positive_count"
+            ],
+            "occupancy_global_negative_count": provenance[
+                "occupancy_global_negative_count"
+            ],
+            "occupancy_global_pos_weight": provenance["occupancy_global_pos_weight"],
+            "occupancy_future_steps": provenance["occupancy_future_steps"],
+        }
+        if {
+            key: metrics.get(key) for key in auxiliary_metric_keys
+        } != expected_auxiliary_metrics:
+            raise RiskDataContractError(
+                "training auxiliary metrics/provenance identity mismatch"
+            )
+    elif auxiliary_metric_keys & set(metrics):
+        raise RiskDataContractError(
+            "risk-only training metrics must not contain occupancy auxiliary fields"
+        )
     if bindings["config_snapshot.json"] != artifact_hashes["config_snapshot.json"]:
         raise RiskDataContractError("config snapshot semantic binding mismatch")
     if bindings["metrics.json"] != artifact_hashes["metrics.json"]:
@@ -1391,11 +1673,32 @@ def train_production_risk_model(
     resume_from: str | Path | None = None,
     resume_expected_publication_instance_digest_sha256: str | None = None,
     dataset_family: LoadedRiskDatasetFamily | None = None,
+    train_occupancy_sidecar_root: str | Path | None = None,
+    validation_occupancy_sidecar_root: str | Path | None = None,
 ) -> ProductionRiskTrainingResult:
-    """Train R0/R1 while preserving split gates, stream cursors, and provenance."""
+    """Train R0/R1/R2 while preserving split gates, cursors, and provenance."""
 
     if not isinstance(config, ProductionRiskTrainingConfig):
         raise RiskDataContractError("config must be ProductionRiskTrainingConfig")
+    if config.occupancy_aux_enabled and train_occupancy_sidecar_root is None:
+        raise RiskDataContractError(
+            "occupancy auxiliary training requires an occupancy sidecar root"
+        )
+    if not config.occupancy_aux_enabled and (
+        train_occupancy_sidecar_root is not None
+        or validation_occupancy_sidecar_root is not None
+    ):
+        raise RiskDataContractError(
+            "occupancy sidecar roots require occupancy_aux_enabled=true"
+        )
+    if (
+        config.occupancy_aux_enabled
+        and validation_dataset is not None
+        and validation_occupancy_sidecar_root is None
+    ):
+        raise RiskDataContractError(
+            "auxiliary validation requires an occupancy sidecar root"
+        )
     checked_code_commit = _require_code_commit(code_commit)
     if (resume_from is None) != (
         resume_expected_publication_instance_digest_sha256 is None
@@ -1422,6 +1725,18 @@ def train_production_risk_model(
         validation_dataset=validation_dataset,
         dataset_family=dataset_family,
     )
+    if config.occupancy_aux_enabled and (
+        config.occupancy_future_steps != train_dataset.grid.future_steps
+    ):
+        raise RiskDataContractError(
+            "occupancy auxiliary horizon must match the authenticated train grid"
+        )
+    if config.occupancy_aux_enabled and validation_dataset is not None and (
+        config.occupancy_future_steps != validation_dataset.grid.future_steps
+    ):
+        raise RiskDataContractError(
+            "occupancy auxiliary horizon must match the authenticated validation grid"
+        )
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RiskDataContractError(
@@ -1434,15 +1749,28 @@ def train_production_risk_model(
     data_scale, scientific_claim_eligible = _training_data_scale(
         config, selected_count
     )
+    auxiliary_statistics = (
+        _auxiliary_occupancy_statistics(
+            dataset=train_dataset,
+            subset=train_subset,
+            config=config,
+            sidecar_root=train_occupancy_sidecar_root,
+        )
+        if config.occupancy_aux_enabled
+        else None
+    )
+    occupancy_pos_weight = (
+        1.0 if auxiliary_statistics is None else auxiliary_statistics.pos_weight
+    )
     if config.stage == "one_shard_smoke":
         try:
             smoke_first_batch, _ = next(
                 iter(
-                    iter_production_risk_batches(
-                        train_dataset,
+                    _iter_training_batches(
+                        dataset=train_dataset,
                         subset=train_subset,
-                        batch_size=config.batch_size,
-                        seed=config.seed,
+                        config=config,
+                        sidecar_root=train_occupancy_sidecar_root,
                         epoch=0,
                     )
                 )
@@ -1467,6 +1795,7 @@ def train_production_risk_model(
         training_data_scale=data_scale,
         scientific_claim_eligible=scientific_claim_eligible,
         consumed_sample_ids=consumed_sample_ids,
+        auxiliary_statistics=auxiliary_statistics,
     )
     staging = destination.with_name(
         f".{destination.name}.staging-{os.getpid()}-{uuid.uuid4().hex}"
@@ -1480,10 +1809,7 @@ def train_production_risk_model(
             with torch.cuda.device(device):
                 torch.cuda.manual_seed(config.seed)
         torch.use_deterministic_algorithms(True)
-        model = RiskModel(
-            variant=config.variant,
-            hidden_channels=config.hidden_channels,
-        ).to(device=device)
+        model = _build_risk_model(config).to(device=device)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=float(config.learning_rate),
@@ -1493,7 +1819,7 @@ def train_production_risk_model(
         optimizer_steps = 0
         completed_epochs = 0
         next_epoch = 0
-        next_cursor: RiskStreamCursor | None = None
+        next_cursor: RiskStreamCursor | OccupancyStreamCursor | None = None
         loss_history: list[float] = []
         optimizer_step_loss_history: list[float] = []
         validation_loss_history: list[float] = []
@@ -1595,6 +1921,8 @@ def train_production_risk_model(
                 config=config,
                 device=device,
                 epoch=0,
+                occupancy_sidecar_root=train_occupancy_sidecar_root,
+                occupancy_pos_weight=occupancy_pos_weight,
             )
             loss_history.append(initial_train_loss)
 
@@ -1617,11 +1945,11 @@ def train_production_risk_model(
             accumulated_sample_count = 0
             accumulated_microbatch_count = 0
             saw_batch = False
-            for raw_batch, stream_cursor in iter_production_risk_batches(
-                train_dataset,
+            for raw_batch, stream_cursor in _iter_training_batches(
+                dataset=train_dataset,
                 subset=train_subset,
-                batch_size=config.batch_size,
-                seed=config.seed,
+                config=config,
+                sidecar_root=train_occupancy_sidecar_root,
                 epoch=epoch,
                 start_cursor=cursor_for_epoch,
             ):
@@ -1630,7 +1958,11 @@ def train_production_risk_model(
                 batch = _move_batch(raw_batch, device)
                 model.train()
                 output, losses = compute_risk_batch_loss(
-                    model, batch, lambda_collision=config.lambda_collision
+                    model,
+                    batch,
+                    lambda_collision=config.lambda_collision,
+                    lambda_occupancy_aux=config.lambda_occupancy_aux,
+                    occupancy_pos_weight=occupancy_pos_weight,
                 )
                 tensors = tuple(output.values()) + tuple(losses.values())
                 if not all(torch.isfinite(value).all().item() for value in tensors):
@@ -1652,7 +1984,7 @@ def train_production_risk_model(
                 accumulated_microbatch_count += 1
                 epoch_running_loss_sum += raw_loss * batch_sample_count
                 epoch_running_sample_count += batch_sample_count
-                terminal_cursor = stream_cursor.shard_index == -1
+                terminal_cursor = _risk_stream_cursor(stream_cursor).shard_index == -1
                 must_step = (
                     accumulated_microbatch_count
                     == config.gradient_accumulation_steps
@@ -1700,6 +2032,8 @@ def train_production_risk_model(
                             config=config,
                             device=device,
                             epoch=epoch,
+                            occupancy_sidecar_root=validation_occupancy_sidecar_root,
+                            occupancy_pos_weight=occupancy_pos_weight,
                         )
                         validation_loss_history.append(validation_loss)
                         if (
@@ -1747,6 +2081,8 @@ def train_production_risk_model(
                             model,
                             batch,
                             lambda_collision=config.lambda_collision,
+                            lambda_occupancy_aux=config.lambda_occupancy_aux,
+                            occupancy_pos_weight=occupancy_pos_weight,
                         )
                     smoke_final_loss = float(
                         final_smoke_losses["total"].detach().cpu().item()
@@ -1794,6 +2130,8 @@ def train_production_risk_model(
                 config=config,
                 device=device,
                 epoch=max(0, config.epochs - 1),
+                occupancy_sidecar_root=train_occupancy_sidecar_root,
+                occupancy_pos_weight=occupancy_pos_weight,
             )
         if not all(
             math.isfinite(value)
@@ -1883,6 +2221,22 @@ def train_production_risk_model(
             "all_forward_loss_gradient_values_finite": all_finite,
             "test_samples_used_for_training_or_selection": 0,
         }
+        if auxiliary_statistics is not None:
+            metrics.update(
+                {
+                    "occupancy_sidecar_collection_digest_sha256": (
+                        auxiliary_statistics.sidecar_collection_digest_sha256
+                    ),
+                    "occupancy_global_positive_count": (
+                        auxiliary_statistics.positive_count
+                    ),
+                    "occupancy_global_negative_count": (
+                        auxiliary_statistics.negative_count
+                    ),
+                    "occupancy_global_pos_weight": auxiliary_statistics.pos_weight,
+                    "occupancy_future_steps": auxiliary_statistics.future_steps,
+                }
+            )
         _write_json(staging / "metrics.json", metrics)
         _write_json(staging / "config_snapshot.json", _config_snapshot(config))
 

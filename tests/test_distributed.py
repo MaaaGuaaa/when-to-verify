@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import timedelta
 import multiprocessing
+import os
 from pathlib import Path
 import queue
 
@@ -11,6 +12,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
+import src.training.risk_ddp_trainer as ddp_trainer
 from src.datasets.risk_dataloader import RiskDataContractError
 from src.training.distributed import (
     DistributedRuntime,
@@ -369,3 +371,42 @@ def test_gloo_ragged_accumulation_matches_synchronous_single_process_schedule(
 
     assert distributed_weights[0] == pytest.approx(expected, abs=1e-6)
     assert distributed_weights[1] == pytest.approx(expected, abs=1e-6)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2 or not torch.cuda.is_available(),
+    reason="launch with torchrun and two allocated CUDA GPUs",
+)
+def test_nccl_optimized_ddp_wrapper_updates_parameters_in_sync() -> None:
+    runtime = discover_distributed_runtime("cuda")
+    initialize_distributed_process_group(runtime)
+    try:
+        torch.manual_seed(17)
+        module = torch.nn.Linear(4, 2).to(runtime.device)
+        model = ddp_trainer._wrap_distributed_model(module, runtime)
+        assert model.broadcast_buffers is False
+        assert model.gradient_as_bucket_view is True
+        assert model.static_graph is False
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        inputs = torch.full(
+            (3, 4),
+            float(runtime.rank + 1),
+            dtype=torch.float32,
+            device=runtime.device,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        model(inputs).square().mean().backward()
+        optimizer.step()
+
+        parameters = torch.cat(
+            [parameter.detach().reshape(-1) for parameter in module.parameters()]
+        )
+        minimum = parameters.clone()
+        maximum = parameters.clone()
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        assert bool(torch.isfinite(parameters).all())
+        assert torch.equal(minimum, maximum)
+    finally:
+        destroy_distributed_process_group()

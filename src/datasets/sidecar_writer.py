@@ -338,8 +338,8 @@ def _validate_grid(grid: Any) -> GridSpec:
         raise TypeError("grid.resolution_m must be a positive finite real")
     if not np.isfinite(resolution) or float(resolution) <= 0.0:
         raise ValueError("grid.resolution_m must be a positive finite real")
-    if grid.future_steps != 15:
-        raise ValueError("SOP08 sidecars require exactly 15 future endpoints")
+    if grid.future_steps != 32:
+        raise ValueError("SOP08 sidecars require exactly 32 future endpoints")
     return grid
 
 

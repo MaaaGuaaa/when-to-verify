@@ -12,6 +12,8 @@ import numpy as np
 import pytest
 
 from src.contracts import (
+    LONG40_FUTURE_STEPS,
+    LONG40_HISTORY_STEPS,
     POSE_TIME_LAYOUT_VERSION,
     GridSpec,
     RiskSample,
@@ -28,8 +30,8 @@ def _grid() -> GridSpec:
     return GridSpec(
         height=3,
         width=3,
-        history_steps=2,
-        future_steps=3,
+        history_steps=LONG40_HISTORY_STEPS,
+        future_steps=LONG40_FUTURE_STEPS,
         resolution_m=0.5,
     )
 
@@ -261,11 +263,11 @@ def _write_cli_inputs(tmp_path: Path, requests) -> tuple[Path, Path]:
     config_path.write_text(
         "\n".join(
             [
-                'schema_version: "3.0.0"',
+                f'schema_version: "{SCHEMA_VERSION}"',
                 "bev:",
                 "  size: 3",
-                "  history_steps: 2",
-                "  future_steps: 3",
+                f"  history_steps: {LONG40_HISTORY_STEPS}",
+                f"  future_steps: {LONG40_FUTURE_STEPS}",
                 "  resolution_m: 0.5",
                 "",
             ]

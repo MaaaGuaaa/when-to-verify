@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from src.contracts import SCHEMA_VERSION
 from src.evaluation.prediction_tables import build_prediction_protocol
 
 
@@ -84,7 +85,7 @@ def _table(
 ) -> dict[str, Any]:
     table = {
         "mode": "production",
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "split": split,
         "method_id": method_id,
         "checkpoint_layout_version": checkpoint_layout_version,
@@ -124,7 +125,7 @@ def _artifact(
 ) -> dict[str, Any]:
     artifact = {
         "mode": "production",
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "fit_split": "calibration",
         "method_id": method_id,
         "checkpoint_layout_version": checkpoint_layout_version,

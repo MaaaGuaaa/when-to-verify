@@ -1158,8 +1158,8 @@ def _query_geometry_from_config(
     )
     if not math.isclose(dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12):
         raise RiskDataContractError("SOP08 future_dt_s must equal 0.2")
-    if grid.future_steps != 15:
-        raise RiskDataContractError("SOP08 future_steps must equal 15")
+    if grid.future_steps != 32:
+        raise RiskDataContractError("SOP08 future_steps must equal 32")
     length = _require_positive_finite_float(
         robot.get("length_m"), field="base config robot.length_m"
     )
@@ -1246,7 +1246,7 @@ def _validate_query_geometry(value: object, *, grid: GridSpec) -> dict[str, obje
     dt_s = _require_positive_finite_float(
         value.get("future_dt_s"), field="query_geometry.future_dt_s"
     )
-    if steps != grid.future_steps or steps != 15 or not math.isclose(
+    if steps != grid.future_steps or steps != 32 or not math.isclose(
         dt_s, 0.2, rel_tol=0.0, abs_tol=1e-12
     ):
         raise RiskDataContractError("occupancy query time grid mismatch")

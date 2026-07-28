@@ -76,6 +76,23 @@ def test_optional_occupancy_auxiliary_loss_requires_both_prediction_and_label():
     )
     assert with_aux["occupancy_aux"].item() == pytest.approx(math.log(2.0))
 
+
+def test_occupancy_auxiliary_loss_uses_train_only_positive_weight():
+    output = {
+        "quantiles": torch.full((1, 4), 0.5, dtype=torch.float32),
+        "collision_logits": torch.zeros(1, dtype=torch.float32),
+        "occupancy_aux_logits": torch.zeros((1, 2, 1, 1), dtype=torch.float32),
+    }
+    losses = risk_loss(
+        output,
+        risk_severity=torch.zeros(1, dtype=torch.float32),
+        collision_label=torch.zeros(1, dtype=torch.float32),
+        occupancy_target=torch.ones((1, 2, 1, 1), dtype=torch.float32),
+        lambda_occupancy_aux=1.0,
+        occupancy_pos_weight=3.0,
+    )
+    assert losses["occupancy_aux"].item() == pytest.approx(3.0 * math.log(2.0))
+
     with pytest.raises(ValueError, match="occupancy"):
         risk_loss(
             output,

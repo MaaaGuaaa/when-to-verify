@@ -36,13 +36,13 @@ def _grid() -> GridSpec:
         height=17,
         width=17,
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
         resolution_m=0.25,
     )
 
 
 def _poses(x_values: np.ndarray, *, y: float) -> np.ndarray:
-    poses = np.empty((15, 3), dtype=np.float32)
+    poses = np.empty((len(x_values), 3), dtype=np.float32)
     poses[:, 0] = np.asarray(x_values, dtype=np.float32)
     poses[:, 1] = np.float32(y)
     poses[:, 2] = np.float32(0.0)
@@ -201,7 +201,7 @@ def test_sidecar_arrays_are_binary_uint8_owned_read_only_and_endpoint_float32() 
     assert set(np.unique(sidecar.robot_future_footprints)).issubset({0, 1})
     np.testing.assert_array_equal(sidecar.future_endpoint_times_s, expected_times)
     assert sidecar.future_endpoint_times_s[0] == pytest.approx(0.2)
-    assert sidecar.future_endpoint_times_s[-1] == pytest.approx(3.0)
+    assert sidecar.future_endpoint_times_s[-1] == pytest.approx(6.4)
 
 
 def test_sidecar_constructor_snapshots_arrays_and_rejects_nonbinary_masks() -> None:

@@ -35,6 +35,7 @@ from src.models.risk_model import (
 )
 from src.training.distributed import (
     DistributedRuntime,
+    SynchronousPartitionPlan,
     all_reduce_sample_count,
     broadcast_rank_zero_setup,
     scale_distributed_batch_mean_loss,
@@ -45,6 +46,7 @@ from src.training.risk_trainer import (
     ProductionRiskTrainingResult,
     _absolute,
     _atomic_rename_directory_noreplace,
+    _build_risk_model,
     _capture_rng_state,
     _canonical_json_bytes,
     _config_digest,
@@ -523,6 +525,35 @@ def _all_reduce_values(
     return tuple(float(value) for value in tensor.cpu().tolist())
 
 
+def _reduce_optimizer_window_statistics(
+    *,
+    local_loss_sum: float,
+    local_sample_count: int,
+    local_crossings: int,
+    local_comparisons: int,
+    local_state_is_finite: bool,
+    runtime: DistributedRuntime,
+) -> tuple[float, int, int, int, bool]:
+    reduced = _all_reduce_values(
+        (
+            local_loss_sum,
+            local_sample_count,
+            local_crossings,
+            local_comparisons,
+            0.0 if local_state_is_finite else 1.0,
+        ),
+        runtime,
+    )
+    loss_sum, sample_count, crossings, comparisons, invalid_ranks = reduced
+    return (
+        loss_sum,
+        int(sample_count),
+        int(crossings),
+        int(comparisons),
+        invalid_ranks == 0.0,
+    )
+
+
 def _all_ranks_true(value: bool, runtime: DistributedRuntime) -> bool:
     tensor = torch.tensor(
         1 if value else 0,
@@ -537,6 +568,24 @@ def _all_gather_objects(value: object, runtime: DistributedRuntime) -> list[obje
     gathered: list[object] = [None] * runtime.world_size
     dist.all_gather_object(gathered, value)
     return gathered
+
+
+def _wrap_distributed_model(
+    module: torch.nn.Module,
+    runtime: DistributedRuntime,
+) -> DistributedDataParallel:
+    # PyTorch 2.0 static_graph is incompatible with this trainer's multi-epoch
+    # no_sync accumulation path.
+    arguments: dict[str, object] = {
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    }
+    if runtime.backend == "nccl":
+        arguments.update(
+            device_ids=[runtime.local_rank],
+            output_device=runtime.local_rank,
+        )
+    return DistributedDataParallel(module, **arguments)
 
 
 def _evaluate_batches(
@@ -564,6 +613,7 @@ def _evaluate_batches(
                 model,
                 batch,
                 lambda_collision=config.lambda_collision,
+                lambda_occupancy_aux=config.lambda_occupancy_aux,
             )
             finite = all(
                 bool(torch.isfinite(value).all().item())
@@ -616,6 +666,21 @@ def _rank_membership_record(
             list(sizes) for sizes in plan.local_microbatch_sizes
         ],
     }
+
+
+def _validate_completed_epoch_membership(
+    *,
+    actual_sample_ids: set[str],
+    plan: SynchronousPartitionPlan,
+    runtime: DistributedRuntime,
+) -> None:
+    expected_sample_ids = {
+        sample_id
+        for batch in plan.rank_microbatches[runtime.rank]
+        for sample_id in batch
+    }
+    if not _all_ranks_true(actual_sample_ids == expected_sample_ids, runtime):
+        raise RiskDataContractError("distributed epoch sample membership mismatch")
 
 
 def _validate_actual_rank_membership(
@@ -944,6 +1009,10 @@ def train_distributed_production_risk_model(
 ) -> ProductionRiskTrainingResult:
     """Train one risk model with exact ragged DDP sample weighting."""
 
+    if config.occupancy_aux_enabled:
+        raise RiskDataContractError(
+            "distributed occupancy auxiliary training is not implemented; use strict single-device training"
+        )
     checked_code_commit = _require_code_commit(code_commit)
     if (resume_from is None) != (
         resume_expected_publication_instance_digest_sha256 is None
@@ -1001,10 +1070,7 @@ def train_distributed_production_risk_model(
         if device.type == "cuda":
             torch.cuda.manual_seed(config.seed)
         torch.use_deterministic_algorithms(True)
-        base_model = RiskModel(
-            variant=config.variant,
-            hidden_channels=config.hidden_channels,
-        ).to(device=device)
+        base_model = _build_risk_model(config).to(device=device)
         optimizer = torch.optim.AdamW(
             base_model.parameters(),
             lr=float(config.learning_rate),
@@ -1143,14 +1209,7 @@ def train_distributed_production_risk_model(
                 "resume_optimizer_step": optimizer_steps,
             }
 
-        if device.type == "cuda":
-            model = DistributedDataParallel(
-                base_model,
-                device_ids=[runtime.local_rank],
-                output_device=runtime.local_rank,
-            )
-        else:
-            model = DistributedDataParallel(base_model)
+        model = _wrap_distributed_model(base_model, runtime)
 
         if resume_state is not None:
             rank_state = resume_state["per_rank_state"][runtime.rank]
@@ -1222,6 +1281,7 @@ def train_distributed_production_risk_model(
                             model,
                             batch,
                             lambda_collision=config.lambda_collision,
+                            lambda_occupancy_aux=config.lambda_occupancy_aux,
                         )
                         local_outputs_finite = local_outputs_finite and all(
                             bool(torch.isfinite(value).all().item())
@@ -1252,35 +1312,34 @@ def train_distributed_production_risk_model(
                     or bool(torch.isfinite(parameter.grad).all().item())
                     for parameter in base_model.parameters()
                 )
-                if not _all_ranks_true(
-                    local_outputs_finite and local_gradients_finite,
-                    runtime,
-                ):
+                (
+                    global_loss_sum,
+                    reduced_sample_count,
+                    reduced_crossings,
+                    _,
+                    global_state_is_finite,
+                ) = _reduce_optimizer_window_statistics(
+                    local_loss_sum=local_loss_sum,
+                    local_sample_count=local_window_count,
+                    local_crossings=local_crossings,
+                    local_comparisons=local_comparisons,
+                    local_state_is_finite=(
+                        local_outputs_finite and local_gradients_finite
+                    ),
+                    runtime=runtime,
+                )
+                if not global_state_is_finite:
                     all_finite = False
                     raise RiskDataContractError(
                         "distributed forward/loss/gradient contains NaN/Inf"
                     )
-                if not _all_ranks_true(local_crossings == 0, runtime):
+                if reduced_crossings != 0:
                     raise RiskDataContractError(
                         "distributed quantile outputs cross"
                     )
                 optimizer.step()
                 optimizer_steps += 1
-                (
-                    global_loss_sum,
-                    reduced_sample_count,
-                    _,
-                    _,
-                ) = _all_reduce_values(
-                    (
-                        local_loss_sum,
-                        local_window_count,
-                        local_crossings,
-                        local_comparisons,
-                    ),
-                    runtime,
-                )
-                if int(reduced_sample_count) != global_window_count:
+                if reduced_sample_count != global_window_count:
                     raise RiskDataContractError(
                         "distributed optimizer window sample count mismatch"
                     )
@@ -1288,20 +1347,17 @@ def train_distributed_production_risk_model(
                     global_loss_sum / reduced_sample_count
                 )
                 epoch_running_loss_sum += global_loss_sum
-                epoch_running_sample_count += int(reduced_sample_count)
+                epoch_running_sample_count += reduced_sample_count
                 next_microbatch_index = window_end
                 epoch_complete = (
                     config.stage != "one_shard_smoke"
                     and next_microbatch_index == len(rank_batches)
                 )
                 if epoch_complete:
-                    gathered_ids = _all_gather_objects(
-                        tuple(sorted(epoch_consumed_sample_ids)),
-                        runtime,
-                    )
-                    _validate_actual_rank_membership(
-                        gathered_ids,
-                        expected_ids=set(train_view.subset.sample_ids),
+                    _validate_completed_epoch_membership(
+                        actual_sample_ids=epoch_consumed_sample_ids,
+                        plan=plan,
+                        runtime=runtime,
                     )
                     if epoch_running_sample_count != len(
                         train_view.subset.sample_ids

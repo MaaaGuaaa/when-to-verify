@@ -9,6 +9,7 @@ from typing import Callable
 
 import pytest
 
+from src.contracts import SCHEMA_VERSION
 from src.calibration.split_conformal import (
     CalibrationContractError,
     assert_calibration_artifact_test_isolation,
@@ -182,7 +183,7 @@ def _toy_table(*, split: str) -> dict[str, object]:
     table: dict[str, object] = {
         "prediction_table_layout_version": "risk_prediction_table_v2",
         "mode": "toy",
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "split": split,
         "method_id": "toy-r0",
         "checkpoint_layout_version": "risk_model_checkpoint_v2",
@@ -365,7 +366,7 @@ def test_production_rejects_cross_family_and_split_member_mismatch(
         ("g1_split_manifest_digest", "0" * 32, "g1_split_manifest_digest"),
         ("dynamic_objects_config_digest", "0" * 64, "dynamic_objects_config_digest"),
         ("target_type_policy_digest", "0" * 32, "target_type_policy_digest"),
-        ("schema_version", "3.0.1", "schema_version"),
+        ("schema_version", "4.0.1", "schema_version"),
         ("channel_spec", {"flat": ["drifted"]}, "channel_spec"),
     ],
 )

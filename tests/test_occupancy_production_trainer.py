@@ -21,6 +21,7 @@ from src.contracts import (
 )
 from src.datasets.risk_dataloader import (
     ProductionOccupancyBatch,
+    RiskDataContractError,
     select_production_risk_subset,
 )
 from src.datasets.risk_dataset_seal import (
@@ -70,7 +71,7 @@ def _batch(*, batch_size: int = 3, height: int = 4, width: int = 4) -> Productio
     )
     state[:, STATE_CHANNELS.index("last_seen_occupancy"), 1, 1] = 0.75
     state[:, STATE_CHANNELS.index("occlusion_age_map")] = 0.25
-    query = torch.zeros(batch_size, 15, height, width, dtype=torch.float32)
+    query = torch.zeros(batch_size, 32, height, width, dtype=torch.float32)
     query[:, :, 1, 1] = 1.0
     hidden = torch.zeros_like(query)
     hidden[0, :, 1, 1] = 1.0
@@ -97,7 +98,7 @@ def _batch(*, batch_size: int = 3, height: int = 4, width: int = 4) -> Productio
         },
         query_inputs={
             "robot_endpoint_footprints": query,
-            "endpoint_times_s": torch.arange(1, 16, dtype=torch.float32) * 0.2,
+            "endpoint_times_s": torch.arange(1, 33, dtype=torch.float32) * 0.2,
         },
         occupancy_targets={"hidden_risk_occupancy": hidden},
         sample_ids=tuple(f"sample-{index}" for index in range(batch_size)),
@@ -111,8 +112,8 @@ def _batch(*, batch_size: int = 3, height: int = 4, width: int = 4) -> Productio
 
 def test_production_score_api_is_oracle_isolated_and_b1_through_b4_are_bounded() -> None:
     batch = _batch()
-    model = ConvGRUOccupancyPredictor(hidden_channels=2, future_steps=15)
-    aggregator = LearnedOccupancyRiskAggregator(future_steps=15, hidden_dim=4)
+    model = ConvGRUOccupancyPredictor(hidden_channels=2, future_steps=32)
+    aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=4)
     signature = inspect.signature(score_production_occupancy_baseline)
     assert "occupancy_targets" not in signature.parameters
     assert "targets" not in signature.parameters
@@ -156,6 +157,21 @@ def test_production_score_api_is_oracle_isolated_and_b1_through_b4_are_bounded()
         assert torch.equal(score, repeated), method
 
 
+def test_production_batch_rejects_legacy_15_step_horizon() -> None:
+    batch = _batch()
+    legacy_masks = torch.zeros(3, 15, 4, 4, dtype=torch.float32)
+
+    with pytest.raises(RiskDataContractError, match="32"):
+        replace(
+            batch,
+            query_inputs={
+                "robot_endpoint_footprints": legacy_masks,
+                "endpoint_times_s": torch.arange(1, 16, dtype=torch.float32) * 0.2,
+            },
+            occupancy_targets={"hidden_risk_occupancy": legacy_masks.clone()},
+        )
+
+
 def test_global_class_weight_requires_both_classes_and_is_not_batch_local() -> None:
     assert compute_global_binary_pos_weight(
         positive_count=3,
@@ -181,6 +197,7 @@ def test_production_config_freezes_engineering_stages_and_positive_hyperparamete
         stage="one_shard_smoke",
         seed=7,
         device="cpu",
+        future_steps=32,
         hidden_channels=2,
         convgru_kernel_size=3,
         learned_aggregator_hidden_dim=4,
@@ -196,6 +213,8 @@ def test_production_config_freezes_engineering_stages_and_positive_hyperparamete
         sigma_time_s=2.0,
     )
     assert config.stage == "one_shard_smoke"
+    with pytest.raises(ValueError, match="future_steps"):
+        replace(config, future_steps=15)
     with pytest.raises(ValueError, match="stage"):
         replace(config, stage="toy")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="occupancy_learning_rate"):
@@ -239,7 +258,7 @@ def _production_fixture(tmp_path: Path):
     publication = create_formal_risk_publication(
         tmp_path / "upstream",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     sidecars = create_formal_risk_sidecar_publication(
         publication,
@@ -269,6 +288,7 @@ def _training_config(*, device: str = "cpu") -> ProductionOccupancyTrainingConfi
         stage="one_shard_smoke",
         seed=17,
         device=device,
+        future_steps=32,
         hidden_channels=2,
         convgru_kernel_size=3,
         learned_aggregator_hidden_dim=4,

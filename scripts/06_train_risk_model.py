@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train deterministic SOP09 R0/R1 models in explicit toy mode."""
+"""Train deterministic SOP09 R0/R1/R2 models in explicit toy mode."""
 
 from __future__ import annotations
 
@@ -87,7 +87,6 @@ _PRODUCTION_CONFIG_KEYS = {
     "variant",
     "seed",
     "device",
-    "hidden_channels",
     "max_samples",
     "batch_size",
     "epochs",
@@ -97,6 +96,19 @@ _PRODUCTION_CONFIG_KEYS = {
     "lambda_collision",
     "checkpoint_interval_steps",
     "optimizer",
+}
+_PRODUCTION_OPTIONAL_CONFIG_DEFAULTS = {
+    "hidden_channels": None,
+    "occupancy_aux_enabled": False,
+    "lambda_occupancy_aux": 0.0,
+    "occupancy_future_steps": 32,
+    "r2_d_model": 128,
+    "r2_nhead": 4,
+    "r2_num_decoder_layers": 2,
+    "r2_dim_feedforward": 256,
+    "r2_dropout": 0.1,
+    "r2_query_bins": 8,
+    "r2_fusion_mode": "cross_attention",
 }
 
 
@@ -150,8 +162,10 @@ def _load_config(path: Path) -> dict[str, object]:
         raise RiskDataContractError(f"missing risk model config keys: {missing}")
     if value["mode"] != "toy":
         raise RiskDataContractError("toy risk model config mode must be toy")
-    if value["variants"] != ["r0", "r1"]:
-        raise RiskDataContractError("toy comparison variants must be exactly [r0, r1]")
+    if value["variants"] not in (["r0", "r1"], ["r0", "r1", "r2"]):
+        raise RiskDataContractError(
+            "toy comparison variants must be [r0, r1] or [r0, r1, r2]"
+        )
     if value["optimizer"] != "AdamW":
         raise RiskDataContractError("SOP09 optimizer must be AdamW")
     if float(value["lambda_occupancy_aux"]) != 0.0:
@@ -178,7 +192,8 @@ def _load_config(path: Path) -> dict[str, object]:
 
 def _load_production_config(path: Path) -> dict[str, object]:
     value = _load_yaml_mapping(path)
-    unknown = sorted(set(value) - _PRODUCTION_CONFIG_KEYS)
+    allowed = _PRODUCTION_CONFIG_KEYS | set(_PRODUCTION_OPTIONAL_CONFIG_DEFAULTS)
+    unknown = sorted(set(value) - allowed)
     missing = sorted(_PRODUCTION_CONFIG_KEYS - set(value))
     if unknown:
         raise RiskDataContractError(
@@ -188,6 +203,7 @@ def _load_production_config(path: Path) -> dict[str, object]:
         raise RiskDataContractError(
             f"missing production risk model config keys: {missing}"
         )
+    value = {**_PRODUCTION_OPTIONAL_CONFIG_DEFAULTS, **value}
     if value["mode"] != "production":
         raise RiskDataContractError("production risk model config mode must be production")
     if value["optimizer"] != "AdamW":
@@ -211,6 +227,16 @@ def _load_production_config(path: Path) -> dict[str, object]:
                 "weight_decay",
                 "lambda_collision",
                 "checkpoint_interval_steps",
+                "occupancy_aux_enabled",
+                "lambda_occupancy_aux",
+                "occupancy_future_steps",
+                "r2_d_model",
+                "r2_nhead",
+                "r2_num_decoder_layers",
+                "r2_dim_feedforward",
+                "r2_dropout",
+                "r2_query_bins",
+                "r2_fusion_mode",
             )
         }
     )
@@ -247,6 +273,16 @@ def _effective_config(args: argparse.Namespace) -> dict[str, object]:
                     "weight_decay",
                     "lambda_collision",
                     "checkpoint_interval_steps",
+                    "occupancy_aux_enabled",
+                    "lambda_occupancy_aux",
+                    "occupancy_future_steps",
+                    "r2_d_model",
+                    "r2_nhead",
+                    "r2_num_decoder_layers",
+                    "r2_dim_feedforward",
+                    "r2_dropout",
+                    "r2_query_bins",
+                    "r2_fusion_mode",
                 )
             }
         )
@@ -288,9 +324,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-channels", type=_positive_int)
     parser.add_argument("--train-seal-root", type=Path)
     parser.add_argument("--train-collection-root", type=Path)
+    parser.add_argument("--train-occupancy-sidecar-root", type=Path)
     parser.add_argument("--validation-seal-root", type=Path)
     parser.add_argument("--validation-collection-root", type=Path)
-    parser.add_argument("--variant", choices=("r0", "r1"))
+    parser.add_argument("--validation-occupancy-sidecar-root", type=Path)
+    parser.add_argument("--variant", choices=("r0", "r1", "r2"))
     parser.add_argument(
         "--stage",
         choices=("one_shard_smoke", "real_1k_overfit", "formal_50k"),
@@ -548,15 +586,47 @@ def main() -> int:
                         "weight_decay",
                         "lambda_collision",
                         "checkpoint_interval_steps",
+                        "occupancy_aux_enabled",
+                        "lambda_occupancy_aux",
+                        "occupancy_future_steps",
+                        "r2_d_model",
+                        "r2_nhead",
+                        "r2_num_decoder_layers",
+                        "r2_dim_feedforward",
+                        "r2_dropout",
+                        "r2_query_bins",
+                        "r2_fusion_mode",
                     )
                 }
             )
             runtime = discover_distributed_runtime(training_config.device)
+            if training_config.occupancy_aux_enabled:
+                if args.train_occupancy_sidecar_root is None:
+                    raise RiskDataContractError(
+                        "occupancy auxiliary training requires --train-occupancy-sidecar-root"
+                    )
+                if validation_paths[0] is not None and (
+                    args.validation_occupancy_sidecar_root is None
+                ):
+                    raise RiskDataContractError(
+                        "auxiliary validation requires --validation-occupancy-sidecar-root"
+                    )
+            elif (
+                args.train_occupancy_sidecar_root is not None
+                or args.validation_occupancy_sidecar_root is not None
+            ):
+                raise RiskDataContractError(
+                    "occupancy sidecar roots require occupancy_aux_enabled=true"
+                )
             if runtime.is_distributed and not args.distributed:
                 raise RiskDataContractError(
                     "WORLD_SIZE>1 requires explicit --distributed"
                 )
             if args.distributed:
+                if training_config.occupancy_aux_enabled:
+                    raise RiskDataContractError(
+                        "distributed occupancy auxiliary training is not implemented"
+                    )
                 if not runtime.is_distributed:
                     raise RiskDataContractError(
                         "--distributed requires torchrun with WORLD_SIZE>1"
@@ -612,6 +682,10 @@ def main() -> int:
                         None
                         if args.dataset_family_root is None
                         else load_risk_dataset_family(args.dataset_family_root)
+                    ),
+                    train_occupancy_sidecar_root=args.train_occupancy_sidecar_root,
+                    validation_occupancy_sidecar_root=(
+                        args.validation_occupancy_sidecar_root
                     ),
                 )
             if not args.distributed or runtime.is_rank_zero:
@@ -862,17 +936,17 @@ def main() -> int:
             "semantic_digest_sha256": semantic_digest,
         }
         _write_json(staging / "manifest.json", manifest)
-        artifact_names = (
+        artifact_names = [
             "config_snapshot.json",
-            "r0_checkpoint.pt",
-            "r1_checkpoint.pt",
+            *[f"{variant}_checkpoint.pt" for variant in config["variants"]],
             "metrics.json",
             "manifest.json",
-            "r0_calibration_prediction_table.json",
-            "r0_test_prediction_table.json",
-            "r1_calibration_prediction_table.json",
-            "r1_test_prediction_table.json",
-        )
+            *[
+                f"{variant}_{split}_prediction_table.json"
+                for variant in config["variants"]
+                for split in ("calibration", "test")
+            ],
+        ]
         _write_json(
             staging / "checksums.json",
             {"sha256": {name: _sha256(staging / name) for name in artifact_names}},
@@ -888,7 +962,7 @@ def main() -> int:
     print(f"validation_sample_count={len(validation_dataset.samples)}")
     print(f"calibration_sample_count={len(calibration_dataset.samples)}")
     print(f"test_sample_count={len(test_dataset.samples)}")
-    print("model_variants=r0,r1")
+    print(f"model_variants={','.join(str(variant) for variant in config['variants'])}")
     print("real_data_status=not_evaluated_real_data")
     return 0
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from src.contracts import SCHEMA_VERSION
 from src.calibration.split_conformal import (
     CALIBRATION_ARTIFACT_LAYOUT_VERSION,
     PREDICTION_TABLE_LAYOUT_VERSION,
@@ -102,7 +103,7 @@ def _toy_table(split: str, rows: list[dict]) -> dict:
     table = {
         "prediction_table_layout_version": PREDICTION_TABLE_LAYOUT_VERSION,
         "mode": "toy",
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "split": split,
         "method_id": "r0",
         "checkpoint_layout_version": "risk_model_checkpoint_v2",

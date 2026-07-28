@@ -15,7 +15,7 @@ from typing import Callable
 import numpy as np
 import pytest
 
-from src.contracts import GridSpec
+from src.contracts import SCHEMA_VERSION, GridSpec
 from src.datasets.shard_writer import load_risk_shard, write_risk_shard
 from src.datasets.sidecar_writer import (
     load_risk_sidecar_shard,
@@ -81,7 +81,7 @@ def _make_case(tmp_path: Path) -> _Case:
     publication = create_formal_risk_publication(
         tmp_path / "accepted",
         history_steps=8,
-        future_steps=15,
+        future_steps=32,
     )
     digests = ("d" * 64, "e" * 64)
     trajectories = ("forward_v00_w02", "forward_v01_w01")
@@ -118,7 +118,7 @@ def _make_case(tmp_path: Path) -> _Case:
         "generation_state": "complete",
         "producer_version": "sop07_risk_dataset_cli_v3",
         "sample_count": 12,
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "shard_count": 2,
         "shards": report_rows,
         "split": "train",
@@ -130,7 +130,7 @@ def _make_case(tmp_path: Path) -> _Case:
         "counts": {"events": 2, "shards": 2},
         "handoff_version": "sop05_batch_index_handoff_v1",
         "producer_version": "sop05_generation_run_v6",
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "shards": handoff_rows,
         "split": "train",
     }

@@ -114,7 +114,7 @@ _ROBOT_PROVENANCE_KEYS = frozenset(
 _OOD_EVIDENCE_KEYS = frozenset({"rule_version", "source", "reason"})
 
 
-class _FrozenDict(dict[str, object]):
+class _FrozenDict(dict):
     """JSON-shaped ``dict`` whose nested identity cannot be mutated."""
 
     def __init__(self, value: Mapping[str, object]) -> None:

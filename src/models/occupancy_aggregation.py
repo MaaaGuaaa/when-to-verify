@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 
-def future_endpoint_times(*, future_steps: int = 15, dt_s: float = 0.2) -> np.ndarray:
+def future_endpoint_times(*, future_steps: int = 32, dt_s: float = 0.2) -> np.ndarray:
     """Return float32 endpoint times ``dt_s .. future_steps * dt_s``."""
     if isinstance(future_steps, bool) or not isinstance(future_steps, int) or future_steps < 1:
         raise ValueError("future_steps must be a positive integer")

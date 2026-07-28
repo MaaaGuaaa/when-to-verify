@@ -1,4 +1,4 @@
-"""SOP09 R0/R1 trajectory-conditioned risk models and checkpoint v2."""
+"""SOP09 R0/R1/R2 risk models and checkpoint v2."""
 
 from __future__ import annotations
 
@@ -7,12 +7,14 @@ import hashlib
 import hmac
 import io
 import json
+import math
 from pathlib import Path
 import pickle
 from typing import BinaryIO, Mapping
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from src.contracts import (
     N_HISTORY_CHANNELS,
@@ -37,8 +39,20 @@ from src.models.bev_encoder import BEVEncoder, ConvGRUCell
 from src.models.losses import risk_loss
 
 RISK_CHECKPOINT_LAYOUT_VERSION = "risk_model_checkpoint_v2"
-RISK_MODEL_VARIANTS: tuple[str, ...] = ("r0", "r1")
+RISK_MODEL_VARIANTS: tuple[str, ...] = ("r0", "r1", "r2")
 TRAJECTORY_SENSITIVITY_EPSILON = 1e-8
+R2_SCENE_INPUT_CHANNELS = 8 * N_HISTORY_CHANNELS + N_STATE_CHANNELS
+R2_STEM_CHANNELS = 32
+R2_D_MODEL = 128
+R2_NUM_HEADS = 4
+R2_DECODER_LAYERS = 2
+R2_DIM_FEEDFORWARD = 256
+R2_DROPOUT = 0.1
+R2_MAX_SCENE_TOKENS = 400
+R2_SCENE_TOKEN_GRID = (20, 20)
+R2_QUERY_BINS = 8
+R2_FUSION_MODES = frozenset({"cross_attention", "concat"})
+R2_OCCUPANCY_AUX_CHANNELS = 32
 RISK_COMMON_PROVENANCE_KEYS = frozenset(
     {"schema_version", "channel_spec", "model_variant", "config_digest", "seed"}
 )
@@ -68,6 +82,16 @@ RISK_PRODUCTION_PROVENANCE_KEYS = frozenset(
         "selected_sample_count",
         "consumed_sample_count",
         "consumed_sample_ids_digest_sha256",
+    }
+)
+RISK_AUXILIARY_PROVENANCE_KEYS = frozenset(
+    {
+        "occupancy_auxiliary_enabled",
+        "occupancy_sidecar_collection_digest_sha256",
+        "occupancy_global_positive_count",
+        "occupancy_global_negative_count",
+        "occupancy_global_pos_weight",
+        "occupancy_future_steps",
     }
 )
 RISK_CHECKPOINT_TOP_LEVEL_KEYS = frozenset(
@@ -102,26 +126,551 @@ def noncrossing_quantiles(raw: torch.Tensor) -> torch.Tensor:
     return torch.cat(values, dim=1)
 
 
+class _DeterministicGridPool(nn.Module):
+    """Pool regular feature grids without CUDA adaptive-pool atomics."""
+
+    def __init__(self, output_size: tuple[int, int]) -> None:
+        super().__init__()
+        self.output_size = output_size
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 4:
+            raise ValueError("grid-pool features must have shape [B,C,H,W]")
+        height, width = features.shape[-2:]
+        output_height, output_width = self.output_size
+        if (height, width) == self.output_size:
+            return features
+        if (
+            height >= output_height
+            and width >= output_width
+            and height % output_height == 0
+            and width % output_width == 0
+        ):
+            return F.avg_pool2d(
+                features,
+                kernel_size=(height // output_height, width // output_width),
+                stride=(height // output_height, width // output_width),
+            )
+        return F.interpolate(features, size=self.output_size, mode="nearest")
+
+
+def _resize_grid(
+    features: torch.Tensor, output_size: tuple[int, int]
+) -> torch.Tensor:
+    """Resize masks/features with deterministic pooling when the grid divides."""
+
+    return _DeterministicGridPool(output_size)(features)
+
+
+class _SceneContext(nn.Module):
+    """Scene-only bottleneck context with both local and global receptive fields."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        context_channels = max(32, channels // 2)
+        self.reduce = nn.Sequential(
+            nn.Conv2d(channels, context_channels, kernel_size=1),
+            nn.GELU(),
+        )
+        self.dilated = nn.Sequential(
+            nn.Conv2d(
+                context_channels,
+                context_channels,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                context_channels,
+                context_channels,
+                kernel_size=3,
+                padding=4,
+                dilation=4,
+            ),
+            nn.GELU(),
+        )
+        self.expand = nn.Conv2d(context_channels, channels, kernel_size=1)
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.GELU(),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        local = self.expand(self.dilated(self.reduce(features)))
+        return features + local + self.global_context(features)
+
+
+class _SceneOnlyOccupancyDecoder(nn.Module):
+    """Multiscale scene-only decoder for future hidden occupancy supervision."""
+
+    def __init__(self, *, d_model: int, future_steps: int) -> None:
+        super().__init__()
+        self.decode_40 = self._block(d_model + 96, 96)
+        self.decode_80 = self._block(96 + 64, 64)
+        self.decode_full = self._block(64 + R2_STEM_CHANNELS, R2_STEM_CHANNELS)
+        self.output = nn.Conv2d(
+            R2_STEM_CHANNELS, future_steps, kernel_size=1
+        )
+
+    @staticmethod
+    def _block(in_channels: int, out_channels: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+
+    def forward(
+        self,
+        *,
+        scene_stem: torch.Tensor,
+        scene_80: torch.Tensor,
+        scene_40: torch.Tensor,
+        scene_context: torch.Tensor,
+    ) -> torch.Tensor:
+        decoded_40 = self.decode_40(
+            torch.cat(
+                (
+                    F.interpolate(
+                        scene_context,
+                        size=scene_40.shape[-2:],
+                        mode="nearest",
+                    ),
+                    scene_40,
+                ),
+                dim=1,
+            )
+        )
+        decoded_80 = self.decode_80(
+            torch.cat(
+                (
+                    F.interpolate(
+                        decoded_40, size=scene_80.shape[-2:], mode="nearest"
+                    ),
+                    scene_80,
+                ),
+                dim=1,
+            )
+        )
+        decoded_full = self.decode_full(
+            torch.cat(
+                (
+                    F.interpolate(
+                        decoded_80, size=scene_stem.shape[-2:], mode="nearest"
+                    ),
+                    scene_stem,
+                ),
+                dim=1,
+            )
+        )
+        return self.output(decoded_full)
+
+
+class TrajectoryQueryTransformer(nn.Module):
+    """Lightweight R2 decoder that cross-attends legal trajectory queries to BEV.
+
+    The scene path receives only flattened observed history plus current state;
+    the trajectory map becomes a small set of decoder queries.  Scene memory is
+    formed by CNN features with convolutional and pooled global context, without
+    global scene-token self-attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int = R2_D_MODEL,
+        nhead: int = R2_NUM_HEADS,
+        num_decoder_layers: int = R2_DECODER_LAYERS,
+        dim_feedforward: int = R2_DIM_FEEDFORWARD,
+        dropout: float = R2_DROPOUT,
+        query_bins: int = R2_QUERY_BINS,
+        fusion_mode: str = "cross_attention",
+        occupancy_aux_enabled: bool = False,
+        occupancy_future_steps: int = R2_OCCUPANCY_AUX_CHANNELS,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("d_model", d_model),
+            ("nhead", nhead),
+            ("num_decoder_layers", num_decoder_layers),
+            ("dim_feedforward", dim_feedforward),
+            ("query_bins", query_bins),
+            ("occupancy_future_steps", occupancy_future_steps),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"R2 {name} must be a positive integer")
+        if d_model % nhead != 0:
+            raise ValueError("R2 d_model must be divisible by nhead")
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError("R2 dropout must lie in [0,1)")
+        if fusion_mode not in R2_FUSION_MODES:
+            raise ValueError(f"R2 fusion_mode must be one of {sorted(R2_FUSION_MODES)}")
+        if not isinstance(occupancy_aux_enabled, bool):
+            raise ValueError("occupancy_aux_enabled must be boolean")
+
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.num_decoder_layers = int(num_decoder_layers)
+        self.dim_feedforward = int(dim_feedforward)
+        self.dropout = float(dropout)
+        self.query_bins = int(query_bins)
+        self.fusion_mode = fusion_mode
+        self.occupancy_aux_enabled = occupancy_aux_enabled
+        self.occupancy_future_steps = int(occupancy_future_steps)
+        self.max_scene_tokens = R2_MAX_SCENE_TOKENS
+        self.scene_token_grid = R2_SCENE_TOKEN_GRID
+
+        # This branch has no trajectory channels by construction: 16 flattened
+        # history channels plus 9 current-state channels is the frozen total 25.
+        self.scene_stem = nn.Sequential(
+            nn.Conv2d(R2_SCENE_INPUT_CHANNELS, R2_STEM_CHANNELS, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(R2_STEM_CHANNELS, R2_STEM_CHANNELS, 3, padding=1),
+            nn.GELU(),
+        )
+        self.scene_down_80 = nn.Sequential(
+            nn.Conv2d(R2_STEM_CHANNELS, 64, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.scene_down_40 = nn.Sequential(
+            nn.Conv2d(64, 96, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.scene_down_20 = nn.Sequential(
+            nn.Conv2d(96, d_model, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.scene_context = _SceneContext(d_model)
+        self.trajectory_encoder = nn.Sequential(
+            nn.Conv2d(N_TRAJECTORY_CHANNELS, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, d_model, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(d_model, d_model, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.scene_token_pool = _DeterministicGridPool(R2_SCENE_TOKEN_GRID)
+        self.scene_position = nn.Linear(2, d_model, bias=False)
+        self.trajectory_position = nn.Linear(2, d_model, bias=False)
+        self.time_embedding = nn.Embedding(query_bins, d_model)
+        self.scene_norm = nn.LayerNorm(d_model)
+        self.query_norm = nn.LayerNorm(d_model)
+        self.trajectory_decoder: nn.TransformerDecoder | None = None
+        self.trajectory_concat_encoder: nn.TransformerEncoder | None = None
+        if fusion_mode == "cross_attention":
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.trajectory_decoder = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=num_decoder_layers,
+                norm=nn.LayerNorm(d_model),
+            )
+        else:
+            query_encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.trajectory_concat_encoder = nn.TransformerEncoder(
+                query_encoder_layer,
+                num_layers=num_decoder_layers,
+                norm=nn.LayerNorm(d_model),
+            )
+        fusion_features = (
+            d_model + ROBOT_STATE_DIM
+            if fusion_mode == "cross_attention"
+            else 2 * d_model + ROBOT_STATE_DIM
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_features, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.quantile_head = nn.Linear(d_model, len(QUANTILE_LEVELS))
+        self.collision_head = nn.Linear(d_model, 1)
+        self.occupancy_aux_decoder: nn.Module | None
+        if occupancy_aux_enabled:
+            self.occupancy_aux_decoder = _SceneOnlyOccupancyDecoder(
+                d_model=d_model,
+                future_steps=occupancy_future_steps,
+            )
+        else:
+            self.occupancy_aux_decoder = None
+
+    def export_config(self) -> dict[str, object]:
+        return {
+            "variant": "r2",
+            "history_steps": 8,
+            "r2_d_model": self.d_model,
+            "r2_nhead": self.nhead,
+            "r2_num_decoder_layers": self.num_decoder_layers,
+            "r2_dim_feedforward": self.dim_feedforward,
+            "r2_dropout": self.dropout,
+            "r2_query_bins": self.query_bins,
+            "r2_fusion_mode": self.fusion_mode,
+            "occupancy_aux_enabled": self.occupancy_aux_enabled,
+            "occupancy_future_steps": self.occupancy_future_steps,
+        }
+
+    @staticmethod
+    def _position_tokens(
+        features: torch.Tensor, projection: nn.Linear
+    ) -> torch.Tensor:
+        """Create lightweight 2-D positions without adding input channels."""
+
+        height, width = features.shape[-2:]
+        y = torch.linspace(
+            -1.0, 1.0, height, device=features.device, dtype=features.dtype
+        )
+        x = torch.linspace(
+            -1.0, 1.0, width, device=features.device, dtype=features.dtype
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coordinates = torch.stack((yy, xx), dim=-1).reshape(1, height * width, 2)
+        return projection(coordinates).expand(features.shape[0], -1, -1)
+
+    def _scene_tokens(self, scene_features: torch.Tensor) -> torch.Tensor:
+        height, width = scene_features.shape[-2:]
+        if height * width > self.max_scene_tokens:
+            scene_features = self.scene_token_pool(scene_features)
+        tokens = scene_features.flatten(2).transpose(1, 2)
+        return self.scene_norm(
+            tokens + self._position_tokens(scene_features, self.scene_position)
+        )
+
+    def _trajectory_queries(
+        self, trajectory_features: torch.Tensor, trajectory_channels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool legal swept cells into ordered time-to-arrival query tokens."""
+
+        target_size = trajectory_features.shape[-2:]
+        swept = _resize_grid(trajectory_channels[:, :1], target_size).clamp(0.0, 1.0)
+        arrival = _resize_grid(
+            trajectory_channels[:, 1:2] * trajectory_channels[:, :1], target_size
+        ) / swept.clamp_min(torch.finfo(trajectory_features.dtype).eps)
+        weights: list[torch.Tensor] = []
+        for index in range(self.query_bins):
+            lower = float(index) / self.query_bins
+            upper = float(index + 1) / self.query_bins
+            if index + 1 == self.query_bins:
+                in_bin = (arrival >= lower) & (arrival <= upper)
+            else:
+                in_bin = (arrival >= lower) & (arrival < upper)
+            weights.append(swept * in_bin.to(dtype=swept.dtype))
+        query_weights = torch.cat(weights, dim=1)
+        weight_sums = query_weights.sum(dim=(-2, -1))
+        valid = weight_sums > 0.0
+        no_valid = ~valid.any(dim=1)
+        if torch.any(no_valid):
+            fallback = swept[:, 0]
+            fallback_is_empty = fallback.sum(dim=(-2, -1)) <= 0.0
+            fallback = torch.where(
+                fallback_is_empty[:, None, None], torch.ones_like(fallback), fallback
+            )
+            query_weights = query_weights.clone()
+            query_weights[no_valid, 0] = fallback[no_valid]
+            weight_sums = query_weights.sum(dim=(-2, -1))
+            valid = weight_sums > 0.0
+        normalized = query_weights / weight_sums.clamp_min(
+            torch.finfo(trajectory_features.dtype).eps
+        )[:, :, None, None]
+        query_features = torch.einsum(
+            "bqhw,bdhw->bqd", normalized, trajectory_features
+        )
+        height, width = target_size
+        y = torch.linspace(
+            -1.0, 1.0, height, device=trajectory_features.device, dtype=trajectory_features.dtype
+        )
+        x = torch.linspace(
+            -1.0, 1.0, width, device=trajectory_features.device, dtype=trajectory_features.dtype
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coordinates = torch.stack((yy, xx), dim=-1)
+        query_coordinates = torch.einsum(
+            "bqhw,hwc->bqc", normalized, coordinates
+        )
+        time_ids = torch.arange(
+            self.query_bins, device=trajectory_features.device, dtype=torch.long
+        )
+        query_tokens = (
+            query_features
+            + self.trajectory_position(query_coordinates)
+            + self.time_embedding(time_ids).unsqueeze(0)
+        )
+        return self.query_norm(query_tokens), valid
+
+    @staticmethod
+    def _masked_max(tokens: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        masked = tokens.masked_fill(~valid[:, :, None], float("-inf"))
+        return masked.amax(dim=1)
+
+    def forward(
+        self,
+        scene_inputs: torch.Tensor,
+        trajectory_channels: torch.Tensor,
+        robot_state: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if (
+            scene_inputs.ndim != 4
+            or scene_inputs.shape[1] != R2_SCENE_INPUT_CHANNELS
+        ):
+            raise RiskDataContractError("R2 scene inputs must have shape [B,25,H,W]")
+        if (
+            trajectory_channels.ndim != 4
+            or trajectory_channels.shape[1] != N_TRAJECTORY_CHANNELS
+        ):
+            raise RiskDataContractError(
+                "R2 trajectory inputs must have shape [B,4,H,W]"
+            )
+        if scene_inputs.shape[0] != trajectory_channels.shape[0] or (
+            scene_inputs.shape[-2:] != trajectory_channels.shape[-2:]
+        ):
+            raise RiskDataContractError("R2 scene and trajectory inputs must align")
+        if robot_state.shape != (scene_inputs.shape[0], ROBOT_STATE_DIM):
+            raise RiskDataContractError("R2 robot_state must have shape [B,2]")
+
+        scene_stem = self.scene_stem(scene_inputs)
+        scene_80 = self.scene_down_80(scene_stem)
+        scene_40 = self.scene_down_40(scene_80)
+        scene_context = self.scene_context(self.scene_down_20(scene_40))
+        scene_tokens = self._scene_tokens(scene_context)
+        trajectory_tokens, valid_queries = self._trajectory_queries(
+            self.trajectory_encoder(trajectory_channels), trajectory_channels
+        )
+        padding_mask = ~valid_queries
+        if self.fusion_mode == "cross_attention":
+            assert self.trajectory_decoder is not None
+            decoded_queries = self.trajectory_decoder(
+                trajectory_tokens,
+                scene_tokens,
+                tgt_key_padding_mask=padding_mask,
+            )
+            fusion_inputs = torch.cat(
+                (self._masked_max(decoded_queries, valid_queries), robot_state), dim=1
+            )
+        else:
+            assert self.trajectory_concat_encoder is not None
+            decoded_queries = self.trajectory_concat_encoder(
+                trajectory_tokens, src_key_padding_mask=padding_mask
+            )
+            fusion_inputs = torch.cat(
+                (
+                    self._masked_max(decoded_queries, valid_queries),
+                    scene_tokens.mean(dim=1),
+                    robot_state,
+                ),
+                dim=1,
+            )
+        fused = self.fusion(
+            fusion_inputs
+        )
+        collision_logits = self.collision_head(fused).squeeze(-1)
+        output = {
+            "quantiles": noncrossing_quantiles(self.quantile_head(fused)),
+            "collision_logits": collision_logits,
+            "p_collision": torch.sigmoid(collision_logits),
+        }
+        if self.occupancy_aux_decoder is not None:
+            output["occupancy_aux_logits"] = self.occupancy_aux_decoder(
+                scene_stem=scene_stem,
+                scene_80=scene_80,
+                scene_40=scene_40,
+                scene_context=scene_context,
+            )
+        return output
+
+
 class RiskModel(nn.Module):
-    """R0 stacked-history CNN or R1 ConvGRU temporal risk model."""
+    """R0/R1 baselines plus the R2 trajectory-query Transformer."""
 
     def __init__(
         self,
         *,
         variant: str = "r0",
-        hidden_channels: int = 16,
+        hidden_channels: int | None = None,
         history_steps: int = 8,
+        r2_d_model: int = R2_D_MODEL,
+        r2_nhead: int = R2_NUM_HEADS,
+        r2_num_decoder_layers: int = R2_DECODER_LAYERS,
+        r2_dim_feedforward: int = R2_DIM_FEEDFORWARD,
+        r2_dropout: float = R2_DROPOUT,
+        r2_query_bins: int = R2_QUERY_BINS,
+        r2_fusion_mode: str = "cross_attention",
+        occupancy_aux_enabled: bool = False,
+        occupancy_future_steps: int = R2_OCCUPANCY_AUX_CHANNELS,
+        # Read legacy pre-refactor R2 checkpoints without emitting this shape
+        # back into new checkpoint configs.
+        d_model: int | None = None,
+        nhead: int | None = None,
+        num_decoder_layers: int | None = None,
+        dim_feedforward: int | None = None,
+        dropout: float | None = None,
     ) -> None:
         super().__init__()
         if variant not in RISK_MODEL_VARIANTS:
             raise ValueError(f"variant must be one of {RISK_MODEL_VARIANTS}")
-        if hidden_channels < 1:
-            raise ValueError("hidden_channels must be positive")
+        if not isinstance(occupancy_aux_enabled, bool):
+            raise ValueError("occupancy_aux_enabled must be boolean")
+        if variant != "r2" and occupancy_aux_enabled:
+            raise ValueError("occupancy_aux_enabled is available only for r2")
         if history_steps != 8:
             raise ValueError("SOP09 frozen history_steps must equal 8")
         self.variant = variant
-        self.hidden_channels = int(hidden_channels)
         self.history_steps = int(history_steps)
+        if variant == "r2":
+            if hidden_channels is not None:
+                raise ValueError("hidden_channels is unavailable for the r2 model variant")
+            legacy_values = {
+                "d_model": d_model,
+                "nhead": nhead,
+                "num_decoder_layers": num_decoder_layers,
+                "dim_feedforward": dim_feedforward,
+                "dropout": dropout,
+            }
+            current_values = {
+                "d_model": r2_d_model,
+                "nhead": r2_nhead,
+                "num_decoder_layers": r2_num_decoder_layers,
+                "dim_feedforward": r2_dim_feedforward,
+                "dropout": r2_dropout,
+            }
+            for name, legacy_value in legacy_values.items():
+                if legacy_value is not None:
+                    current_values[name] = legacy_value
+            self.hidden_channels = None
+            self.r2_model = TrajectoryQueryTransformer(
+                d_model=int(current_values["d_model"]),
+                nhead=int(current_values["nhead"]),
+                num_decoder_layers=int(current_values["num_decoder_layers"]),
+                dim_feedforward=int(current_values["dim_feedforward"]),
+                dropout=float(current_values["dropout"]),
+                query_bins=r2_query_bins,
+                fusion_mode=r2_fusion_mode,
+                occupancy_aux_enabled=occupancy_aux_enabled,
+                occupancy_future_steps=occupancy_future_steps,
+            )
+            return
+        if hidden_channels is None:
+            hidden_channels = 16
+        if type(hidden_channels) is not int or hidden_channels < 1:
+            raise ValueError("hidden_channels must be a positive integer for r0/r1")
+        self.hidden_channels = int(hidden_channels)
         if variant == "r0":
             input_channels = (
                 history_steps * N_HISTORY_CHANNELS
@@ -146,6 +695,8 @@ class RiskModel(nn.Module):
         self.collision_head = nn.Linear(2 * hidden_channels, 1)
 
     def export_config(self) -> dict[str, object]:
+        if self.variant == "r2":
+            return self.r2_model.export_config()
         return {
             "variant": self.variant,
             "hidden_channels": self.hidden_channels,
@@ -201,7 +752,7 @@ class RiskModel(nn.Module):
                 dim=1,
             )
             features = self.pool(self.spatial_encoder(spatial)).flatten(1)
-        else:
+        elif self.variant == "r1":
             hidden: torch.Tensor | None = None
             for step in range(steps):
                 encoded = self.history_encoder(history[:, step])
@@ -211,6 +762,12 @@ class RiskModel(nn.Module):
             context = self.context_encoder(torch.cat((state, trajectory), dim=1))
             context_features = self.pool(context).flatten(1)
             features = torch.cat((temporal_features, context_features), dim=1)
+        else:
+            scene_inputs = torch.cat(
+                (history.reshape(batch, steps * channels, height, width), state),
+                dim=1,
+            )
+            return self.r2_model(scene_inputs, trajectory, robot_state)
         fused = self.fusion(torch.cat((features, robot_state), dim=1))
         raw_quantiles = self.quantile_head(fused)
         collision_logits = self.collision_head(fused).squeeze(-1)
@@ -231,9 +788,20 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
         if mode == "toy"
         else RISK_PRODUCTION_PROVENANCE_KEYS
     )
-    if set(provenance) != expected_keys:
-        missing = sorted(expected_keys - set(provenance))
-        unexpected = sorted(repr(key) for key in set(provenance) - expected_keys)
+    actual_keys = set(provenance)
+    permits_auxiliary = (
+        mode == "production"
+        and actual_keys
+        == (RISK_PRODUCTION_PROVENANCE_KEYS | RISK_AUXILIARY_PROVENANCE_KEYS)
+    )
+    if actual_keys != expected_keys and not permits_auxiliary:
+        expected_with_auxiliary = (
+            expected_keys | RISK_AUXILIARY_PROVENANCE_KEYS
+            if mode == "production"
+            else expected_keys
+        )
+        missing = sorted(expected_with_auxiliary - actual_keys)
+        unexpected = sorted(repr(key) for key in actual_keys - expected_with_auxiliary)
         raise RiskDataContractError(
             "checkpoint provenance keys must match the mode-specific contract; "
             f"missing={missing}, unexpected={unexpected}"
@@ -291,6 +859,47 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
                 "toy training and validation dataset manifest digests must be distinct"
             )
         return
+
+    if permits_auxiliary:
+        if provenance["occupancy_auxiliary_enabled"] is not True:
+            raise RiskDataContractError(
+                "auxiliary checkpoint provenance must record occupancy_auxiliary_enabled=true"
+            )
+        sidecar_digest = provenance["occupancy_sidecar_collection_digest_sha256"]
+        if (
+            not isinstance(sidecar_digest, str)
+            or len(sidecar_digest) != 64
+            or any(character not in "0123456789abcdef" for character in sidecar_digest)
+        ):
+            raise RiskDataContractError(
+                "checkpoint occupancy sidecar collection digest must be a lowercase SHA-256 digest"
+            )
+        positive_count = provenance["occupancy_global_positive_count"]
+        negative_count = provenance["occupancy_global_negative_count"]
+        if (
+            type(positive_count) is not int
+            or type(negative_count) is not int
+            or positive_count < 1
+            or negative_count < 1
+        ):
+            raise RiskDataContractError(
+                "checkpoint occupancy class counts must be positive integers"
+            )
+        pos_weight = provenance["occupancy_global_pos_weight"]
+        expected_weight = float(negative_count) / float(positive_count)
+        if (
+            type(pos_weight) not in {int, float}
+            or not math.isfinite(float(pos_weight))
+            or float(pos_weight) <= 0.0
+            or not math.isclose(float(pos_weight), expected_weight, rel_tol=0.0, abs_tol=0.0)
+        ):
+            raise RiskDataContractError(
+                "checkpoint occupancy_global_pos_weight must equal negative/positive count"
+            )
+        if provenance["occupancy_future_steps"] != 32:
+            raise RiskDataContractError(
+                "checkpoint auxiliary occupancy horizon must equal 32"
+            )
 
     digest_contract = {
         "g1_split_manifest_digest": (32, "BLAKE2b-128"),
@@ -517,6 +1126,26 @@ def save_risk_checkpoint(
     _validate_provenance(mode, provenance)
     if provenance["model_variant"] != model.variant:
         raise RiskDataContractError("provenance model_variant does not match model")
+    if mode == "production":
+        model_config = model.export_config()
+        model_uses_auxiliary = (
+            model.variant == "r2"
+            and model_config.get("occupancy_aux_enabled") is True
+        )
+        provenance_binds_auxiliary = (
+            provenance.get("occupancy_auxiliary_enabled") is True
+        )
+        if model_uses_auxiliary != provenance_binds_auxiliary:
+            raise RiskDataContractError(
+                "production auxiliary provenance does not match the model"
+            )
+        if model_uses_auxiliary and (
+            model_config.get("occupancy_future_steps")
+            != provenance.get("occupancy_future_steps")
+        ):
+            raise RiskDataContractError(
+                "production auxiliary model/provenance occupancy horizon mismatch"
+            )
     if inference_parameters is None:
         frozen_inference_parameters: object = {
             "quantile_levels": list(QUANTILE_LEVELS),
@@ -657,13 +1286,36 @@ def compute_risk_batch_loss(
     batch: object,
     *,
     lambda_collision: float,
+    lambda_occupancy_aux: float = 0.0,
+    occupancy_target: torch.Tensor | None = None,
+    occupancy_pos_weight: float = 1.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Evaluate the risk loss without admitting auxiliary labels as inputs.
+
+    An authenticated sidecar provides ``occupancy_targets.hidden_risk_occupancy``
+    on a separate batch namespace.  Model inputs remain unchanged, and enabling
+    an auxiliary head without that label fails closed.
+    """
+
     output = model(batch.model_inputs)
+    if occupancy_target is None:
+        occupancy_targets = getattr(batch, "occupancy_targets", None)
+        if isinstance(occupancy_targets, Mapping):
+            candidate = occupancy_targets.get("hidden_risk_occupancy")
+            if isinstance(candidate, torch.Tensor):
+                occupancy_target = candidate
+    if output.get("occupancy_aux_logits") is not None and occupancy_target is None:
+        raise RiskDataContractError(
+            "occupancy auxiliary output requires a separate 32-step occupancy target"
+        )
     losses = risk_loss(
         output,
         risk_severity=batch.targets["risk_severity"],
         collision_label=batch.targets["collision_label"],
         lambda_collision=lambda_collision,
+        occupancy_target=occupancy_target,
+        lambda_occupancy_aux=lambda_occupancy_aux,
+        occupancy_pos_weight=occupancy_pos_weight,
     )
     return output, losses
 
@@ -971,7 +1623,7 @@ def train_toy_risk_model(
     lambda_collision: float = 1.0,
     seed: int = 42,
 ) -> tuple[RiskModel, dict[str, object]]:
-    """Deterministically fit one toy R0/R1 without consulting test data."""
+    """Deterministically fit one toy R0/R1/R2 without consulting test data."""
 
     validate_toy_risk_dataset_publication(train_dataset)
     validate_toy_risk_dataset_publication(validation_dataset)
@@ -1007,7 +1659,10 @@ def train_toy_risk_model(
     )
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
-    model = RiskModel(variant=variant, hidden_channels=hidden_channels)
+    model = RiskModel(
+        variant=variant,
+        hidden_channels=None if variant == "r2" else hidden_channels,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), learning_rate, weight_decay=0.0
     )
@@ -1120,10 +1775,22 @@ def train_toy_risk_model(
 
 
 __all__ = [
+    "R2_DECODER_LAYERS",
+    "R2_DIM_FEEDFORWARD",
+    "R2_D_MODEL",
+    "R2_DROPOUT",
+    "R2_MAX_SCENE_TOKENS",
+    "R2_NUM_HEADS",
+    "R2_OCCUPANCY_AUX_CHANNELS",
+    "R2_QUERY_BINS",
+    "R2_SCENE_INPUT_CHANNELS",
+    "R2_SCENE_TOKEN_GRID",
+    "R2_STEM_CHANNELS",
     "RISK_CHECKPOINT_LAYOUT_VERSION",
     "RISK_MODEL_VARIANTS",
     "TRAJECTORY_SENSITIVITY_EPSILON",
     "RiskModel",
+    "TrajectoryQueryTransformer",
     "compute_risk_batch_loss",
     "load_risk_checkpoint",
     "noncrossing_quantiles",

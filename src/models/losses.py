@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Mapping, Sequence
 
 import torch
@@ -47,6 +48,7 @@ def risk_loss(
     lambda_collision: float = 1.0,
     occupancy_target: torch.Tensor | None = None,
     lambda_occupancy_aux: float = 0.0,
+    occupancy_pos_weight: float = 1.0,
     levels: Sequence[float] = QUANTILE_LEVELS,
 ) -> dict[str, torch.Tensor]:
     """Compose pinball + collision BCE + optional occupancy BCE."""
@@ -56,6 +58,8 @@ def risk_loss(
         raise ValueError("risk model output lacks quantiles/collision_logits")
     if lambda_collision < 0.0 or lambda_occupancy_aux < 0.0:
         raise ValueError("loss weights must be nonnegative")
+    if not math.isfinite(float(occupancy_pos_weight)) or float(occupancy_pos_weight) <= 0.0:
+        raise ValueError("occupancy_pos_weight must be positive and finite")
     quantiles = output["quantiles"]
     logits = output["collision_logits"]
     if logits.ndim != 1 or collision_label.shape != logits.shape:
@@ -93,7 +97,9 @@ def risk_loss(
         if torch.any((occupancy_target < 0.0) | (occupancy_target > 1.0)).item():
             raise ValueError("occupancy auxiliary target must be in [0,1]")
         occupancy_aux = F.binary_cross_entropy_with_logits(
-            occupancy_prediction, occupancy_target
+            occupancy_prediction,
+            occupancy_target,
+            pos_weight=occupancy_prediction.new_tensor(float(occupancy_pos_weight)),
         )
     else:
         occupancy_aux = pinball.new_zeros(())

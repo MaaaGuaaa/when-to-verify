@@ -14,7 +14,7 @@ from src.contracts import HISTORY_CHANNELS, STATE_CHANNELS
 from .occupancy_aggregation import future_endpoint_times
 
 
-FUTURE_STEPS = 15
+FUTURE_STEPS = 32
 FUTURE_DT_S = 0.2
 HISTORY_STEPS = 8
 
@@ -177,7 +177,7 @@ class ConvGRUCell(nn.Module):
 
 
 class ConvGRUOccupancyPredictor(nn.Module):
-    """Encode eight observed BEV frames and autoregress 15 occupancy logits."""
+    """Encode eight observed BEV frames and autoregress future occupancy logits."""
 
     def __init__(
         self,

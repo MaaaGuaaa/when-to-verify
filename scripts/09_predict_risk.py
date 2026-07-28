@@ -55,6 +55,7 @@ from src.evaluation.prediction_tables import (  # noqa: E402
 )
 from src.models.occupancy_baseline import (  # noqa: E402
     ConvGRUOccupancyPredictor,
+    FUTURE_STEPS,
     LearnedOccupancyRiskAggregator,
 )
 from src.models.risk_model import load_risk_checkpoint  # noqa: E402
@@ -292,13 +293,16 @@ def _load_selected_occupancy_models(
     if config.get("seed") != seed:
         raise PredictionProducerError("occupancy checkpoint seed mismatch")
     model_spec = checkpoint["model_spec"]
+    future_steps = model_spec.get("future_steps")
+    if future_steps != FUTURE_STEPS or config.get("future_steps") != future_steps:
+        raise PredictionProducerError("occupancy checkpoint future_steps mismatch")
     model = ConvGRUOccupancyPredictor(
         hidden_channels=int(model_spec["hidden_channels"]),
-        future_steps=15,
+        future_steps=int(future_steps),
         kernel_size=int(model_spec["convgru_kernel_size"]),
     )
     aggregator = LearnedOccupancyRiskAggregator(
-        future_steps=15,
+        future_steps=int(future_steps),
         hidden_dim=int(model_spec["learned_aggregator_hidden_dim"]),
     )
     model.load_state_dict(checkpoint["b3_model_state_dict"], strict=True)

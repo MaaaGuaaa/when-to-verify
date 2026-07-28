@@ -38,6 +38,8 @@ from src.models.occupancy_aggregation import (
 from src.models.occupancy_baseline import (
     AgeDecay,
     ConvGRUOccupancyPredictor,
+    FUTURE_DT_S,
+    FUTURE_STEPS,
     LastObservationHold,
     LearnedOccupancyRiskAggregator,
 )
@@ -132,7 +134,10 @@ def occupancy_checkpoint_semantic_digest(checkpoint: Mapping[str, Any]) -> str:
 
 
 def _expected_endpoints() -> np.ndarray:
-    return future_endpoint_times(future_steps=15, dt_s=0.2)
+    return future_endpoint_times(
+        future_steps=TOY_FUTURE_STEPS,
+        dt_s=TOY_DT_S,
+    )
 
 
 def _channel_spec_is_current(value: Any) -> bool:
@@ -207,7 +212,7 @@ def validate_occupancy_dataset_manifest(
         atol=1e-6,
         rtol=0.0,
     ):
-        raise ValueError("future_endpoint_times_s must contain 0.2 .. 3.0 endpoint times")
+        raise ValueError("future_endpoint_times_s must contain 0.2 .. 6.4 endpoint times")
     actual_digest = result.get("toy_dataset_manifest_digest")
     if not isinstance(actual_digest, str) or actual_digest != expected_manifest_digest:
         raise ValueError("toy_dataset_manifest_digest mismatch")
@@ -453,13 +458,23 @@ def score_production_occupancy_baseline(
         for value in (history, state, footprints, endpoint_times)
     ):
         raise TypeError("production baseline inputs must be torch tensors")
-    if endpoint_times.dtype != torch.float32 or endpoint_times.shape != (15,):
-        raise ValueError("endpoint_times_s must be float32 [15]")
+    if endpoint_times.dtype != torch.float32 or endpoint_times.shape != (FUTURE_STEPS,):
+        raise ValueError(f"endpoint_times_s must be float32 [{FUTURE_STEPS}]")
     expected_endpoints = (
-        torch.arange(1, 16, device=endpoint_times.device, dtype=torch.float32) * 0.2
+        torch.arange(
+            1,
+            FUTURE_STEPS + 1,
+            device=endpoint_times.device,
+            dtype=torch.float32,
+        )
+        * FUTURE_DT_S
     )
     if not torch.equal(endpoint_times, expected_endpoints):
-        raise ValueError("endpoint_times_s must equal 0.2 .. 3.0")
+        raise ValueError("endpoint_times_s must equal 0.2 .. 6.4")
+    if occupancy_model.future_steps != FUTURE_STEPS:
+        raise ValueError(f"occupancy_model.future_steps must be {FUTURE_STEPS}")
+    if learned_aggregator.future_steps != FUTURE_STEPS:
+        raise ValueError(f"learned_aggregator.future_steps must be {FUTURE_STEPS}")
 
     model_was_training = occupancy_model.training
     aggregator_was_training = learned_aggregator.training
@@ -468,11 +483,11 @@ def score_production_occupancy_baseline(
     try:
         with torch.no_grad():
             if method == "B1":
-                probability = LastObservationHold(future_steps=15)(history)
+                probability = LastObservationHold(future_steps=FUTURE_STEPS)(history)
             elif method == "B2":
                 probability = AgeDecay(
-                    future_steps=15,
-                    dt_s=0.2,
+                    future_steps=FUTURE_STEPS,
+                    dt_s=FUTURE_DT_S,
                     tau_s=b2_tau_s,
                     a_max_s=b2_a_max_s,
                 )(state)
@@ -484,7 +499,7 @@ def score_production_occupancy_baseline(
                 score = weighted_swept_volume_risk(
                     probability,
                     footprints,
-                    dt_s=0.2,
+                    dt_s=FUTURE_DT_S,
                     sigma_time_s=sigma_time_s,
                 )
     finally:

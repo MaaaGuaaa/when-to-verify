@@ -8,6 +8,7 @@ import queue
 import pytest
 import torch
 
+import src.training.risk_ddp_trainer as ddp_trainer
 from src.datasets.risk_training_store import (
     build_authenticated_risk_training_view,
     open_authenticated_risk_snapshot,
@@ -16,6 +17,7 @@ from src.datasets.risk_training_store import (
 from src.models.risk_model import load_risk_checkpoint
 from src.training.distributed import (
     DistributedRuntime,
+    build_synchronous_partition_plan,
     destroy_distributed_process_group,
     initialize_distributed_process_group,
 )
@@ -27,6 +29,133 @@ from src.training.risk_ddp_trainer import (
 )
 from src.training.risk_trainer import ProductionRiskTrainingConfig
 from tests.test_risk_production_training import _publish_and_load
+
+
+def test_ddp_wrapper_enables_safe_single_node_optimizations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_ddp(module: torch.nn.Module, **kwargs: object) -> object:
+        captured["module"] = module
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(ddp_trainer, "DistributedDataParallel", fake_ddp)
+    module = torch.nn.Linear(2, 1)
+    runtime = DistributedRuntime(0, 2, 0, "gloo", "cpu")
+
+    wrapped = ddp_trainer._wrap_distributed_model(module, runtime)
+
+    assert wrapped is sentinel
+    assert captured == {
+        "module": module,
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    }
+
+
+def test_optimizer_window_statistics_use_one_collective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[float, ...]] = []
+
+    def fake_reduce(values, runtime):
+        calls.append(tuple(float(value) for value in values))
+        return (10.5, 7.0, 1.0, 12.0, 0.0)
+
+    monkeypatch.setattr(ddp_trainer, "_all_reduce_values", fake_reduce)
+    runtime = DistributedRuntime(0, 2, 0, "gloo", "cpu")
+
+    reduced = ddp_trainer._reduce_optimizer_window_statistics(
+        local_loss_sum=4.0,
+        local_sample_count=3,
+        local_crossings=0,
+        local_comparisons=6,
+        local_state_is_finite=True,
+        runtime=runtime,
+    )
+
+    assert calls == [(4.0, 3.0, 0.0, 6.0, 0.0)]
+    assert reduced == (10.5, 7, 1, 12, True)
+
+
+def test_completed_epoch_membership_checks_local_plan_without_object_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_ids = tuple(f"sample-{index:02d}" for index in range(11))
+    plan = build_synchronous_partition_plan(
+        sample_ids,
+        subset_digest_sha256="c" * 64,
+        seed=3,
+        epoch=0,
+        world_size=2,
+        batch_size=3,
+        gradient_accumulation_steps=2,
+    )
+    runtime = DistributedRuntime(0, 2, 0, "gloo", "cpu")
+    expected = {
+        sample_id
+        for batch in plan.rank_microbatches[runtime.rank]
+        for sample_id in batch
+    }
+    checks: list[bool] = []
+
+    def all_ranks_true(value: bool, observed_runtime: DistributedRuntime) -> bool:
+        assert observed_runtime == runtime
+        checks.append(value)
+        return value
+
+    monkeypatch.setattr(ddp_trainer, "_all_ranks_true", all_ranks_true)
+    monkeypatch.setattr(
+        ddp_trainer,
+        "_all_gather_objects",
+        lambda *args, **kwargs: pytest.fail("completed epoch gathered sample IDs"),
+    )
+
+    ddp_trainer._validate_completed_epoch_membership(
+        actual_sample_ids=expected,
+        plan=plan,
+        runtime=runtime,
+    )
+
+    assert checks == [True]
+
+
+def test_completed_epoch_membership_rejects_local_plan_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample_ids = tuple(f"sample-{index:02d}" for index in range(11))
+    plan = build_synchronous_partition_plan(
+        sample_ids,
+        subset_digest_sha256="c" * 64,
+        seed=3,
+        epoch=0,
+        world_size=2,
+        batch_size=3,
+        gradient_accumulation_steps=2,
+    )
+    runtime = DistributedRuntime(0, 2, 0, "gloo", "cpu")
+    expected = {
+        sample_id
+        for batch in plan.rank_microbatches[runtime.rank]
+        for sample_id in batch
+    }
+    missing_one = set(expected)
+    missing_one.pop()
+    monkeypatch.setattr(
+        ddp_trainer,
+        "_all_ranks_true",
+        lambda value, observed_runtime: value,
+    )
+
+    with pytest.raises(ValueError, match="epoch sample membership mismatch"):
+        ddp_trainer._validate_completed_epoch_membership(
+            actual_sample_ids=missing_one,
+            plan=plan,
+            runtime=runtime,
+        )
 
 
 def _distributed_training_worker(

@@ -50,13 +50,13 @@ def _model_inputs(batch_size: int = 3, grid_size: int = 8):
 
 def _query_inputs(batch_size: int = 3, grid_size: int = 8):
     footprints = torch.zeros(
-        (batch_size, 15, grid_size, grid_size),
+        (batch_size, 32, grid_size, grid_size),
         dtype=torch.float32,
     )
     footprints[:, :, 3:5, 3:5] = 1.0
     return {
         "robot_endpoint_footprints": footprints,
-        "endpoint_times_s": torch.arange(1, 16, dtype=torch.float32) * 0.2,
+        "endpoint_times_s": torch.arange(1, 33, dtype=torch.float32) * 0.2,
     }
 
 
@@ -69,11 +69,11 @@ def test_one_batch_scores_all_six_methods_without_label_arguments() -> None:
         },
         occupancy_model=ConvGRUOccupancyPredictor(
             hidden_channels=2,
-            future_steps=15,
+            future_steps=32,
             kernel_size=3,
         ),
         learned_aggregator=LearnedOccupancyRiskAggregator(
-            future_steps=15,
+            future_steps=32,
             hidden_dim=4,
         ),
         model_inputs=_model_inputs(),
@@ -403,10 +403,10 @@ def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
     )
     occupancy_model = ConvGRUOccupancyPredictor(
         hidden_channels=2,
-        future_steps=15,
+        future_steps=32,
         kernel_size=3,
     )
-    aggregator = LearnedOccupancyRiskAggregator(future_steps=15, hidden_dim=4)
+    aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=4)
     checkpoint = {
         "checkpoint_role": "best",
         "provenance": {
@@ -421,6 +421,7 @@ def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
             "hidden_channels": 2,
             "convgru_kernel_size": 3,
             "learned_aggregator_hidden_dim": 4,
+            "future_steps": 32,
         },
         "b3_model_state_dict": occupancy_model.state_dict(),
         "b4_aggregator_state_dict": aggregator.state_dict(),
@@ -456,3 +457,76 @@ def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
             dataset_family=family,
             seed=42,
         )
+
+
+def test_occupancy_checkpoint_loader_uses_bound_long40_horizon(
+    producer_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    family = SimpleNamespace(
+        risk_dataset_family_digest="a" * 64,
+        members={
+            "train": {"risk_dataset_manifest_digest": "b" * 64},
+            "val": {"risk_dataset_manifest_digest": "c" * 64},
+        },
+    )
+    expected_model = ConvGRUOccupancyPredictor(
+        hidden_channels=2,
+        future_steps=32,
+        kernel_size=3,
+    )
+    expected_aggregator = LearnedOccupancyRiskAggregator(
+        future_steps=32,
+        hidden_dim=4,
+    )
+    checkpoint = {
+        "checkpoint_role": "best",
+        "provenance": {
+            "risk_dataset_family_digest": "a" * 64,
+            "train_risk_dataset_manifest_digest": "b" * 64,
+            "validation_risk_dataset_manifest_digest": "c" * 64,
+            "global_cross_split_leakage": "PROVEN",
+            "scientific_claim_eligible": True,
+            "test_samples_used_for_training_or_selection": 0,
+        },
+        "model_spec": {
+            "hidden_channels": 2,
+            "convgru_kernel_size": 3,
+            "learned_aggregator_hidden_dim": 4,
+            "future_steps": 32,
+        },
+        "b3_model_state_dict": expected_model.state_dict(),
+        "b4_aggregator_state_dict": expected_aggregator.state_dict(),
+        "checkpoint_semantic_digest_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        producer_module,
+        "validate_formal_occupancy_training_publication",
+        lambda root: {"validation_status": "selected_on_authenticated_val"},
+    )
+    monkeypatch.setattr(
+        producer_module,
+        "load_formal_production_occupancy_checkpoint",
+        lambda path: checkpoint,
+    )
+    monkeypatch.setattr(
+        producer_module,
+        "_read_json",
+        lambda path, **kwargs: {
+            "seed": 42,
+            "future_steps": 32,
+            "b2_tau_s": 2.0,
+            "b2_a_max_s": 5.0,
+            "sigma_time_s": 2.0,
+        },
+    )
+
+    model, aggregator, _, _ = producer_module._load_selected_occupancy_models(
+        tmp_path,
+        dataset_family=family,
+        seed=42,
+    )
+
+    assert model.future_steps == 32
+    assert aggregator.future_steps == 32

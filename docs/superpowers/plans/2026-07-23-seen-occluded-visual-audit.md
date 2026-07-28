@@ -1,5 +1,9 @@
 # Real Seen-Then-Occluded Visual Audit Implementation Plan
 
+> ⚠️ **Archival plan:** The 23-frame audit layout below is historical and must
+> not be used for current production audits. Use the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and run an immutable audit-only producer that selects three real THOR-derived `seen_then_occluded` collision mothers with complete six-position paired groups and writes one replay GIF, one paired PNG, and one scientific audit record per sample.

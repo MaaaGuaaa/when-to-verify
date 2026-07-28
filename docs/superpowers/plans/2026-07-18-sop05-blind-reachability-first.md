@@ -1,5 +1,9 @@
 # SOP05 Blind-Reachability-First Implementation Plan
 
+> ⚠️ **Archival plan:** The 23-sample/15-future implementation below is
+> superseded and must not be used for current production. Use the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the low-yield, mode-collapsed SOP05 v4 proposal with a deterministic environment-occlusion generator that uses real 23-point snippets, publishes enough valid collision mothers, and treats complete sixpacks as a separate audit subset.

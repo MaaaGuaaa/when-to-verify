@@ -1,5 +1,9 @@
 # SOP05 Global Total Selection Implementation Plan
 
+> ⚠️ **Archival plan:** This plan predates the canonical long40 timeline.
+> Retain it for provenance only; current work follows the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish a deterministic total quota of ten physically valid SOP05 collision-and-occlusion events without any hard event-type ratio.

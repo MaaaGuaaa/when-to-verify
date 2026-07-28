@@ -1,5 +1,9 @@
 # SOP08 Sidecar Backfill And Complete Bundle Implementation Plan
 
+> ⚠️ **Archival plan:** This schema-3/15-step plan is retained only for provenance.
+> Do not execute it for current production. The active authority is the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish sample-ID-aligned future hidden occupancy labels for all 127,787 accepted SOP07 samples and rebuild a portable four-split bundle that can train SOP08 baselines and a later risk-model occupancy auxiliary head without upstream data generation.

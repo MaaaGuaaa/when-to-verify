@@ -1,5 +1,9 @@
 # Recording-Generalization and MotionSnippet v2 Implementation Plan
 
+> ⚠️ **Archival plan:** The 23-sample/15-future layout below is retained for
+> provenance only. Do not execute it for current production; use the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Preserve the frozen 37/5/5/5 THÖR recording assignment, state its known-session evaluation scope honestly, and rebuild SOP-03 with measured 8-frame history, current index 7, and 15-frame future in every MotionSnippet v2 artifact.

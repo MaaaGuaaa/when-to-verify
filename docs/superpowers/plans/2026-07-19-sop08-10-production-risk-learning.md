@@ -1,5 +1,9 @@
 # SOP08--10 Production Risk Learning Implementation Plan
 
+> ⚠️ **Archival plan:** This schema-3/15-step production plan is retained only
+> for provenance. Current work follows the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Connect the accepted schema-3 SOP07 collection to deterministic streaming SOP09 training, publish SOP08 oracle-isolated companion labels, and enable split-safe SOP10 production calibration and evaluation.

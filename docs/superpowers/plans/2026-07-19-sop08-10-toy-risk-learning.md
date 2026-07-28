@@ -1,5 +1,9 @@
 # SOP08--10 Toy-First Risk Learning Implementation Plan
 
+> ⚠️ **Archival plan:** This plan predates the long40 migration. Its 15-step
+> timing is not a current contract. Use the
+> [Long40 system contract](../../long40_system_contract.md).
+
 > **For agentic workers:** use test-driven development task by task. All Python
 > tests and generators run through Slurm; the login node is for Git and text
 > inspection only.

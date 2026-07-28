@@ -5,6 +5,10 @@
 > 计划目标：在不牺牲数据隔离、标签一致性和实验可信度的前提下，尽可能并行推进数据、模型、验证价值、闭环评估和论文写作。  
 > 推荐冲刺周期：**2026-07-14 至 2026-07-28**。  
 > 适用对象：多人研发团队、多个 Codex/Agent 并行协作，或单人通过多个独立工作线程推进。
+>
+> **统一时间契约：** 所有现行工作流遵循
+> [`long40_system_contract.md`](./long40_system_contract.md)。旧的 23 样本、15
+> 未来步和 3.0 秒计划只能作为历史记录。
 
 ---
 
@@ -38,11 +42,11 @@ execute / verify / reject 离线闭环
 核心表格、消融、案例图
 ```
 
-Schema 3 已冻结 future-endpoint 时间契约；其中继续使用 dynamic-object schema v2
-引入的三类对象语义。主论文目标事件默认使用 `human` snippet；所有
+Schema `4.0.0` 已冻结 long40 future-endpoint 时间契约；其中继续使用既有
+三类对象语义。主论文目标事件默认使用 `human` snippet；所有
 `carried_object/unknown_dynamic` 仍保留在 observed/oracle world，并参与可见性、
-占据和真实 footprint 风险计算。W2 及之后的任务必须拒绝 schema 2 的
-`q0...q14 / 0.0...2.8 s` artifact，并在每一级
+占据和真实 footprint 风险计算。W2 及之后的任务必须拒绝 Schema `1/2/3` 的旧时间
+布局、23 样本 snippet 和 15 步 trajectory，并在每一级
 门禁后重建下游数据、checkpoint、calibration 和结果；非人 target 只作为显式扩展。
 下游只能读取 contract/snippet 冻结的 `object_type` 与 footprint spec，禁止根据原始
 body name、role 或文件名重新分类。W2 的 target-type policy 必须包含白名单和三类
@@ -251,7 +255,7 @@ class VerificationSample:
     metadata: dict
 ```
 
-全局产物契约为 `schema_version=3.0.0`。其中保留 dynamic-object schema v2
+全局产物契约为 `schema_version=4.0.0`。其中保留既有
 冻结的 `human`、`carried_object`、`unknown_dynamic` 三类对象语义；这不得被误解
 为仍可发布全局 schema 2 产物。数据适配器保留所有有效非机器人 BODY，以
 `recording_id::body_name` 作为对象 ID。THÖR split 固定评测未见 recording/已知
@@ -277,20 +281,20 @@ history:
   dt: 0.2
 
 future:
-  horizon_s: 3.0
+  horizon_s: 6.4
   dt: 0.2
-  steps: 15
+  steps: 32
 ```
 
 ### 3.2.1 Additive hidden-occupancy sidecar
 
-SOP08 占据监督是 schema 3 外置的 additive label-only 发布：它不修改
-`RiskSample`、model-input 通道或 core `schema_version=3.0.0`。冻结数组为：
+SOP08 占据监督是 Schema 4 long40 外置的 additive label-only 发布：它不修改
+`RiskSample` 或 model-input 通道。冻结数组为：
 
 ```text
-hidden_risk_occupancy     float32 [N,15,160,160]  # 逻辑/loader
-robot_future_footprints   float32 [N,15,160,160]  # query companion
-future_endpoint_times_s   float32 [15]            # 0.2,...,3.0，不含 t=0
+hidden_risk_occupancy     float32 [N,32,160,160]  # 逻辑/loader
+robot_future_footprints   float32 [N,32,160,160]  # query companion
+future_endpoint_times_s   float32 [32]            # 0.2,...,6.4，不含 t=0
 ```
 
 两个 binary mask 在压缩 NPZ 中均以 `uint8` 存储，loader 才转为
@@ -476,17 +480,17 @@ train / calibration / val / test
 
 ## 6.3 Snippet 过滤
 
-生产片段固定为 4.4 秒、23 个真实采样点；速度阈值按 object type 读取
-schema 3 配置中保留的 dynamic-object v2 类型字段：
+生产片段固定为 7.8 秒、40 个真实采样点；速度阈值按 object type 读取
+Schema 4 配置中保留的 dynamic-object 类型字段：
 
 ```yaml
-motion_snippet_layout_version: history8_current7_future15_v1
-duration_s: 4.4
+motion_snippet_layout_version: history8_current7_future32_v1
+duration_s: 7.8
 sample_dt_s: 0.2
-sample_count: 23
+sample_count: 40
 history_steps: 8
 current_index: 7
-future_steps: 15
+future_steps: 32
 human_min_speed_mps: 0.30
 nonhuman_min_speed_mps: 0.05
 max_speed_mps: 2.00
@@ -494,10 +498,10 @@ max_gap_s: 0.3
 max_accel_mps2: 2.50
 ```
 
-索引 `0:8` 为 `-1.4...0.0 s` 的真实历史，索引 7 为当前，索引 `8:23` 为
-`0.2...3.0 s` 的真实未来。每个 snippet 保存 object type、相对 pose/yaw、速度、
+索引 `0:8` 为 `-1.4...0.0 s` 的真实历史，索引 7 为当前，索引 `8:40` 为
+`0.2...6.4 s` 的真实未来。每个 snippet 保存 object type、相对 pose/yaw、速度、
 footprint spec、source recording/session/object、完整布局和新 split digest。禁止补点、
-外推、跨 gap 插值；旧 16 点/3.0 s library 由 loader 明确拒绝。
+外推、跨 gap 插值；旧 23/16 点 library 由 loader 明确拒绝。
 
 ## 6.4 理想结果
 
@@ -530,15 +534,14 @@ footprint spec、source recording/session/object、完整布局和新 split dige
 ## 7.1 任务
 
 - 接收 `BaseState`、`LocalTrajectory`、typed `MotionSnippet`；
-- `LocalTrajectory` 只接受 `sop04_audited_bank_v2` /
-  `future_endpoints_dt_to_horizon_v1`：15 个 future pose 是 `q1…q15`、时间为
-  `0.2…3.0 s`，冲突零基 index `k` 映射为 `(k+1)*0.2 s`；旧 `0.0…2.8 s`
-  布局不得兼容
+- `LocalTrajectory` 只接受 `sop04_audited_bank_v3_long40` /
+  `future_endpoints_dt_to_horizon_v1`：32 个 future pose 是 `q1…q32`、时间为
+  `0.2…6.4 s`，冲突零基 index `k` 映射为 `(k+1)*0.2 s`；旧 15 步布局不得兼容
 - SOP05 preflight 必须由 CLI 显式接收目录外可信 SOP04 handoff digest，并在
   `sop05_input_lock_v2` / run identity 中绑定 bank/layout/time/offset、bank semantic
   digest 和 external handoff digest
-- 只接受 `history8_current7_future15_v1`；固定使用
-  `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:23]`，未来冲突锚点的
+- 只接受 `history8_current7_future32_v1`；固定使用
+  `history=poses[0:8]`、`current=poses[7]`、`future=poses[8:40]`，未来冲突锚点的
   source time 为 `1.4 + conflict_time_s`；
 - SOP05 正式生成器语义固定为 `blind_reachability_history_stratified_v4`，低层
   reachability 固定为 `blind_reachability_quota_first_v3`，当前只发布 environment
@@ -563,7 +566,7 @@ footprint spec、source recording/session/object、完整布局和新 split dige
   静态重叠或与机器人/上下文对象扫掠冲突的遮挡物；
 - 用与正式 renderer 一致的栅格、ray casting 和遮挡几何生成 current blind-region
   mask，并按 footprint/yaw 生成目标中心可放置 mask；
-- 在候选轨迹上枚举对齐的冲突时刻/点，从真实 23 点 snippet 当前位置到冲突点
+- 在候选轨迹上枚举对齐的冲突时刻/点，从真实 40 点 snippet 当前位置到冲突点
   构造 reachability arc；先用 mask 与 chord fast path 筛选，无法证明安全的候选进入
   每 anchor 有上限的 exact fallback；
 - 对目标 snippet 只做该 reachability candidate 冻结的 SE(2) 变换，正式路径固定
@@ -683,9 +686,9 @@ empty_blind_spot: 0.10
 ## 8.1 任务
 
 - 差速模型 rollout；
-- 当前局部原点 `q0` 只作为积分种子；正式数组 `poses[0:15]=q1...q15`，零基 index
-  `k` 对应 `(k+1)*dt`，覆盖 `0.2...3.0 s`；
-- 候选库绑定 `future_endpoints_dt_to_horizon_v1`，拒绝旧 `q0...q14 / 0.0...2.8 s`；
+- 当前局部原点 `q0` 只作为积分种子；正式数组 `poses[0:32]=q1...q32`，零基 index
+  `k` 对应 `(k+1)*dt`，覆盖 `0.2...6.4 s`；
+- 候选库绑定 `future_endpoints_dt_to_horizon_v1`，拒绝旧 15 步布局；
 - 过滤静态碰撞和动力学不合理轨迹；
 - 生成 swept mask、TTA、braking map；
 - 计算 collision、near miss、min clearance、TTC、连续风险严重度；
@@ -718,8 +721,8 @@ empty_blind_spot: 0.10
   必须严格 join，每 split 发布 authenticated dataset seal；完整训练包中
   sidecar 数据准备是必做项。
 
-当前已实现 schema 3 hidden-risk GT、`RiskSample` 组装、deterministic immutable
-shard API 与正式数据集 CLI，但只有 unit/toy-fixture 和确定性验证。
+旧 Schema 3 hidden-risk GT、`RiskSample` 组装、deterministic immutable
+shard API 与正式数据集 CLI 仅构成历史实现证据。Schema 4 long40 conformance、
 10–100 真实样本 smoke、global cross-shard audit 以及目标规模运行仍待执行。
 
 ## 8.2 候选轨迹
@@ -729,15 +732,15 @@ shard API 与正式数据集 CLI，但只有 unit/toy-fixture 和确定性验证
 ```yaml
 linear_velocities: [0.0, 0.2, 0.4, 0.6, 0.8]
 angular_velocities: [-0.8, -0.4, 0.0, 0.4, 0.8]
-horizon_s: 3.0
+horizon_s: 6.4
 dt: 0.2
 ```
 
-正式候选库冻结为 `trajectory_bank_version=sop04_audited_bank_v2`、
+正式候选库冻结为 `trajectory_bank_version=sop04_audited_bank_v3_long40`、
 `pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，首末 pose 时间分别为
-`0.2 s` 与 `3.0 s`。v2 audit 必须通过 future-endpoint kinematics、query-map、
+`0.2 s` 与 `6.4 s`。long40 audit 必须通过 future-endpoint kinematics、query-map、
 shape/dtype/finite 和 serial/parallel exact-match，并以目录外 external handoff digest
-交给 W2/SOP05；v1 或 `poses[0]=q0` 的库立即拒绝。
+交给 W2/SOP05；v1/v2、15 步或 `poses[0]=q0` 的库立即拒绝。
 
 可加入少量后退 stress test，但不作为主训练分布。
 
@@ -1527,8 +1530,7 @@ G* 是否包含验证成本
 # 17. 推荐 CLI 与产物
 
 本节的命令是目标编排界面，不是真实数据规模完成声明。截至本次契约对齐，
-schema 3 risk GT、`RiskSample`、单个 immutable shard API 和正式
-`scripts/04_generate_risk_dataset.py` CLI 已实现并有 unit/toy-fixture 验证；
+只完成文档层的 Schema 4 long40 冻结；旧实现证据不能替代 conformance。
 10–100 真实样本 smoke、global cross-shard audit、shard collection manifest 及
 目标规模运行仍待实现或验证。
 
@@ -1579,7 +1581,7 @@ outputs/event_centered_blind_spot/schema-v3/risk-dataset-seals/<run-id>/<split>/
 - [ ] 每个已接受 risk shard 有且仅有一个 sidecar + marker，无
       missing/extra/duplicate `sample_id`；
 - [ ] 正式 loader 验证全部 split/shard/sample 边界、source risk semantic
-      digest、shape/dtype/finite/binary、全零边界和 `0.2...3.0 s`；
+      digest、shape/dtype/finite/binary、全零边界和 `0.2...6.4 s`；
 - [ ] `train` / `calibration` / `val` / `test` 各有一个已重载的 authenticated
       seal，绑定对应 risk collection、sidecar collection 与所有 pair markers；
 - [ ] 新完整训练 bundle 包含四 split risk shards、sidecars/markers、seals、
@@ -1728,7 +1730,7 @@ cross-attention → concatenate + CNN
 ```
 
 其中降低 occupancy 分辨率只能作为新的、显式版本化的实验分支，不能就地重采样或
-静默偏离当前冻结的 `float32 [N,15,160,160]` 监督契约。若确需使用
+静默偏离当前冻结的 `float32 [N,32,160,160]` 监督契约。若确需使用
 `96×96` 或 `128×128`，必须定义新的 sidecar schema、独立配置和发布版本，重新生成并
 核验 train/calibration/val/test 四个 split，同时显式更新所有消费者的兼容性；当前
 `hidden_risk_occupancy` 发布仍固定为 `160×160`。

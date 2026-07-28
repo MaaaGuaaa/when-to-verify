@@ -1,5 +1,9 @@
 # Recording-Generalization Provenance Design
 
+> ⚠️ **Archival design:** The 23-sample/15-future MotionSnippet contract below
+> is retained only as historical context. Current production follows the
+> [Long40 system contract](../../long40_system_contract.md).
+
 ## Status
 
 Approved in conversation on 2026-07-17 for implementation planning. The

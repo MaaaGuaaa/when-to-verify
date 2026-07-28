@@ -1,5 +1,9 @@
 # SOP08--10 Production Risk Learning Design
 
+> ⚠️ **Archival design:** The schema-3/3.0-second assumptions below are
+> superseded. Current production follows the
+> [Long40 system contract](../../long40_system_contract.md).
+
 ## Status
 
 The user approved the production direction on 2026-07-19 after the completed

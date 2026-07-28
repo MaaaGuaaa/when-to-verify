@@ -4,6 +4,10 @@
 > 中文暂定名：**学习何时验证：面向机器人局部规划的决策校准隐藏风险**  
 > 文档目的：把当前研究思路整理成可由 Codex/工程 Agent 直接拆解和实现的技术规格。  
 > 推荐第一版范围：**2D BEV、差速轮式机器人、通用动态对象、程序化遮挡、短时局部规划**。
+>
+> **时间契约：** 本文所有现行 SOP 均遵循
+> [`long40_system_contract.md`](./long40_system_contract.md)。旧的
+> `23` 样本/`15` 未来步/`3.0 s` 表述已废弃，不得作为生产兼容路径。
 
 ---
 
@@ -65,12 +69,13 @@ THÖR-MAGNI 等真实数据中，天然“轨迹进入盲区且与隐藏动态�
 2. 从当前机器人状态程序化采样候选局部轨迹；
 3. 在候选轨迹上选择潜在冲突点和冲突时刻；
 4. 在冲突点附近放置程序化遮挡物，或施加结构性盲区；
-5. 对真实 23 点 / 4.4 s 动态对象轨迹片段只做刚体变换；正式 schema 3
+5. 对真实 40 点 / 7.8 s 动态对象轨迹片段只做刚体变换；正式 Schema `4.0.0`
    SOP05 固定 `time_scale=1.0`，不为对齐事件而外推或补写轨迹；
-6. 以 collision 母事件为可独立发布单元，再独立尝试近碰、时序安全、空间
-   安全、无关隐藏对象和空盲区变体；未成功的变体记录稳定缺失原因，不会作废
-   已合法的母事件或其他变体；
-7. 用完整 oracle 世界自动计算风险 GT 和验证价值 GT。
+6. 在 SOP05 后半段从母事件合成一个 A/B 最终场景：A 以 `0.30` 概率保留
+   历史全盲目标，并对完整 Long40 轨迹做均匀角度旋转；B 固定历史 8 帧，按
+   截断 `Normal(0,(pi/12)^2)` 旋转未来 32 帧。每个母事件至多输出一个场景；
+7. 在 SOP06 为该最终场景渲染一份 history-only BEV；
+8. 在 SOP07 用完整 oracle 世界和机器人 future 自动计算风险 GT，再计算验证价值 GT。
 
 ---
 
@@ -265,21 +270,26 @@ p_{local}=R(-\theta_t)(p_{global}-p_t^{robot})
 
 ### 4.2 时间统一
 
-推荐：
+冻结为：
 
 ```text
 history_dt       = 0.2 s
 history_steps K  = 8
 history_span     = 1.4 s  # 8 个含当前点的采样：-1.4 ... 0.0 s
-future_horizon   = 3.0 s
+current_index    = 7
+future_horizon   = 6.4 s
 future_dt        = 0.2 s
-future_steps T   = 15
+future_steps T   = 32
+sample_count     = 40
+snippet_duration = 7.8 s
+schema_version   = 4.0.0
 ```
 
 未来数组统一采用 `future_endpoints_dt_to_horizon_v1`：当前位姿 `q0` 只作为积分种子，
-不写入未来数组；`poses[0:15]=q1...q15`，零基索引 `k` 的物理时刻严格为
-`(k+1)*future_dt`，即 `0.2...3.0 s`。旧 `q0...q14 / 0.0...2.8 s` 布局属于
-schema 2，不得由 schema 3 loader 静默解释或改标签。
+不写入未来数组；`poses[0:32]=q1...q32`，零基索引 `k` 的物理时刻严格为
+`(k+1)*future_dt`，即 `0.2...6.4 s`。旧 `q0...q14 / 0.0...2.8 s`、
+`q1...q15 / 0.2...3.0 s` 和 Schema `3.0.0` 时间布局均为历史格式，当前 loader
+必须显式拒绝。
 
 原始轨迹统一用线性插值/角度 unwrap 后插值到上述时间网格。
 
@@ -373,7 +383,7 @@ OracleContext = {
 }
 ```
 
-observed `BaseState` 与完整 `OracleContext` 必须写入不同对象/文件。对象 ID 排序且唯一；history/future/spec 的 key 必须严格对齐。`BaseState` 不得携带 future。全局 schema 1/2 产物不做兼容读取，升级到 schema 3 后统一重建。
+observed `BaseState` 与完整 `OracleContext` 必须写入不同对象/文件。对象 ID 排序且唯一；history/future/spec 的 key 必须严格对齐。`BaseState` 不得携带 future。Schema `1/2/3` 的旧时间布局不做兼容读取，升级到 Schema `4.0.0` long40 后统一重建。
 
 筛选条件：
 
@@ -398,13 +408,13 @@ observed `BaseState` 与完整 `OracleContext` 必须写入不同对象/文件�
 从每个动态对象轨迹中滑窗提取：
 
 ```text
-motion_snippet_layout_version = history8_current7_future15_v1
-snippet_duration = 4.4 s
+motion_snippet_layout_version = history8_current7_future32_v1
+snippet_duration = 7.8 s
 snippet_dt = 0.2 s
-sample_count = 23
+sample_count = 40
 history_steps = 8
 current_index = 7
-future_steps = 15
+future_steps = 32
 human speed = 0.30~2.00 m/s
 carried_object / unknown_dynamic speed = 0.05~2.00 m/s
 max_acceleration = 2.5 m/s²（各类型可配置）
@@ -427,21 +437,21 @@ MotionSnippet = {
     "source_object_id": str,
     "object_type": str,
     "footprint": dict,
-    "positions": np.ndarray[23, 2],       # float32
-    "velocities": np.ndarray[23, 2],      # float32
-    "headings": np.ndarray[23],           # float32 yaw
-    "duration_s": 4.4,
+    "positions": np.ndarray[40, 2],       # float32
+    "velocities": np.ndarray[40, 2],      # float32
+    "headings": np.ndarray[40],           # float32 yaw
+    "duration_s": 7.8,
     "mean_speed": float,
     "max_acc": float,
 }
 ```
 
-索引 `0:8` 是真实历史（`-1.4 ... 0.0 s`），索引 7 是当前，索引 `8:23` 是真实未来
-（`0.2 ... 3.0 s`）。数组必须全部 finite。library NPZ metadata、summary 和 source
+索引 `0:8` 是真实历史（`-1.4 ... 0.0 s`），索引 7 是当前，索引 `8:40` 是真实未来
+（`0.2 ... 6.4 s`）。数组必须全部 finite。library NPZ metadata、summary 和 source
 manifest 必须同时记录上述完整布局与新 `split_manifest_digest`。生产 loader 对缺少
-布局字段、16 点、3.0 s 或 digest 不一致的旧产物明确失败；禁止重复 current pose、
-反向外推、理想轨迹补历史或跨 gap 插值。4.4 s 连续窗口造成的短 segment 必须进入
-`insufficient_contiguous_duration` 拒绝统计。
+布局字段、非 40 点、旧 23/16 点或 digest 不一致的产物明确失败；禁止重复 current
+pose、反向外推、理想轨迹补历史或跨 gap 插值。`7.8 s` 连续窗口造成的短 segment
+必须进入 `insufficient_contiguous_duration` 拒绝统计。
 
 ### 6.3 允许变换
 
@@ -463,9 +473,8 @@ time scale a：片段库研究扩展可为 0.8~1.2；当前正式 SOP05 固定�
 - 不穿过静态障碍或新插入遮挡物；
 - 速度符合对象类型配置范围；正式路径不通过时间重采样改变真实片段；
 - 加速度不超过阈值；
-- 当前帧目标不可见；8 帧有限历史必须属于下述
-  `seen_then_occluded` / `unseen_in_history_window` 之一，不要求所有母事件在整段
-  历史中都不可见；
+- 8 帧有限历史至少 4 帧可见、至少 1 帧被环境遮挡；遮挡帧可位于窗口任意位置，
+  当前/决策帧不要求遮挡；
 - 未来窗口内至少部分进入局部地图；
 - 不与机器人当前 footprint 重叠。
 
@@ -495,24 +504,24 @@ y_{k+1}=y_k+v\sin\theta_k\Delta t
 linear_velocities:  [0.20, 0.40, 0.60, 0.80]
 angular_velocities: [-0.80, -0.40, 0.00, 0.40, 0.80]
 reverse_velocities: [-0.20, -0.40]   # 仅部分样本/结构盲区 stress test
-horizon: 3.0
+horizon: 6.4
 step_dt: 0.2
 ```
 
 基础候选约 20 条，按概率加入 6 条倒车候选。
 
 冻结的积分与序列化语义为：`q0=(0,0,0)` 只作为当前时刻的积分种子，不进入
-`LocalTrajectory.poses`；15 个输出依次为 `q1…q15`，时间偏移严格是
-`0.2,0.4,…,3.0 s`。因此零基 future index `k` 对应
+`LocalTrajectory.poses`；32 个输出依次为 `q1…q32`，时间偏移严格是
+`0.2,0.4,…,6.4 s`。因此零基 future index `k` 对应
 `tau=(k+1)*0.2 s`，不得将 `poses[0]` 解释为当前时刻。
 
 正式共享库必须声明
-`trajectory_bank_version=sop04_audited_bank_v2` 与
-`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，并由 v2 audit 证明
+`trajectory_bank_version=sop04_audited_bank_v3_long40` 与
+`pose_time_layout_version=future_endpoints_dt_to_horizon_v1`，并由 long40 audit 证明
 future-endpoint kinematics、shape/dtype/finite、query-map 以及 serial/parallel
 determinism。SOP05 只接受三个 core payload 的精确 checksum envelope，并要求调用方从
-产物目录外传入可信 `external_handoff_digest`；旧 v1、缺少时间字段或
-`0.0…2.8 s` 布局一律拒绝，不做双版本兼容。
+产物目录外传入可信 `external_handoff_digest`；旧 v1/v2、15 步、缺少时间字段或
+非 `0.2…6.4 s` 布局一律拒绝，不做双版本兼容。
 
 ### 7.2 轨迹过滤
 
@@ -557,13 +566,13 @@ S(\xi)=\bigcup_{\tau=1}^{T}B_r(q_\tau)
 ```text
 BaseState z
     ↓
-读取 schema 3 候选轨迹 ξ，缓存 canonical future sweep；history/seam 按 pair 构建
+读取 Schema 4 long40 候选轨迹 ξ，缓存 canonical 32-step future sweep；history/seam 按 pair 构建
     ↓
 在自由空间提议与 ξ 有因果关系、但不阻塞扫掠体的静态遮挡物
     ↓
 用与正式 renderer 相同的栅格、ray casting 和遮挡几何得到当前 blind-region mask
     ↓
-枚举对齐的冲突端点 τ*=(k+1)future_dt 和真实 23 点 MotionSnippet
+枚举对齐的冲突端点 τ*=(k+1)future_dt 和真实 40 点 LongMotionSnippet
     ↓
 从 snippet 当前点到 p* 构造 SE(2) reachability arc，先查询盲区内可放置的
 footprint-center mask
@@ -584,7 +593,7 @@ reachability 几何仍固定为 `blind_reachability_quota_first_v3`；producer/r
 `sop05_history_stratified_selection_v2`。v4 沿用 v3 的全部几何权威和由 pair seed
 稳定打散的 conflict/snippet/side/angle 搜索，只在 exact-valid 边界新增有限历史分层，
 并要求 pair 与 run 两级都满足各分层硬配额后才能完成。该升级不放宽物理验收，且不
-改变模型张量布局；所有产物仍标记 `schema_version=3.0.0`。
+改变 long40 模型张量布局；所有产物标记 `schema_version=4.0.0`。
 
 正式 loader 必须显式拒绝旧 producer/report/selection
 `sop05_generation_run_v6` / `sop05_pair_generation_report_v4` /
@@ -632,7 +641,7 @@ p^*=q(\tau^*)
 
 ### 8.4 环境遮挡物放置
 
-当前 schema 3 正式 SOP05 只发布 environment collision 母事件，生成器语义固定为
+当前 Schema `4.0.0` 正式 SOP05 只发布 environment collision 母事件，生成器语义固定为
 `blind_reachability_history_stratified_v4`，低层 reachability 固定为
 `blind_reachability_quota_first_v3`。它不先生成目标曲线再反复尝试用单一正前方障碍遮住，
 而是对候选轨迹的交互范围、bearing bin、遮挡物类型/尺寸/姿态构建稳定的
@@ -685,22 +694,19 @@ pair 调度必须同时约束 running futures 与已完成待按 rank 输出的 
 完成顺序不得改变事件、stage 计数或选择结果。
 
 正式移植只执行 reachability candidate 已冻结的 SE(2) 变换，`time_scale=1.0`；完整
-23 点源轨迹、逐帧 yaw 与非初始点弯曲必须保留。候选随后使用真实
-circle/rectangle footprint 做静态几何、动力学、当前隐藏、未来连续出现、
+40 点源轨迹、逐帧 yaw 与非初始点弯曲必须保留。候选随后使用真实
+circle/rectangle footprint 做静态几何、动力学、窗口遮挡、未来连续出现、
 遮挡物与目标轨迹净空、以及目标与机器人在选定 future index 上的真实 collision
 检查。传感器当前位姿只用于 LOS/FOV，不得隐式前插到碰撞 sweep。动态 sweep
 仍需按不超过半个 BEV cell 的平移步长和 `5°` yaw 步长加密，并用 signed clearance
 与保守运动上界认证帧间连续安全；无法证明正净空时保守拒绝。
 
-通过上述物理检查后，目标的 8 帧 `target_visibility_history` 才进入正式分层：
+通过上述物理检查后，目标的 8 帧 `target_visibility_history` 必须满足窗口遮挡
+契约：至少 4 帧可见、至少 1 帧遮挡。遮挡 witness 记录最后一个历史遮挡帧，并与
+决策帧时间分离；若目标在决策帧可见，必须进入 observed `BaseState`。
 
-- `seen_then_occluded`：历史中至少一帧可见，且最后至少连续 2 帧不可见；
-- `unseen_in_history_window`：8 帧全部不可见。该名称只描述序列化窗口，不能写成
-  `never_seen` 或声称目标在更早时间也从未被看见。
-
-生产默认按 `80% / 20%` 请求两层样本。权重是 pair/run 两级硬配额，不是软采样提示；
-某层不足时不得用另一层回填，publication 必须保持 `quota_unmet`。该比例是为了同时
-评估陈旧观测风险和纯盲区风险而设定的受控实验组成，不代表真实环境中的自然频率。
+生产默认按 `80% / 20%` 请求 `initial_visible` / `initially_hidden` 起始层。两层都
+必须满足相同的窗口遮挡契约；权重是 pair/run 两级硬配额，不是软采样提示。
 两层中的每个 SOP05 母事件都必须与候选轨迹真实碰撞；安全、临界安全和无关样本由
 SOP06 在同一母事件上构造，避免模型把“出现遮挡”本身学成危险标签。
 每个 event 必须保存规范化 policy/digest、regime、最后可见 index 和 trailing-hidden
@@ -720,7 +726,7 @@ exact_validation_count
 
 这些是算法成本与失败位置的正式报告，不得只报最终成功率。历史
 `joint_occluder_first_v4` 及其候选前缀仅用于读取旧实验的迁移说明；它不是当前
-producer 版本，正式 schema 3 producer/loader 必须拒绝该标识，不得在加载时升级解释。
+producer 版本，正式 Schema `4.0.0` producer/loader 必须拒绝该标识，不得在加载时升级解释。
 
 规模运行不得假设每个 pair 必然成功。2026-07-19 的 train smoke 中 100 个真实 pair
 产生 95 个 exact-valid 母事件并稳定选出 90 个，生产申请应至少预留约 5–10% 的 pair
@@ -736,8 +742,8 @@ producer 版本，正式 schema 3 producer/loader 必须拒绝该标识，不得
 
 1. 遮挡物不得与机器人候选轨迹扫掠体相交；
 2. 遮挡物不得与基础静态障碍大面积重叠；
-3. 当前帧目标不可见；历史允许“曾可见后遮挡”，不得要求 8 帧全部被截断；
-4. 历史类别必须满足配置的 `seen_then_occluded` / `unseen_in_history_window` 硬配额；
+3. 8 帧历史至少 4 帧可见且至少 1 帧遮挡；当前帧可见时必须进入 observed 输入；
+4. 起始可见性类别必须满足配置的 `initial_visible` / `initially_hidden` 硬配额；
 5. 目标对象未来从遮挡边界出现时应在物理上连续；
 6. 不允许任何动态对象的真实 footprint 轨迹穿墙。
 
@@ -771,7 +777,7 @@ structural blind spot 30%
 mixed 10%
 ```
 
-上述 `60/30/10` 只能作为历史诊断参考，不是 schema 3 正式配置字段、
+上述 `60/30/10` 只能作为历史诊断参考，不是 Schema `4.0.0` 正式配置字段、
 publication quota 或训练门槛。同样，任何 `6/3/1` 的 environment/structural/mixed
 组成都不能决定发布资格。发布只看请求的总样本数及每个事件是否满足
 collision、当前遮挡、未来出现和物理有效性契约；类型计数只作诊断。
@@ -831,7 +837,7 @@ SOP-05 读取 v2 snippet 时固定使用：
 ```text
 history = transformed_poses[0:8]
 current = transformed_poses[7]
-future = transformed_poses[8:23]
+future = transformed_poses[8:40]
 source_anchor_time = 1.4 + conflict_time_s
 ```
 
@@ -869,7 +875,7 @@ t^{source}_{k^*}-1.4\approx \tau^*
    candidate；当前正式路径固定 `time_scale=1.0`；
 2. 将 source anchor 平移到原点；
 3. 将 anchor 速度旋转到候选横穿方向；
-4. 平移到 \(p^*\)，并对完整 23 点位置/速度/yaw 应用同一 SE(2)；
+4. 平移到 \(p^*\)，并对完整 40 点位置/速度/yaw 应用同一 SE(2)；
 5. 不再重采样该变换，对完整历史/未来轨迹做 exact 几何与可见性检查。
 
 ### 9.4 失败候选和续跑
@@ -878,9 +884,8 @@ t^{source}_{k^*}-1.4\approx \tau^*
 reason 记录，然后继续冻结调度中的后续候选；不得改写已失败候选的身份或
 用应当失败的候选凑数：
 
-- 当前时刻目标对象可见；
-- 8 帧历史不属于请求层：`seen_then_occluded` 要求至少一帧可见且末尾至少连续
-  2 帧不可见，`unseen_in_history_window` 要求 8 帧全部不可见；
+- 8 帧历史少于 4 帧可见或不存在遮挡帧；
+- 起始可见性不属于请求的 `initial_visible` / `initially_hidden` 层；
 - 对象真实 circle/rectangle footprint 穿墙；
 - 对象与机器人当前 footprint 重叠；
 - 未来轨迹超出范围过多；
@@ -895,13 +900,26 @@ environment 事件进行正式统计；structural/mixed 扩展必须使用独立
 
 ---
 
-## 10. 配对反事实样本生成
+## 10. SOP5 A/B 单场景合成（当前）
 
-对同一 BaseState、候选轨迹、遮挡物和目标 `MotionSnippet`，生成多个只改变关键
-变量的版本。所有带目标的变体固定目标 object type、footprint spec、source object ID、
-`source_recording_id` 和 `source_session_id`，并使用 mother 记录的同一 history policy
-重算 8 帧可见性。非空变体必须保持 collision mother 的 history regime；发生漂移时以
-`target_history_visibility_regime_changed` 拒绝该位，不能改变整个 group 的其他合法位。
+SOP05 先决定并合成一个最终场景，SOP06 只渲染该场景，SOP07 才计算标签。
+每个 `(split, mother_id)` 输出零或一个场景，不创建 empty/present 或多风险类别的
+paired sibling。
+
+- **A, unseen in history:** 以 `0.30` 进入有目标分支；其余输出只移除目标的空
+  场景。有目标时，对完整 40 帧轨迹绕 index 7 做 `Uniform[-pi,pi)` 刚体旋转，
+  最多尝试 32 次。拒绝越界、环境/上下文碰撞、history robot collision 或历史重新
+  可见；未来 robot collision 不拒绝。
+- **B, seen then occluded:** 要求 index 7 前至少一帧可见且 index 7 隐藏。前 8 帧和
+  current 不变，只将未来 32 帧绕 index 7 按截断 `Normal(0,(pi/12)^2)` 旋转，最多
+  尝试 32 次。只过滤 future 环境/上下文碰撞；不加 future visibility、robot risk 或
+  dynamics filter。
+
+两类都保留选择角度和拒绝统计作 oracle/audit provenance，但这些值和 target future
+不得进入 SOP06 renderer input 或模型 metadata。风险、near miss、clearance 和权重
+都不是 SOP05 的选择条件。
+
+### Historical paired design (retired; Sections 10.1-10.3 are archival only)
 
 ### 10.1 样本类型
 
@@ -931,7 +949,7 @@ environment 事件进行正式统计；structural/mixed 扩展必须使用独立
 ±0.8s ~ ±1.5s
 ```
 
-时间变体只能从独立配置给出的冻结偏移序列，在同一条 23 点真实 snippet 内重设冲突
+时间变体只能从独立配置给出的冻结偏移序列，在同一条 40 点真实 snippet 内重设冲突
 锚点，不得外推；它必须同步重建 history/current/future，保持空间路径相交、同步
 footprint 不相交，并重新满足当前隐藏和连续出现条件。某个冻结偏移若因 source 锚点、
 静止片段或其他 typed-transplant 契约被拒绝，生成器必须记录稳定、低基数的
@@ -1030,7 +1048,14 @@ source_session_id
 
 ---
 
-## 11. 历史观测与 BEV 信念渲染
+## 11. SOP6 历史观测与单场景 BEV 信念渲染
+
+SOP6 对每个 SOP05 最终场景只渲染一次。核心 renderer 只接收当前可得的静态图、
+历史动态对象轨迹/spec、传感器配置和 BaseState；它不得读取 target future、robot
+future、oracle world、选角、重试记录、碰撞或风险标签。A 的隐藏目标不因 oracle
+future 出现在历史 BEV 中；B 保留固定的已观测历史。SOP6 不生成变体，也不计算标签。
+B 的逐帧 observed mask 必须沿 SOP05 交接；遮挡后的精确 target pose 不得进入 renderer
+input，也不得参与 footprint rasterization 或 ray casting。
 
 ### 11.1 模型可见输入与 oracle 世界必须分离
 
@@ -1042,7 +1067,8 @@ source_session_id
 
 1. 读取真实机器人历史位姿；
 2. 应用同一个程序化遮挡物/FOV 模型；
-3. 按每个动态对象的 pose/yaw 和 circle/rectangle spec 放置历史 footprint；
+3. 只对该帧 observed mask 为真的动态对象，按 pose/yaw 和 circle/rectangle spec
+   放置历史 footprint；
 4. 用 ray casting 计算 visible cells；
 5. 写入 visible free / visible occupied；
 6. 不可见区域写入 unknown；
@@ -1092,7 +1118,11 @@ A_max = 5.0s
 
 ---
 
-## 12. 风险 Ground Truth
+## 12. SOP7 风险 Ground Truth
+
+SOP7 将同 ID 的 SOP6 history-only observation 与 SOP05 保留在 oracle 侧的目标/
+机器人 future 结合，计算 collision、near miss、clearance、TTC 和 severity。该步骤
+不依赖 paired group、coverage mask 或 complete-pair marker。
 
 ### 12.1 只统计隐藏风险
 
@@ -1215,6 +1245,12 @@ def compute_risk_gt(robot_traj, hidden_object_trajectories, dynamic_object_specs
 
 推荐使用 Zarr；依赖不方便时使用压缩 NPZ shards + JSONL metadata。
 
+当前单场景发布沿用 `RiskSample.pair_group_id` 字段以保持磁盘 schema 兼容，但其值是
+唯一的 `sop06-single/<regime>/<split>/<mother_id>` 标识，不表示存在 paired sibling。
+每个 RiskSample 对应一个 SOP06 observation 和一个 SOP07 oracle label。下文涉及
+`independent_partial_pairs_v2` 的段落只说明历史产物兼容，不能作为当前 producer 或
+release gate。
+
 ```python
 RiskSample = {
     "sample_id": str,
@@ -1251,9 +1287,9 @@ blind spot type
 random seed
 ```
 
-当前 schema 3 SOP07 的已实现边界如下：
+当前 Schema `4.0.0` SOP07 的目标边界如下：
 
-- `hidden_risk_gt_schema3_v1` 只遍历由调用方显式声明且经 renderer 验证当前
+- `hidden_risk_gt_schema4_v2` 只遍历由调用方显式声明且经 renderer 验证当前
   不可见的 object IDs；world 中其他对象不能影响主标签。
 - `RiskSample` 的 history/state channels 由 history-only renderer 构建；候选轨迹的
   四个 query maps 按冻结顺序拼接。`OracleWorld` future 只在独立标签分支内读取，
@@ -1268,12 +1304,9 @@ random seed
   写入 staging 后必须用正式 loader 重读并校验 schema/layout、shape/dtype/finite、
   manifest/semantic digest 和 split leakage，通过后才原子暴露。目标目录已存在时
   直接失败，禁止覆盖。v1 shard 不是可兼容输入，必须 fail closed。
-- `scripts/04_generate_risk_dataset.py` 已实现正式编排入口。它对一个 formal
-  `independent_partial_pairs_v2` group 的所有已成功 variants 做一次原子
-  `RiskSample` 组装/发布；缺位仍由 coverage + stable reason 记录，不会为
-  凑齐六类而丢弃合法部分组。只有 conditional complete audit 路径要求六位
-  全齐。CLI 的 exact `expected_sample_count` 指整个 shard 的最终样本数，不是
-  “每个 group 必须是 six-pack”。
+- 当前 producer 对每个 finalized SOP05 single scenario 组装一个 `RiskSample` 并
+  发布；SOP07 failure 只进入计数，不会为凑齐任何 sibling 而丢弃合法样本。CLI 的
+  exact `expected_sample_count` 指整个 shard 的最终样本数，不是每母事件的变体 quota。
 - shard 作者可以通过 `split_audit_records` 对跨 shard 的 base/source recording
   泄漏执行 fail-closed 校验，并完整报告允许的 THÖR session overlap；当前 CLI
   未提供额外 `split_audit_records`，审计上下文只包含本 shard 自动生成的 manifest
@@ -1292,17 +1325,17 @@ random seed
   的完整 sample-ID membership、member digest、checkpoint、cohort 和 artifact provenance；
   raw family/audit mapping、跨 family 或部分 test 表不能进入正式结果。
 
-### 13.1 schema 3 外置隐藏占据 sidecar
+### 13.1 Schema 4 long40 外置隐藏占据 sidecar
 
 SOP08 将占据监督发布为 additive label-only sidecar，不向上述
-`RiskSample` 增加字段，不改变 model-input schema，因此 core
-`schema_version=3.0.0` 与通道顺序均不升版。冻结契约为：
+`RiskSample` 增加字段。时间布局随统一契约升为
+`schema_version=4.0.0`，通道顺序保持不变。冻结契约为：
 
 - `hidden_risk_occupancy`：逻辑/正式 loader 输出为
-  `float32 [N,15,160,160]`；磁盘中是 binary `uint8` 压缩 NPZ。
+  `float32 [N,32,160,160]`；磁盘中是 binary `uint8` 压缩 NPZ。
 - `robot_future_footprints`：同 shape 的 query-only companion；
-  `future_endpoint_times_s` 为 `float32 [15]`，精确对应
-  `0.2, 0.4, ..., 3.0 s`，不含 `t=0`。
+  `future_endpoint_times_s` 为 `float32 [32]`，精确对应
+  `0.2, 0.4, ..., 6.4 s`，不含 `t=0`。
 - 两个 mask 共用已冻结的 robot-centric `160×160`、`0.1 m/cell`
   grid 和现有 footprint rasterizer，禁止单独重实现栅格化语义。
 - 占据标签对参与 SOP07 hidden-risk target 的、由调用方显式声明的
@@ -1325,7 +1358,7 @@ SOP08 将占据监督发布为 additive label-only sidecar，不向上述
       唯一 sidecar shard 和 pair completion marker，且无 missing/extra/duplicate
       `sample_id`。
 - [ ] 四个 split 均由正式 loader 重读，通过 shape/dtype/finite/binary、
-      `0.2...3.0 s`、source risk semantic digest 和全零边界检查。
+      `0.2...6.4 s`、source risk semantic digest 和全零边界检查。
 - [ ] 四个 split 各自发布绑定 risk collection、sidecar collection 和全部
       pair markers 的 authenticated dataset seal，并在打包前完整重载。
 - [ ] 新版本完整训练包同时包含四 split immutable risk shards、sidecars/
@@ -1943,9 +1976,11 @@ scenario bank: M=16
 
 ## 24. 防止半合成生成器捷径
 
-### 24.1 配对样本
+### 24.1 单场景合成审计
 
-相同几何只改变目标动态对象的时间偏移、横向偏移或是否存在；其他动态对象不变。
+当前发布不依赖 paired 对照。A/B 采样必须保留 regime、presence branch、选角、尝试数
+和拒绝原因作为 audit-only provenance，并按 regime/presence/risk-label 报告结果，避免
+模型把遮挡形状或生成器分支当成风险捷径。
 
 ### 24.2 随机化
 
@@ -2150,7 +2185,7 @@ project/
 
 ```yaml
 seed: 42
-schema_version: "3.0.0"
+schema_version: "4.0.0"
 
 bev:
   range_m: 16.0
@@ -2158,7 +2193,7 @@ bev:
   size: 160
   history_steps: 8
   history_dt: 0.2
-  future_steps: 15
+  future_steps: 32
   future_dt: 0.2
 
 robot:
@@ -2198,7 +2233,7 @@ trajectories:
   angular_velocities: [-0.8, -0.4, 0.0, 0.4, 0.8]
   reverse_velocities: [-0.2, -0.4]
   reverse_probability: 0.2
-  horizon_s: 3.0
+  horizon_s: 6.4
   dt_s: 0.2
 
 production_event_kind: environment
@@ -2273,7 +2308,9 @@ python scripts/02_build_snippet_library.py --split test
 # 4. 提取 base states
 python scripts/03_extract_base_states.py --all-splits
 
-# 5. 生成事件中心风险数据（CLI 已实现；尚未做真实 smoke/规模验证）
+# 5. Retired paired CLI example (do not use for the current single-scene release)
+# Current entry ownership is SOP05 A/B synthesis -> SOP06 one history BEV -> SOP07 labels.
+# The paired-config argument below is archival compatibility text only.
 python scripts/04_generate_risk_dataset.py \
   --sop03-root <schema3-sop03-root> \
   --sop04-root <schema3-sop04-root> \
@@ -2334,16 +2371,13 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - 目标动态对象当前不可见，未来可从边缘出现；
 - circle/rectangle footprint 与逐帧 yaw 的遮挡和碰撞结果正确。
 
-### 31.3 配对样本测试
+### 31.3 A/B 单场景测试
 
-同一 pair group（不要求每个组必须完整）：
-
-- collision variant 的 min clearance ≤ 0；
-- temporal-safe 空间路径相交但时间不相交；
-- empty variant 只移除目标动态对象，其他动态对象不变；
-- 除指定变量外几何相同。
-- collision 母事件可独立通过；各 negative 缺失时 coverage mask 与 reason 精确对齐；
-- 部分组渲染永不设置 `audit_certified=true`，完整组只用于条件审计。
+- A 的 prior 是 `0.30`，完整 Long40 旋转、32 次上限和历史隐藏 gate 可复现；
+- B 的前 8 帧保持不变，未来 32 帧使用截断正态选角和环境 gate；
+- 每个母事件最多一个 accepted scenario，失败只产生可审计 deficit；
+- SOP6 renderer input 中不可检索 target future、oracle、角度、尝试或风险字段；
+- SOP7 的 risk GT 与手算 toy collision/near-miss 一致。
 
 ### 31.4 风险 GT 测试
 
@@ -2356,7 +2390,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - `hidden_risk_occupancy` 只 OR 已声明 SOP07 hidden targets，不含
   static/undeclared/context actors，且不按未来可见性裁剪；
 - `empty_blind_spot`/无 hidden target 全零，并与重用 rasterizer 生成的
-  `robot_future_footprints` 在 `0.2...3.0 s` 端点严格对齐；
+  `robot_future_footprints` 在 `0.2...6.4 s` 端点严格对齐；
 - sidecar 磁盘 binary `uint8` 与 loader `float32` 契约、risk semantic digest/
   marker/seal 严格 join 和 `model_inputs` 隔离测试通过。
 
@@ -2377,10 +2411,10 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 ✓ 能从一个 recording 生成 base states
 ✓ 能建立独立 train/test snippet libraries
 ✓ 能从一条直线候选轨迹生成墙后横穿 human-target 事件
-✓ 能独立发布 collision 母事件，并对各 paired negative 报告 coverage/缺失原因
-✓ 能渲染 K 帧不完整 BEV 和完整 oracle
+✓ SOP05 能为每个母事件发布至多一个 A/B 最终场景，并保留可审计失败原因
+✓ SOP06 能为该最终场景渲染一份 K 帧 history-only BEV，oracle 保持分离
 ✓ 能计算 collision/risk GT
-✓ 四 split hidden-occupancy sidecars、pair markers 和 authenticated seals 完整打包并可严格重载
+✓ 四 split hidden-occupancy sidecars、single-scenario release markers 和 authenticated seals 完整打包并可严格重载
 ✓ 能训练过拟合 1000 个 risk samples
 ✓ 能生成至少两个验证动作价值不同的样本
 ✓ 能训练 verification model 过拟合小数据

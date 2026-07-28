@@ -1,5 +1,9 @@
 # Real Seen-Then-Occluded Visual Audit Design
 
+> ⚠️ **Archival design:** The 23-frame/3.0-second replay contract below is
+> superseded. Current audits follow the
+> [Long40 system contract](../../long40_system_contract.md).
+
 ## Status
 
 Approved for a three-sample, real-data visual audit. This is an audit-only

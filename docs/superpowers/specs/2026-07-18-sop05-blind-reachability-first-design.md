@@ -1,5 +1,9 @@
 # SOP05 Blind-Reachability-First Design
 
+> ⚠️ **Archival design:** This 23-frame/15-step design is retained only as
+> historical context. Current production follows the
+> [Long40 system contract](../../long40_system_contract.md).
+
 ## Status and decision
 
 This design replaces the SOP05 `joint_occluder_first_v4` production proposal

@@ -1,5 +1,8 @@
 # SOP08--10 Toy-First Risk Learning Design
 
+> ⚠️ **Archival design:** The 15-step/3.0-second layout below is historical.
+> Current work must use the [Long40 system contract](../../long40_system_contract.md).
+
 ## Status
 
 Approved by continuation of the user goal on 2026-07-19. The immediate

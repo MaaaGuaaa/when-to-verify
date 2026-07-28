@@ -1,19 +1,19 @@
 # SOP05 到 SOP06 双通道交接
 
-_给负责 SOP06 批量渲染的实现方；自然分布数据现在即可开始，A-supplement 后续单独接入。_
+_给负责 SOP06 批量渲染的实现方；自然分布与 A-supplement 均已就绪，必须分批接入。_
 
 ---
 
 ## 当前结论
 
 1. 先把现有自然分布数据渲染到 `outputs/sop06_history_bev_natural_v1/`。
-2. 后续 A-supplement 渲染到 `outputs/sop06_history_bev_a_supplement_v1/`。
+2. A-supplement 现在可渲染到 `outputs/sop06_history_bev_a_supplement_v1/`。
 3. 两批产物保持独立、不可变，不向第一批目录追加文件。
 4. SOP06 只渲染 SOP05 已确定的场景，禁止重新旋转、重新抽 presence 或重新选择未来轨迹。
 
 ## 生产入口
 
-建议新增：
+现有入口：
 
 ```text
 scripts/06_generate_single_scene_bev.py
@@ -105,8 +105,8 @@ final.source_publication_semantic_digest == mother.publication_semantic_digest
 6. 调用 `render_sop06_single_publication`。不得再次执行 `generate_unseen_prior_mother`
    或 seen-prior 未来选择。
 
-建议新增一个直接面向持久化 final record 的公共适配器，避免为了调用 SOP06 而伪造
-sampling provenance 或重新运行 SOP05。
+当前入口已直接读取持久化 final record；不得为了调用 SOP06 而伪造 sampling provenance
+或重新运行 SOP05。
 
 ## 输出与断点恢复
 
@@ -117,17 +117,43 @@ sampling provenance 或重新运行 SOP05。
 - manifest 至少记录 `source_mode`、SOP05 source digest、final release checksum identity、
   split、accepted count 和 source family。
 
-## A-supplement 后续接入
+## A-supplement 接入
 
-A-supplement 会提供四个新的 complete-mother source/final 配对，接口与 held-out 完全相同：
+A-supplement 已提供四个 complete-mother source/final 配对，配置摘要为
+`e039619e6f5e3fc5648ed3470def005f6849e15c8978f223aaeada7756232a58`：
+
+| split | source mothers | final accepted | present | empty | source digest |
+|---|---:|---:|---:|---:|---|
+| train | 23000 | 16531 | 2859 | 13672 | `b89fcf51715c6613da227cc3d75da57bdc3ff39ac49eca3423bee42df333a031` |
+| calibration | 3000 | 2221 | 383 | 1838 | `38a56f4958556818c7622316b5d4de265b1ebdd1dd9cb034084cb69819bd213f` |
+| val | 3000 | 2049 | 382 | 1667 | `b3a58fb46d410f4f6064cc87729f757f84adbf5b7566300f36be2eb8bbabc0ab` |
+| test | 3000 | 2073 | 384 | 1689 | `b8dfd0c34faf43c08a79a5babd65db9dc7ae9efc4a5c2ea156a1713ad8a28dcf` |
+
+路径按 split 对应：
 
 ```text
 source_family=a_supplement
 source_mode=complete_mother
+source_root=outputs/sop05r_teb_a_supplement_<split>_v1
+final_scenario_root=outputs/sop05_final_a_supplement_<split>_v1
 output_root=outputs/sop06_history_bev_a_supplement_v1/<split>
 ```
 
-自然分布 SOP06 不需要等待这些产物。补充集完成后启动第二组 SOP06 作业即可。
+每个 split 使用以下入口独立提交，不要向 natural 输出目录追加：
+
+```bash
+python scripts/06_generate_single_scene_bev.py \
+  --source-family a_supplement \
+  --source-mode complete_mother \
+  --source-root outputs/sop05r_teb_a_supplement_<split>_v1 \
+  --final-scenario-root outputs/sop05_final_a_supplement_<split>_v1 \
+  --split <split> \
+  --output-dir outputs/sop06_history_bev_a_supplement_v1/<split> \
+  --workers <n>
+```
+
+四批合计 `22874` 条最终 A 场景，其中 `4008` 条 target-present。SOP06 禁止重抽
+presence、角度或未来轨迹。
 
 ## 最小验收
 
@@ -140,4 +166,3 @@ output_root=outputs/sop06_history_bev_a_supplement_v1/<split>
 
 详细设计见
 [`2026-07-27-sop05-a-supplement-sop06-dual-lane-design.md`](superpowers/specs/2026-07-27-sop05-a-supplement-sop06-dual-lane-design.md)。
-

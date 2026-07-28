@@ -21,6 +21,7 @@ from src.calibration.grouped_calibration import (  # noqa: E402
     GROUP_DIMENSIONS,
     fit_grouped_calibration,
 )
+from src.contracts import SCHEMA_VERSION  # noqa: E402
 from src.calibration.split_conformal import (  # noqa: E402
     CALIBRATION_ARTIFACT_LAYOUT_VERSION,
     calibration_artifact_semantic_digest,
@@ -207,7 +208,7 @@ def main() -> int:
             else "sop10_toy_calibration"
         ),
         "mode": args.mode,
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "fit_split": "calibration",
         "method_id": table["method_id"],
         "checkpoint_layout_version": table["checkpoint_layout_version"],

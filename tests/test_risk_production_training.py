@@ -40,6 +40,7 @@ from src.models.risk_model import (
     compute_risk_batch_loss,
     load_risk_checkpoint,
     production_trajectory_query_sensitivity,
+    save_risk_checkpoint,
 )
 import src.training.risk_trainer as trainer_module
 from src.training.risk_trainer import (
@@ -396,6 +397,15 @@ def test_public_contract_config_and_loss_are_exact(tmp_path: Path) -> None:
         "real_1k",
         True,
     )
+    formal_config = replace(_config(), stage="formal_50k")
+    assert trainer_module._training_data_scale(formal_config, 49_999) == (
+        "fixture_standin",
+        False,
+    )
+    assert trainer_module._training_data_scale(formal_config, 50_000) == (
+        "formal_50k",
+        True,
+    )
 
     raw_config = yaml.safe_load(PRODUCTION_CONFIG.read_text(encoding="utf-8"))
     assert raw_config == {
@@ -543,6 +553,48 @@ def test_gpu_one_shard_smoke_is_finite_reloadable_and_label_free(
     ]
     assert sensitivity["materially_sensitive"] is True
     assert sensitivity["combined_mean_absolute_delta"] > 0.0
+
+
+def test_formal_checkpoint_claim_requires_exactly_fifty_thousand_samples(
+    tmp_path: Path,
+) -> None:
+    _, dataset = _publish_and_load(tmp_path / "formal-claim")
+    provenance = _production_provenance(dataset)
+    provenance.update(
+        {
+            "training_stage": "formal_50k",
+            "training_data_scale": "formal_50k",
+            "scientific_claim_eligible": True,
+            "selected_sample_count": 49_999,
+            "consumed_sample_count": 49_999,
+            "validation_risk_dataset_manifest_digest": "e" * 64,
+            "risk_dataset_family_digest": "f" * 64,
+            "global_cross_split_leakage": "PROVEN",
+        }
+    )
+
+    with pytest.raises(RiskDataContractError, match="exactly 50000"):
+        save_risk_checkpoint(
+            tmp_path / "invalid-formal-claim.pt",
+            model=RiskModel(variant="r0", hidden_channels=4),
+            mode="production",
+            provenance=provenance,
+        )
+    provenance.update(
+        {
+            "training_data_scale": "fixture_standin",
+            "scientific_claim_eligible": False,
+            "selected_sample_count": 50_000,
+            "consumed_sample_count": 50_000,
+        }
+    )
+    with pytest.raises(RiskDataContractError, match="exact 50000-sample identity"):
+        save_risk_checkpoint(
+            tmp_path / "underclaimed-formal-run.pt",
+            model=RiskModel(variant="r0", hidden_channels=4),
+            mode="production",
+            provenance=provenance,
+        )
 
 
 def test_real_fixture_training_is_deterministic_and_reduces_loss(
@@ -1079,6 +1131,52 @@ def test_stage_gates_checkpoint_provenance_and_atomic_no_clobber(
             mode="production",
             provenance=bad_runtime,
         )
+
+
+def test_public_training_loader_snapshots_and_authenticates_best_checkpoint(
+    tmp_path: Path,
+) -> None:
+    loader = getattr(
+        trainer_module,
+        "load_production_risk_training_publication",
+        None,
+    )
+    assert callable(loader)
+    _, train = _publish_and_load(tmp_path / "train")
+    _, validation = _publish_and_load(tmp_path / "validation", split="val")
+    family = _publish_family(
+        tmp_path / "dataset-family",
+        train=train,
+        validation=validation,
+    )
+    subset = select_production_risk_subset(train, max_samples=1000, seed=42)
+    result = train_production_risk_model(
+        train_dataset=train,
+        train_subset=subset,
+        config=_config(stage="formal_50k", epochs=1),
+        output_dir=tmp_path / "formal-training",
+        validation_dataset=validation,
+        dataset_family=family,
+    )
+
+    loaded = loader(result.output_dir, checkpoint_role="best")
+
+    assert loaded.root == result.output_dir
+    assert loaded.checkpoint_filename == "best_checkpoint.pt"
+    assert loaded.manifest["stage"] == "formal_50k"
+    assert loaded.checkpoint["checkpoint_semantic_digest_sha256"] == (
+        loaded.manifest["artifact_semantic_bindings"]["best_checkpoint.pt"]
+    )
+
+    tampered = tmp_path / "tampered-training"
+    shutil.copytree(result.output_dir, tampered)
+    checkpoint_path = tampered / "best_checkpoint.pt"
+    checkpoint_bytes = bytearray(checkpoint_path.read_bytes())
+    checkpoint_bytes[-1] ^= 1
+    checkpoint_path.write_bytes(checkpoint_bytes)
+
+    with pytest.raises(RiskDataContractError, match="checksum"):
+        loader(tampered, checkpoint_role="best")
 
 
 def test_production_cli_returns_without_toy_fallthrough(

@@ -259,6 +259,7 @@ def test_production_calibration_publishes_family_bound_manifest(
         (output_dir / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["artifact_kind"] == "sop10_production_calibration"
+    assert manifest["schema_version"] == SCHEMA_VERSION
     assert manifest["risk_dataset_family_layout_version"] == (
         "risk_dataset_family_v1"
     )
@@ -458,6 +459,7 @@ def test_production_eval_publishes_family_and_isolation_metadata(
         (output_dir / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["artifact_kind"] == "sop10_production_offline_evaluation"
+    assert manifest["schema_version"] == SCHEMA_VERSION
     assert manifest["risk_dataset_family_layout_version"] == (
         "risk_dataset_family_v1"
     )

@@ -18,7 +18,7 @@ from typing import Any, BinaryIO, Mapping, Sequence
 
 import numpy as np
 
-from src.contracts import SCHEMA_VERSION, GridSpec
+from src.contracts import LONG40_FUTURE_HORIZON_S, SCHEMA_VERSION, GridSpec
 from src.datasets.split_manager import SPLIT_NAMES
 from src.generation.risk_sidecars import RiskLabelSidecar
 from src.utils.atomic_publish import atomic_rename_noreplace
@@ -377,7 +377,10 @@ def _build_arrays(
         if sidecar.robot_future_footprints.shape != expected_shape:
             raise ValueError("robot_future_footprints shape differs from grid")
         if not np.array_equal(sidecar.future_endpoint_times_s, expected_times):
-            raise ValueError("sidecar future endpoint times must be 0.2 ... 3.0 s")
+            raise ValueError(
+                "sidecar future endpoint times must be "
+                f"0.2 ... {LONG40_FUTURE_HORIZON_S:.1f} s"
+            )
     arrays = {
         "hidden_risk_occupancy": np.ascontiguousarray(
             np.stack(
@@ -644,7 +647,10 @@ def _validate_loaded_arrays(
     if not np.array_equal(
         arrays["future_endpoint_times_s"], _expected_endpoint_times(grid)
     ):
-        raise ValueError("future endpoint times must be exactly 0.2 ... 3.0 s")
+        raise ValueError(
+            "future endpoint times must be exactly "
+            f"0.2 ... {LONG40_FUTURE_HORIZON_S:.1f} s"
+        )
 
 
 def _load_pair_marker_summary(raw: bytes) -> dict[str, object]:

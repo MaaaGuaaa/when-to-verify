@@ -1,4 +1,4 @@
-"""Deterministic, resumable SOP09 training over authenticated schema-3 shards."""
+"""Deterministic, resumable SOP09 training over authenticated schema-4 shards."""
 
 from __future__ import annotations
 
@@ -248,6 +248,17 @@ class ProductionRiskTrainingResult:
 
 
 @dataclass(frozen=True)
+class LoadedProductionRiskTrainingPublication:
+    """One checkpoint loaded from a single authenticated file snapshot."""
+
+    root: Path
+    manifest: dict[str, object]
+    model: torch.nn.Module
+    checkpoint: dict[str, object]
+    checkpoint_filename: str
+
+
+@dataclass(frozen=True)
 class _AuxiliaryOccupancyStatistics:
     sidecar_collection_digest_sha256: str
     positive_count: int
@@ -398,7 +409,9 @@ def _training_data_scale(
         if selected_sample_count < 1000:
             return "fixture_standin", False
         return "real_1k", True
-    return "formal_50k", True
+    if selected_sample_count == 50_000:
+        return "formal_50k", True
+    return "fixture_standin", False
 
 
 def _config_snapshot(config: ProductionRiskTrainingConfig) -> dict[str, object]:
@@ -1401,6 +1414,7 @@ def _validate_published_resume_state(
     resume_path: Path,
     *,
     expected_publication_instance_digest_sha256: str,
+    snapshots: Mapping[str, bytes] | None = None,
 ) -> _ValidatedTrainingPublication:
     """Validate one immutable publication from single-read file snapshots."""
 
@@ -1416,7 +1430,11 @@ def _validate_published_resume_state(
         expected_publication_instance_digest_sha256,
         "expected publication_instance_digest_sha256",
     )
-    snapshots = _snapshot_direct_regular_files(root)
+    snapshots = (
+        _snapshot_direct_regular_files(root)
+        if snapshots is None
+        else dict(snapshots)
+    )
     required_outer = {
         "training_manifest.json",
         ".producer-complete",
@@ -1659,6 +1677,69 @@ def _validate_published_resume_state(
         interval_states=tuple(
             sorted(intervals, key=lambda item: int(item[1]["optimizer_steps"]))
         ),
+    )
+
+
+def load_production_risk_training_publication(
+    root: str | Path,
+    *,
+    checkpoint_role: Literal["best", "final"],
+) -> LoadedProductionRiskTrainingPublication:
+    """Load one checkpoint after validating a single immutable publication snapshot."""
+
+    publication_root = _absolute(root)
+    if publication_root.is_symlink() or not publication_root.is_dir():
+        raise RiskDataContractError("production training publication root is invalid")
+    if checkpoint_role not in {"best", "final"}:
+        raise RiskDataContractError("checkpoint_role must be 'best' or 'final'")
+    checkpoint_filename = f"{checkpoint_role}_checkpoint.pt"
+    snapshots = _snapshot_direct_regular_files(publication_root)
+    manifest_bytes = snapshots.get("training_manifest.json")
+    if manifest_bytes is None:
+        raise RiskDataContractError(
+            "complete published training artifact requires training_manifest.json"
+        )
+    manifest_preview = _read_canonical_json_bytes(
+        manifest_bytes,
+        label="training manifest",
+    )
+    expected_instance_digest = _require_sha256(
+        manifest_preview.get("publication_instance_digest_sha256"),
+        "manifest publication_instance_digest_sha256",
+    )
+    validated = _validate_published_resume_state(
+        publication_root / "training_state.pt",
+        expected_publication_instance_digest_sha256=expected_instance_digest,
+        snapshots=snapshots,
+    )
+    checkpoint_bytes = snapshots.get(checkpoint_filename)
+    if checkpoint_bytes is None:
+        raise RiskDataContractError(
+            f"training publication lacks {checkpoint_filename}"
+        )
+    provenance = validated.manifest.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise RiskDataContractError("training manifest provenance must be a mapping")
+    model, checkpoint = load_risk_checkpoint(
+        io.BytesIO(checkpoint_bytes),
+        expected_mode="production",
+        expected_provenance=provenance,
+    )
+    bindings = validated.manifest.get("artifact_semantic_bindings")
+    if (
+        not isinstance(bindings, Mapping)
+        or bindings.get(checkpoint_filename)
+        != checkpoint.get("checkpoint_semantic_digest_sha256")
+    ):
+        raise RiskDataContractError(
+            f"checkpoint semantic binding mismatch: {checkpoint_filename}"
+        )
+    return LoadedProductionRiskTrainingPublication(
+        root=publication_root,
+        manifest=validated.manifest,
+        model=model,
+        checkpoint=checkpoint,
+        checkpoint_filename=checkpoint_filename,
     )
 
 
@@ -2335,8 +2416,10 @@ def train_production_risk_model(
 
 
 __all__ = [
+    "LoadedProductionRiskTrainingPublication",
     "PRODUCTION_RISK_TRAINING_LAYOUT_VERSION",
     "ProductionRiskTrainingConfig",
     "ProductionRiskTrainingResult",
+    "load_production_risk_training_publication",
     "train_production_risk_model",
 ]

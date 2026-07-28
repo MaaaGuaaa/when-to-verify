@@ -12,8 +12,8 @@ learning_rate: 0.0001
 weight_decay: 0.0001
 lambda_collision: 1.0
 checkpoint_interval_steps: 100
-occupancy_aux_enabled: false
-lambda_occupancy_aux: 0.0
+occupancy_aux_enabled: true
+lambda_occupancy_aux: 0.2
 occupancy_future_steps: 32
 r2_d_model: 128
 r2_nhead: 4

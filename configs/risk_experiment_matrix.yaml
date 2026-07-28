@@ -1,0 +1,61 @@
+layout_version: risk_experiment_matrix_v1
+schema_version: 4.0.0
+prediction_protocol: configs/prediction_protocol_production.json
+seeds:
+  - 42
+  - 43
+  - 44
+stages:
+  - one_shard_smoke
+  - real_1k_overfit
+  - formal_50k
+stage_sample_limits:
+  one_shard_smoke: one_authenticated_shard
+  real_1k_overfit: 1000
+  formal_50k: 50000
+formal_methods:
+  - risk-r0
+  - risk-r1
+  - risk-r2
+  - B1
+  - B2
+  - B3
+  - B4
+risk_experiments:
+  - name: R0
+    role: direct_risk_baseline
+    config: configs/risk_model_r0_production.yaml
+    formal_method_id: risk-r0
+  - name: R1
+    role: temporal_direct_risk_baseline
+    config: configs/risk_model_r1_production.yaml
+    formal_method_id: risk-r1
+  - name: R2
+    role: main_method
+    config: configs/risk_model_r2_production.yaml
+    formal_method_id: risk-r2
+  - name: R2-no-aux
+    role: occupancy_auxiliary_ablation
+    config: configs/risk_model_r2_no_aux_production.yaml
+    formal_method_id: null
+  - name: R2-concat
+    role: fusion_ablation
+    config: configs/risk_model_r2_concat_control_production.yaml
+    formal_method_id: null
+occupancy_experiments:
+  - name: B1
+    role: last_observation_hold_hand_aggregation
+    config: configs/occupancy_baseline_production.yaml
+    formal_method_id: B1
+  - name: B2
+    role: age_decay_hand_aggregation
+    config: configs/occupancy_baseline_production.yaml
+    formal_method_id: B2
+  - name: B3
+    role: convgru_occupancy_hand_aggregation
+    config: configs/occupancy_baseline_production.yaml
+    formal_method_id: B3
+  - name: B4
+    role: convgru_occupancy_learned_aggregation
+    config: configs/occupancy_baseline_production.yaml
+    formal_method_id: B4

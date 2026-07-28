@@ -19,6 +19,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.contracts import SCHEMA_VERSION  # noqa: E402
 from src.calibration.split_conformal import (  # noqa: E402
     BASELINE_SPEC_LAYOUT_VERSION,
     FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
@@ -421,7 +422,7 @@ def main() -> int:
             else "sop10_toy_offline_evaluation"
         ),
         "mode": args.mode,
-        "schema_version": "3.0.0",
+        "schema_version": SCHEMA_VERSION,
         "evaluated_split": "test",
         "method_id": table["method_id"],
         "checkpoint_layout_version": table["checkpoint_layout_version"],

@@ -1348,9 +1348,9 @@ SOP08 将占据监督发布为 additive label-only sidecar，不向上述
   join；缺失、重复、额外或任一 digest 不匹配均 fail closed，禁止宽松按位置配对。
 - sidecar 只能用于 supervision 和 offline metrics，不得出现在
   `model_inputs`。同一 `hidden_risk_occupancy` 是 SOP08 B3 ConvGRU/B4
-  aggregation 训练标签，也是 SOP09/R3 可选 occupancy auxiliary head 的标签。
-  四 split sidecar 数据准备是完整训练包的必做步骤，是否启用 auxiliary
-  head 仍是实验选项。
+  aggregation 训练标签，也是 SOP09 正式 R2 occupancy auxiliary head 的标签。
+  正式 `risk-r2` 必须启用该 head；只有 R2-no-aux 消融关闭它。四 split
+  sidecar 数据准备始终是完整训练包的必做步骤。
 
 ### 13.2 四 split 发布与打包门禁
 
@@ -1407,19 +1407,19 @@ future occupancy + swept volume → 手写概率聚合 → trajectory risk
 B3 ConvGRU predictor 和 B4 learned aggregator 必须读取第 13.1 节的同一
 `hidden_risk_occupancy` 监督，不得从 model-input 通道反推或替换该标签。
 
-### 14.3 可选辅助任务
+### 14.3 R2 辅助任务与消融
 
 主模型使用共享 encoder：
 
 ```text
 BEV encoder
   ├── trajectory risk head     # 主任务
-  └── hidden occupancy head    # 辅助监督，可选
+  └── hidden occupancy head    # R2 训练辅助监督
 ```
 
 推理时风险 head 不应强制经过 occupancy 输出。
-完整数据包始终准备占据 sidecar；是否在 SOP09/R3 启用该 auxiliary
-head/loss 由消融配置决定，不得借关闭 auxiliary head 跳过 sidecar 数据准备。
+正式 R2 训练必须启用该 auxiliary head/loss，正式推理丢弃其输出。
+R2-no-aux 仅用于消融；不得借关闭 auxiliary head 跳过 sidecar 数据准备。
 
 ---
 
@@ -1439,16 +1439,16 @@ MLP
 Q50, Q80, Q90, Q95, p_collision
 ```
 
-### 15.2 推荐增强结构
+### 15.2 R2 正式结构
 
 ```text
 Temporal BEV Encoder: ConvGRU or temporal CNN
 Trajectory Query Encoder: CNN on swept/TTA/braking maps
-Fusion: cross-attention or feature-wise modulation
+Fusion: cross-attention
 Risk Heads:
   quantile head
   collision head
-Optional:
+Training-only:
   auxiliary occupancy head
 ```
 
@@ -1461,6 +1461,9 @@ Value = BEV latent features
 ```
 
 不要直接把 predicted occupancy map 当唯一 Value。
+`risk-r2` 仅指 cross-attention 且启用 occupancy auxiliary 的主方法。
+concat fusion 与关闭 auxiliary 分别记为 R2-concat、R2-no-aux 消融，
+不得进入正式 method ID 集。
 
 ### 15.3 Loss
 
@@ -2015,14 +2018,17 @@ scenario bank: M=16
 ### 25.1 风险
 
 ```text
-B1 Last observation hold
-B2 Age-decay heuristic
-B3 Occupancy predictor + hand aggregation
-B4 Occupancy predictor + learned aggregator
-B5 Risk-only model without quantile
-B6 Risk model without conformal calibration
-Ours Trajectory-query quantile risk + calibration
-Ours+Aux optional occupancy auxiliary supervision
+R0 / risk-r0  Concat CNN direct-risk baseline
+R1 / risk-r1  Temporal trajectory-conditioned concat baseline
+R2 / risk-r2  Cross-attention trajectory-query risk + occupancy auxiliary
+B1            Last observation hold + hand aggregation
+B2            Age-decay heuristic + hand aggregation
+B3            Occupancy predictor + hand aggregation
+B4            Occupancy predictor + learned aggregation
+
+Ablations only (no formal method ID):
+R2-no-aux     R2 with occupancy auxiliary disabled
+R2-concat     R2 with concat fusion and occupancy auxiliary enabled
 ```
 
 ### 25.2 验证

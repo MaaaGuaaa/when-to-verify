@@ -17,6 +17,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from src.contracts import (
+    LONG40_FUTURE_HORIZON_S,
     N_HISTORY_CHANNELS,
     N_STATE_CHANNELS,
     N_TRAJECTORY_CHANNELS,
@@ -461,9 +462,10 @@ class TrajectoryQueryTransformer(nn.Module):
 
         target_size = trajectory_features.shape[-2:]
         swept = _resize_grid(trajectory_channels[:, :1], target_size).clamp(0.0, 1.0)
-        arrival = _resize_grid(
+        arrival_seconds = _resize_grid(
             trajectory_channels[:, 1:2] * trajectory_channels[:, :1], target_size
         ) / swept.clamp_min(torch.finfo(trajectory_features.dtype).eps)
+        arrival = arrival_seconds / LONG40_FUTURE_HORIZON_S
         weights: list[torch.Tensor] = []
         for index in range(self.query_bins):
             lower = float(index) / self.query_bins
@@ -992,8 +994,29 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
             raise RiskDataContractError(
                 "fixture_standin checkpoint must contain fewer than 1000 samples"
             )
-    if training_stage == "formal_50k" and data_scale != "formal_50k":
-        raise RiskDataContractError("formal_50k checkpoint provenance scale mismatch")
+    if training_stage == "formal_50k":
+        if data_scale not in {"fixture_standin", "formal_50k"}:
+            raise RiskDataContractError(
+                "formal_50k checkpoint provenance scale mismatch"
+            )
+        if provenance["consumed_sample_count"] != provenance[
+            "selected_sample_count"
+        ]:
+            raise RiskDataContractError(
+                "formal_50k checkpoint must consume all selected samples"
+            )
+        if data_scale == "formal_50k" and provenance[
+            "selected_sample_count"
+        ] != 50_000:
+            raise RiskDataContractError(
+                "formal_50k checkpoint provenance requires exactly 50000 samples"
+            )
+        if data_scale == "fixture_standin" and provenance[
+            "selected_sample_count"
+        ] == 50_000:
+            raise RiskDataContractError(
+                "formal checkpoint scale must match its exact 50000-sample identity"
+            )
     if provenance["global_cross_split_leakage"] not in {
         "NOT_PROVEN",
         "PROVEN",

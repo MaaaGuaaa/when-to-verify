@@ -1174,7 +1174,8 @@ cross-shard audit 和 50k/240k 运行仍待完成。
 
 - **优先级：** P0
 - **依赖：** SOP-00、07
-- **输出：** R0 risk-only CNN、R1 temporal trajectory-conditioned model；R2/R3 仅在门禁通过后考虑
+- **输出：** R0 concat CNN、R1 temporal trajectory-conditioned concat、R2
+  cross-attention trajectory-query 主方法，以及 R2-no-aux/R2-concat 消融
 
 ### 文件
 
@@ -1195,15 +1196,18 @@ cross-shard audit 和 50k/240k 运行仍待完成。
       digest 和 `target_type_policy_digest`；禁止复用任何由 v1 shard 训练的 checkpoint
 - [ ] 实现 R0：BEV/state/trajectory concat + 小 CNN + pooling + MLP
 - [ ] 输出 `Q50/Q80/Q90/Q95` 和 `p_collision`
-- [ ] 实现 pinball loss、collision BCE 和可选 occupancy auxiliary loss
-- [ ] R3 可选 occupancy auxiliary head 复用 SOP08 B3/B4 的同一
-      `hidden_risk_occupancy` 标签；四 split sidecar 数据准备是完整训练包必做项，
-      但是否启用 R3 head/loss 仍是实验选项
-- [ ] 通过参数化或累计正增量保证 quantile 不交叉，或显式报告 crossing rate
+- [ ] 实现 pinball loss、collision BCE 和 R2 occupancy auxiliary loss
 - [ ] 实现 R1 temporal CNN/ConvGRU + trajectory channels
+- [ ] 实现 R2 trajectory-query cross-attention；正式 `risk-r2` 必须绑定
+      `r2_fusion_mode=cross_attention`、`occupancy_aux_enabled=true`，auxiliary
+      head 复用 SOP08 B3/B4 的同一 `hidden_risk_occupancy` 标签
+- [ ] 保留 R2-no-aux 与 R2-concat 作为受控消融；二者不得获得新的正式 method ID
+- [ ] 四 split sidecar 数据准备是完整训练包必做项；不得借消融关闭 auxiliary
+      head 而跳过数据准备
+- [ ] 通过参数化或累计正增量保证 quantile 不交叉，或显式报告 crossing rate
 - [ ] 先在 1,000 risk samples 上过拟合
-- [ ] 再运行 50k 首轮训练，保存 best checkpoint、config、channel spec、metrics
-- [ ] 比较 R0/R1 后再决定是否开发 cross-attention
+- [ ] 再以 seeds 42/43/44 运行严格 50k 正式训练，保存 best checkpoint、config、
+      channel spec、metrics；少于或多于 50,000 的运行不得声明正式规模资格
 - [x] `formal_50k` 入口必须加载认证后的 `risk_dataset_family_v1`，并核对实际
       train/val seal 与 family member digest/count；拒绝调用方自行提供的 raw
       cross-split audit JSON。smoke/1k 阶段继续 fail closed，不接受 family 的正式规模声明

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ from src.evaluation.prediction_tables import (
     BASELINE_SPEC_LAYOUT_VERSION,
     PredictionMethodArtifact,
     PredictionTableContractError,
+    UNIFIED_PREDICTION_METHODS,
     baseline_spec_digest,
     build_prediction_protocol,
     build_production_prediction_table,
@@ -42,6 +44,9 @@ from src.training.occupancy_trainer import (
 )
 from tests.fixtures.formal_risk_publication import create_formal_risk_publication
 from tests.test_risk_evaluation_store import _record
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _family(root: Path, *, shared_sessions: bool = False):
@@ -144,6 +149,13 @@ def _artifacts() -> dict[str, PredictionMethodArtifact]:
             digest_kind="risk_checkpoint_semantic_sha256",
             score_definition="risk_model_collision_and_quantile_heads",
         ),
+        "risk-r2": PredictionMethodArtifact(
+            method_id="risk-r2",
+            layout_version="risk_model_checkpoint_v2",
+            digest_sha256="2" * 64,
+            digest_kind="risk_checkpoint_semantic_sha256",
+            score_definition="risk_model_collision_and_quantile_heads",
+        ),
         "B1": PredictionMethodArtifact(
             method_id="B1",
             layout_version=BASELINE_SPEC_LAYOUT_VERSION,
@@ -186,6 +198,15 @@ def test_protocol_round_trip_binds_all_calibration_settings() -> None:
     validated = validate_prediction_protocol(protocol)
     assert validated["alpha"] == 0.1
     assert validated["prediction_key"] == "q90"
+    assert validated["required_methods"] == [
+        "risk-r0",
+        "risk-r1",
+        "risk-r2",
+        "B1",
+        "B2",
+        "B3",
+        "B4",
+    ]
     assert validated["grouped_calibration"]["group_dimensions"] == list(
         GROUP_DIMENSIONS
     )
@@ -197,7 +218,24 @@ def test_protocol_round_trip_binds_all_calibration_settings() -> None:
         validate_prediction_protocol(drifted)
 
 
-def test_six_methods_share_exact_evaluation_rows_and_protocol(tmp_path: Path) -> None:
+def test_production_protocol_file_is_the_frozen_seven_method_protocol() -> None:
+    expected = build_prediction_protocol(
+        alpha=0.1,
+        prediction_key="q90",
+        min_group_size=20,
+        group_dimensions=GROUP_DIMENSIONS,
+    )
+    production = json.loads(
+        (ROOT / "configs" / "prediction_protocol_production.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert production == expected
+    assert production["required_methods"] == list(UNIFIED_PREDICTION_METHODS)
+
+
+def test_seven_methods_share_exact_evaluation_rows_and_protocol(tmp_path: Path) -> None:
     family, members = _family(tmp_path)
     dataset = members["calibration"]
     evaluation = _evaluation(tmp_path / "evaluation-calibration", dataset)
@@ -466,7 +504,7 @@ def test_prediction_collection_round_trips_calibration_then_complete(
     assert complete.manifest["publication_stage"] == "complete"
     assert set(complete.tables_by_split) == {"calibration", "test"}
     assert all(
-        set(methods) == {"risk-r0", "risk-r1", "B1", "B2", "B3", "B4"}
+        set(methods) == set(UNIFIED_PREDICTION_METHODS)
         for methods in complete.tables_by_split.values()
     )
 

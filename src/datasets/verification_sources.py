@@ -10,7 +10,17 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping
 
-from src.contracts import BaseState, GridSpec, LocalTrajectory, OracleContext, SCHEMA_VERSION
+from src.contracts import (
+    LONG40_FUTURE_HORIZON_S,
+    LONG40_FUTURE_STEPS,
+    LONG40_SAMPLE_DT_S,
+    POSE_TIME_LAYOUT_VERSION,
+    SCHEMA_VERSION,
+    BaseState,
+    GridSpec,
+    LocalTrajectory,
+    OracleContext,
+)
 from src.datasets.snippet_library import MotionSnippet
 from src.generation.event_sampler import GeneratedEvent
 from src.generation.event_target_motion_shard import EventTargetMotionRecord
@@ -274,12 +284,11 @@ def _validate_sop04_lock(value: object) -> Mapping[str, object]:
     if (
         lock["completion_policy"] != "sop04_audited_bank_v2"
         or lock["trajectory_bank_version"] != "sop04_audited_bank_v2"
-        or lock["pose_time_layout_version"]
-        != "future_endpoints_dt_to_horizon_v1"
-        or lock["trajectory_steps"] != 15
-        or lock["dt_s"] != 0.2
-        or lock["first_pose_time_s"] != 0.2
-        or lock["last_pose_time_s"] != 3.0
+        or lock["pose_time_layout_version"] != POSE_TIME_LAYOUT_VERSION
+        or lock["trajectory_steps"] != LONG40_FUTURE_STEPS
+        or lock["dt_s"] != LONG40_SAMPLE_DT_S
+        or lock["first_pose_time_s"] != LONG40_SAMPLE_DT_S
+        or lock["last_pose_time_s"] != LONG40_FUTURE_HORIZON_S
     ):
         raise ValueError("SOP04 input lock time/layout contract mismatch")
     return MappingProxyType(dict(lock))

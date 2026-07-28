@@ -1,4 +1,4 @@
-schema_version: "3.0.0"
+schema_version: "4.0.0"
 scenario_bank:
   version: scenario_bank_v1
   compositions:
@@ -11,7 +11,7 @@ scenario_bank:
   irrelevant_offsets_m:
     - [0.0, 2.0]
     - [0.0, -2.0]
-    - [-2.0, 0.0]
+    - [1.0, 0.0]
     - [2.0, 2.0]
     - [2.0, -2.0]
 posterior:
@@ -21,3 +21,5 @@ decision:
   reject_cost: 0.20
   risk_weight: 1.0
   braking_deceleration_mps2: 1.0
+  angular_deceleration_radps2: 1.6
+  braking_margin_s: 0.4

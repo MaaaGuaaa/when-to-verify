@@ -14,6 +14,7 @@ from src.utils.config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_CONFIG = ROOT / "configs/verify_model.yaml"
+NO_RANKING_CONFIG = ROOT / "configs/verify_model_no_ranking.yaml"
 
 
 def _inputs(batch_size: int = 2):
@@ -151,10 +152,24 @@ def test_forward_and_loss_path_produce_finite_cpu_gradients():
 
 def test_model_config_is_strict_and_schema_bound(tmp_path):
     config = load_verify_model_config(MODEL_CONFIG)
-    assert config.schema_version == "3.0.0"
+    assert config.schema_version == "4.0.0"
     assert config.model.version == VERIFICATION_MODEL_VERSION
     invalid = tmp_path / "invalid.yaml"
     invalid.write_text(MODEL_CONFIG.read_text() + "unexpected: true\n")
 
     with pytest.raises(ValueError, match="keys"):
         load_verify_model_config(invalid)
+
+
+def test_no_ranking_ablation_changes_only_the_ranking_weight():
+    main = load_verify_model_config(MODEL_CONFIG)
+    ablation = load_verify_model_config(NO_RANKING_CONFIG)
+
+    assert ablation.schema_version == "4.0.0"
+    assert ablation.model == main.model
+    assert ablation.training == main.training
+    assert ablation.loss.ranking_weight == 0.0
+    assert ablation.loss.huber_delta == main.loss.huber_delta
+    assert ablation.loss.value_weight == main.loss.value_weight
+    assert ablation.loss.useful_weight == main.loss.useful_weight
+    assert ablation.loss.ranking_margin == main.loss.ranking_margin

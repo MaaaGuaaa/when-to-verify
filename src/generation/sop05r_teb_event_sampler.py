@@ -23,7 +23,6 @@ from src.geometry import (
     RectangleOccluder,
     inflate_footprint,
 )
-from src.generation.event_sampler import GeneratedEvent
 from src.planning.lightweight_teb import PlannedTebRoute
 from src.utils.seeding import stable_digest
 
@@ -32,7 +31,12 @@ from .anchored_human_placement import (
     _sample_robot_poses,
     synchronized_centerline_blocking,
 )
-from .dynamic_object_transplant import (
+from .continuous_collision import (
+    ContinuousCollisionEvidence,
+    compute_continuous_collision_evidence,
+)
+from .event_contracts import (
+    GeneratedEvent,
     TransplantedDynamicObject,
     footprint_from_spec,
 )
@@ -48,10 +52,6 @@ from .occluder_sampler import (
     synchronized_sweeps_intersect,
 )
 from .sop05r_contracts import Sop05rTebConfig
-from .sop05r_event_sampler import (
-    ContinuousCollisionEvidence,
-    compute_continuous_collision_evidence,
-)
 from .sop05r_teb_decision_state import (
     Sop05rTebDecisionState,
     Sop05rTebDecisionStateCandidateRejected,

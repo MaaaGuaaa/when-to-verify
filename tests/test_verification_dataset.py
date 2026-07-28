@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.contracts import LocalTrajectory, validate_verification_sample
+from src.contracts import (
+    SCHEMA_VERSION,
+    LocalTrajectory,
+    validate_verification_sample,
+)
 from src.datasets.verification_dataset import (
     VERIFICATION_DATASET_VERSION,
     VerificationGroupInput,
@@ -18,8 +22,8 @@ from src.datasets.verification_dataloader import (
     write_verification_shard,
 )
 from src.generation.verification_gt import (
-    VERIFICATION_GT_VERSION,
-    VerificationValueResult,
+    SAMPLED_REALIZATION_GT_VERSION,
+    SampledVerificationValueResult,
 )
 from src.planning.verification_actions import (
     CANONICAL_ACTION_IDS,
@@ -51,29 +55,26 @@ def _nominal(grid) -> LocalTrajectory:
     )
 
 
-def _value(action_id: str, index: int) -> VerificationValueResult:
+def _value(action_id: str, index: int) -> SampledVerificationValueResult:
     action_cost = 0.01 + 0.001 * index
     post_risk = 0.20 + action_cost
     value = 0.50 - post_risk
-    return VerificationValueResult(
-        version=VERIFICATION_GT_VERSION,
-        bank_size=1,
-        scenario_bank_digest="scenario-digest-toy",
+    return SampledVerificationValueResult(
+        version=SAMPLED_REALIZATION_GT_VERSION,
+        sampled_child_world_id="sampled-child-toy",
         nominal_trajectory_id="nominal-toy",
         verification_action_id=action_id,
-        posterior_mode="exact",
-        posterior_temperature=None,
-        posterior=np.ones((1, 1), dtype=np.float64),
-        nominal_execute_losses=np.asarray([0.50], dtype=np.float64),
-        mean_execute_loss=0.50,
+        realized_execute_loss=0.50,
+        reject_cost=0.60,
         br_before=0.50,
-        post_decision_risks=np.asarray([0.20], dtype=np.float64),
-        best_decision_ids=("replan-toy",),
-        mean_post_decision_risk_before_action_cost=0.20,
+        realized_post_decision_risk_before_action_cost=0.20,
+        best_decision_id="replan-toy",
+        unclipped_best_policy_loss=0.20,
         action_cost=action_cost,
         post_risk=post_risk,
         value_target=value,
         useful_target=int(value > 0.0),
+        post_plan_status="feasible_plan",
     )
 
 
@@ -119,6 +120,7 @@ def _source_and_library(*, split: str = "train"):
 def test_builds_canonical_six_action_group_and_validates_contract():
     grid, library, source = _source_and_library()
 
+    assert VERIFICATION_DATASET_VERSION == "verification_dataset_schema4_v5"
     samples = build_verification_samples(source, library=library, grid=grid)
     repeated = build_verification_samples(source, library=library, grid=grid)
 
@@ -139,7 +141,7 @@ def test_builds_canonical_six_action_group_and_validates_contract():
             source.expected_fov_masks[action.action_id],
         )
         assert sample.metadata == {
-            "schema_version": "3.0.0",
+            "schema_version": SCHEMA_VERSION,
             "verification_dataset_version": VERIFICATION_DATASET_VERSION,
             "ranking_group_id": samples[0].metadata["ranking_group_id"],
             "action_index": index,
@@ -149,11 +151,9 @@ def test_builds_canonical_six_action_group_and_validates_contract():
                 "source_mode": "toy",
             },
             "label_audit": {
-                "verification_gt_version": VERIFICATION_GT_VERSION,
-                "scenario_bank_digest": "scenario-digest-toy",
-                "posterior_mode": "exact",
-                "posterior_temperature": None,
-                "bank_size": 1,
+                "verification_gt_version": SAMPLED_REALIZATION_GT_VERSION,
+                "sampled_child_world_id": "sampled-child-toy",
+                "post_plan_status": "feasible_plan",
             },
         }
         assert sample.bev_history.dtype == np.float32
@@ -167,13 +167,24 @@ def test_builds_canonical_six_action_group_and_validates_contract():
 
     assert not np.shares_memory(samples[0].bev_history, source.bev_history)
     assert not np.shares_memory(samples[0].state_channels, source.state_channels)
+    assert all(
+        sample.bev_history is samples[0].bev_history for sample in samples
+    )
+    assert all(
+        sample.state_channels is samples[0].state_channels
+        for sample in samples
+    )
+    assert all(
+        sample.trajectory_channels is samples[0].trajectory_channels
+        for sample in samples
+    )
 
 
 def test_action_result_mismatch_and_non_static_mask_values_fail_closed():
     grid, library, source = _source_and_library()
     values = dict(source.value_results)
-    values["yaw_left_10"] = replace(
-        values["yaw_left_10"], verification_action_id="yaw_right_10"
+    values["arc_left_30"] = replace(
+        values["arc_left_30"], verification_action_id="arc_right_30"
     )
     with pytest.raises(ValueError, match="action ID"):
         build_verification_samples(
@@ -181,8 +192,8 @@ def test_action_result_mismatch_and_non_static_mask_values_fail_closed():
         )
 
     masks = dict(source.expected_fov_masks)
-    masks["yaw_left_10"] = masks["yaw_left_10"].copy()
-    masks["yaw_left_10"][0, 0, 0] = 0.5
+    masks["arc_left_30"] = masks["arc_left_30"].copy()
+    masks["arc_left_30"][0, 0, 0] = 0.5
     with pytest.raises(ValueError, match="binary"):
         build_verification_samples(
             replace(source, expected_fov_masks=masks), library=library, grid=grid
@@ -273,6 +284,70 @@ def test_verification_shard_round_trip_is_deterministic_and_pickle_free(tmp_path
             shard_index=0,
             expected_sample_count=6,
         )
+
+
+def test_verification_payload_checksum_streams_in_fixed_blocks(tmp_path, monkeypatch):
+    grid, library, source = _source_and_library()
+    source = replace(
+        source,
+        bev_history=np.random.default_rng(0).random(
+            source.bev_history.shape, dtype=np.float32
+        ),
+    )
+    samples = build_verification_samples(source, library=library, grid=grid)
+    block_size = 1 << 20
+    original_open = Path.open
+    payload_read_sessions = []
+
+    class TrackedPayloadReader:
+        def __init__(self, handle, reads):
+            self._handle = handle
+            self._reads = reads
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def read(self, size=-1):
+            payload = self._handle.read(size)
+            self._reads.append((size, len(payload)))
+            return payload
+
+    def track_payload_reads(path, *args, **kwargs):
+        handle = original_open(path, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path.name != "samples.npz" or "r" not in mode:
+            return handle
+        reads = []
+        payload_read_sessions.append(reads)
+        return TrackedPayloadReader(handle, reads)
+
+    monkeypatch.setattr(Path, "open", track_payload_reads)
+    root = tmp_path / "streaming-checksum"
+    write_verification_shard(
+        samples,
+        root,
+        grid=grid,
+        library=library,
+        expected_sample_count=6,
+    )
+    writer_session_count = len(payload_read_sessions)
+
+    loaded = load_verification_shard(root, grid=grid, library=library)
+
+    assert (root / "samples.npz").stat().st_size > block_size
+    assert writer_session_count >= 1
+    assert len(payload_read_sessions) > writer_session_count
+    for reads in payload_read_sessions:
+        assert all(requested == block_size for requested, _ in reads)
+        assert sum(returned > 0 for _, returned in reads) >= 2
+        assert reads[-1] == (block_size, 0)
+    assert len(loaded.samples) == len(samples)
 
 
 def test_writer_and_loader_reject_corrupt_numeric_or_metadata_payloads(tmp_path):

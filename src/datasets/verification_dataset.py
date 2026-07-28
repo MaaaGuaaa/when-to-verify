@@ -1,4 +1,4 @@
-"""Schema-3 verification samples with an explicit model-input allowlist."""
+"""Verification samples labeled from one SOP5-sampled child realization."""
 
 from __future__ import annotations
 
@@ -22,17 +22,18 @@ from src.contracts import (
 from src.datasets.risk_dataset import build_trajectory_channels
 from src.datasets.split_manager import SPLIT_NAMES
 from src.generation.verification_gt import (
-    VERIFICATION_GT_VERSION,
-    VerificationValueResult,
+    SAMPLED_REALIZATION_GT_VERSION,
+    SampledVerificationValueResult,
 )
 from src.planning.verification_actions import (
     CANONICAL_ACTION_IDS,
     VerificationActionLibrary,
 )
+from src.planning.replanning import POST_PLAN_STATUSES
 from src.utils.seeding import stable_digest
 
 
-VERIFICATION_DATASET_VERSION = "verification_dataset_schema3_v1"
+VERIFICATION_DATASET_VERSION = "verification_dataset_schema4_v5"
 MODEL_INPUT_KEYS = (
     "bev_history",
     "state_channels",
@@ -62,10 +63,8 @@ _METADATA_KEYS = frozenset(
 _LABEL_AUDIT_KEYS = frozenset(
     {
         "verification_gt_version",
-        "scenario_bank_digest",
-        "posterior_mode",
-        "posterior_temperature",
-        "bank_size",
+        "sampled_child_world_id",
+        "post_plan_status",
     }
 )
 
@@ -80,7 +79,7 @@ class VerificationGroupInput:
     bev_history: np.ndarray
     state_channels: np.ndarray
     expected_fov_masks: Mapping[str, np.ndarray]
-    value_results: Mapping[str, VerificationValueResult]
+    value_results: Mapping[str, SampledVerificationValueResult]
     provenance: Mapping[str, object]
 
 
@@ -148,17 +147,19 @@ def _canonical_provenance(value: Any, *, path: str = "provenance") -> dict:
 def _validate_result_group(
     source: VerificationGroupInput,
     library: VerificationActionLibrary,
-) -> dict[str, VerificationValueResult]:
+) -> dict[str, SampledVerificationValueResult]:
     if not isinstance(source.value_results, Mapping):
         raise TypeError("value_results must be a mapping")
     results = dict(source.value_results)
     if set(results) != set(CANONICAL_ACTION_IDS):
         raise ValueError("value_results must contain exactly the six canonical actions")
-    reference: VerificationValueResult | None = None
+    reference: SampledVerificationValueResult | None = None
     for action in library.actions:
         result = results[action.action_id]
-        if not isinstance(result, VerificationValueResult):
-            raise TypeError("value_results must contain VerificationValueResult values")
+        if not isinstance(result, SampledVerificationValueResult):
+            raise TypeError(
+                "value_results must contain SampledVerificationValueResult values"
+            )
         if result.verification_action_id != action.action_id:
             raise ValueError("verification result action ID mismatch")
         if result.nominal_trajectory_id != source.nominal_trajectory.trajectory_id:
@@ -166,14 +167,22 @@ def _validate_result_group(
         if reference is None:
             reference = result
             continue
-        if result.scenario_bank_digest != reference.scenario_bank_digest:
-            raise ValueError("six-action group must use one scenario bank")
-        if result.bank_size != reference.bank_size:
-            raise ValueError("six-action group bank sizes differ")
-        if result.posterior_mode != reference.posterior_mode or (
-            result.posterior_temperature != reference.posterior_temperature
+        if result.sampled_child_world_id != reference.sampled_child_world_id:
+            raise ValueError("six-action group must use one sampled child world")
+        if not np.isclose(
+            result.realized_execute_loss,
+            reference.realized_execute_loss,
+            rtol=0.0,
+            atol=1e-12,
         ):
-            raise ValueError("six-action group posterior configuration differs")
+            raise ValueError("six-action group realized execute losses differ")
+        if not np.isclose(
+            result.reject_cost,
+            reference.reject_cost,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("six-action group reject costs differ")
         if not np.isclose(result.br_before, reference.br_before, rtol=0.0, atol=1e-12):
             raise ValueError("six-action group br_before values differ")
     return results
@@ -277,10 +286,8 @@ def build_verification_samples(
             "provenance": _canonical_provenance(provenance),
             "label_audit": {
                 "verification_gt_version": result.version,
-                "scenario_bank_digest": result.scenario_bank_digest,
-                "posterior_mode": result.posterior_mode,
-                "posterior_temperature": result.posterior_temperature,
-                "bank_size": result.bank_size,
+                "sampled_child_world_id": result.sampled_child_world_id,
+                "post_plan_status": result.post_plan_status,
             },
         }
         sample = VerificationSample(
@@ -289,21 +296,9 @@ def build_verification_samples(
             base_state_id=base_state_id,
             nominal_trajectory_id=nominal_id,
             verification_action_id=action.action_id,
-            bev_history=_owned_array(
-                bev,
-                name="bev_history",
-                shape=bev.shape,
-            ),
-            state_channels=_owned_array(
-                state,
-                name="state_channels",
-                shape=state.shape,
-            ),
-            trajectory_channels=_owned_array(
-                trajectory_channels,
-                name="trajectory_channels",
-                shape=trajectory_channels.shape,
-            ),
+            bev_history=bev,
+            state_channels=state,
+            trajectory_channels=trajectory_channels,
             verification_fov_mask=masks[action.action_id],
             verification_action_vector=vector,
             value_target=float(result.value_target),
@@ -399,27 +394,14 @@ def validate_verification_sample_for_publication(
     audit = metadata["label_audit"]
     if not isinstance(audit, dict) or set(audit) != _LABEL_AUDIT_KEYS:
         raise ValueError("label_audit keys are invalid")
-    if audit["verification_gt_version"] != VERIFICATION_GT_VERSION:
+    if audit["verification_gt_version"] != SAMPLED_REALIZATION_GT_VERSION:
         raise ValueError("unsupported verification GT version")
-    _nonempty_string(audit["scenario_bank_digest"], name="scenario_bank_digest")
-    if audit["posterior_mode"] not in {"exact", "soft"}:
-        raise ValueError("posterior_mode must be exact or soft")
-    temperature = audit["posterior_temperature"]
-    if audit["posterior_mode"] == "exact" and temperature is not None:
-        raise ValueError("exact posterior must not record a temperature")
-    if audit["posterior_mode"] == "soft" and (
-        isinstance(temperature, bool)
-        or not isinstance(temperature, (int, float))
-        or not np.isfinite(temperature)
-        or temperature <= 0.0
-    ):
-        raise ValueError("soft posterior temperature must be finite and positive")
-    if (
-        isinstance(audit["bank_size"], bool)
-        or not isinstance(audit["bank_size"], int)
-        or audit["bank_size"] <= 0
-    ):
-        raise ValueError("label_audit bank_size must be a positive integer")
+    _nonempty_string(
+        audit["sampled_child_world_id"],
+        name="sampled_child_world_id",
+    )
+    if audit["post_plan_status"] not in POST_PLAN_STATUSES:
+        raise ValueError("label_audit post_plan_status is unsupported")
     expected_sample_id = "verification-" + stable_digest(
         VERIFICATION_DATASET_VERSION,
         sample.split,

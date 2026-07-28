@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -12,7 +12,10 @@ from src.contracts import (
     TRAJECTORY_CHANNELS,
     VerificationSample,
 )
-from src.evaluation.verification_metrics import evaluate_verification_predictions
+from src.evaluation.verification_metrics import (
+    evaluate_verification_predictions,
+    verification_slice_fields,
+)
 
 
 def _legal_arrays(
@@ -139,7 +142,10 @@ def occupancy_entropy_reduction_score(
 
 
 def evaluate_verification_baselines(
-    samples: Sequence[VerificationSample], *, huber_delta: float
+    samples: Sequence[VerificationSample],
+    *,
+    huber_delta: float,
+    slice_fields: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, object]:
     """Evaluate all legal deployment-side baselines on complete sample groups."""
 
@@ -165,6 +171,11 @@ def evaluate_verification_baselines(
     useful = np.asarray([sample.useful_target for sample in rows], dtype=np.int64)
     groups = tuple(str(sample.metadata["ranking_group_id"]) for sample in rows)
     actions = tuple(sample.verification_action_id for sample in rows)
+    slices = (
+        verification_slice_fields(rows)
+        if slice_fields is None
+        else slice_fields
+    )
     result: dict[str, object] = {}
     for name, function in score_functions.items():
         scores = np.asarray([function(sample) for sample in rows], dtype=np.float64)
@@ -176,6 +187,7 @@ def evaluate_verification_baselines(
             group_ids=groups,
             action_ids=actions,
             huber_delta=huber_delta,
+            slice_fields=slices,
         )
         result[name] = {
             key: report[key]
@@ -186,6 +198,7 @@ def evaluate_verification_baselines(
                 "top_two_selection_rate",
                 "selected_action_counts",
                 "selected_action_proportions",
+                "slices",
             )
         }
     return result

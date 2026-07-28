@@ -21,6 +21,7 @@ from src.contracts import (
 )
 from src.datasets.snippet_library import MotionSnippet, SnippetLibrary
 from src.generation.dynamic_object_transplant import (
+    TransplantedDynamicObject,
     TransplantError,
     footprint_from_spec,
 )
@@ -50,6 +51,13 @@ from src.generation.paired_variants import (
     load_paired_variant_config,
     normalize_paired_variant_config,
     summarize_paired_groups,
+    validate_sop05r_target_history_prefix,
+    resolve_sop06_trajectory_handoff,
+)
+from src.generation.sop05r_event_sampler import evaluate_obstacle_first_template
+from src.generation.sop05r_trajectory_store import (
+    load_sop05r_trajectory_store,
+    publish_sop05r_trajectory_store,
 )
 from src.geometry import (
     RectangleFootprint,
@@ -63,9 +71,235 @@ from src.geometry import (
 from src.planning.query_maps import build_local_trajectory
 from src.planning.trajectory_sampler import sample_candidate_rollouts
 from src.utils.config import load_config
+from tests.test_sop05r_event_sampler import _fixture as sop05r_event_fixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _sop05r_prefix_target() -> TransplantedDynamicObject:
+    history = np.column_stack(
+        (
+            np.arange(8, dtype=np.float32),
+            np.zeros(8, dtype=np.float32),
+            np.zeros(8, dtype=np.float32),
+        )
+    )
+    future = np.column_stack(
+        (
+            np.arange(8, 23, dtype=np.float32),
+            np.zeros(15, dtype=np.float32),
+            np.zeros(15, dtype=np.float32),
+        )
+    )
+    return TransplantedDynamicObject(
+        target_dynamic_object_id="target-sop05r-prefix",
+        source_object_id="recording::human-1",
+        snippet_id="snippet-sop05r-prefix",
+        object_type="human",
+        footprint_spec={
+            "object_type": "human",
+            "footprint": {"kind": "circle", "radius_m": 0.3},
+        },
+        footprint_spec_digest="a" * 32,
+        history_poses=history,
+        current_pose=history[-1].copy(),
+        future_poses=future,
+        provenance={"source_recording_id": "recording"},
+    )
+
+
+def test_sop05r_target_present_pair_can_fork_only_after_last_visible_frame() -> None:
+    mother = _sop05r_prefix_target()
+    changed_history = mother.history_poses.copy()
+    changed_history[5:, 1] += 2.0
+    changed_future = mother.future_poses.copy()
+    changed_future[:, 1] += 3.0
+    variant = replace(
+        mother,
+        history_poses=changed_history,
+        current_pose=changed_history[-1].copy(),
+        future_poses=changed_future,
+    )
+
+    validate_sop05r_target_history_prefix(
+        mother_target=mother,
+        variant_target=variant,
+        last_visible_index=4,
+    )
+
+    visible_drift = changed_history.copy()
+    visible_drift[4, 0] += 0.25
+    with pytest.raises(PairGenerationError, match="visible history prefix"):
+        validate_sop05r_target_history_prefix(
+            mother_target=mother,
+            variant_target=replace(
+                variant,
+                history_poses=visible_drift,
+                current_pose=visible_drift[-1].copy(),
+            ),
+            last_visible_index=4,
+        )
+
+
+def test_sop05r_target_present_pair_rejects_target_spec_drift() -> None:
+    mother = _sop05r_prefix_target()
+
+    with pytest.raises(PairGenerationError, match="target identity or footprint"):
+        validate_sop05r_target_history_prefix(
+            mother_target=mother,
+            variant_target=replace(mother, footprint_spec_digest="b" * 32),
+            last_visible_index=4,
+        )
+
+
+def test_sop05r_handoff_loads_nominal_alternatives_and_same_goal(
+    tmp_path: Path,
+) -> None:
+    base_config, config, base_state, context, template, _ = sop05r_event_fixture()
+    evaluation = evaluate_obstacle_first_template(
+        template=template,
+        base_state=base_state,
+        oracle_context=context,
+        base_config=base_config,
+        config=config,
+        seed=31,
+    )
+    assert evaluation.mother is not None
+    mother = evaluation.mother
+    root = tmp_path / "sop05r-trajectories"
+    publish_sop05r_trajectory_store(
+        root,
+        (mother.trajectory_record,),
+        base_config=base_config,
+    )
+    store = load_sop05r_trajectory_store(root)
+
+    handoff = resolve_sop06_trajectory_handoff(
+        mother_event=mother.event,
+        sop05r_trajectory_store=store,
+    )
+
+    assert handoff.generator_algorithm_version == (
+        "obstacle_first_event_generation_v1"
+    )
+    assert handoff.nominal_trajectory.trajectory_id == (
+        mother.trajectory_record.nominal_trajectory_id
+    )
+    assert tuple(
+        trajectory.trajectory_id for trajectory in handoff.alternative_trajectories
+    ) == mother.trajectory_record.alternative_trajectory_ids
+    np.testing.assert_array_equal(
+        handoff.shared_goal_world_pose,
+        mother.trajectory_record.shared_goal_world_pose,
+    )
+    assert handoff.collection_semantic_digest == store.collection_semantic_digest
+
+
+def test_sop05r_handoff_rejects_legacy_sop04_trajectory_lookup() -> None:
+    base_config, config, base_state, context, template, _ = sop05r_event_fixture()
+    evaluation = evaluate_obstacle_first_template(
+        template=template,
+        base_state=base_state,
+        oracle_context=context,
+        base_config=base_config,
+        config=config,
+        seed=31,
+    )
+    assert evaluation.mother is not None
+
+    with pytest.raises(PairGenerationError, match="SOP04"):
+        resolve_sop06_trajectory_handoff(
+            mother_event=evaluation.mother.event,
+            legacy_trajectory=evaluation.mother.nominal_route.trajectory,
+        )
+
+
+def _sop05r_source_snippet(mother_event) -> MotionSnippet:
+    target = mother_event.target
+    poses = np.vstack((target.history_poses, target.future_poses))
+    positions = poses[:, :2].copy()
+    velocities = np.gradient(positions, 0.2, axis=0).astype(np.float32)
+    return MotionSnippet(
+        snippet_id=target.snippet_id,
+        split=target.provenance["source_split"],
+        source_recording_id=target.provenance["source_recording_id"],
+        source_session_id=target.provenance["source_session_id"],
+        source_object_id=target.source_object_id,
+        object_type=target.object_type,
+        footprint=dict(target.footprint_spec["footprint"]),
+        start_timestamp=0.0,
+        positions=positions,
+        velocities=velocities,
+        headings=poses[:, 2].copy(),
+        duration_s=4.4,
+        mean_speed_mps=float(np.linalg.norm(velocities, axis=1).mean()),
+        max_acceleration_mps2=float(
+            np.linalg.norm(np.diff(velocities, axis=0) / 0.2, axis=1).max()
+        ),
+        mean_abs_curvature_per_m=0.0,
+        provenance={"fixture": "sop05r-paired-handoff"},
+    )
+
+
+def test_sop05r_pair_generation_uses_store_and_preserves_visible_prefix(
+    tmp_path: Path,
+) -> None:
+    base_config, config, base_state, context, template, _ = sop05r_event_fixture()
+    evaluation = evaluate_obstacle_first_template(
+        template=template,
+        base_state=base_state,
+        oracle_context=context,
+        base_config=base_config,
+        config=config,
+        seed=31,
+    )
+    assert evaluation.mother is not None
+    mother = evaluation.mother
+    root = tmp_path / "sop05r-trajectories"
+    publish_sop05r_trajectory_store(
+        root,
+        (mother.trajectory_record,),
+        base_config=base_config,
+    )
+    store = load_sop05r_trajectory_store(root)
+
+    group = generate_paired_variants(
+        mother_event=mother.event,
+        source_snippet=_sop05r_source_snippet(mother.event),
+        base_state=base_state,
+        trajectory=None,
+        oracle_context=context,
+        base_config=base_config,
+        paired_config=load_paired_variant_config(
+            ROOT / "configs" / "paired_variants.yaml"
+        ),
+        seed=31,
+        sop05r_trajectory_store=store,
+    )
+
+    assert "collision" in group.by_kind
+    assert "temporal_safe" in group.by_kind, group.missing_variant_reasons
+    assert group.by_kind["temporal_safe"].world.metadata["paired_transform"][
+        "collision_censored_by_horizon"
+    ]
+    last_visible = mother.history_assessment.last_visible_index
+    for variant in group.variants:
+        metadata = variant.world.metadata
+        assert metadata["sop05r_trajectory_collection_digest"] == (
+            store.collection_semantic_digest
+        )
+        assert metadata["sop05r_nominal_trajectory_id"] == (
+            mother.trajectory_record.nominal_trajectory_id
+        )
+        assert metadata["sop05r_alternative_trajectory_ids"] == list(
+            mother.trajectory_record.alternative_trajectory_ids
+        )
+        if variant.target is not None and last_visible is not None:
+            np.testing.assert_array_equal(
+                variant.target.history_poses[: last_visible + 1],
+                mother.event.target.history_poses[: last_visible + 1],
+            )
 
 
 def _snippet() -> MotionSnippet:

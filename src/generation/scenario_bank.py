@@ -24,7 +24,7 @@ from src.contracts import (
     validate_oracle_world,
 )
 from src.geometry import rasterize_footprint
-from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_contracts import footprint_from_spec
 from src.utils.seeding import derive_seed, stable_digest
 
 
@@ -60,10 +60,13 @@ class ScenarioBankGeometryError(ValueError):
         self.variant_kind = variant_kind
         self.object_id = object_id
         self.future_index = future_index
+        time_location = (
+            "current_pose" if future_index == -1 else f"future_index={future_index}"
+        )
         super().__init__(
             "scenario dynamic trajectory violates static geometry: "
             f"variant={variant_kind}, object={object_id}, "
-            f"future_index={future_index}"
+            f"{time_location}"
         )
 
 
@@ -522,6 +525,15 @@ def validate_scenario_bank(bank: ScenarioBank, *, grid: GridSpec) -> None:
             raise ValueError("scenario current visible occupancy differs across worlds")
         for object_id in sorted(ids):
             footprint = footprint_from_spec(hypothesis.world.dynamic_object_specs[object_id])
+            if np.any(
+                rasterize_footprint(footprint, current[object_id], grid)
+                & (reference_static != 0.0)
+            ):
+                raise ScenarioBankGeometryError(
+                    variant_kind=hypothesis.variant_kind,
+                    object_id=object_id,
+                    future_index=-1,
+                )
             for future_index, pose in enumerate(
                 hypothesis.world.dynamic_object_trajectories[object_id]
             ):

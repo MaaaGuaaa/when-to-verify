@@ -20,6 +20,7 @@ from src.datasets.verification_dataset import (
 from src.evaluation.verification_metrics import (
     evaluate_verification_predictions,
     validate_verification_checkpoint_manifest,
+    verification_slice_fields,
 )
 from src.models.verification_model import (
     VerificationValueModel,
@@ -196,10 +197,6 @@ def _metric_report(
     useful_probability: np.ndarray,
     huber_delta: float,
 ) -> dict[str, object]:
-    source_modes = tuple(
-        str(sample.metadata["provenance"].get("source_mode", "unknown"))
-        for sample in samples
-    )
     return evaluate_verification_predictions(
         value_prediction=value_prediction,
         useful_probability=useful_probability,
@@ -214,10 +211,7 @@ def _metric_report(
         ),
         action_ids=tuple(sample.verification_action_id for sample in samples),
         huber_delta=huber_delta,
-        slice_fields={
-            "action": tuple(sample.verification_action_id for sample in samples),
-            "source_mode": source_modes,
-        },
+        slice_fields=verification_slice_fields(samples),
     )
 
 
@@ -448,8 +442,10 @@ def load_verification_training_checkpoint(
     expected_model_config: Mapping[str, object],
     expected_seed: int,
     expected_code_version: str,
+    expected_value_calibration_digest: str | None = None,
+    expected_reject_cost: float | None = None,
 ) -> LoadedVerificationTrainingCheckpoint:
-    """Load only a finite checkpoint whose embedded v2 manifest matches exactly."""
+    """Load only a finite checkpoint whose embedded v3 manifest matches exactly."""
 
     try:
         payload = torch.load(Path(path), map_location="cpu")
@@ -466,6 +462,8 @@ def load_verification_training_checkpoint(
         expected_model_config=expected_model_config,
         expected_seed=expected_seed,
         expected_code_version=expected_code_version,
+        expected_value_calibration_digest=expected_value_calibration_digest,
+        expected_reject_cost=expected_reject_cost,
     )
     state = payload["model_state_dict"]
     if not isinstance(state, dict) or not state:

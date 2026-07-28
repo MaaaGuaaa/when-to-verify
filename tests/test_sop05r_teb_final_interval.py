@@ -5,7 +5,7 @@ from dataclasses import replace
 import numpy as np
 
 import src.generation.sop05r_teb_event_sampler as sampler_module
-from src.generation.sop05r_event_sampler import (
+from src.generation.continuous_collision import (
     ContinuousCollisionEvidence,
     compute_continuous_collision_evidence,
 )

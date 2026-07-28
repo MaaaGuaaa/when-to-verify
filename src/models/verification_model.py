@@ -219,7 +219,7 @@ def _strict_section(
 
 
 def load_verify_model_config(path: str | Path) -> VerifyModelConfig:
-    """Load the schema-3 V0 architecture/loss/training configuration strictly."""
+    """Load the Schema-4 V0 architecture/loss/training configuration strictly."""
 
     try:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))

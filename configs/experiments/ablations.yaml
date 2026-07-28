@@ -1,0 +1,49 @@
+schema_version: "4.0.0"
+matrix_version: "sop16_experiment_matrix_v1"
+matrix_name: "sop16-ablations"
+scientific_status: "production_evaluation"
+closed_loop_config: "../closed_loop_production.yaml"
+required_target_type_policy: "human_target_with_contextual_dynamic_objects"
+seeds: [7, 11, 17]
+strategies: [never, always, visible, swept, entropy, learned, oracle]
+experiments:
+  - experiment_id: "without-age"
+    category: "ablation"
+    risk_method: "risk_without_age"
+    value_method: "learned_value"
+    suite_pattern: "ablations/without-age/seed-{seed}"
+    parameters: {ablation: "age", target_type: "human"}
+    runtime_overrides: {}
+    claims: ["Quantify the closed-loop effect of removing occlusion age."]
+  - experiment_id: "without-history"
+    category: "ablation"
+    risk_method: "risk_without_history"
+    value_method: "learned_value"
+    suite_pattern: "ablations/without-history/seed-{seed}"
+    parameters: {ablation: "history", target_type: "human"}
+    runtime_overrides: {}
+    claims: ["Quantify the closed-loop effect of removing observation history."]
+  - experiment_id: "without-trajectory-query"
+    category: "ablation"
+    risk_method: "risk_without_trajectory_query"
+    value_method: "learned_value"
+    suite_pattern: "ablations/without-trajectory-query/seed-{seed}"
+    parameters: {ablation: "trajectory_query", target_type: "human"}
+    runtime_overrides: {}
+    claims: ["Quantify the effect of removing trajectory-conditioned queries."]
+  - experiment_id: "without-calibration"
+    category: "ablation"
+    risk_method: "risk_only"
+    value_method: "learned_value"
+    suite_pattern: "ablations/without-calibration/seed-{seed}"
+    parameters: {ablation: "calibration", target_type: "human"}
+    runtime_overrides: {}
+    claims: ["Measure whether calibration changes false-safe execution."]
+  - experiment_id: "without-ranking"
+    category: "ablation"
+    risk_method: "risk_calibration"
+    value_method: "value_without_ranking"
+    suite_pattern: "ablations/without-ranking/seed-{seed}"
+    parameters: {ablation: "ranking", target_type: "human"}
+    runtime_overrides: {}
+    claims: ["Quantify the action-selection effect of removing ranking loss."]

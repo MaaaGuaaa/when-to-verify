@@ -1,0 +1,9 @@
+schema_version: "4.0.0"
+generator_version: "sop05_unseen_history_prior_v1"
+contract_version: "sop05_unseen_history_prior_contract_v1"
+p_hidden_human: 0.30
+max_attempts_per_mother: 32
+max_variants_per_mother: 1
+hard_total_sample_cap: 125000
+manifest_targets: [50000, 100000, 125000]
+seed: 42

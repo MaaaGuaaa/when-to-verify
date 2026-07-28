@@ -4,9 +4,14 @@ import numpy as np
 import pytest
 
 from src.contracts import LocalTrajectory, build_grid_spec
-from src.geometry import RectangleFootprint, rasterize_footprint
+from src.geometry import (
+    RectangleFootprint,
+    inflate_footprint,
+    rasterize_footprint,
+)
 from src.planning.query_maps import build_local_trajectory
 from src.planning.replanning import (
+    POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN,
     REPLANNING_VERSION,
     generate_replanned_candidates,
 )
@@ -47,7 +52,7 @@ def test_replanned_candidates_start_at_post_pose_and_use_fresh_sampler(
     result = generate_replanned_candidates(
         post_action_pose=post_pose,
         nominal_trajectory=nominal,
-        action_id="arc_left_20",
+        action_id="arc_left_45",
         config=base_config,
         static_occupancy=static,
         braking_deceleration_mps2=1.0,
@@ -95,7 +100,7 @@ def test_replanned_candidates_start_at_post_pose_and_use_fresh_sampler(
             assert np.isfinite(array).all()
 
 
-def test_replanning_filters_parent_frame_static_collisions_and_retains_stop(
+def test_replanning_filters_static_collisions_and_reports_no_motion_plan(
     base_config, nominal
 ):
     grid = build_grid_spec(base_config)
@@ -115,12 +120,8 @@ def test_replanning_filters_parent_frame_static_collisions_and_retains_stop(
     )
 
     assert result.rejection_counts.get("static_collision", 0) > 0
-    stop = [
-        candidate
-        for candidate in result.candidates
-        if candidate.trajectory.metadata["is_stop"]
-    ]
-    assert len(stop) == 1
+    assert result.plan_status == POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN
+    assert result.candidates == ()
     assert result.reject_available
 
 
@@ -147,3 +148,37 @@ def test_replanning_is_deterministic(base_config, nominal):
         np.testing.assert_array_equal(
             left.swept_mask_in_parent_frame, right.swept_mask_in_parent_frame
         )
+
+
+def test_only_stop_survivor_becomes_no_feasible_plan_bypass(base_config, nominal):
+    grid = build_grid_spec(base_config)
+    robot = base_config["robot"]
+    inflated_robot = inflate_footprint(
+        RectangleFootprint(
+            float(robot["length_m"]),
+            float(robot["width_m"]),
+        ),
+        float(robot["inflation_m"]),
+    )
+    static = np.ones((grid.height, grid.width), dtype=np.float32)
+    static[
+        rasterize_footprint(
+            inflated_robot,
+            np.zeros(3, dtype=np.float32),
+            grid,
+        )
+    ] = 0.0
+
+    result = generate_replanned_candidates(
+        post_action_pose=np.zeros(3, dtype=np.float32),
+        nominal_trajectory=nominal,
+        action_id="forward_peek",
+        config=base_config,
+        static_occupancy=static,
+        braking_deceleration_mps2=1.0,
+        max_candidates=8,
+    )
+
+    assert result.plan_status == POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN
+    assert result.candidates == ()
+    assert result.reject_available

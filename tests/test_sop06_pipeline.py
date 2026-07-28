@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import numpy as np
 import pytest
@@ -11,7 +11,10 @@ import src.generation.paired_variants as paired_variants_module
 from src.contracts import (
     SCHEMA_VERSION,
     HISTORY_CHANNELS,
+    POSE_TIME_LAYOUT_VERSION,
+    STATE_CHANNELS,
     BaseState,
+    LocalTrajectory,
     OracleContext,
     OracleWorld,
     build_grid_spec,
@@ -30,19 +33,43 @@ from src.generation.dynamic_object_transplant import (
     footprint_from_spec,
 )
 from src.generation.paired_variants import PairedEventGroup, PairedVariant
+from src.generation.paired_variants import (
+    resolve_sop06_trajectory_handoff,
+)
+from src.generation.sop05r_contracts import SOP05R_GENERATOR_VERSION
+from src.generation.sop05r_event_sampler import evaluate_obstacle_first_template
+from src.generation.sop05r_trajectory_store import (
+    load_sop05r_trajectory_store,
+    publish_sop05r_trajectory_store,
+)
 from src.generation.sop06_pipeline import render_sop06_variant
+from src.generation.sop06_pipeline import (
+    Sop06SingleFailureRecord,
+    Sop06SinglePublicationContext,
+    Sop06SingleRendererInput,
+    adapt_finalized_sop05_scenario,
+    adapt_seen_prior_result,
+    adapt_unseen_prior_realization,
+    build_sop06_single_risk_input,
+    coordinate_sop06_single_release,
+    render_sop06_single_publication,
+)
+from src.generation.sop05_seen_prior import SeenPriorResult
+from src.generation.sop05_unseen_prior import UnseenPriorRealization
 from src.generation.structural_blindspot import (
     StructuralBlindSpot,
     footprint_visibility_sequence,
     has_continuous_emergence,
 )
 from src.geometry import (
+    CircleFootprint,
     RectangleFootprint,
     rasterize_footprint,
     raycast_visibility,
     world_to_grid,
 )
 from src.utils.seeding import stable_digest
+from tests.test_sop05r_event_sampler import _fixture as sop05r_event_fixture
 
 
 TARGET_ID = "generated::human::sop06-pipeline"
@@ -62,7 +89,7 @@ def _config() -> dict[str, object]:
             "size": 9,
             "history_steps": 8,
             "history_dt_s": 0.2,
-            "future_steps": 15,
+            "future_steps": 32,
             "future_dt_s": 0.2,
         },
         "robot": {
@@ -225,6 +252,525 @@ def _inputs(
     }
 
 
+def _single_trajectory(grid) -> LocalTrajectory:
+    return LocalTrajectory(
+        trajectory_id="single-trajectory",
+        poses=np.zeros((grid.future_steps, 3), dtype=np.float32),
+        controls=np.zeros((grid.future_steps, 2), dtype=np.float32),
+        swept_mask=np.zeros((grid.height, grid.width), dtype=np.float32),
+        tta_map=np.full((grid.height, grid.width), -1.0, dtype=np.float32),
+        braking_map=np.zeros((grid.height, grid.width), dtype=np.float32),
+        centerline_map=np.zeros((grid.height, grid.width), dtype=np.float32),
+        task_cost=0.0,
+        metadata={"pose_time_layout_version": POSE_TIME_LAYOUT_VERSION},
+    )
+
+
+def _seen_prior_publication_context(
+    *,
+    suffix: str = "single",
+    mother_id: str = "seen-mother",
+) -> tuple[dict[str, object], Sop06SinglePublicationContext]:
+    inputs = _inputs(suffix=suffix)
+    record = inputs["record"]
+    world = inputs["world"]
+    base_state = inputs["base_state"]
+    config = inputs["config"]
+    assert isinstance(base_state, BaseState)
+    assert isinstance(config, dict)
+    grid = build_grid_spec(config)
+    return inputs, Sop06SinglePublicationContext(
+        sample_id=f"sop06-single-{suffix}",
+        mother_id=mother_id,
+        split="train",
+        base_state=base_state,
+        trajectory=_single_trajectory(grid),
+        oracle_world=world,
+        observed_static_occupancy=np.array(world.static_occupancy, copy=True),
+        scene_dynamic_history={
+            object_id: np.array(history, copy=True)
+            for object_id, history in base_state.visible_dynamic_object_history.items()
+        },
+        scene_dynamic_specs={
+            object_id: dict(spec)
+            for object_id, spec in base_state.visible_dynamic_object_specs.items()
+        },
+        hidden_object_ids=(TARGET_ID,),
+        sensor_config=None,
+        target_dynamic_object_id=record.target_dynamic_object_id,
+        target_footprint_spec=dict(record.footprint_spec),
+        target_history_observed=np.array(
+            [True, True, True, True, True, False, False, False],
+            dtype=np.bool_,
+        ),
+        provenance={"source_kind": "sop06-single-fixture"},
+    )
+
+
+def _seen_prior_result(inputs: dict[str, object], *, mother_id: str) -> SeenPriorResult:
+    record = inputs["record"]
+    assert hasattr(record, "history_poses")
+    return SeenPriorResult(
+        mother_id=mother_id,
+        history_poses=np.array(record.history_poses, copy=True),
+        current_pose=np.array(record.current_pose, copy=True),
+        future_poses=np.array(record.future_poses, copy=True),
+        theta_rad=0.0,
+        accepted_attempt=1,
+    )
+
+
+def test_persisted_final_adapter_keeps_a_target_out_of_renderer_history() -> None:
+    inputs, context = _seen_prior_publication_context(suffix="persisted-a")
+    record = inputs["record"]
+
+    publication = adapt_finalized_sop05_scenario(
+        context=context,
+        regime="unseen_in_history_window",
+        target_present=True,
+        history_poses=np.array(record.history_poses, copy=True),
+        future_poses=np.array(record.future_poses, copy=True),
+    )
+
+    target_id = context.target_dynamic_object_id
+    assert target_id not in publication.renderer_input.scene_dynamic_history
+    assert target_id not in publication.renderer_input.scene_dynamic_specs
+    np.testing.assert_array_equal(
+        publication.oracle_world.dynamic_object_trajectories[target_id],
+        record.future_poses,
+    )
+
+
+def test_persisted_final_adapter_uses_only_b_observed_history() -> None:
+    inputs, context = _seen_prior_publication_context(suffix="persisted-b")
+    record = inputs["record"]
+    observed = np.array(
+        [True, True, False, False, False, False, False, False],
+        dtype=np.bool_,
+    )
+    context = replace(context, target_history_observed=observed)
+
+    publication = adapt_finalized_sop05_scenario(
+        context=context,
+        regime="seen_then_occluded",
+        target_present=True,
+        history_poses=np.array(record.history_poses, copy=True),
+        future_poses=np.array(record.future_poses, copy=True),
+    )
+
+    target_id = context.target_dynamic_object_id
+    stored = publication.renderer_input.scene_dynamic_history[target_id]
+    np.testing.assert_array_equal(stored[2:], np.repeat(stored[1:2], 6, axis=0))
+    np.testing.assert_array_equal(
+        publication.renderer_input.scene_dynamic_history_observed[target_id],
+        observed,
+    )
+    with pytest.raises(ValueError, match="must contain a target"):
+        adapt_finalized_sop05_scenario(
+            context=context,
+            regime="seen_then_occluded",
+            target_present=False,
+            history_poses=np.array(record.history_poses, copy=True),
+            future_poses=np.array(record.future_poses, copy=True),
+        )
+
+
+def test_seen_prior_uses_generic_single_result_renderer_and_sop7_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+    from src.datasets.risk_dataset import build_risk_sample
+
+    inputs, context = _seen_prior_publication_context()
+    publication = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=context.mother_id),
+        context=context,
+    )
+    calls: list[dict[str, object]] = []
+
+    def guarded_renderer(base_state: BaseState, **kwargs: object):
+        assert base_state is publication.renderer_input.base_state
+        assert set(kwargs) == {
+            "scene_dynamic_history",
+            "scene_dynamic_specs",
+            "static_occupancy",
+            "sensor_config",
+            "config",
+            "scene_dynamic_history_observed",
+        }
+        assert not any(
+            token in key
+            for key in kwargs
+            for token in ("future", "oracle", "theta", "attempt", "risk")
+        )
+        calls.append(dict(kwargs))
+        return "model-safe-render"
+
+    monkeypatch.setattr(pipeline, "render_observation", guarded_renderer)
+    assert render_sop06_single_publication(
+        publication,
+        config=inputs["config"],
+    ) == "model-safe-render"
+    assert len(calls) == 1
+    assert all(
+        token not in field.name.lower()
+        for field in fields(Sop06SingleRendererInput)
+        for token in ("future", "oracle", "theta", "angle", "attempt", "risk")
+    )
+
+    risk_input = build_sop06_single_risk_input(publication)
+    assert risk_input.sample_id == publication.sample_id
+    assert risk_input.base_state.split == publication.split
+    assert risk_input.hidden_object_ids == (TARGET_ID,)
+    assert np.array_equal(
+        risk_input.scene_dynamic_history[TARGET_ID],
+        publication.renderer_input.scene_dynamic_history[TARGET_ID],
+    )
+    assert np.array_equal(
+        risk_input.scene_dynamic_history_observed[TARGET_ID],
+        context.target_history_observed,
+    )
+    assert np.array_equal(
+        risk_input.oracle_world.dynamic_object_trajectories[TARGET_ID],
+        _seen_prior_result(inputs, mother_id=context.mother_id).future_poses,
+    )
+
+    sample = build_risk_sample(
+        risk_input,
+        base_config=inputs["config"],
+        risk_config={
+            "sigma_distance_m": 0.5,
+            "sigma_time_s": 2.0,
+            "near_miss_distance_m": 0.35,
+        },
+    )
+    assert sample.sample_id == publication.sample_id
+    assert sample.split == publication.split
+    assert not any(
+        token in key.lower()
+        for key in sample.metadata
+        for token in ("future", "oracle", "theta", "angle", "attempt", "risk")
+    )
+
+
+def test_single_sop7_consumes_persisted_observation_without_rerender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.datasets.risk_dataset as risk_dataset
+
+    inputs, context = _seen_prior_publication_context(suffix="persisted-risk")
+    publication = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=context.mother_id),
+        context=context,
+    )
+    rendered = render_sop06_single_publication(
+        publication,
+        config=inputs["config"],
+    )
+    monkeypatch.setattr(
+        risk_dataset,
+        "render_observation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted SOP06 observation was rerendered")
+        ),
+    )
+
+    sample = risk_dataset.build_risk_sample(
+        build_sop06_single_risk_input(publication),
+        base_config=inputs["config"],
+        risk_config={
+            "sigma_distance_m": 0.5,
+            "sigma_time_s": 2.0,
+            "near_miss_distance_m": 0.35,
+        },
+        rendered_observation=rendered,
+    )
+
+    np.testing.assert_array_equal(sample.bev_history, rendered.bev_history)
+    np.testing.assert_array_equal(sample.state_channels, rendered.state_channels)
+
+
+@pytest.mark.parametrize("tampered_field", ("trajectory", "oracle_world"))
+def test_single_sop7_handoff_rejects_pre_long40_future(
+    tampered_field: str,
+) -> None:
+    inputs, context = _seen_prior_publication_context()
+    publication = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=context.mother_id),
+        context=context,
+    )
+    if tampered_field == "trajectory":
+        publication = replace(
+            publication,
+            trajectory=replace(
+                publication.trajectory,
+                poses=publication.trajectory.poses[:15].copy(),
+                controls=publication.trajectory.controls[:15].copy(),
+            ),
+        )
+    else:
+        trajectories = {
+            object_id: future.copy()
+            for object_id, future in publication.oracle_world.dynamic_object_trajectories.items()
+        }
+        trajectories[TARGET_ID] = trajectories[TARGET_ID][:15].copy()
+        publication = replace(
+            publication,
+            oracle_world=replace(
+                publication.oracle_world,
+                dynamic_object_trajectories=trajectories,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="32 future endpoints"):
+        build_sop06_single_risk_input(publication)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("history_steps", 7),
+        ("history_dt_s", 0.1),
+        ("future_steps", 15),
+        ("future_dt_s", 0.1),
+    ),
+)
+def test_single_sop7_risk_sample_rejects_non_long40_base_config(
+    field: str,
+    value: int | float,
+) -> None:
+    from src.datasets.risk_dataset import build_risk_sample
+
+    inputs, context = _seen_prior_publication_context()
+    publication = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=context.mother_id),
+        context=context,
+    )
+    config = {
+        **inputs["config"],
+        "bev": {**inputs["config"]["bev"], field: value},
+    }
+
+    with pytest.raises(ValueError, match=rf"base_config\.bev\.{field} must equal"):
+        build_risk_sample(
+            build_sop06_single_risk_input(publication),
+            base_config=config,
+            risk_config={
+                "sigma_distance_m": 0.5,
+                "sigma_time_s": 2.0,
+                "near_miss_distance_m": 0.35,
+            },
+        )
+
+
+def test_seen_prior_keeps_h7_visible_for_model_input() -> None:
+    inputs, context = _seen_prior_publication_context()
+    observed = np.array(
+        [True, True, False, False, False, False, False, True],
+        dtype=np.bool_,
+    )
+    context = replace(context, target_history_observed=observed)
+    result = _seen_prior_result(inputs, mother_id=context.mother_id)
+
+    publication = adapt_seen_prior_result(result, context=context)
+
+    published_observed = publication.renderer_input.scene_dynamic_history_observed[
+        TARGET_ID
+    ]
+    published_history = publication.renderer_input.scene_dynamic_history[TARGET_ID]
+    np.testing.assert_array_equal(published_observed, observed)
+    assert bool(published_observed[7])
+    np.testing.assert_array_equal(published_history[7], result.history_poses[7])
+
+
+@pytest.mark.parametrize("unsafe_field", ("scene_dynamic_specs", "target_footprint_spec"))
+def test_single_publication_rejects_oracle_fields_in_dynamic_specs(
+    unsafe_field: str,
+) -> None:
+    inputs, context = _seen_prior_publication_context()
+    if unsafe_field == "scene_dynamic_specs":
+        specs = {
+            object_id: dict(spec)
+            for object_id, spec in context.scene_dynamic_specs.items()
+        }
+        specs[CONTEXT_ID]["oracle_future"] = [0.0]
+        context = replace(context, scene_dynamic_specs=specs)
+    else:
+        target_spec = dict(context.target_footprint_spec)
+        target_spec["future_angle"] = 0.0
+        context = replace(context, target_footprint_spec=target_spec)
+
+    with pytest.raises(ValueError, match="oracle-only information"):
+        adapt_seen_prior_result(
+            _seen_prior_result(inputs, mother_id=context.mother_id),
+            context=context,
+        )
+
+
+def test_single_renderer_rejects_oracle_fields_in_tampered_dynamic_specs() -> None:
+    inputs, context = _seen_prior_publication_context()
+    publication = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=context.mother_id),
+        context=context,
+    )
+    specs = {
+        object_id: dict(spec)
+        for object_id, spec in publication.renderer_input.scene_dynamic_specs.items()
+    }
+    specs[CONTEXT_ID]["oracle_future"] = [0.0]
+    tampered_input = replace(publication.renderer_input, scene_dynamic_specs=specs)
+
+    with pytest.raises(ValueError, match="oracle-only information"):
+        render_sop06_single_publication(
+            replace(publication, renderer_input=tampered_input),
+            config=inputs["config"],
+        )
+
+
+def test_seen_prior_hidden_suffix_cannot_change_model_visible_bev() -> None:
+    inputs, context = _seen_prior_publication_context()
+    result = _seen_prior_result(inputs, mother_id=context.mother_id)
+    publication = adapt_seen_prior_result(result, context=context)
+    observed = publication.renderer_input.scene_dynamic_history_observed[TARGET_ID]
+    safe_history = publication.renderer_input.scene_dynamic_history[TARGET_ID]
+
+    np.testing.assert_array_equal(observed, context.target_history_observed)
+    np.testing.assert_array_equal(
+        safe_history[~observed],
+        np.repeat(safe_history[4:5], 3, axis=0),
+    )
+
+    drifted_history = np.array(result.history_poses, copy=True)
+    drifted_history[5:, 0] += np.float32(4.0)
+    drifted_history[5:, 1] -= np.float32(3.0)
+    drifted = replace(
+        result,
+        history_poses=drifted_history,
+        current_pose=drifted_history[-1].copy(),
+    )
+    drifted_publication = adapt_seen_prior_result(drifted, context=context)
+    np.testing.assert_array_equal(
+        drifted_publication.renderer_input.scene_dynamic_history[TARGET_ID],
+        safe_history,
+    )
+
+    rendered = render_sop06_single_publication(
+        publication,
+        config=inputs["config"],
+    )
+    drifted_rendered = render_sop06_single_publication(
+        drifted_publication,
+        config=inputs["config"],
+    )
+    np.testing.assert_array_equal(rendered.bev_history, drifted_rendered.bev_history)
+    np.testing.assert_array_equal(
+        rendered.state_channels,
+        drifted_rendered.state_channels,
+    )
+
+    background_input = replace(
+        publication.renderer_input,
+        scene_dynamic_history={
+            object_id: history
+            for object_id, history in publication.renderer_input.scene_dynamic_history.items()
+            if object_id != TARGET_ID
+        },
+        scene_dynamic_specs={
+            object_id: spec
+            for object_id, spec in publication.renderer_input.scene_dynamic_specs.items()
+            if object_id != TARGET_ID
+        },
+        scene_dynamic_history_observed={
+            object_id: mask
+            for object_id, mask in (
+                publication.renderer_input.scene_dynamic_history_observed.items()
+            )
+            if object_id != TARGET_ID
+        },
+    )
+    background = render_sop06_single_publication(
+        replace(publication, renderer_input=background_input),
+        config=inputs["config"],
+    )
+    dynamic_index = HISTORY_CHANNELS.index("past_dynamic_occupancy")
+    visible_index = HISTORY_CHANNELS.index("past_visible_mask")
+    np.testing.assert_array_equal(
+        rendered.bev_history[~observed][:, dynamic_index],
+        background.bev_history[~observed][:, dynamic_index],
+    )
+    np.testing.assert_array_equal(
+        rendered.bev_history[~observed][:, visible_index],
+        background.bev_history[~observed][:, visible_index],
+    )
+    for channel in (
+        "current_visible_free",
+        "current_visible_occupied",
+        "current_unobservable_mask",
+    ):
+        index = STATE_CHANNELS.index(channel)
+        np.testing.assert_array_equal(
+            rendered.state_channels[index],
+            background.state_channels[index],
+        )
+
+
+def test_seen_prior_combined_coordinator_preserves_one_to_one_identity_and_cap() -> None:
+    inputs, seen_context = _seen_prior_publication_context(
+        suffix="seen",
+        mother_id="seen-mother",
+    )
+    seen = adapt_seen_prior_result(
+        _seen_prior_result(inputs, mother_id=seen_context.mother_id),
+        context=seen_context,
+    )
+    _, unseen_context = _seen_prior_publication_context(
+        suffix="unseen",
+        mother_id="unseen-mother",
+    )
+    grid = build_grid_spec(inputs["config"])
+    unseen = adapt_unseen_prior_realization(
+        UnseenPriorRealization(
+            mother_id=unseen_context.mother_id,
+            split=unseen_context.split,
+            grid=grid,
+            robot_footprint=CircleFootprint(0.1),
+            robot_history=np.zeros((8, 3), dtype=np.float32),
+            static_occupancy=np.zeros((grid.height, grid.width), dtype=np.float32),
+            occluder_occupancy=np.zeros((grid.height, grid.width), dtype=np.float32),
+            context_obstacles=(),
+            sensor_config=None,
+            target_motion=None,
+        ),
+        context=unseen_context,
+    )
+    failure = Sop06SingleFailureRecord(
+        mother_id="failed-mother",
+        split="train",
+        regime="seen_then_occluded",
+        reason="no_legal_future",
+    )
+
+    release = coordinate_sop06_single_release(
+        (unseen, seen),
+        failures=(failure,),
+    )
+
+    assert [entry.mother_id for entry in release.entries] == [
+        "seen-mother",
+        "unseen-mother",
+    ]
+    assert release.accepted_counts == {
+        "seen_then_occluded": 1,
+        "unseen_in_history_window": 1,
+    }
+    assert release.failed_counts == {"seen_then_occluded": 1}
+    assert len({entry.sample_id for entry in release.entries}) == 2
+    with pytest.raises(ValueError, match="one-to-one"):
+        coordinate_sop06_single_release((seen, seen))
+    with pytest.raises(ValueError, match="not filled"):
+        coordinate_sop06_single_release((seen, unseen), requested_prefix_size=50000)
+
+
 def test_present_variant_uses_only_history_at_the_core_renderer_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,6 +853,95 @@ def test_mother_entry_always_includes_target_and_independently_rerenders(
     assert not np.shares_memory(first.bev_history, second.bev_history)
 
 
+def test_sop05r_consumer_requires_authenticated_trajectory_handoff(
+    tmp_path,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    base_config, config, base_state, context, template, _ = sop05r_event_fixture()
+    evaluation = evaluate_obstacle_first_template(
+        template=template,
+        base_state=base_state,
+        oracle_context=context,
+        base_config=base_config,
+        config=config,
+        seed=31,
+    )
+    assert evaluation.mother is not None
+    mother = evaluation.mother
+    root = tmp_path / "sop05r-trajectories"
+    publish_sop05r_trajectory_store(
+        root,
+        (mother.trajectory_record,),
+        base_config=base_config,
+    )
+    handoff = resolve_sop06_trajectory_handoff(
+        mother_event=mother.event,
+        sop05r_trajectory_store=load_sop05r_trajectory_store(root),
+    )
+
+    rendered = pipeline.render_sop06_mother_event(
+        record=mother.event.target_motion_record,
+        world=mother.event.world,
+        base_state=base_state,
+        oracle_context=context,
+        config=base_config,
+        trajectory_handoff=handoff,
+    )
+
+    assert rendered.bev_history.shape[0] == base_config["bev"]["history_steps"]
+    with pytest.raises(ValueError, match="trajectory handoff"):
+        pipeline.render_sop06_mother_event(
+            record=mother.event.target_motion_record,
+            world=mother.event.world,
+            base_state=base_state,
+            oracle_context=context,
+            config=base_config,
+        )
+
+
+def test_sop05r_consumer_rejects_visible_prefix_drift_but_allows_hidden_fork() -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs = _inputs()
+    metadata = dict(inputs["world"].metadata)
+    metadata.pop("joint_pair_generator_algorithm_version", None)
+    metadata.update(
+        {
+            "generator_algorithm_version": SOP05R_GENERATOR_VERSION,
+            "target_history_last_visible_index": 4,
+        }
+    )
+    mother_world = replace(inputs["world"], metadata=metadata)
+    variant = _paired_variant({**inputs, "world": mother_world}, empty=False)
+    assert variant.target is not None
+
+    hidden_fork = variant.target.history_poses.copy()
+    hidden_fork[5:, 1] += np.float32(0.25)
+    pipeline.validate_sop05r_paired_target_prefix(
+        inputs["record"],
+        mother_world,
+        replace(
+            variant.target,
+            history_poses=hidden_fork,
+            current_pose=hidden_fork[-1].copy(),
+        ),
+    )
+
+    visible_drift = hidden_fork.copy()
+    visible_drift[4, 0] += np.float32(0.25)
+    with pytest.raises(ValueError, match="visible history prefix"):
+        pipeline.validate_sop05r_paired_target_prefix(
+            inputs["record"],
+            mother_world,
+            replace(
+                variant.target,
+                history_poses=visible_drift,
+                current_pose=visible_drift[-1].copy(),
+            ),
+        )
+
+
 def test_pipeline_recovers_structural_sensor_and_passes_world_occupancy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,6 +971,33 @@ def test_pipeline_recovers_structural_sensor_and_passes_world_occupancy(
         rendered.state_channels,
         inputs["world"].static_occupancy,
     )
+
+
+def test_pipeline_sensor_override_preserves_world_validation_and_changes_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.generation.sop06_pipeline as pipeline
+
+    inputs = _inputs(
+        structural={
+            "forward_fov_deg": 180.0,
+            "range_m": 4.0,
+            "blind_sectors": [],
+        }
+    )
+    override = StructuralBlindSpot(forward_fov_deg=360.0, range_m=4.0)
+    real_renderer = pipeline.render_observation
+    captured: dict[str, object] = {}
+
+    def recording_renderer(base_state: BaseState, **kwargs: object):
+        captured.update(kwargs)
+        return real_renderer(base_state, **kwargs)
+
+    monkeypatch.setattr(pipeline, "render_observation", recording_renderer)
+    render_sop06_variant(**inputs, sensor_config_override=override)
+
+    assert captured["sensor_config"] is override
+    assert captured["static_occupancy"] is inputs["world"].static_occupancy
 
 
 def test_mother_entry_rejects_target_present_switch() -> None:
@@ -583,7 +1245,7 @@ def _paired_variant(
         target_visibility_history=history_visibility,
         visibility_sequence=visibility_sequence,
         clearance_sequence_m=(
-            None if empty else np.zeros(15, dtype=np.float32)
+            None if empty else np.zeros(32, dtype=np.float32)
         ),
         min_clearance_m=None if empty else -0.1,
         time_to_min_clearance_s=None if empty else 1.0,
@@ -1985,7 +2647,7 @@ def test_pipeline_rejects_paired_target_without_continuous_emergence() -> None:
 
     inputs = _inputs()
     variant = _paired_variant(inputs, empty=False)
-    sequence = np.zeros(16, dtype=bool)
+    sequence = np.zeros(33, dtype=bool)
     metadata = dict(variant.world.metadata)
     metadata["visibility_sequence"] = [bool(value) for value in sequence]
     variant = replace(
@@ -2011,7 +2673,7 @@ def test_pipeline_rejects_paired_target_not_visible_at_final_frame() -> None:
 
     inputs = _inputs()
     variant = _paired_variant(inputs, empty=False)
-    sequence = np.zeros(16, dtype=bool)
+    sequence = np.zeros(33, dtype=bool)
     sequence[1:3] = True
     metadata = dict(variant.world.metadata)
     metadata["visibility_sequence"] = [bool(value) for value in sequence]

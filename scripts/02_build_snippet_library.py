@@ -80,7 +80,7 @@ def main() -> int:
         type=Path,
         default=_ROOT / "outputs/snippets",
     )
-    parser.add_argument("--duration-s", type=float, default=4.4)
+    parser.add_argument("--duration-s", type=float, default=7.8)
     parser.add_argument("--stride-s", type=float, default=1.0)
     parser.add_argument("--workers", type=_positive_integer, default=8)
     args = parser.parse_args()

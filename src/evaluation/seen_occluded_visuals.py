@@ -62,6 +62,17 @@ class VisualAuditBundle:
     grid: GridSpec
     robot_length_m: float = 0.7
     robot_width_m: float = 0.55
+    source_static_occupancy: np.ndarray | None = None
+    planner_routes_world: tuple[np.ndarray, ...] = ()
+    planner_slot_ids: tuple[str, ...] = ()
+    planner_trajectory_ids: tuple[str, ...] = ()
+    nominal_trajectory_id: str | None = None
+    alternative_trajectory_ids: tuple[str, ...] = ()
+    shared_goal_world_pose: np.ndarray | None = None
+    conflict_point: np.ndarray | None = None
+    inflated_obstacle_margin_m: float = 0.0
+    verification_action_id: str | None = None
+    verification_trace: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -156,8 +167,8 @@ def _validate_bundle(bundle: VisualAuditBundle) -> None:
         raise ValueError("event_id must be non-empty")
     if not isinstance(bundle.grid, GridSpec):
         raise TypeError("grid must be a GridSpec")
-    if bundle.grid.history_steps != 8 or bundle.grid.future_steps != 15:
-        raise ValueError("visual audit requires history=8 and future=15")
+    if bundle.grid.history_steps != 8 or bundle.grid.future_steps != 32:
+        raise ValueError("visual audit requires history=8 and future=32")
     validate_base_state(bundle.base_state, bundle.grid)
     validate_oracle_context(bundle.oracle_context, bundle.grid)
     if bundle.oracle_context.base_state_id != bundle.base_state.state_id:
@@ -165,7 +176,7 @@ def _validate_bundle(bundle: VisualAuditBundle) -> None:
     _pose_array(
         bundle.trajectory.poses,
         name="trajectory.poses",
-        expected_steps=15,
+        expected_steps=32,
     )
     static = np.asarray(bundle.static_occupancy)
     if static.shape != (bundle.grid.height, bundle.grid.width):
@@ -181,6 +192,56 @@ def _validate_bundle(bundle: VisualAuditBundle) -> None:
         or bundle.robot_width_m <= 0.0
     ):
         raise ValueError("robot dimensions must be positive finite values")
+    if bundle.source_static_occupancy is not None:
+        source_static = np.asarray(bundle.source_static_occupancy)
+        if (
+            source_static.shape != (bundle.grid.height, bundle.grid.width)
+            or source_static.dtype.kind not in "biuf"
+            or not np.isfinite(source_static).all()
+        ):
+            raise ValueError("source_static_occupancy violates the grid contract")
+    route_count = len(bundle.planner_routes_world)
+    if not (
+        route_count
+        == len(bundle.planner_slot_ids)
+        == len(bundle.planner_trajectory_ids)
+    ):
+        raise ValueError("planner route visual identities must align")
+    for route in bundle.planner_routes_world:
+        _pose_array(route, name="planner_routes_world", expected_steps=15)
+    if route_count:
+        if bundle.nominal_trajectory_id not in bundle.planner_trajectory_ids:
+            raise ValueError("visual nominal trajectory is not a planner route")
+        if any(
+            trajectory_id not in bundle.planner_trajectory_ids
+            for trajectory_id in bundle.alternative_trajectory_ids
+        ):
+            raise ValueError("visual alternative trajectory is not a planner route")
+    if bundle.shared_goal_world_pose is not None:
+        goal = np.asarray(bundle.shared_goal_world_pose)
+        if goal.shape != (3,) or not np.isfinite(goal).all():
+            raise ValueError("shared_goal_world_pose must be a finite pose")
+    if bundle.conflict_point is not None:
+        conflict = np.asarray(bundle.conflict_point)
+        if conflict.shape != (2,) or not np.isfinite(conflict).all():
+            raise ValueError("conflict_point must be a finite point")
+    if not np.isfinite(bundle.inflated_obstacle_margin_m) or (
+        bundle.inflated_obstacle_margin_m < 0.0
+    ):
+        raise ValueError("inflated_obstacle_margin_m must be finite and nonnegative")
+    if bundle.verification_trace is not None:
+        trace = np.asarray(bundle.verification_trace)
+        if (
+            trace.ndim != 2
+            or trace.shape[0] < 2
+            or trace.shape[1] != 3
+            or not np.isfinite(trace).all()
+        ):
+            raise ValueError("verification_trace must be finite [N, 3]")
+        if not isinstance(bundle.verification_action_id, str) or not (
+            bundle.verification_action_id
+        ):
+            raise ValueError("verification trace requires an action ID")
     for index, variant in enumerate(bundle.variants):
         _validate_variant(variant, index=index)
     collision_visibility = bundle.variants[0].visibility_history
@@ -372,6 +433,13 @@ def _rectangle_corners(
 
 def _axis_limits(bundle: VisualAuditBundle) -> tuple[float, float, float, float]:
     points = [np.zeros((1, 2), dtype=np.float32), bundle.trajectory.poses[:, :2]]
+    points.extend(route[:, :2] for route in bundle.planner_routes_world)
+    if bundle.shared_goal_world_pose is not None:
+        points.append(np.asarray(bundle.shared_goal_world_pose[:2]).reshape(1, 2))
+    if bundle.conflict_point is not None:
+        points.append(np.asarray(bundle.conflict_point).reshape(1, 2))
+    if bundle.verification_trace is not None:
+        points.append(np.asarray(bundle.verification_trace[:, :2]))
     for variant in bundle.variants:
         if variant.target_history is not None:
             points.extend(
@@ -430,14 +498,26 @@ def _draw_background(ax, bundle: VisualAuditBundle, visibility: np.ndarray) -> N
     ax.imshow(
         _mask_rgba(
             np.asarray(bundle.static_occupancy != 0, dtype=np.bool_),
-            (0.20, 0.22, 0.24),
-            0.88,
+            (0.38, 0.40, 0.42),
+            0.62,
         ),
         origin="lower",
         extent=extent,
         interpolation="nearest",
         zorder=2,
     )
+    if bundle.source_static_occupancy is not None:
+        ax.imshow(
+            _mask_rgba(
+                np.asarray(bundle.source_static_occupancy != 0, dtype=np.bool_),
+                (0.17, 0.19, 0.21),
+                0.92,
+            ),
+            origin="lower",
+            extent=extent,
+            interpolation="nearest",
+            zorder=3,
+        )
 
 
 def _draw_occluders(ax, bundle: VisualAuditBundle, Polygon) -> None:
@@ -491,17 +571,111 @@ def _draw_robot(ax, bundle: VisualAuditBundle, pose: np.ndarray, Polygon) -> Non
 def _draw_common(ax, bundle: VisualAuditBundle, visibility: np.ndarray, Polygon) -> None:
     _draw_background(ax, bundle, visibility)
     _draw_occluders(ax, bundle, Polygon)
-    candidate = np.vstack(
-        (np.zeros((1, 3), dtype=np.float32), bundle.trajectory.poses)
-    )
-    ax.plot(
-        candidate[:, 0],
-        candidate[:, 1],
-        color="#008a8a",
-        linewidth=4.2,
-        solid_capstyle="round",
-        zorder=8,
-    )
+    if bundle.inflated_obstacle_margin_m > 0.0:
+        for occluder in bundle.occluders:
+            pose = np.asarray(occluder["pose"], dtype=np.float64)
+            corners = _rectangle_corners(
+                pose,
+                length_m=float(occluder["length_m"])
+                + 2.0 * bundle.inflated_obstacle_margin_m,
+                width_m=float(occluder["width_m"])
+                + 2.0 * bundle.inflated_obstacle_margin_m,
+            )
+            ax.add_patch(
+                Polygon(
+                    corners,
+                    closed=True,
+                    fill=False,
+                    edgecolor="#d55e00",
+                    linestyle="--",
+                    linewidth=2.0,
+                    zorder=7,
+                )
+            )
+    if bundle.planner_routes_world:
+        start = bundle.base_state.robot_history[-1].reshape(1, 3)
+        for route, trajectory_id in zip(
+            bundle.planner_routes_world,
+            bundle.planner_trajectory_ids,
+            strict=True,
+        ):
+            path = np.vstack((start, route))
+            is_nominal = trajectory_id == bundle.nominal_trajectory_id
+            is_alternative = trajectory_id in bundle.alternative_trajectory_ids
+            ax.plot(
+                path[:, 0],
+                path[:, 1],
+                color=(
+                    "#008a8a"
+                    if is_nominal
+                    else "#009e73" if is_alternative else "#6f7780"
+                ),
+                linewidth=4.2 if is_nominal else 1.8,
+                alpha=1.0 if is_nominal else 0.82,
+                solid_capstyle="round",
+                zorder=8 if is_nominal else 6,
+            )
+    else:
+        candidate = np.vstack(
+            (np.zeros((1, 3), dtype=np.float32), bundle.trajectory.poses)
+        )
+        ax.plot(
+            candidate[:, 0],
+            candidate[:, 1],
+            color="#008a8a",
+            linewidth=4.2,
+            solid_capstyle="round",
+            zorder=8,
+        )
+    if bundle.shared_goal_world_pose is not None:
+        ax.scatter(
+            [bundle.shared_goal_world_pose[0]],
+            [bundle.shared_goal_world_pose[1]],
+            marker="*",
+            s=180,
+            color="#0072b2",
+            edgecolor="white",
+            linewidth=1.0,
+            zorder=12,
+        )
+    if bundle.conflict_point is not None:
+        ax.scatter(
+            [bundle.conflict_point[0]],
+            [bundle.conflict_point[1]],
+            marker="X",
+            s=110,
+            color="#d55e00",
+            edgecolor="white",
+            linewidth=0.9,
+            zorder=12,
+        )
+    if bundle.verification_trace is not None:
+        ax.plot(
+            bundle.verification_trace[:, 0],
+            bundle.verification_trace[:, 1],
+            color="#e69f00",
+            linestyle="-.",
+            linewidth=2.8,
+            zorder=11,
+        )
+
+
+def _sop05r_layer_metadata(bundle: VisualAuditBundle) -> dict[str, object]:
+    return {
+        "source_static_map_rendered": bundle.source_static_occupancy is not None,
+        "generated_obstacle_rendered": bool(bundle.occluders),
+        "inflated_obstacle_boundary_rendered": (
+            bundle.inflated_obstacle_margin_m > 0.0
+        ),
+        "shared_goal_rendered": bundle.shared_goal_world_pose is not None,
+        "conflict_point_rendered": bundle.conflict_point is not None,
+        "planner_route_count": len(bundle.planner_routes_world),
+        "planner_slot_ids": list(bundle.planner_slot_ids),
+        "nominal_trajectory_id": bundle.nominal_trajectory_id,
+        "alternative_trajectory_ids": list(bundle.alternative_trajectory_ids),
+        "verification_action_id": bundle.verification_action_id,
+        "verification_trace_rendered": bundle.verification_trace is not None,
+    }
 
 
 def _draw_context_history(
@@ -785,6 +959,7 @@ def _render_replay(
         "context_future_rendering": "oracle_only_animated",
         "bytes": path.stat().st_size,
         "sha256": _sha256_file(path),
+        **_sop05r_layer_metadata(bundle),
     }
 
 
@@ -908,6 +1083,7 @@ def _render_paired(
         "shared_axes": [float(value) for value in limits],
         "bytes": path.stat().st_size,
         "sha256": _sha256_file(path),
+        **_sop05r_layer_metadata(bundle),
     }
 
 

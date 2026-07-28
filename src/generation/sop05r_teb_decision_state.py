@@ -310,8 +310,17 @@ def build_teb_decision_state(
             teb_config.occlusion.minimum_occluded_history_frames
         ),
     )
-    if not history_assessment.eligible:
-        raise ValueError("decision history does not satisfy the frozen visibility rule")
+    placement_selection_mode = str(
+        placement.provenance.get("placement_selection_mode", "seen_first")
+    )
+    if placement_selection_mode == "h0_hidden":
+        if 0 not in history_assessment.blocked_indices:
+            raise ValueError("h0_hidden decision history must be initially blocked")
+    elif placement_selection_mode == "seen_first":
+        if not history_assessment.eligible:
+            raise ValueError("decision history does not satisfy the frozen visibility rule")
+    else:
+        raise ValueError("decision history uses an unknown placement selection mode")
     if (
         history_assessment.observed_class
         != placement_result.visibility.observed_class
@@ -530,7 +539,8 @@ def build_teb_decision_state(
             "occlusion_witness_sample_index": witness.sample_index,
             "route_prefix_end_time_s": decision_time_s,
             "visible_history_frames": history_assessment.visible_frames,
-                "occluded_history_frames": history_assessment.occluded_frames,
+            "occluded_history_frames": history_assessment.occluded_frames,
+            "placement_selection_mode": placement_selection_mode,
             "decision_visible": target_currently_visible,
             "dropped_dynamic_object_ids": dropped_dynamic_object_ids,
             "dropped_dynamic_object_reason": (

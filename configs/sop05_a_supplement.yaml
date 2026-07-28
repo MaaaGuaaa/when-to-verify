@@ -1,0 +1,28 @@
+version: sop05_a_supplement_v1
+sampling_origin: targeted_a_supplement
+present_angle_distribution: uniform_half_open_pi_v1
+present_max_attempts_per_mother: 256
+final_sampling_seed: 20260727
+source_generation_seeds:
+  train: 2026072701
+  calibration: 2026072702
+  val: 2026072703
+  test: 2026072704
+source_mother_quotas:
+  train: 23000
+  calibration: 3000
+  val: 3000
+  test: 3000
+quotas:
+  train:
+    accepted: 16531
+    present: 2859
+  calibration:
+    accepted: 2221
+    present: 383
+  val:
+    accepted: 2049
+    present: 382
+  test:
+    accepted: 2073
+    present: 384

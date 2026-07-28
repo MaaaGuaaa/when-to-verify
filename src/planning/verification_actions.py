@@ -25,22 +25,22 @@ from src.planning.differential_drive import (
 )
 
 
-ACTION_LIBRARY_VERSION = "verification_actions_v2"
+ACTION_LIBRARY_VERSION = "verification_actions_v3"
 CANONICAL_ACTION_IDS = (
-    "arc_left_10",
-    "arc_right_10",
-    "arc_left_20",
-    "arc_right_20",
+    "arc_left_30",
+    "arc_right_30",
+    "arc_left_45",
+    "arc_right_45",
     "forward_peek",
     "stop_scan",
 )
-_EXPECTED_DELTAS = {
-    "arc_left_10": (0.25, 10.0),
-    "arc_right_10": (0.25, -10.0),
-    "arc_left_20": (0.40, 20.0),
-    "arc_right_20": (0.40, -20.0),
-    "forward_peek": (0.30, 0.0),
-    "stop_scan": (0.0, 0.0),
+_EXPECTED_PARAMETERS = {
+    "arc_left_30": (0.80, 0.45, 30.0),
+    "arc_right_30": (0.80, 0.45, -30.0),
+    "arc_left_45": (1.00, 0.60, 45.0),
+    "arc_right_45": (1.00, 0.60, -45.0),
+    "forward_peek": (0.80, 0.30, 0.0),
+    "stop_scan": (0.60, 0.0, 0.0),
 }
 _TOP_LEVEL_KEYS = frozenset(
     {"schema_version", "library_version", "sensor_fov_deg", "actions"}
@@ -184,7 +184,7 @@ def load_verification_actions(path: str | Path) -> VerificationActionLibrary:
     if sensor_fov_deg <= 0.0 or sensor_fov_deg > 360.0:
         raise ValueError("sensor_fov_deg must be in (0, 360]")
     if not np.isclose(sensor_fov_deg, 360.0, rtol=0.0, atol=1e-12):
-        raise ValueError("verification_actions_v2 requires sensor_fov_deg=360")
+        raise ValueError("verification_actions_v3 requires sensor_fov_deg=360")
     rows = raw["actions"]
     if not isinstance(rows, list) or any(
         not isinstance(row, dict) or set(row) != _ACTION_KEYS for row in rows
@@ -197,19 +197,34 @@ def load_verification_actions(path: str | Path) -> VerificationActionLibrary:
     actions: list[VerificationAction] = []
     for row in rows:
         action_id = row["action_id"]
-        expected_forward, expected_yaw_deg = _EXPECTED_DELTAS[action_id]
+        expected_duration, expected_forward, expected_yaw_deg = (
+            _EXPECTED_PARAMETERS[action_id]
+        )
+        duration = _finite_real(
+            row["duration_s"], name=f"{action_id}.duration_s"
+        )
         forward = _finite_real(
             row["delta_forward_m"], name=f"{action_id}.delta_forward_m"
         )
         yaw_deg = _finite_real(row["delta_yaw_deg"], name=f"{action_id}.delta_yaw_deg")
-        if not np.isclose(forward, expected_forward, rtol=0.0, atol=1e-12) or not np.isclose(
-            yaw_deg, expected_yaw_deg, rtol=0.0, atol=1e-12
+        if (
+            not np.isclose(
+                duration, expected_duration, rtol=0.0, atol=1e-12
+            )
+            or not np.isclose(
+                forward, expected_forward, rtol=0.0, atol=1e-12
+            )
+            or not np.isclose(
+                yaw_deg, expected_yaw_deg, rtol=0.0, atol=1e-12
+            )
         ):
-            raise ValueError(f"{action_id} delta differs from the frozen action")
+            raise ValueError(
+                f"{action_id} parameters differ from the frozen action"
+            )
         actions.append(
             VerificationAction(
                 action_id=action_id,
-                duration_s=row["duration_s"],
+                duration_s=duration,
                 delta_forward_m=forward,
                 delta_yaw_rad=np.deg2rad(yaw_deg),
             )

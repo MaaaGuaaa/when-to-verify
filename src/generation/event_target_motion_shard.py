@@ -14,6 +14,7 @@ import tempfile
 from copy import deepcopy
 from dataclasses import dataclass, fields
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -145,7 +146,7 @@ _WORLD_METADATA_KEYS = frozenset(
 )
 
 
-class _FrozenDict(dict[str, object]):
+class _FrozenDict(dict):
     """JSON-serializable dict whose identity content cannot be mutated."""
 
     @staticmethod
@@ -203,6 +204,106 @@ class LoadedEventTargetMotionShard:
     manifest_digest: str
     payload_semantic_digest: str
     summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class EventTargetMotionSelectionReader:
+    """Authenticated target-motion metadata with on-demand OracleWorld loading.
+
+    The history/current/future arrays are small enough to retain in memory. Oracle
+    worlds are deliberately decoded only for explicitly requested event IDs.
+    """
+
+    root: Path
+    rows_by_event_id: Mapping[str, Mapping[str, object]]
+    history_poses: np.ndarray
+    current_poses: np.ndarray
+    future_poses: np.ndarray
+    manifest_digest: str
+    payload_semantic_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "rows_by_event_id",
+            MappingProxyType(
+                {
+                    event_id: MappingProxyType(dict(row))
+                    for event_id, row in self.rows_by_event_id.items()
+                }
+            ),
+        )
+
+    def load_records_and_worlds(
+        self,
+        event_ids: Sequence[str],
+        *,
+        grid: GridSpec,
+    ) -> tuple[tuple[EventTargetMotionRecord, OracleWorld], ...]:
+        """Materialize only the requested records and their OracleWorld files."""
+
+        requested = tuple(event_ids)
+        if not requested or any(
+            not isinstance(event_id, str) or not event_id for event_id in requested
+        ):
+            raise ValueError("selected target-motion event IDs are invalid")
+        if len(set(requested)) != len(requested):
+            raise ValueError("selected target-motion event IDs are not unique")
+        results: list[tuple[EventTargetMotionRecord, OracleWorld]] = []
+        world_root = (self.root / _WORLD_DIRECTORY).resolve()
+        for event_id in requested:
+            row = self.rows_by_event_id.get(event_id)
+            if row is None:
+                raise ValueError("selected target-motion event is missing")
+            row_index = row["row_index"]
+            if not isinstance(row_index, int) or isinstance(row_index, bool):
+                raise ValueError("selected target-motion row index is invalid")
+            record = create_event_target_motion_record(
+                generated_event_id=str(row["generated_event_id"]),
+                world_id=str(row["world_id"]),
+                base_state_id=str(row["base_state_id"]),
+                trajectory_id=str(row["trajectory_id"]),
+                target_dynamic_object_id=str(row["target_dynamic_object_id"]),
+                source_snippet_id=str(row["source_snippet_id"]),
+                source_object_id=str(row["source_object_id"]),
+                object_type=str(row["object_type"]),
+                footprint_spec=dict(row["footprint_spec"]),
+                footprint_spec_digest=str(row["footprint_spec_digest"]),
+                target_type_policy_digest=str(row["target_type_policy_digest"]),
+                history_poses=self.history_poses[row_index],
+                current_pose=self.current_poses[row_index],
+                future_poses=self.future_poses[row_index],
+            )
+            for name in (
+                "history_array_digest",
+                "future_array_digest",
+                "record_digest",
+            ):
+                if getattr(record, name) != row[name]:
+                    raise ValueError(f"selected target-motion {name} mismatch")
+            expected_world_file = (
+                f"{_WORLD_DIRECTORY}/{_safe_world_filename(record.world_id)}"
+            )
+            if row["world_file"] != expected_world_file:
+                raise ValueError("selected target-motion world filename mismatch")
+            world_path = (self.root / str(row["world_file"])).resolve()
+            try:
+                world_path.relative_to(world_root)
+            except ValueError as exc:
+                raise ValueError("selected target-motion world path escapes root") from exc
+            try:
+                world = load_dataclass(world_path)
+            except Exception as exc:
+                raise ValueError(
+                    f"invalid OracleWorld file for {record.world_id}"
+                ) from exc
+            if not isinstance(world, OracleWorld):
+                raise ValueError("world artifact did not decode to OracleWorld")
+            if compute_oracle_world_semantic_digest(world) != row["world_semantic_digest"]:
+                raise ValueError("selected target-motion world_semantic_digest mismatch")
+            validate_event_target_motion_world_join(record, world, grid)
+            results.append((record, world))
+        return tuple(results)
 
 
 @dataclass(frozen=True)
@@ -1134,6 +1235,164 @@ def _validate_expected_id_set(
         raise TypeError(f"expected_{name}s must be a set of non-empty strings")
     if actual != set(expected):
         raise ValueError(f"{name} set mismatch")
+
+
+def _payload_semantic_digest_from_manifest_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    manifest_digest: str,
+) -> str:
+    payload = {
+        **_layout_metadata(),
+        "array_dtype": _FLOAT32_LE_DTYPE_TOKEN,
+        "array_order": _ARRAY_ORDER_TOKEN,
+        "manifest_digest": manifest_digest,
+        "records": [
+            {
+                "generated_event_id": row["generated_event_id"],
+                "history_array_digest": row["history_array_digest"],
+                "future_array_digest": row["future_array_digest"],
+                "record_digest": row["record_digest"],
+            }
+            for row in rows
+        ],
+    }
+    return _semantic_digest(_PAYLOAD_DIGEST_DOMAIN, payload)
+
+
+def load_event_target_motion_selection(
+    input_dir: str | Path,
+    *,
+    expected_payload_semantic_digest: str | None = None,
+) -> EventTargetMotionSelectionReader:
+    """Authenticate one target-motion shard without decoding every OracleWorld.
+
+    This is intentionally narrower than :func:`load_event_target_motion_shard`:
+    it validates global metadata and the compact target arrays once, then checks
+    each selected OracleWorld and record when ``load_records_and_worlds`` is
+    called. It is suitable for bounded downstream rendering boundaries.
+    """
+
+    root = Path(input_dir)
+    if not root.is_dir():
+        raise ValueError("shard input directory does not exist")
+    expected_root_entries = {
+        _MANIFEST_FILENAME,
+        _PAYLOAD_FILENAME,
+        _SUMMARY_FILENAME,
+        _WORLD_DIRECTORY,
+    }
+    if {path.name for path in root.iterdir()} != expected_root_entries:
+        raise ValueError("shard root file set mismatch")
+    if not (root / _WORLD_DIRECTORY).is_dir():
+        raise ValueError("oracle_worlds must be a directory")
+
+    rows = _load_manifest(root / _MANIFEST_FILENAME)
+    generated_event_ids = [row["generated_event_id"] for row in rows]
+    if generated_event_ids != sorted(generated_event_ids):
+        raise ValueError("manifest generated_event_id order mismatch")
+    if len(generated_event_ids) != len(set(generated_event_ids)):
+        raise ValueError("duplicate generated_event_id in manifest")
+    if [row["row_index"] for row in rows] != list(range(len(rows))):
+        raise ValueError("manifest row indexes must be 0..N-1")
+    row_world_ids = [row["world_id"] for row in rows]
+    if len(row_world_ids) != len(set(row_world_ids)):
+        raise ValueError("duplicate world_id in manifest")
+    manifest_digests = {row["manifest_digest"] for row in rows}
+    if len(manifest_digests) != 1:
+        raise ValueError("manifest_digest must be identical in every row")
+    stored_manifest_digest = manifest_digests.pop()
+    _require_digest(stored_manifest_digest, "manifest_digest")
+    base_rows = [
+        {key: value for key, value in row.items() if key != "manifest_digest"}
+        for row in rows
+    ]
+    if _manifest_digest(base_rows) != stored_manifest_digest:
+        raise ValueError("manifest_digest mismatch")
+    computed_payload_digest = _payload_semantic_digest_from_manifest_rows(
+        rows,
+        manifest_digest=stored_manifest_digest,
+    )
+
+    summary = _load_json_object(root / _SUMMARY_FILENAME, "shard summary")
+    _require_exact_keys(summary, _SUMMARY_KEYS, "shard summary")
+    _validate_layout_metadata(summary, "shard summary")
+    if summary != _summary(len(rows), stored_manifest_digest, computed_payload_digest):
+        raise ValueError("shard summary mismatch")
+    if expected_payload_semantic_digest is not None:
+        _require_digest(
+            expected_payload_semantic_digest,
+            "expected_payload_semantic_digest",
+        )
+        if computed_payload_digest != expected_payload_semantic_digest:
+            raise ValueError("target-motion payload semantic digest mismatch")
+
+    try:
+        with np.load(root / _PAYLOAD_FILENAME, allow_pickle=False) as payload:
+            if set(payload.files) != set(_NPZ_KEYS):
+                raise ValueError("NPZ payload keys mismatch")
+            history = np.array(payload["history_poses"], copy=True)
+            current = np.array(payload["current_poses"], copy=True)
+            future = np.array(payload["future_poses"], copy=True)
+            meta_raw = payload["meta_json"]
+            if meta_raw.shape != () or meta_raw.dtype.kind not in "US":
+                raise ValueError("NPZ meta_json must be a scalar string")
+            meta = json.loads(str(meta_raw), parse_constant=_reject_json_constant)
+    except (OSError, KeyError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid NPZ payload") from exc
+    if not isinstance(meta, dict):
+        raise ValueError("NPZ meta_json must decode to an object")
+    _require_exact_keys(meta, _NPZ_META_KEYS, "NPZ metadata")
+    _validate_layout_metadata(meta, "NPZ metadata")
+    count = len(rows)
+    _validate_array(
+        history,
+        name="history_poses payload",
+        shape=(count, HISTORY_STEPS, 3),
+        require_owned_c=True,
+    )
+    _validate_array(
+        current,
+        name="current_poses payload",
+        shape=(count, 3),
+        require_owned_c=True,
+    )
+    _validate_array(
+        future,
+        name="future_poses payload",
+        shape=(count, FUTURE_STEPS, 3),
+        require_owned_c=True,
+    )
+    if not np.array_equal(current, history[:, CURRENT_INDEX, :]):
+        raise ValueError("payload current/history seam mismatch")
+    expected_meta = {
+        "array_dtype": _FLOAT32_LE_DTYPE_TOKEN,
+        "array_order": _ARRAY_ORDER_TOKEN,
+        "record_count": count,
+        "generated_event_ids": generated_event_ids,
+        "history_array_digests": [
+            row["history_array_digest"] for row in rows
+        ],
+        "future_array_digests": [row["future_array_digest"] for row in rows],
+        "record_digests": [row["record_digest"] for row in rows],
+        "manifest_digest": stored_manifest_digest,
+        "payload_semantic_digest": computed_payload_digest,
+    }
+    for key, expected in expected_meta.items():
+        if meta.get(key) != expected:
+            raise ValueError(f"NPZ metadata {key} mismatch")
+    history.setflags(write=False)
+    current.setflags(write=False)
+    future.setflags(write=False)
+    return EventTargetMotionSelectionReader(
+        root=root,
+        rows_by_event_id={row["generated_event_id"]: row for row in rows},
+        history_poses=history,
+        current_poses=current,
+        future_poses=future,
+        manifest_digest=stored_manifest_digest,
+        payload_semantic_digest=computed_payload_digest,
+    )
 
 
 def load_event_target_motion_shard(

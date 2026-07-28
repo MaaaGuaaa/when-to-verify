@@ -239,4 +239,32 @@ def test_builder_reports_typed_static_geometry_ineligibility():
 
     assert captured.value.variant_kind == "current"
     assert captured.value.object_id == "critical_cart"
-    assert captured.value.future_index == 0
+    assert captured.value.future_index == -1
+
+
+def test_builder_rejects_current_pose_static_overlap_before_future():
+    toy, world = _current_inputs()
+    colliding_current = {
+        key: value.copy() for key, value in toy.dynamic_current_poses.items()
+    }
+    colliding_current["irrelevant_person"] = np.asarray(
+        [1.10, -0.70, 0.0], dtype=np.float32
+    )
+
+    with pytest.raises(ScenarioBankGeometryError) as captured:
+        build_scenario_bank(
+            current_world=world,
+            target_object_id="critical_cart",
+            current_dynamic_poses=colliding_current,
+            current_visible_mask=toy.current_visible_mask,
+            grid=toy.grid,
+            split="train",
+            source_namespace="toy/train/source-0",
+            seed=42,
+            size=8,
+            config=load_scenario_bank_config(CONFIG),
+        )
+
+    assert captured.value.variant_kind == "current"
+    assert captured.value.object_id == "irrelevant_person"
+    assert captured.value.future_index == -1

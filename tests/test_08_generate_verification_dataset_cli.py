@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,8 +38,6 @@ def _toy_args(output: Path):
         str(ROOT / "configs/verification_actions.yaml"),
         "--gt-config",
         str(ROOT / "configs/verification_gt.yaml"),
-        "--bank-size",
-        "8",
         "--max-replan-candidates",
         "3",
         "--seed",
@@ -59,6 +58,16 @@ def test_toy_cli_is_deterministic_immutable_and_explicitly_smoke_only(tmp_path):
     assert first_report["scientific_status"] == "toy_smoke_only"
     assert first_report["sample_count"] == 12
     assert first_report["group_count"] == 2
+    assert first_report["value_semantics"] == (
+        "one_sop05_sampled_child_per_group"
+    )
+    assert len(first_report["sampled_child_world_ids"]) == 2
+    assert {
+        "bank_size",
+        "posterior_mode",
+        "posterior_temperature",
+        "scenario_bank_digests",
+    }.isdisjoint(first_report)
     assert first_report["collection_semantic_digest"] == (
         second_report["collection_semantic_digest"]
     )
@@ -110,13 +119,77 @@ def test_heldout_mode_requires_explicit_split_and_never_falls_back(tmp_path):
         module.main(args)
 
 
-def test_heldout_mode_rejects_per_split_soft_posterior_fitting(tmp_path):
+def test_cli_exposes_no_downstream_bank_or_posterior_controls():
     module = _module()
-    args = _toy_args(tmp_path / "heldout-soft")
-    args[args.index("toy")] = "sop05-heldout"
-    args.extend(["--split", "test", "--posterior-mode", "soft"])
-    with pytest.raises(ValueError, match="frozen train normalizer"):
-        module.main(args)
+    destinations = {action.dest for action in module._parser()._actions}
+    assert {
+        "bank_size",
+        "posterior_mode",
+        "posterior_temperature",
+    }.isdisjoint(destinations)
+
+
+def test_finalized_release_routes_one_task_per_mother_without_sample_count(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    module = _module()
+    captured = {}
+
+    def publish(request, *, progress_callback):
+        captured["request"] = request
+        progress_callback(1, 1, False)
+        return SimpleNamespace(
+            output_dir=request.output_dir,
+            split=request.split,
+            task_count=3,
+            accepted_group_count=2,
+            rejected_task_count=1,
+            sample_count=12,
+            shard_count=1,
+            reused_shard_count=0,
+            manifest_digest="a" * 64,
+        )
+
+    monkeypatch.setattr(module, "publish_verification_release", publish)
+    args = [
+        "--mode",
+        "sop05-final",
+        "--split",
+        "train",
+        "--source-family",
+        "natural",
+        "--source-mode",
+        "complete_mother",
+        "--source-root",
+        str(tmp_path / "source"),
+        "--final-scenario-root",
+        str(tmp_path / "final"),
+        "--output-dir",
+        str(tmp_path / "release"),
+        "--actions-config",
+        str(ROOT / "configs/verification_actions.yaml"),
+        "--gt-config",
+        str(ROOT / "configs/verification_gt.yaml"),
+        "--workers",
+        "2",
+        "--groups-per-shard",
+        "16",
+        "--max-tasks",
+        "3",
+    ]
+
+    assert module.main(args) == 0
+    request = captured["request"]
+    assert request.max_tasks == 3
+    assert request.groups_per_shard == 16
+    assert request.workers == 2
+    assert request.max_replan_candidates == 4
+    assert json.loads(capsys.readouterr().out)["sample_count"] == 12
+
+    with pytest.raises(ValueError, match="one fixed task per mother"):
+        module.main([*args, "--sample-count", "12"])
 
 
 def test_real_source_selection_retries_only_typed_ineligibility():

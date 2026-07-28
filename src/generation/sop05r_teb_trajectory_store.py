@@ -191,6 +191,64 @@ class Sop05rTebTrajectoryStore:
         object.__setattr__(self, "manifest", MappingProxyType(dict(self.manifest)))
 
 
+class Sop05rTebTrajectorySelectionReader:
+    """Keep one NPZ open and materialize only explicitly selected records."""
+
+    def __init__(
+        self,
+        archive: object,
+        rows: Mapping[str, Mapping[str, object]],
+        *,
+        collection_semantic_digest: str,
+    ) -> None:
+        self._archive = archive
+        self._available_keys = frozenset(archive.files)
+        self._rows = dict(rows)
+        self.collection_semantic_digest = collection_semantic_digest
+        self._closed = False
+
+    def load_records(
+        self,
+        event_ids: Sequence[str],
+    ) -> tuple[Sop05rTebTrajectoryRecord, ...]:
+        if self._closed:
+            raise ValueError("TEB trajectory selection reader is closed")
+        records: list[Sop05rTebTrajectoryRecord] = []
+        for event_id in event_ids:
+            row = self._rows.get(event_id)
+            if row is None:
+                raise ValueError(f"selected TEB trajectory event is missing: {event_id}")
+            records.append(
+                _record_from_row(
+                    self,
+                    row=row,
+                    available_keys=self._available_keys,
+                )
+            )
+        return tuple(records)
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        if self._closed:
+            raise ValueError("TEB trajectory selection reader is closed")
+        if key not in self._available_keys:
+            raise KeyError(key)
+        archive_zip = getattr(self._archive, "zip", None)
+        if archive_zip is None:
+            return self._archive[key]
+        with archive_zip.open(f"{key}.npy") as handle:
+            return np.lib.format.read_array(
+                handle,
+                allow_pickle=bool(self._archive.allow_pickle),
+                pickle_kwargs=self._archive.pickle_kwargs,
+                max_header_size=self._archive.max_header_size,
+            )
+
+    def close(self) -> None:
+        if not self._closed:
+            self._archive.close()
+            self._closed = True
+
+
 def publish_sop05r_teb_trajectory_store(
     records: Sequence[Sop05rTebTrajectoryRecord],
     output_dir: str | Path,
@@ -289,11 +347,17 @@ def _load_array(
     *,
     name: str,
     metadata: Mapping[str, object],
+    available_keys: frozenset[str] | None = None,
 ) -> np.ndarray:
     if set(metadata) != {"key", "dtype", "shape", "semantic_digest"}:
         raise ValueError(f"{name} array metadata schema mismatch")
     key = metadata["key"]
-    if not isinstance(key, str) or key not in payload:
+    available = (
+        available_keys
+        if available_keys is not None
+        else getattr(payload, "files", payload)
+    )
+    if not isinstance(key, str) or key not in available:
         raise ValueError(f"{name} array key is missing")
     array = np.ascontiguousarray(payload[key])
     if array.dtype.str != metadata["dtype"] or list(array.shape) != metadata["shape"]:
@@ -302,6 +366,197 @@ def _load_array(
         raise ValueError(f"{name} array semantic digest mismatch")
     array.setflags(write=False)
     return array
+
+
+def _validate_record_row(
+    row: Mapping[str, object],
+    *,
+    expected_row_index: int | None = None,
+) -> Mapping[str, Mapping[str, object]]:
+    if row.get("record_version") != SOP05R_TEB_TRAJECTORY_RECORD_VERSION:
+        raise ValueError("v1 or unknown TEB trajectory record is not accepted")
+    row_index = row.get("row_index")
+    if (
+        isinstance(row_index, bool)
+        or not isinstance(row_index, int)
+        or row_index < 0
+        or (expected_row_index is not None and row_index != expected_row_index)
+    ):
+        raise ValueError("TEB trajectory row index mismatch")
+    semantic_row = dict(row)
+    stored_digest = semantic_row.pop("record_semantic_digest", None)
+    if _sha256(_canonical_json(semantic_row)) != stored_digest:
+        raise ValueError("TEB trajectory record semantic digest mismatch")
+    array_meta = row.get("arrays")
+    if not isinstance(array_meta, dict) or set(array_meta) != set(_ARRAY_NAMES):
+        raise ValueError("TEB trajectory array schema mismatch")
+    if any(not isinstance(array_meta[name], dict) for name in _ARRAY_NAMES):
+        raise ValueError("TEB trajectory array metadata must be mappings")
+    return array_meta
+
+
+def _record_from_row(
+    payload: Mapping[str, np.ndarray],
+    *,
+    row: Mapping[str, object],
+    expected_row_index: int | None = None,
+    available_keys: frozenset[str] | None = None,
+) -> Sop05rTebTrajectoryRecord:
+    array_meta = _validate_record_row(
+        row,
+        expected_row_index=expected_row_index,
+    )
+    arrays = {
+        name: _load_array(
+            payload,
+            name=name,
+            metadata=array_meta[name],
+            available_keys=available_keys,
+        )
+        for name in _ARRAY_NAMES
+    }
+    route = PlannedTebRoute(
+        planner_version=str(row["planner_version"]),
+        goal_world_pose=arrays["goal_world_pose"],
+        band_poses_world=arrays["band_poses_world"],
+        band_interval_dt_s=arrays["band_interval_dt_s"],
+        sample_times_s=arrays["route_sample_times_s"],
+        sampled_poses_world=arrays["route_poses_world"],
+        sampled_controls=arrays["route_controls"],
+        goal_arrival_time_s=float(row["goal_arrival_time_s"]),
+        task_cost=float(row["full_route_task_cost"]),
+    )
+    suffix_metadata = row.get("suffix_metadata")
+    if not isinstance(suffix_metadata, dict):
+        raise ValueError("TEB suffix metadata must be a mapping")
+    suffix = LocalTrajectory(
+        trajectory_id=str(row["nominal_trajectory_id"]),
+        poses=arrays["suffix_poses"],
+        controls=arrays["suffix_controls"],
+        swept_mask=arrays["suffix_swept_mask"],
+        tta_map=arrays["suffix_tta_map"],
+        braking_map=arrays["suffix_braking_map"],
+        centerline_map=arrays["suffix_centerline_map"],
+        task_cost=float(row["suffix_task_cost"]),
+        metadata=suffix_metadata,
+    )
+    return Sop05rTebTrajectoryRecord(
+        event_id=str(row["event_id"]),
+        source_base_state_id=str(row["source_base_state_id"]),
+        decision_state_id=str(row["decision_state_id"]),
+        template_id=str(row["template_id"]),
+        planner_version=str(row["planner_version"]),
+        config_digest=str(row["config_digest"]),
+        shared_goal_world_pose=arrays["goal_world_pose"],
+        full_route=route,
+        nominal_trajectory=suffix,
+    )
+
+
+def open_sop05r_teb_trajectory_selection(
+    input_dir: str | Path,
+    *,
+    rows: Sequence[Mapping[str, object]] | None = None,
+    event_ids: Sequence[str] | None = None,
+) -> Sop05rTebTrajectorySelectionReader:
+    """Open a complete store without reading arrays outside ``rows``."""
+
+    if (rows is None) == (event_ids is None):
+        raise ValueError("provide exactly one of rows or event_ids")
+
+    root = Path(input_dir)
+    if not root.is_dir():
+        raise ValueError("TEB trajectory store directory does not exist")
+    expected = {_MANIFEST, _PAYLOAD, _SUMMARY, _CHECKSUMS, _COMPLETE}
+    if {path.name for path in root.iterdir()} != expected:
+        raise ValueError("TEB trajectory store file set mismatch")
+
+    checksums = _read_json(root / _CHECKSUMS)
+    if (
+        not isinstance(checksums, dict)
+        or checksums.get("store_version") != SOP05R_TEB_TRAJECTORY_STORE_VERSION
+        or not isinstance(checksums.get("files"), dict)
+        or set(checksums["files"]) != expected - {_CHECKSUMS}
+    ):
+        raise ValueError("TEB trajectory checksum manifest schema mismatch")
+    for name in (_MANIFEST, _SUMMARY, _COMPLETE):
+        if _sha256_file(root / name) != checksums["files"].get(name):
+            raise ValueError(f"TEB trajectory checksum mismatch: {name}")
+
+    manifest = _read_json(root / _MANIFEST)
+    summary = _read_json(root / _SUMMARY)
+    marker = _read_json(root / _COMPLETE)
+    if not all(isinstance(value, dict) for value in (manifest, summary, marker)):
+        raise ValueError("TEB trajectory metadata must be mappings")
+    if manifest.get("store_version") != SOP05R_TEB_TRAJECTORY_STORE_VERSION:
+        raise ValueError("v1 or unknown trajectory store is not accepted by v2 loader")
+    manifest_rows = manifest.get("records")
+    if not isinstance(manifest_rows, list):
+        raise ValueError("TEB trajectory records must be a list")
+    digest = _collection_digest(manifest_rows)
+    if digest != manifest.get("collection_semantic_digest"):
+        raise ValueError("TEB trajectory collection semantic digest mismatch")
+    if (
+        summary.get("store_version") != SOP05R_TEB_TRAJECTORY_STORE_VERSION
+        or summary.get("record_count") != len(manifest_rows)
+        or summary.get("collection_semantic_digest") != digest
+        or not bool(summary.get("quota_met"))
+        or marker.get("completion_version")
+        != SOP05R_TEB_TRAJECTORY_COMPLETION_VERSION
+        or marker.get("collection_semantic_digest") != digest
+        or marker.get("record_count") != len(manifest_rows)
+        or marker.get("requested_count") != manifest.get("requested_count")
+    ):
+        raise ValueError("TEB trajectory complete metadata mismatch")
+
+    selected_by_event: dict[str, Mapping[str, object]] = {}
+    if rows is not None:
+        selected_rows = tuple(rows)
+        for row in selected_rows:
+            if not isinstance(row, dict):
+                raise ValueError("selected TEB trajectory row must be a mapping")
+            row_index = row.get("row_index")
+            if (
+                isinstance(row_index, bool)
+                or not isinstance(row_index, int)
+                or not 0 <= row_index < len(manifest_rows)
+                or manifest_rows[row_index] != row
+            ):
+                raise ValueError("selected TEB trajectory row differs from manifest")
+            _validate_record_row(row, expected_row_index=row_index)
+            event_id = row.get("event_id")
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError("selected TEB trajectory event ID is invalid")
+            if event_id in selected_by_event:
+                raise ValueError("selected TEB trajectory event IDs are not unique")
+            selected_by_event[event_id] = row
+    else:
+        assert event_ids is not None
+        requested_ids = tuple(event_ids)
+        if not requested_ids or any(
+            not isinstance(event_id, str) or not event_id
+            for event_id in requested_ids
+        ):
+            raise ValueError("selected TEB trajectory event IDs are invalid")
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError("selected TEB trajectory event IDs are not unique")
+        requested = set(requested_ids)
+        for row_index, row in enumerate(manifest_rows):
+            event_id = row.get("event_id")
+            if event_id in requested:
+                _validate_record_row(row, expected_row_index=row_index)
+                selected_by_event[str(event_id)] = row
+        if set(selected_by_event) != requested:
+            raise ValueError("selected TEB trajectory event is missing")
+    try:
+        archive = np.load(root / _PAYLOAD, allow_pickle=False)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise ValueError("failed to open TEB trajectory payload") from exc
+    return Sop05rTebTrajectorySelectionReader(
+        archive,
+        selected_by_event,
+        collection_semantic_digest=digest,
+    )
 
 
 def load_sop05r_teb_trajectory_store(
@@ -369,60 +624,17 @@ def load_sop05r_teb_trajectory_store(
     for row_index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise ValueError("TEB trajectory row must be a mapping")
-        if row.get("record_version") != SOP05R_TEB_TRAJECTORY_RECORD_VERSION:
-            raise ValueError("v1 or unknown TEB trajectory record is not accepted")
-        if row.get("row_index") != row_index:
-            raise ValueError("TEB trajectory row index mismatch")
-        semantic_row = dict(row)
-        stored_digest = semantic_row.pop("record_semantic_digest", None)
-        if _sha256(_canonical_json(semantic_row)) != stored_digest:
-            raise ValueError("TEB trajectory record semantic digest mismatch")
-        array_meta = row.get("arrays")
-        if not isinstance(array_meta, dict) or set(array_meta) != set(_ARRAY_NAMES):
-            raise ValueError("TEB trajectory array schema mismatch")
-        arrays = {
-            name: _load_array(payload, name=name, metadata=array_meta[name])
-            for name in _ARRAY_NAMES
-        }
-        consumed.update(str(array_meta[name]["key"]) for name in _ARRAY_NAMES)
-        route = PlannedTebRoute(
-            planner_version=str(row["planner_version"]),
-            goal_world_pose=arrays["goal_world_pose"],
-            band_poses_world=arrays["band_poses_world"],
-            band_interval_dt_s=arrays["band_interval_dt_s"],
-            sample_times_s=arrays["route_sample_times_s"],
-            sampled_poses_world=arrays["route_poses_world"],
-            sampled_controls=arrays["route_controls"],
-            goal_arrival_time_s=float(row["goal_arrival_time_s"]),
-            task_cost=float(row["full_route_task_cost"]),
-        )
-        suffix_metadata = row.get("suffix_metadata")
-        if not isinstance(suffix_metadata, dict):
-            raise ValueError("TEB suffix metadata must be a mapping")
-        suffix = LocalTrajectory(
-            trajectory_id=str(row["nominal_trajectory_id"]),
-            poses=arrays["suffix_poses"],
-            controls=arrays["suffix_controls"],
-            swept_mask=arrays["suffix_swept_mask"],
-            tta_map=arrays["suffix_tta_map"],
-            braking_map=arrays["suffix_braking_map"],
-            centerline_map=arrays["suffix_centerline_map"],
-            task_cost=float(row["suffix_task_cost"]),
-            metadata=suffix_metadata,
-        )
         records.append(
-            Sop05rTebTrajectoryRecord(
-                event_id=str(row["event_id"]),
-                source_base_state_id=str(row["source_base_state_id"]),
-                decision_state_id=str(row["decision_state_id"]),
-                template_id=str(row["template_id"]),
-                planner_version=str(row["planner_version"]),
-                config_digest=str(row["config_digest"]),
-                shared_goal_world_pose=arrays["goal_world_pose"],
-                full_route=route,
-                nominal_trajectory=suffix,
+            _record_from_row(
+                payload,
+                row=row,
+                expected_row_index=row_index,
             )
         )
+        array_meta = row["arrays"]
+        if not isinstance(array_meta, dict):
+            raise AssertionError("validated TEB array metadata changed unexpectedly")
+        consumed.update(str(array_meta[name]["key"]) for name in _ARRAY_NAMES)
     if consumed != set(payload):
         raise ValueError("TEB trajectory payload contains unknown or missing arrays")
     if [record.event_id for record in records] != sorted(

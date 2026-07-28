@@ -1,0 +1,8 @@
+schema_version: "4.0.0"
+calibration_version: verification_reject_cost_calibration_v1
+candidates: [0.2, 0.3, 0.5]
+criteria:
+  minimum_group_count: 100
+  minimum_positive_fraction: 0.10
+  maximum_positive_fraction: 0.70
+  minimum_mixed_action_count: 2

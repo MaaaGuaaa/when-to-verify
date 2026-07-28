@@ -101,7 +101,7 @@ THÖR-MAGNI 等真实数据中，天然“轨迹进入盲区且与隐藏动态�
 - 不处理红绿灯、车道、人行道通行规则等自动驾驶语义；
 - 不把 3D semantic occupancy prediction 作为主贡献；
 - 不做端到端强化学习控制；
-- 不声称 scenario bank 产生严格 Bayes ground truth；
+- 不声称单子事件 realized `G*` 是严格 Bayes ground truth；
 - 不声称无条件安全保证；
 - 不要求真实数据中天然存在大量遮挡碰撞事件；
 - 不要求数据集中真实机器人未来轨迹作为唯一候选轨迹。
@@ -1512,64 +1512,18 @@ U_{1-\alpha}=Q_{1-\alpha}+q_{cal}
 
 ---
 
-## 16. Scenario Bank：验证价值标签的隐藏世界集合
+## 16. SOP5 已采样子事件：验证价值标签的唯一实现
 
-### 16.1 命名约束
+SOP5 已经对同一个母事件施加扰动，使相同初始观测对应不同结局，并按规定概率采样
+一个子事件。SOP11–13 直接消费这个子事件 \(W^\*\)，不在下游再次生成 world variant、
+scenario bank、经验 posterior 或 observation-signature normalizer。
 
-论文和代码中称为：
+不确定性来自数据集中“相同类型初始观测、不同已采样结局”的总体分布；价值模型只能
+看到部署时可用的初始观测和动作，因此不能预知某条样本的结局。`sampled_child_world_id`
+只用于标签审计，不能进入模型输入。
 
-```text
-scenario-bank empirical decision risk
-simulator-defined decision-value target
-counterfactual verification-value target
-```
-
-不要称其为严格 Bayes ground truth。
-
-### 16.2 每个当前观测生成 M 个可能世界
-
-\[
-\Omega_z=\{W^1,\ldots,W^M\}
-\]
-
-推荐：
-
-```text
-M = 16（起步）
-M = 32（敏感性实验）
-```
-
-### 16.3 世界组成
-
-建议固定配额：
-
-```text
-1 个真实/当前半合成 oracle 世界
-2 个空盲区世界
-5 个时间偏移变体
-4 个空间偏移变体
-2 个速度缩放变体
-2 个无关隐藏动态对象变体
-```
-
-每个世界必须和当前模型输入一致：
-
-- 当前 visible cells 的 occupancy 一致；
-- 差异仅位于不可观测区域或未来状态；
-- 不违反静态几何；
-- 不产生当前时刻直接可见的新增动态对象；
-- 每个 world 内 `dynamic_object_trajectories/specs` key 对齐；跨 variant 只允许计划定义
-  的 target 缺失/状态变化，非目标对象不会被删除或改型。
-
-### 16.4 世界先验权重
-
-第一版均匀：
-
-\[
-w_m=1/M
-\]
-
-增强版可按训练数据事件频率或生成概率设置权重，但必须做敏感性实验。
+旧 `scenario_bank` 和 `observation_posterior` 实现仅用于历史实验复核，不属于当前生产
+标签路径。
 
 ---
 
@@ -1579,18 +1533,22 @@ w_m=1/M
 
 ```yaml
 verification_actions:
-  - name: yaw_left_10
-    delta_yaw_deg: 10
-    duration: 0.4
-  - name: yaw_right_10
-    delta_yaw_deg: -10
-    duration: 0.4
-  - name: yaw_left_20
-    delta_yaw_deg: 20
-    duration: 0.7
-  - name: yaw_right_20
-    delta_yaw_deg: -20
-    duration: 0.7
+  - name: arc_left_30
+    delta_forward_m: 0.45
+    delta_yaw_deg: 30
+    duration: 0.8
+  - name: arc_right_30
+    delta_forward_m: 0.45
+    delta_yaw_deg: -30
+    duration: 0.8
+  - name: arc_left_45
+    delta_forward_m: 0.60
+    delta_yaw_deg: 45
+    duration: 1.0
+  - name: arc_right_45
+    delta_forward_m: 0.60
+    delta_yaw_deg: -45
+    duration: 1.0
   - name: forward_peek
     delta_forward_m: 0.30
     duration: 0.8
@@ -1626,7 +1584,8 @@ lambda_yaw: 0.0015  # 每度
 
 验证模型输入 \((z,\xi,v)\) 中，\(\xi\) 表示当前 nominal local plan/局部意图。
 
-执行 \(v\) 后，从新位姿生成：
+执行 \(v\) 时可因新观测提前转入 observe-and-replan 或 emergency-brake。应从实际响应
+分支的终点生成：
 
 \[
 \Xi^v(z,\xi)
@@ -1644,154 +1603,90 @@ lambda_yaw: 0.0015  # 每度
 - 过滤静态碰撞；
 - 可保留 stop/reject。
 
+所有可评估策略都必须和原 horizon 时间对齐。若机器人已安全刹停，但由于动态对象过近
+而没有可行未来规划，则输出显式 `safe_stop_no_feasible_plan`，由价值旁路处理；不得
+构造半截轨迹交给轨迹风险模型。
+
 ---
 
 ## 19. 验证价值 Ground Truth
 
-### 19.1 当前不验证的经验决策风险
+### 19.1 当前不验证的 realized 决策风险
 
-当前 nominal 轨迹的执行成本：
-
-\[
-C_E(\xi,W^m)=c_{task}(\xi)+\lambda_c I_{coll}+\lambda_n I_{near}
-\]
-
-拒绝成本：
+对 SOP5 已采样子事件 \(W^\*\)，nominal 执行损失和拒绝成本为：
 
 \[
-C_R=c_{reject}
+L_E=\lambda_r R(\xi,W^\*),\qquad C_R=c_{reject}
 \]
-
-当前经验风险：
 
 \[
-\widehat{BR}(z,\xi)=
-\min\left(
-\frac1M\sum_m C_E(\xi,W^m),
-C_R
-\right)
+BR_{before}(z,\xi,W^\*)=\min(L_E,C_R)
 \]
 
-### 19.2 反事实验证观测
+### 19.2 验证、响应与完整策略
 
-对每个 \(v,W^m\)：
-
-1. 应用验证 primitive 得到新机器人位姿；
-2. 对完整 oracle 世界 ray cast；
-3. 得到新增可见 occupancy、visible mask、updated age map；
-4. 得到 observation signature \(\phi(o_v^m)\)；
-5. 生成重规划候选集 \(\Xi^v(z,\xi)\)。
-
-### 19.3 Soft posterior
-
-signature 推荐：
-
-```text
-new_visible_area
-new_visible_area ∩ original swept volume
-new_visible_area ∩ replanned swept volumes
-number_of_new_visible_occupied_cells
-minimum_visible_actor_distance_to_local_goal_corridor
-whether_dynamic_actor_seen
-critical_region_age_reduction
-```
+对每个动作 \(v\)，只在 \(W^\*\) 上模拟一次时序观测。动作可完整执行，也可因新观测
+转入 observe-and-replan 或 emergency-brake。对每条完整、时间对齐策略 \(\pi\)：
 
 \[
-w_{j|m}^{v}=\frac{\exp(-D(\phi_j,\phi_m)/\tau_o)}{\sum_k\exp(-D(\phi_k,\phi_m)/\tau_o)}
+L(\pi,W^\*)=
+\max\left(0,\frac{c_{task}(\pi)}{c_{task}(\xi)}-1\right)
++\lambda_r R(\pi,W^\*)
 \]
 
-默认：
-
-```text
-tau_o = 0.2
-signature 每维先按 train statistics 标准化
-```
-
-### 19.4 观察后重新规划的经验风险
-
-假设在真实世界 \(m\) 下看到观测 \(o_v^m\)，对所有新候选轨迹取最小后验经验损失：
+若存在可行完整策略：
 
 \[
-\widehat{BR}_v^m=
-\min\left[
-C_R,
-\min_{\xi'\in\Xi^v(z,\xi)}
-\sum_j w_{j|m}^{v} C_E(\xi',W^j)
-\right]
+L_{post}=\min\left(C_R,\min_{\pi}L(\pi,W^\*)\right)
 \]
 
-### 19.5 验证后期望风险
+若安全刹停后没有可行未来规划，则直接使用旁路：
 
 \[
-PostRisk(z,\xi,v)=c(v)+\frac1M\sum_m\widehat{BR}_v^m
+L_{post}=C_R
 \]
 
-### 19.6 净验证价值
+该旁路不调用不存在的未来策略轨迹风险，不把半截轨迹输入轨迹风险模型。
+
+### 19.3 净验证价值
 
 \[
-G^*(z,\xi,v)=\widehat{BR}(z,\xi)-PostRisk(z,\xi,v)
+PostRisk(z,\xi,v,W^\*)=L_{post}+c(v)
 \]
 
-解释：
+\[
+G^*(z,\xi,v,W^\*)=BR_{before}-PostRisk
+\]
 
-- \(G^*>0\)：验证动作在 scenario-bank 目标下净收益为正；
-- \(G^*<0\)：验证成本超过其决策收益；
-- \(G^*\) 已经扣除 \(c(v)\)，在线不能重复加验证成本。
+- \(G^*>0\)：该已采样子事件上验证动作的 realized 净收益为正；
+- \(G^*<0\)：验证成本超过 realized 决策收益；
+- \(c(v)\) 只加一次，在线不能重复计费；
+- 六个动作共享同一 \(W^\*\) 和同一 `br_before`。
 
-### 19.7 伪代码
+### 19.4 伪代码
 
 ```python
-def verification_value_target(state, nominal_traj, action, worlds, cfg):
-    # 1. 不验证时：执行 nominal trajectory 或拒绝
-    execute_losses = [
-        task_cost(nominal_traj) + oracle_safety_loss(nominal_traj, world, cfg)
-        for world in worlds
-    ]
-    br_before = min(np.mean(execute_losses), cfg.reject_cost)
+def verification_value_target(state, nominal, action, sampled_world, cfg):
+    execute = cfg.risk_weight * oracle_risk(nominal, sampled_world)
+    br_before = min(execute, cfg.reject_cost)
 
-    # 2. 每个 world 产生反事实观测
-    observations = []
-    signatures = []
-    replanned_sets = []
+    branch = simulate_reactive_verify(state, action, sampled_world, cfg)
+    replanning = replan_from_branch_end(branch, nominal, cfg)
 
-    for world in worlds:
-        new_state, observation = simulate_verify(state, action, world, cfg)
-        observations.append(observation)
-        signatures.append(make_signature(observation, nominal_traj, cfg))
-        replanned_sets.append(
-            generate_replanned_candidates(new_state, nominal_traj, cfg)
-        )
+    if replanning.safe_stop_no_feasible_plan:
+        post_decision = cfg.reject_cost
+    else:
+        policies = build_time_aligned_policies(branch, replanning, cfg)
+        losses = [
+            relative_task_regret(policy, nominal)
+            + cfg.risk_weight * oracle_risk(policy, sampled_world)
+            for policy in policies
+        ]
+        post_decision = min(cfg.reject_cost, min(losses))
 
-    # 验证动作后的机器人位姿相同，通常候选集可共用；
-    # 若环境过滤依赖 world，则保留逐 world 候选集。
-    post_risks = []
-
-    for m, observed_signature in enumerate(signatures):
-        posterior = soft_posterior(signatures, observed_signature, cfg.tau_o)
-        candidate_set = replanned_sets[m]
-
-        candidate_risks = []
-        for traj_prime in candidate_set:
-            expected_loss = 0.0
-            for weight, world in zip(posterior, worlds):
-                expected_loss += weight * (
-                    task_cost(traj_prime)
-                    + oracle_safety_loss(traj_prime, world, cfg)
-                )
-            candidate_risks.append(expected_loss)
-
-        best_replanned = min(candidate_risks) if candidate_risks else float("inf")
-        post_risks.append(min(best_replanned, cfg.reject_cost))
-
-    post_risk = verification_cost(action, cfg) + np.mean(post_risks)
+    post_risk = post_decision + verification_cost(action, cfg)
     value = br_before - post_risk
-
-    return {
-        "value": float(value),
-        "useful": int(value > 0.0),
-        "br_before": float(br_before),
-        "post_risk": float(post_risk),
-    }
+    return value, int(value > 0.0), br_before, post_risk
 ```
 
 ---
@@ -1959,7 +1854,7 @@ risk samples: 240,000
 nominal trajectories for verification: 2/base
 verification actions: 6
 verification samples: 60,000
-scenario bank M: 16
+sampled SOP5 child/event: 1
 ```
 
 ### 23.2 推荐论文版
@@ -1969,7 +1864,7 @@ base states: 10,000~20,000
 candidate trajectories/base: 12~20
 risk samples: 0.5M~1.5M
 verification samples: 0.2M~0.8M
-scenario bank: M=16
+sampled SOP5 child/event: 1
 ```
 
 ---
@@ -2081,14 +1976,12 @@ Regret=G^*(v^*)-G^*(\hat v)
 
 ## 27. 必须实现的敏感性实验
 
-因为 scenario bank 和 soft posterior 是模拟器定义的近似目标，必须报告：
+因为标签依赖 SOP5 扰动采样分布和响应/成本设定，必须报告：
 
 ```text
-M ∈ {8, 16, 32}
-tau_o ∈ {0.1, 0.2, 0.5}
-scenario composition variants
-signature feature ablation
-uniform vs non-uniform world prior
+SOP5 outcome strata and sampling probabilities
+response/braking thresholds
+replan candidate count
 verification cost scale
 ```
 
@@ -2269,10 +2162,12 @@ risk_gt:
   sigma_time_s: 2.0
   near_miss_distance_m: 0.35
 
-scenario_bank:
-  size: 16
-  posterior_temperature: 0.2
+verification_gt:
   reject_cost: 0.20
+  risk_weight: 1.0
+  braking_deceleration_mps2: 1.0
+  angular_deceleration_radps2: 1.6
+  braking_margin_s: 0.4
 
 verification:
   useful_margin: 0.0
@@ -2339,8 +2234,9 @@ python scripts/07_calibrate_risk.py \
 
 # 9. 生成验证价值目标
 python scripts/08_generate_verification_dataset.py \
+  --mode sop05-train \
   --split train \
-  --scenario-bank-size 16
+  --max-replan-candidates 4
 
 # 10. 训练验证价值模型
 python scripts/09_train_verification_model.py --config configs/verify_model.yaml
@@ -2456,10 +2352,10 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 ### Phase D：验证价值
 
 1. verification primitive geometry；
-2. scenario bank；
-3. counterfactual ray casting；
+2. sampled-child counterfactual observation trace；
+3. reactive response / safe-stop bypass；
 4. replan candidate set；
-5. G* 生成；
+5. realized G* 生成；
 6. value model。
 
 ### Phase E：闭环
@@ -2487,7 +2383,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 - 比 visible-area gain 更低 top-1 regret；
 - 比 always verify 少做验证；
 - 比 never verify 更低碰撞/false-safe；
-- 对 M、\(\tau_o\)、scenario composition 具有可接受稳定性。
+- 对 SOP5 outcome strata、响应阈值和 verification cost 具有可接受稳定性。
 
 ### 33.2 失败判据
 
@@ -2495,7 +2391,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 
 - risk-only 模型明显不如 occupancy baseline；
 - 模型仅根据盲区面积或 swept-volume 面积预测风险；
-- verification value 对 scenario bank 参数极度敏感；
+- verification value 对 SOP5 结局分层或响应/成本参数极度敏感；
 - 验证动作排序和闭环收益无相关性；
 - paired temporal-safe 样本大量误判；
 - train/test snippet 或 recording 泄漏；
@@ -2515,7 +2411,7 @@ python scripts/11_eval_closed_loop.py --benchmark arena
 
 ### 不应主张
 
-1. scenario bank 是真实后验；
+1. 单个 SOP5 采样子事件代表完整真实后验；
 2. G* 是严格 Bayes ground truth；
 3. 连续 risk severity 是真实碰撞概率；
 4. 模型提供无条件安全保证；

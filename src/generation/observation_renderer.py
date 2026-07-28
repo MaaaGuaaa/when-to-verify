@@ -24,7 +24,7 @@ from src.contracts import (
 from src.geometry.footprints import RectangleFootprint
 from src.geometry.rasterization import rasterize_footprint
 from src.geometry.raycasting import raycast_visibility
-from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_contracts import footprint_from_spec
 from src.generation.structural_blindspot import (
     StructuralBlindSpot,
     build_structural_visibility,
@@ -154,8 +154,9 @@ def _validate_scene(
     base_state: Any,
     scene_dynamic_history: Any,
     scene_dynamic_specs: Any,
+    scene_dynamic_history_observed: Any,
     grid: GridSpec,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if not isinstance(base_state, BaseState):
         raise TypeError("base_state must be a BaseState")
     validate_base_state(base_state, grid)
@@ -174,6 +175,32 @@ def _validate_scene(
         isinstance(object_id, str) and object_id for object_id in object_ids
     ):
         raise ValueError("scene dynamic object IDs must be non-empty strings")
+
+    if scene_dynamic_history_observed is None:
+        observed = {
+            object_id: np.ones(grid.history_steps, dtype=np.bool_)
+            for object_id in object_ids
+        }
+    else:
+        if not isinstance(scene_dynamic_history_observed, Mapping):
+            raise TypeError("scene_dynamic_history_observed must be a mapping or None")
+        if set(scene_dynamic_history_observed) != object_ids:
+            raise ValueError(
+                "scene observed-history and dynamic-history keys must match"
+            )
+        observed = {}
+        for object_id in sorted(object_ids):
+            value = scene_dynamic_history_observed[object_id]
+            name = f"scene_dynamic_history_observed[{object_id!r}]"
+            if not isinstance(value, np.ndarray):
+                raise TypeError(f"{name} must be an np.ndarray")
+            if value.dtype != np.bool_:
+                raise TypeError(f"{name} dtype must be bool")
+            if value.shape != (grid.history_steps,):
+                raise ValueError(f"{name} shape must be ({grid.history_steps},)")
+            observed[object_id] = np.array(
+                value, dtype=np.bool_, order="C", copy=True
+            )
 
     footprints: dict[str, Any] = {}
     for object_id in sorted(object_ids):
@@ -197,6 +224,10 @@ def _validate_scene(
     if not context_ids.issubset(object_ids):
         raise ValueError("BaseState context objects must be present in the scene")
     for object_id in base_state.dynamic_object_ids:
+        if not bool(np.all(observed[object_id])):
+            raise ValueError(
+                "BaseState context history must remain observed at every frame"
+            )
         if not np.array_equal(
             scene_dynamic_history[object_id],
             base_state.visible_dynamic_object_history[object_id],
@@ -209,7 +240,7 @@ def _validate_scene(
             != base_state.visible_dynamic_object_specs[object_id]
         ):
             raise ValueError("BaseState context spec must be exactly preserved")
-    return footprints
+    return footprints, observed
 
 
 def _copy_static_occupancy(static_occupancy: Any, grid: GridSpec) -> np.ndarray:
@@ -252,13 +283,15 @@ def render_observation(
     static_occupancy: np.ndarray,
     sensor_config: StructuralBlindSpot | None,
     config: Mapping[str, Any],
+    scene_dynamic_history_observed: Mapping[str, np.ndarray] | None = None,
 ) -> RenderedObservation:
-    """Render the frozen two-history/nine-state layout from scene history."""
+    """Render the frozen layout from deployment-observed scene history."""
     config_dict, grid = _validated_config_and_grid(config)
-    footprints = _validate_scene(
+    footprints, observed = _validate_scene(
         base_state,
         scene_dynamic_history,
         scene_dynamic_specs,
+        scene_dynamic_history_observed,
         grid,
     )
     static = _copy_static_occupancy(static_occupancy, grid)
@@ -279,6 +312,8 @@ def render_observation(
     for object_id in sorted(footprints):
         footprint = footprints[object_id]
         for step, pose in enumerate(scene_dynamic_history[object_id]):
+            if not observed[object_id][step]:
+                continue
             dynamic_occupancy[step] |= rasterize_footprint(
                 footprint,
                 pose,

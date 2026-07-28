@@ -1,0 +1,89 @@
+schema_version: "4.0.0"
+matrix_version: "sop16_experiment_matrix_v1"
+matrix_name: "sop16-main"
+scientific_status: "production_evaluation"
+closed_loop_config: "../closed_loop_production.yaml"
+required_target_type_policy: "human_target_with_contextual_dynamic_objects"
+seeds: [7, 11, 17]
+strategies: [never, always, visible, swept, entropy, learned, oracle]
+experiments:
+  - experiment_id: "risk-last"
+    category: "main"
+    risk_method: "last"
+    value_method: "learned_value"
+    suite_pattern: "main/risk-last/seed-{seed}"
+    parameters: {target_type: "human", calibrated: false}
+    runtime_overrides: {}
+    claims: ["Compare last-observation risk within the common closed-loop protocol."]
+  - experiment_id: "risk-age"
+    category: "main"
+    risk_method: "age"
+    value_method: "learned_value"
+    suite_pattern: "main/risk-age/seed-{seed}"
+    parameters: {target_type: "human", calibrated: false}
+    runtime_overrides: {}
+    claims: ["Compare age-aware risk within the common closed-loop protocol."]
+  - experiment_id: "occupancy-aggregation"
+    category: "main"
+    risk_method: "occupancy_aggregation"
+    value_method: "learned_value"
+    suite_pattern: "main/occupancy-aggregation/seed-{seed}"
+    parameters: {target_type: "human", calibrated: false}
+    runtime_overrides: {}
+    claims: ["Measure occupancy aggregation on the registered safety and efficiency metrics."]
+  - experiment_id: "risk-only"
+    category: "main"
+    risk_method: "risk_only"
+    value_method: "learned_value"
+    suite_pattern: "main/risk-only/seed-{seed}"
+    parameters: {target_type: "human", calibrated: false}
+    runtime_overrides: {}
+    claims: ["Measure uncalibrated learned risk on the registered closed-loop metrics."]
+  - experiment_id: "risk-calibration"
+    category: "main"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "main/risk-calibration/seed-{seed}"
+    parameters: {target_type: "human", calibrated: true}
+    runtime_overrides: {}
+    claims: ["Compare calibrated risk and verification strategies on safety-efficiency tradeoffs."]
+  - experiment_id: "risk-aux-optional"
+    category: "main"
+    risk_method: "risk_aux_optional"
+    value_method: "learned_value"
+    suite_pattern: "main/risk-aux-optional/seed-{seed}"
+    parameters: {target_type: "human", calibrated: true, optional: true}
+    runtime_overrides: {}
+    claims: ["Report the optional auxiliary-head method without replacing the primary method."]
+  - experiment_id: "controlled-same-area"
+    category: "controlled"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "controlled/same-area/seed-{seed}"
+    parameters: {target_type: "human", controlled_test: "same_area"}
+    runtime_overrides: {}
+    claims: ["Audit action ranking when visible areas are matched."]
+  - experiment_id: "controlled-temporal-safe"
+    category: "controlled"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "controlled/temporal-safe/seed-{seed}"
+    parameters: {target_type: "human", controlled_test: "temporal_safe"}
+    runtime_overrides: {}
+    claims: ["Audit temporal safety discrimination under matched spatial coverage."]
+  - experiment_id: "controlled-irrelevant-hidden"
+    category: "controlled"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "controlled/irrelevant-hidden/seed-{seed}"
+    parameters: {target_type: "human", controlled_test: "irrelevant_hidden"}
+    runtime_overrides: {}
+    claims: ["Audit resistance to verification of irrelevant hidden regions."]
+  - experiment_id: "controlled-empty"
+    category: "controlled"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "controlled/empty/seed-{seed}"
+    parameters: {target_type: "human", controlled_test: "empty"}
+    runtime_overrides: {}
+    claims: ["Audit unnecessary verification in empty blind-spot scenes."]

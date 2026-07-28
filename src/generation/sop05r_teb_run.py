@@ -26,7 +26,10 @@ from .event_target_motion_shard import (
     load_event_target_motion_shard,
     write_event_target_motion_shard,
 )
-from .anchored_human_placement import solve_anchored_human_placement
+from .anchored_human_placement import (
+    PLACEMENT_SELECTION_MODES,
+    solve_anchored_human_placement,
+)
 from .sop05r_contracts import (
     SOP05R_TEB_COMPLETION_MARKER_VERSION,
     SOP05R_TEB_GENERATOR_VERSION,
@@ -55,6 +58,7 @@ from .sop05r_teb_output_loader import (
 from .sop05r_teb_templates import canonical_sop05r_teb_base_state_digest
 from .sop05r_teb_templates import iter_sop05r_teb_task_templates
 from .sop05r_teb_trajectory_store import (
+    load_sop05r_teb_trajectory_store,
     publish_sop05r_teb_trajectory_store,
 )
 
@@ -76,11 +80,15 @@ class Sop05rTebRunRequest:
     verification_action_config_path: Path
     output_dir: Path
     seed: int
-    accepted_quota: int
+    accepted_quota: int | None
     max_base_states: int
     checksum_workers: int
     workers: int
     git_executable: Path
+    base_state_start: int = 0
+    exclude_existing_output: Path | None = None
+    resume_staging_root: Path | None = None
+    placement_selection_mode: str = "seen_first"
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,7 @@ class _BaseStateGenerationContext:
     snippets: Sequence[object]
     seed: int
     split: str
+    placement_selection_mode: str
 
 
 @dataclass(frozen=True)
@@ -198,6 +207,7 @@ def _generate_base_state_result(
                 base_config=context.base_config,
                 teb_config=context.teb_config,
                 seed=derive_seed(rng_seed, snippet.snippet_id, snippet_rank),
+                selection_mode=context.placement_selection_mode,
             )
             m5_candidate_counts.update(placement.candidate_counts)
             m5_candidate_rejections.update(placement.rejection_counts)
@@ -421,6 +431,68 @@ def _write_checksums(staging: Path) -> None:
     )
 
 
+def _resume_staged_artifacts(
+    staging: Path,
+    *,
+    selected: Sequence[Sop05rTebMotherCandidate],
+    base_config: Mapping[str, object],
+    requested_count: int,
+    complete: bool,
+) -> tuple[object, LoadedEventTargetMotionShard]:
+    if {path.name for path in staging.iterdir()} != {
+        "trajectory_store",
+        "target_motion",
+    }:
+        raise Sop05rTebRunError("resume staging must contain only completed stores")
+    trajectories = load_sop05r_teb_trajectory_store(
+        staging / "trajectory_store",
+        require_complete=complete,
+    )
+    expected_by_event = {
+        mother.event.generated_event_id: mother for mother in selected
+    }
+    if tuple(record.event_id for record in trajectories.records) != tuple(
+        sorted(expected_by_event)
+    ):
+        raise Sop05rTebRunError("resume trajectory event IDs differ from replay")
+    for record in trajectories.records:
+        mother = expected_by_event[record.event_id]
+        expected = mother.trajectory_record
+        if (
+            record.source_base_state_id != expected.source_base_state_id
+            or record.decision_state_id != expected.decision_state_id
+            or record.nominal_trajectory.trajectory_id
+            != expected.nominal_trajectory.trajectory_id
+            or record.config_digest != expected.config_digest
+        ):
+            raise Sop05rTebRunError("resume trajectory identity differs from replay")
+    target_motion = load_event_target_motion_shard(
+        staging / "target_motion",
+        grid=build_grid_spec(dict(base_config)),
+        expected_generated_event_ids=set(expected_by_event),
+        expected_base_state_ids={
+            mother.trajectory_record.decision_state_id for mother in selected
+        },
+        expected_trajectory_ids={
+            mother.trajectory_record.nominal_trajectory.trajectory_id
+            for mother in selected
+        },
+    )
+    target_by_event = {
+        record.generated_event_id: record for record in target_motion.records
+    }
+    for event_id, mother in expected_by_event.items():
+        expected = mother.event.target_motion_record
+        actual = target_by_event.get(event_id)
+        if actual is None or actual.record_digest != expected.record_digest:
+            raise Sop05rTebRunError("resume target motion differs from replay")
+    if len(trajectories.records) != len(selected) or len(target_motion.records) != len(
+        selected
+    ):
+        raise Sop05rTebRunError("resume stores do not meet the requested count")
+    return trajectories, target_motion
+
+
 def publish_sop05r_teb_run(
     mothers: Sequence[Sop05rTebMotherCandidate],
     output_dir: str | Path,
@@ -434,6 +506,7 @@ def publish_sop05r_teb_run(
     rejection_counts: Mapping[str, int],
     m5_candidate_counts: Mapping[str, int] | None = None,
     m5_candidate_rejection_counts: Mapping[str, int] | None = None,
+    resume_staging_root: str | Path | None = None,
 ) -> LoadedSop05rTebOutput:
     """Publish selected M6 mothers, including useful partial/empty diagnostics."""
 
@@ -464,35 +537,57 @@ def publish_sop05r_teb_run(
         raise Sop05rTebRunError("source_evidence must normalize to a mapping")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging_root = Path(
-        tempfile.mkdtemp(
-            prefix=f".{destination.name}.sop05r-teb-stage-",
-            dir=destination.parent,
+    created_staging = resume_staging_root is None
+    if created_staging:
+        staging_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.sop05r-teb-stage-",
+                dir=destination.parent,
+            )
         )
-    )
-    staging = staging_root / destination.name
-    staging.mkdir()
+        staging = staging_root / destination.name
+        staging.mkdir()
+    else:
+        staging_root = Path(resume_staging_root)
+        staging = staging_root / destination.name
+        if (
+            staging_root.is_symlink()
+            or not staging_root.is_dir()
+            or staging.is_symlink()
+            or not staging.is_dir()
+            or {path.name for path in staging_root.iterdir()} != {destination.name}
+        ):
+            raise Sop05rTebRunError("resume staging root layout is invalid")
     try:
-        trajectories = publish_sop05r_teb_trajectory_store(
-            tuple(mother.trajectory_record for mother in selected),
-            staging / "trajectory_store",
-            requested_count=requested_count,
-            complete=complete,
-        )
-        if selected:
-            write_event_target_motion_shard(
-                [mother.event.target_motion_record for mother in selected],
-                [mother.event.world for mother in selected],
-                staging / "target_motion",
-                grid=build_grid_spec(base_snapshot),
+        if created_staging:
+            trajectories = publish_sop05r_teb_trajectory_store(
+                tuple(mother.trajectory_record for mother in selected),
+                staging / "trajectory_store",
+                requested_count=requested_count,
+                complete=complete,
             )
-            target_motion = load_event_target_motion_shard(
-                staging / "target_motion",
-                grid=build_grid_spec(base_snapshot),
-                expected_generated_event_ids=set(event_ids),
-            )
+            if selected:
+                write_event_target_motion_shard(
+                    [mother.event.target_motion_record for mother in selected],
+                    [mother.event.world for mother in selected],
+                    staging / "target_motion",
+                    grid=build_grid_spec(base_snapshot),
+                )
+                target_motion = load_event_target_motion_shard(
+                    staging / "target_motion",
+                    grid=build_grid_spec(base_snapshot),
+                    expected_generated_event_ids=set(event_ids),
+                )
+            else:
+                target_motion = _empty_target_motion(staging / "target_motion")
         else:
-            target_motion = _empty_target_motion(staging / "target_motion")
+            trajectories, target_motion = _resume_staged_artifacts(
+                staging,
+                selected=selected,
+                base_config=base_snapshot,
+                requested_count=requested_count,
+                complete=complete,
+            )
 
         decisions_dir = staging / "decision_states"
         decisions_dir.mkdir()
@@ -588,7 +683,10 @@ def publish_sop05r_teb_run(
         atomic_rename_noreplace(staging, destination)
         return loaded
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        if created_staging:
+            shutil.rmtree(staging_root, ignore_errors=True)
+        elif not staging.exists():
+            staging_root.rmdir()
 
 
 def preflight_summary(request: Sop05rTebRunRequest) -> dict[str, object]:
@@ -604,7 +702,22 @@ def preflight_summary(request: Sop05rTebRunRequest) -> dict[str, object]:
         "output_dir": str(request.output_dir),
         "seed": request.seed,
         "accepted_quota": request.accepted_quota,
+        "accepted_selection": (
+            "all_accepted_v1"
+            if request.accepted_quota is None
+            else "accepted_quota_v1"
+        ),
         "max_base_states": request.max_base_states,
+        "base_state_start": request.base_state_start,
+        "exclude_existing_output": (
+            None
+            if request.exclude_existing_output is None
+            else "provided"
+        ),
+        "resume_staging_root": (
+            None if request.resume_staging_root is None else "provided"
+        ),
+        "placement_selection_mode": request.placement_selection_mode,
         "workers": request.workers,
         "publication_semantic_digest": None,
     }
@@ -615,7 +728,7 @@ def _progress_snapshot(
     processed_base_states: int,
     total_base_states: int,
     accepted_count: int,
-    requested_count: int,
+    requested_count: int | None,
     started_at_s: float,
     denominator_counts: Mapping[str, int],
     rejection_counts: Mapping[str, int],
@@ -625,12 +738,16 @@ def _progress_snapshot(
         accepted_count / elapsed_seconds if elapsed_seconds > 0.0 else None
     )
     estimated_remaining_seconds = (
-        0.0
-        if accepted_count >= requested_count
+        None
+        if requested_count is None
         else (
-            None
-            if accepted_per_second is None or accepted_per_second <= 0.0
-            else (requested_count - accepted_count) / accepted_per_second
+            0.0
+            if accepted_count >= requested_count
+            else (
+                None
+                if accepted_per_second is None or accepted_per_second <= 0.0
+                else (requested_count - accepted_count) / accepted_per_second
+            )
         )
     )
     return {
@@ -640,7 +757,9 @@ def _progress_snapshot(
         "accepted_count": accepted_count,
         "requested_count": requested_count,
         "completion_fraction": (
-            1.0 if requested_count == 0 else accepted_count / requested_count
+            None
+            if requested_count is None
+            else (1.0 if requested_count == 0 else accepted_count / requested_count)
         ),
         "denominator_counts": {
             str(key): int(value) for key, value in sorted(denominator_counts.items())
@@ -654,6 +773,39 @@ def _progress_snapshot(
     }
 
 
+def _excluded_event_ids(
+    request: Sop05rTebRunRequest,
+    *,
+    config_digest: str,
+) -> tuple[frozenset[str], Mapping[str, object]]:
+    """Strictly load an earlier compatible collection used for deduplication."""
+
+    if request.exclude_existing_output is None:
+        return frozenset(), {}
+    try:
+        loaded = load_sop05r_teb_output(
+            request.exclude_existing_output,
+            require_complete=True,
+        )
+    except ValueError as exc:
+        raise Sop05rTebRunError(
+            f"failed to load excluded SOP05R TEB output: {exc}"
+        ) from exc
+    if loaded.manifest.get("config_digest") != config_digest:
+        raise Sop05rTebRunError(
+            "excluded SOP05R TEB output uses a different generator config"
+        )
+    return (
+        frozenset(event.generated_event_id for event in loaded.events),
+        {
+            "excluded_existing_event_count": len(loaded.events),
+            "excluded_existing_publication_semantic_digest": (
+                loaded.publication_semantic_digest
+            ),
+        },
+    )
+
+
 def execute_sop05r_teb_run(
     request: Sop05rTebRunRequest,
     *,
@@ -663,8 +815,20 @@ def execute_sop05r_teb_run(
 
     if not isinstance(request, Sop05rTebRunRequest):
         raise TypeError("request must be a Sop05rTebRunRequest")
-    if request.accepted_quota < 0 or request.max_base_states <= 0:
+    if (
+        request.accepted_quota is not None
+        and (
+            isinstance(request.accepted_quota, bool)
+            or not isinstance(request.accepted_quota, int)
+            or request.accepted_quota < 0
+        )
+    ) or request.max_base_states <= 0 or request.base_state_start < 0:
         raise Sop05rTebRunError("quota must be nonnegative and max_base_states positive")
+    if request.placement_selection_mode not in PLACEMENT_SELECTION_MODES:
+        raise Sop05rTebRunError(
+            "placement_selection_mode must be one of "
+            + ", ".join(PLACEMENT_SELECTION_MODES)
+        )
     started_at_s = time.monotonic()
     base_config = load_config(request.base_config_path)
     grid = build_grid_spec(base_config)
@@ -677,6 +841,7 @@ def execute_sop05r_teb_run(
             split=request.split,
             grid=grid,
             max_base_states=request.max_base_states,
+            base_state_start=request.base_state_start,
         )
     except Sop05rTebLong40InputError as exc:
         raise Sop05rTebRunError(str(exc)) from exc
@@ -692,10 +857,20 @@ def execute_sop05r_teb_run(
         snippets=snippets,
         seed=request.seed,
         split=request.split,
+        placement_selection_mode=request.placement_selection_mode,
     )
-    indexed_state_pairs = tuple(enumerate(inputs.state_pairs))
+    excluded_event_ids, exclusion_evidence = _excluded_event_ids(
+        request,
+        config_digest=teb_config.digest,
+    )
+    indexed_state_pairs = tuple(
+        enumerate(
+            inputs.state_pairs,
+            start=getattr(inputs, "base_state_start", request.base_state_start),
+        )
+    )
     processed_base_states = 0
-    if request.accepted_quota > 0:
+    if request.accepted_quota is None or request.accepted_quota > 0:
         for base_result in _ordered_base_state_results(
             indexed_state_pairs,
             context=generation_context,
@@ -712,8 +887,15 @@ def execute_sop05r_teb_run(
                     template_result.m5_candidate_rejections
                 )
                 if template_result.mother is not None:
-                    accepted.append(template_result.mother)
-                if len(accepted) >= request.accepted_quota:
+                    event_id = template_result.mother.event.generated_event_id
+                    if event_id in excluded_event_ids:
+                        counters["m6_excluded_existing"] += 1
+                    else:
+                        accepted.append(template_result.mother)
+                if (
+                    request.accepted_quota is not None
+                    and len(accepted) >= request.accepted_quota
+                ):
                     break
             if progress_callback is not None:
                 progress_callback(
@@ -727,30 +909,55 @@ def execute_sop05r_teb_run(
                         rejection_counts=rejections,
                     )
                 )
-            if len(accepted) >= request.accepted_quota:
+            if (
+                request.accepted_quota is not None
+                and len(accepted) >= request.accepted_quota
+            ):
                 break
 
+    requested_count = (
+        len(accepted)
+        if request.accepted_quota is None
+        else request.accepted_quota
+    )
+    source_evidence = {
+        **inputs.source_evidence,
+        **exclusion_evidence,
+        "base_state_start": request.base_state_start,
+        "accepted_selection": (
+            "all_accepted_v1"
+            if request.accepted_quota is None
+            else "accepted_quota_v1"
+        ),
+        "placement_selection_mode": request.placement_selection_mode,
+    }
+
     loaded = publish_sop05r_teb_run(
-        tuple(accepted[: request.accepted_quota]),
+        tuple(
+            accepted
+            if request.accepted_quota is None
+            else accepted[: request.accepted_quota]
+        ),
         request.output_dir,
         base_config=base_config,
-        requested_count=request.accepted_quota,
+        requested_count=requested_count,
         config_digest=teb_config.digest,
         verification_action_digest=_sha256_file(
             request.verification_action_config_path
         ),
-        source_evidence=inputs.source_evidence,
+        source_evidence=source_evidence,
         denominator_counts=counters,
         rejection_counts=rejections,
         m5_candidate_counts=m5_candidate_counts,
         m5_candidate_rejection_counts=m5_candidate_rejections,
+        resume_staging_root=request.resume_staging_root,
     )
     return Sop05rTebRunResult(
         output_dir=request.output_dir,
         run_state="complete" if loaded.complete else "quota_unmet",
         exit_code=0 if loaded.complete else 4,
         accepted_count=len(loaded.events),
-        requested_count=request.accepted_quota,
+        requested_count=requested_count,
         publication_semantic_digest=loaded.publication_semantic_digest,
         generation_summary=loaded.summary,
         complete=loaded.complete,

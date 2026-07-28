@@ -33,40 +33,46 @@ from src.geometry import (
     rasterize_footprint,
 )
 from src.generation.counterfactual_verify import (
-    expected_verification_fov_mask,
-    fit_signature_normalizer,
-    make_observation_signature,
-    simulate_counterfactual_observation,
+    expected_verification_fov_trace_mask,
+    simulate_counterfactual_observation_trace,
 )
-from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_contracts import footprint_from_spec
 from src.generation.observation_renderer import render_observation
-from src.generation.scenario_bank import (
-    ScenarioBankConfig,
-    ScenarioBankGeometryError,
-    build_scenario_bank,
+from src.generation.sop06_pipeline import (
+    Sop06SinglePublication,
+    render_sop06_mother_event,
 )
-from src.generation.sop06_pipeline import render_sop06_mother_event
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.generation.verification_gt import (
+    SampledVerificationValueResult,
     TypedFootprintRiskLoss,
     VerificationGTConfig,
-    VerificationValueResult,
-    evaluate_verification_value,
+    evaluate_sampled_realization_value,
+)
+from src.generation.verification_response import (
+    resolve_verification_response,
 )
 from src.generation.verification_toy import build_verification_toy_world
 from src.planning.query_maps import build_local_trajectory
-from src.planning.replanning import generate_replanned_candidates
+from src.planning.replanning import (
+    POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN,
+    generate_replanned_candidates,
+)
 from src.planning.trajectory_sampler import sample_candidate_rollouts
 from src.planning.verification_actions import (
     VerificationActionLibrary,
-    action_endpoint,
-    check_action_feasibility,
+    check_action_trace_feasibility,
+    sample_state_aware_action_trace,
+)
+from src.planning.verification_responses import (
+    VerificationPolicyBranch,
+    compose_time_aligned_policy_trajectory,
 )
 from src.utils.config import validate_config
 from src.utils.seeding import stable_digest
 
 
-VERIFICATION_PIPELINE_VERSION = "verification_pipeline_v1"
+VERIFICATION_PIPELINE_VERSION = "verification_pipeline_v6"
 
 
 class VerificationSourceIneligibleError(ValueError):
@@ -91,8 +97,9 @@ class VerificationPipelineInput:
     nominal_trajectory: LocalTrajectory
     current_world: OracleWorld
     current_dynamic_poses: Mapping[str, np.ndarray]
-    target_object_id: str
+    target_object_id: str | None
     robot_pose: np.ndarray
+    robot_state: np.ndarray
     current_visible_mask: np.ndarray
     current_age_map: np.ndarray
     bev_history: np.ndarray
@@ -106,10 +113,8 @@ class VerificationPipelineInput:
 class VerificationGroupResult:
     version: str
     samples: tuple[VerificationSample, ...]
-    values: Mapping[str, VerificationValueResult]
-    scenario_bank_digest: str
-    bank_size: int
-    posterior_mode: str
+    values: Mapping[str, SampledVerificationValueResult]
+    sampled_child_world_id: str
     infeasible_action_ids: tuple[str, ...]
 
 
@@ -154,8 +159,13 @@ def _current_pose_map(
 
 
 def _verification_sensor_geometry(
-    world: OracleWorld, grid: GridSpec
+    world: OracleWorld,
+    grid: GridSpec,
+    *,
+    action_library: VerificationActionLibrary,
 ) -> tuple[float, float]:
+    if not isinstance(action_library, VerificationActionLibrary):
+        raise TypeError("action_library must be a VerificationActionLibrary")
     config = world.blind_spot_config
     if not isinstance(config, Mapping):
         raise ValueError("world blind_spot_config must be a mapping")
@@ -163,16 +173,15 @@ def _verification_sensor_geometry(
     if structural is not None:
         if not isinstance(structural, Mapping):
             raise ValueError("structural blind-spot config must be a mapping")
-        fov = float(np.deg2rad(structural["forward_fov_deg"]))
         sensor_range = float(structural["range_m"])
     else:
-        fov = float(2.0 * np.pi)
         sensor_range = float(
             np.hypot(
                 grid.height * grid.resolution_m,
                 grid.width * grid.resolution_m,
             )
         )
+    fov = float(action_library.sensor_fov_rad)
     if not np.isfinite([fov, sensor_range]).all() or fov <= 0.0 or sensor_range <= 0.0:
         raise ValueError("verification sensor geometry must be finite and positive")
     return fov, sensor_range
@@ -182,6 +191,7 @@ def build_real_verification_input(
     source: VerificationSourceEvent,
     *,
     base_config: Mapping[str, Any],
+    action_library: VerificationActionLibrary,
     sop05_batch_digest: str,
     sop07_collection_digest: str,
     scientific_status: str,
@@ -191,15 +201,27 @@ def build_real_verification_input(
 
     if not isinstance(source, VerificationSourceEvent):
         raise TypeError("source must be a VerificationSourceEvent")
+    if not isinstance(action_library, VerificationActionLibrary):
+        raise TypeError("action_library must be a VerificationActionLibrary")
     config = dict(base_config)
     validate_config(config)
     grid = build_grid_spec(config)
+    sensor_fov, sensor_range = _verification_sensor_geometry(
+        source.event.world,
+        grid,
+        action_library=action_library,
+    )
+    verification_sensor = StructuralBlindSpot(
+        forward_fov_deg=float(np.rad2deg(sensor_fov)),
+        range_m=sensor_range,
+    )
     rendered = render_sop06_mother_event(
         record=source.event.target_motion_record,
         world=source.event.world,
         base_state=source.base_state,
         oracle_context=source.oracle_context,
         config=config,
+        sensor_config_override=verification_sensor,
     )
     visible = (
         rendered.state_channels[STATE_CHANNELS.index("current_visible_free")] != 0.0
@@ -210,9 +232,6 @@ def build_real_verification_input(
         != 0.0
     )
     age = rendered.state_channels[STATE_CHANNELS.index("occlusion_age_map")]
-    sensor_fov, sensor_range = _verification_sensor_geometry(
-        source.event.world, grid
-    )
     event_id = source.event.generated_event_id
     split = source.base_state.split
     if split not in {"train", "calibration", "val", "test"}:
@@ -239,6 +258,8 @@ def build_real_verification_input(
             event_id,
             size=16,
         ),
+        "verification_sensor_fov_deg": float(np.rad2deg(sensor_fov)),
+        "verification_sensor_range_m": sensor_range,
     }
     return VerificationPipelineInput(
         split=split,
@@ -251,6 +272,12 @@ def build_real_verification_input(
         target_object_id=source.event.target.target_dynamic_object_id,
         robot_pose=np.array(
             source.base_state.robot_history[-1],
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        robot_state=np.array(
+            source.base_state.robot_state,
             dtype=ARRAY_DTYPE,
             order="C",
             copy=True,
@@ -269,14 +296,187 @@ def build_real_verification_input(
     )
 
 
+def build_finalized_verification_input(
+    publication: Sop06SinglePublication,
+    *,
+    base_config: Mapping[str, Any],
+    action_library: VerificationActionLibrary,
+    target_current_pose: np.ndarray | None,
+    source_publication_semantic_digest: str,
+    final_release_identity: str,
+) -> VerificationPipelineInput:
+    """Adapt one finalized SOP5 sampled child without creating new worlds."""
+
+    if not isinstance(publication, Sop06SinglePublication):
+        raise TypeError("publication must be a Sop06SinglePublication")
+    if not isinstance(action_library, VerificationActionLibrary):
+        raise TypeError("action_library must be a VerificationActionLibrary")
+    for name, value in (
+        (
+            "source_publication_semantic_digest",
+            source_publication_semantic_digest,
+        ),
+        ("final_release_identity", final_release_identity),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be non-empty")
+    config = dict(base_config)
+    validate_config(config)
+    grid = build_grid_spec(config)
+    world = publication.oracle_world
+    renderer = publication.renderer_input
+    sensor_fov, sensor_range = _verification_sensor_geometry(
+        world,
+        grid,
+        action_library=action_library,
+    )
+    sensor = StructuralBlindSpot(
+        forward_fov_deg=float(np.rad2deg(sensor_fov)),
+        range_m=sensor_range,
+    )
+    rendered = render_observation(
+        renderer.base_state,
+        scene_dynamic_history=renderer.scene_dynamic_history,
+        scene_dynamic_specs=renderer.scene_dynamic_specs,
+        scene_dynamic_history_observed=(
+            renderer.scene_dynamic_history_observed
+        ),
+        static_occupancy=renderer.observed_static_occupancy,
+        sensor_config=sensor,
+        config=config,
+    )
+    visible = (
+        rendered.state_channels[
+            STATE_CHANNELS.index("current_visible_free")
+        ]
+        != 0.0
+    ) | (
+        rendered.state_channels[
+            STATE_CHANNELS.index("current_visible_occupied")
+        ]
+        != 0.0
+    )
+    age = rendered.state_channels[STATE_CHANNELS.index("occlusion_age_map")]
+    if len(publication.hidden_object_ids) != 1:
+        raise VerificationSourceIneligibleError(
+            "hidden_target_count",
+            "finalized sampled child must contain exactly one hidden target",
+        )
+    target_id = publication.hidden_object_ids[0]
+    target_spec = world.dynamic_object_specs[target_id]
+    target_object_type = target_spec.get("object_type")
+    target_footprint = target_spec.get("footprint")
+    if (
+        not isinstance(target_object_type, str)
+        or not target_object_type
+        or not isinstance(target_footprint, Mapping)
+        or target_footprint.get("kind") not in {"circle", "rectangle"}
+    ):
+        raise ValueError("finalized target type/footprint metadata is invalid")
+    target_footprint_kind = str(target_footprint["kind"])
+    if (
+        not isinstance(target_current_pose, np.ndarray)
+        or target_current_pose.shape != (3,)
+        or target_current_pose.dtype != ARRAY_DTYPE
+        or not np.isfinite(target_current_pose).all()
+    ):
+        raise ValueError("target_current_pose must be finite float32 [3]")
+    future_ids = set(world.dynamic_object_trajectories)
+    if (
+        future_ids != set(world.dynamic_object_specs)
+        or target_id not in future_ids
+        or not (future_ids - {target_id}).issubset(
+            renderer.scene_dynamic_history
+        )
+    ):
+        raise ValueError("oracle future IDs lack aligned history/spec fields")
+    current_poses = {
+        object_id: np.array(
+            (
+                target_current_pose
+                if object_id == target_id
+                else renderer.scene_dynamic_history[object_id][-1]
+            ),
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        )
+        for object_id in sorted(future_ids)
+    }
+    return VerificationPipelineInput(
+        split=publication.split,
+        base_state_id=renderer.base_state.state_id,
+        source_namespace=(
+            f"sop05-final/{publication.split}/{publication.sample_id}"
+        ),
+        grid=grid,
+        nominal_trajectory=publication.trajectory,
+        current_world=world,
+        current_dynamic_poses=current_poses,
+        target_object_id=target_id,
+        robot_pose=np.array(
+            renderer.base_state.robot_history[-1],
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        robot_state=np.array(
+            renderer.base_state.robot_state,
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        current_visible_mask=np.asarray(visible, dtype=np.bool_, order="C"),
+        current_age_map=np.array(
+            age,
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        bev_history=np.array(
+            rendered.bev_history,
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        state_channels=np.array(
+            rendered.state_channels,
+            dtype=ARRAY_DTYPE,
+            order="C",
+            copy=True,
+        ),
+        sensor_fov_rad=sensor_fov,
+        sensor_range_m=sensor_range,
+        provenance={
+            "source_mode": "sop05-final",
+            "source_sample_id": publication.sample_id,
+            "source_mother_id": publication.mother_id,
+            "blind_type": publication.regime,
+            "target_object_type": target_object_type,
+            "target_footprint_kind": target_footprint_kind,
+            "source_artifact_digest": stable_digest(
+                source_publication_semantic_digest,
+                final_release_identity,
+                publication.sample_id,
+                size=16,
+            ),
+            "verification_sensor_fov_deg": float(np.rad2deg(sensor_fov)),
+            "verification_sensor_range_m": sensor_range,
+        },
+    )
+
+
 def build_verification_toy_input(
     base_config: Mapping[str, Any],
     *,
+    action_library: VerificationActionLibrary,
     group_index: int,
 ) -> tuple[VerificationPipelineInput, dict[str, Any]]:
     """Create one distinct toy identity while preserving hand-checkable geometry."""
 
     index = _positive_integer(group_index + 1, name="group_index_plus_one") - 1
+    if not isinstance(action_library, VerificationActionLibrary):
+        raise TypeError("action_library must be a VerificationActionLibrary")
     config = deepcopy(dict(base_config))
     config["bev"]["range_m"] = 8.0
     config["bev"]["size"] = 80
@@ -285,7 +485,10 @@ def build_verification_toy_input(
     if build_grid_spec(config) != toy.grid:
         raise RuntimeError("toy config and toy grid differ")
     base_id = f"toy-base-{index:04d}"
-    sensor = StructuralBlindSpot(forward_fov_deg=20.0, range_m=4.0)
+    sensor = StructuralBlindSpot(
+        forward_fov_deg=float(np.rad2deg(action_library.sensor_fov_rad)),
+        range_m=4.0,
+    )
     robot_history = np.zeros((toy.grid.history_steps, 3), dtype=ARRAY_DTYPE)
     base_state = BaseState(
         state_id=base_id,
@@ -367,6 +570,9 @@ def build_verification_toy_input(
         },
         target_object_id="critical_cart",
         robot_pose=np.zeros(3, dtype=ARRAY_DTYPE),
+        robot_state=np.array(
+            base_state.robot_state, dtype=ARRAY_DTYPE, order="C", copy=True
+        ),
         current_visible_mask=np.asarray(visible, dtype=bool, order="C"),
         current_age_map=np.array(age, dtype=ARRAY_DTYPE, order="C", copy=True),
         bev_history=np.array(
@@ -375,13 +581,17 @@ def build_verification_toy_input(
         state_channels=np.array(
             rendered.state_channels, dtype=ARRAY_DTYPE, order="C", copy=True
         ),
-        sensor_fov_rad=float(np.deg2rad(20.0)),
+        sensor_fov_rad=action_library.sensor_fov_rad,
         sensor_range_m=4.0,
         provenance={
             "source_mode": "toy",
             "scientific_status": "toy_smoke_only",
             "source_artifact_digest": case_digest,
             "toy_case_digest": case_digest,
+            "verification_sensor_fov_deg": float(
+                np.rad2deg(action_library.sensor_fov_rad)
+            ),
+            "verification_sensor_range_m": 4.0,
         },
     )
     return source, config
@@ -396,9 +606,34 @@ def _hidden_object_ids(source: VerificationPipelineInput) -> tuple[str, ...]:
         )
         if not np.any(occupied & source.current_visible_mask):
             hidden.append(object_id)
-    if source.target_object_id not in hidden:
-        raise ValueError("scenario target must be hidden in the current observation")
+    if (
+        source.target_object_id is not None
+        and source.target_object_id not in hidden
+    ):
+        raise VerificationSourceIneligibleError(
+            "target_visible_under_verification_sensor",
+            "sampled target is visible in the configured verification observation",
+        )
     return tuple(hidden)
+
+
+def _policy_trajectory_id(
+    *,
+    action_id: str,
+    branch: VerificationPolicyBranch,
+    suffix_trajectory_id: str | None,
+) -> str:
+    if suffix_trajectory_id is None:
+        if branch.branch_kind != "emergency_brake":
+            raise ValueError("only an emergency branch may omit a replan suffix")
+        return (
+            f"policy::brake@{branch.trigger_time_s:.6f}::"
+            f"{action_id}"
+        )
+    return (
+        f"policy::{branch.branch_kind}@{branch.end_time_s:.6f}::"
+        f"{suffix_trajectory_id}"
+    )
 
 
 def generate_verification_group(
@@ -407,14 +642,9 @@ def generate_verification_group(
     base_config: Mapping[str, Any],
     action_library: VerificationActionLibrary,
     gt_config: VerificationGTConfig,
-    scenario_config: ScenarioBankConfig,
-    bank_size: int,
-    posterior_mode: str,
-    posterior_temperature: float | None,
-    seed: int,
     max_replan_candidates: int,
 ) -> VerificationGroupResult:
-    """Run all six actions through the same simulator-defined value path."""
+    """Evaluate all six actions on the one child realization sampled by SOP5."""
 
     if not isinstance(source, VerificationPipelineInput):
         raise TypeError("source must be a VerificationPipelineInput")
@@ -424,41 +654,20 @@ def generate_verification_group(
         raise ValueError("base_config grid differs from verification source")
     if not isinstance(action_library, VerificationActionLibrary):
         raise TypeError("action_library must be a VerificationActionLibrary")
+    if not np.isclose(
+        source.sensor_fov_rad,
+        action_library.sensor_fov_rad,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("verification source FOV differs from the action library")
     if not isinstance(gt_config, VerificationGTConfig):
         raise TypeError("gt_config must be a VerificationGTConfig")
-    if not isinstance(scenario_config, ScenarioBankConfig):
-        raise TypeError("scenario_config must be a ScenarioBankConfig")
-    bank_count = _positive_integer(bank_size, name="bank_size")
     candidate_count = _positive_integer(
         max_replan_candidates, name="max_replan_candidates"
     )
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise TypeError("seed must be an integer")
-    if posterior_mode == "exact" and posterior_temperature is not None:
-        raise ValueError("exact posterior does not use a temperature")
-    if posterior_mode == "soft" and posterior_temperature is None:
-        raise ValueError("soft posterior requires a temperature")
 
-    try:
-        bank = build_scenario_bank(
-            current_world=source.current_world,
-            target_object_id=source.target_object_id,
-            current_dynamic_poses=source.current_dynamic_poses,
-            current_visible_mask=source.current_visible_mask,
-            grid=source.grid,
-            split=source.split,
-            source_namespace=source.source_namespace,
-            seed=seed,
-            size=bank_count,
-            config=scenario_config,
-        )
-    except ScenarioBankGeometryError as exc:
-        reason = (
-            "scenario_current_static_overlap"
-            if exc.variant_kind == "current"
-            else "scenario_variant_static_overlap"
-        )
-        raise VerificationSourceIneligibleError(reason, str(exc)) from exc
+    hidden_ids = _hidden_object_ids(source)
     robot_footprint = _robot_footprint(config)
     dynamic_footprints = {
         object_id: footprint_from_spec(spec)
@@ -473,7 +682,7 @@ def generate_verification_group(
         ).astype(ARRAY_DTYPE)
         for object_id in source.current_world.dynamic_object_trajectories
     }
-    hidden_ids = _hidden_object_ids(source)
+    visible_dynamic_ids = set(dynamic_poses) - set(hidden_ids)
     risk_config = config["risk_gt"]
     risk_loss = TypedFootprintRiskLoss(
         hidden_object_ids=hidden_ids,
@@ -485,25 +694,85 @@ def generate_verification_group(
         near_miss_distance_m=float(risk_config["near_miss_distance_m"]),
     )
     fov_masks: dict[str, np.ndarray] = {}
-    values: dict[str, VerificationValueResult] = {}
+    values: dict[str, SampledVerificationValueResult] = {}
     infeasible: list[str] = []
+    future_dt_s = float(config["bev"]["future_dt_s"])
+    future_horizon_s = source.grid.future_steps * future_dt_s
     for action in action_library.actions:
-        feasibility = check_action_feasibility(
+        action_trace = sample_state_aware_action_trace(
             source.robot_pose,
             action,
+            robot_state=source.robot_state,
+            braking_deceleration_mps2=gt_config.braking_deceleration_mps2,
+            angular_deceleration_radps2=(
+                gt_config.angular_deceleration_radps2
+            ),
+        )
+        feasibility = check_action_trace_feasibility(
+            action_trace,
             robot_footprint=robot_footprint,
             static_occupancy=source.current_world.static_occupancy,
             grid=source.grid,
-            dynamic_object_poses=dynamic_poses,
-            dynamic_object_footprints=dynamic_footprints,
-            dynamic_dt_s=float(config["bev"]["future_dt_s"]),
+            dynamic_object_poses={
+                object_id: dynamic_poses[object_id]
+                for object_id in visible_dynamic_ids
+            },
+            dynamic_object_footprints={
+                object_id: dynamic_footprints[object_id]
+                for object_id in visible_dynamic_ids
+            },
+            dynamic_dt_s=future_dt_s,
         )
         if not feasibility.feasible:
             infeasible.append(action.action_id)
             continue
-        post_pose = action_endpoint(source.robot_pose, action)
+        fov_masks[action.action_id] = expected_verification_fov_trace_mask(
+            source.current_world.static_occupancy,
+            source.grid,
+            action_trace=action_trace,
+            fov_rad=source.sensor_fov_rad,
+            max_range_m=source.sensor_range_m,
+        )
+        planned_observation_trace = simulate_counterfactual_observation_trace(
+            action_trace=action_trace,
+            static_occupancy=source.current_world.static_occupancy,
+            dynamic_current_poses=source.current_dynamic_poses,
+            dynamic_future_poses=(
+                source.current_world.dynamic_object_trajectories
+            ),
+            dynamic_specs=source.current_world.dynamic_object_specs,
+            current_visible_mask=source.current_visible_mask,
+            current_age_map=source.current_age_map,
+            grid=source.grid,
+            future_dt_s=future_dt_s,
+            age_max_s=float(config["age_map"]["a_max_s"]),
+            fov_rad=source.sensor_fov_rad,
+            max_range_m=source.sensor_range_m,
+        )
+        resolution = resolve_verification_response(
+            action_trace=action_trace,
+            observation_trace=planned_observation_trace,
+            robot_footprint=robot_footprint,
+            static_occupancy=source.current_world.static_occupancy,
+            dynamic_current_poses=source.current_dynamic_poses,
+            dynamic_future_poses=(
+                source.current_world.dynamic_object_trajectories
+            ),
+            dynamic_specs=source.current_world.dynamic_object_specs,
+            current_visible_mask=source.current_visible_mask,
+            route_corridor_mask=source.nominal_trajectory.swept_mask,
+            grid=source.grid,
+            future_dt_s=future_dt_s,
+            future_horizon_s=future_horizon_s,
+            braking_deceleration_mps2=gt_config.braking_deceleration_mps2,
+            angular_deceleration_radps2=(
+                gt_config.angular_deceleration_radps2
+            ),
+            braking_margin_s=gt_config.braking_margin_s,
+        )
+        branch = resolution.branch
         replanning = generate_replanned_candidates(
-            post_action_pose=post_pose,
+            post_action_pose=branch.end_pose,
             nominal_trajectory=source.nominal_trajectory,
             action_id=action.action_id,
             config=config,
@@ -511,69 +780,78 @@ def generate_verification_group(
             braking_deceleration_mps2=gt_config.braking_deceleration_mps2,
             max_candidates=candidate_count,
         )
-        fov_masks[action.action_id] = expected_verification_fov_mask(
-            source.current_world.static_occupancy,
-            source.grid,
-            sensor_pose=post_pose,
-            fov_rad=source.sensor_fov_rad,
-            max_range_m=source.sensor_range_m,
-        )
-        observations = tuple(
-            simulate_counterfactual_observation(
-                post_action_pose=post_pose,
-                action_duration_s=action.duration_s,
-                static_occupancy=hypothesis.world.static_occupancy,
-                dynamic_current_poses=hypothesis.current_dynamic_poses,
-                dynamic_future_poses=hypothesis.world.dynamic_object_trajectories,
-                dynamic_specs=hypothesis.world.dynamic_object_specs,
-                current_visible_mask=source.current_visible_mask,
-                current_age_map=source.current_age_map,
-                grid=source.grid,
-                future_dt_s=float(config["bev"]["future_dt_s"]),
-                age_max_s=float(config["age_map"]["a_max_s"]),
-                fov_rad=source.sensor_fov_rad,
-                max_range_m=source.sensor_range_m,
-            )
-            for hypothesis in bank.hypotheses
-        )
-        replanned_masks = tuple(
-            candidate.swept_mask_in_parent_frame
-            for candidate in replanning.candidates
-        )
-        signatures = np.stack(
-            [
-                make_observation_signature(
-                    observation,
-                    grid=source.grid,
-                    original_swept_mask=source.nominal_trajectory.swept_mask,
-                    replanned_swept_masks=replanned_masks,
-                    local_goal_corridor_mask=source.nominal_trajectory.swept_mask,
-                    critical_region_mask=source.nominal_trajectory.swept_mask,
-                    previous_age_map=source.current_age_map,
+        if (
+            replanning.plan_status
+            == POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN
+        ):
+            aligned: list[LocalTrajectory] = []
+            if (
+                branch.branch_kind == "emergency_brake"
+                and resolution.decision.brake_trace_collision_free is not True
+            ):
+                raise VerificationSourceIneligibleError(
+                    "unsafe_emergency_brake",
+                    "no-feasible-plan bypass requires a collision-free "
+                    "emergency brake",
                 )
-                for observation in observations
-            ],
-            axis=0,
-        ).astype(ARRAY_DTYPE)
-        normalizer = (
-            fit_signature_normalizer(signatures, split="train")
-            if posterior_mode == "soft"
-            else None
-        )
-        values[action.action_id] = evaluate_verification_value(
-            bank=bank,
+            if not np.allclose(
+                branch.end_control,
+                0.0,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "no-feasible-plan bypass requires a safe stopped branch"
+                )
+        else:
+            aligned = [
+                compose_time_aligned_policy_trajectory(
+                    template_trajectory=candidate.trajectory,
+                    branch=branch,
+                    future_dt_s=future_dt_s,
+                    trajectory_id=_policy_trajectory_id(
+                        action_id=action.action_id,
+                        branch=branch,
+                        suffix_trajectory_id=candidate.trajectory.trajectory_id,
+                    ),
+                    source_action_id=action.action_id,
+                    source_nominal_trajectory_id=(
+                        source.nominal_trajectory.trajectory_id
+                    ),
+                    suffix_trajectory=candidate.trajectory,
+                    suffix_poses_in_parent_frame=(
+                        candidate.poses_in_parent_frame
+                    ),
+                )
+                for candidate in replanning.candidates
+            ]
+            if branch.branch_kind == "emergency_brake":
+                aligned.append(
+                    compose_time_aligned_policy_trajectory(
+                        template_trajectory=source.nominal_trajectory,
+                        branch=branch,
+                        future_dt_s=future_dt_s,
+                        trajectory_id=_policy_trajectory_id(
+                            action_id=action.action_id,
+                            branch=branch,
+                            suffix_trajectory_id=None,
+                        ),
+                        source_action_id=action.action_id,
+                        source_nominal_trajectory_id=(
+                            source.nominal_trajectory.trajectory_id
+                        ),
+                    )
+                )
+        values[action.action_id] = evaluate_sampled_realization_value(
+            realized_world=source.current_world,
             nominal_trajectory=source.nominal_trajectory,
             action=action,
-            observations=observations,
-            signatures=signatures,
-            replanning_results=(replanning,) * bank.size,
+            replanning_result=replanning,
             risk_loss=risk_loss,
-            posterior_mode=posterior_mode,
-            signature_normalizer=normalizer,
-            posterior_temperature=posterior_temperature,
             reject_cost=gt_config.reject_cost,
             risk_weight=gt_config.risk_weight,
             action_cost_config=config["verification_cost"],
+            time_aligned_policy_trajectories=tuple(aligned),
         )
     if infeasible:
         raise VerificationSourceIneligibleError(
@@ -598,9 +876,7 @@ def generate_verification_group(
         version=VERIFICATION_PIPELINE_VERSION,
         samples=samples,
         values=MappingProxyType(dict(values)),
-        scenario_bank_digest=bank.semantic_digest,
-        bank_size=bank.size,
-        posterior_mode=posterior_mode,
+        sampled_child_world_id=source.current_world.world_id,
         infeasible_action_ids=(),
     )
 
@@ -610,6 +886,7 @@ __all__ = (
     "VerificationGroupResult",
     "VerificationPipelineInput",
     "VerificationSourceIneligibleError",
+    "build_finalized_verification_input",
     "build_real_verification_input",
     "build_verification_toy_input",
     "generate_verification_group",

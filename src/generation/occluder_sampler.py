@@ -155,7 +155,6 @@ class PreparedOccluderCollisionSweep:
                 for start_pose, end_pose in zip(
                     canonical_dense_poses[:-1],
                     canonical_dense_poses[1:],
-                    strict=True,
                 )
             ],
             dtype=np.dtype("<f8"),
@@ -317,7 +316,7 @@ def _densify_pose_sequence(
     """Interpolate a pose path so exact collision checks include frame gaps."""
 
     dense = [poses[0].copy()]
-    for start, end in zip(poses[:-1], poses[1:], strict=True):
+    for start, end in zip(poses[:-1], poses[1:]):
         translation = float(np.linalg.norm(end[:2] - start[:2]))
         yaw_delta = float(wrap_angle(end[2] - start[2]))
         steps = max(
@@ -376,7 +375,6 @@ def _densify_synchronized_pose_sequences(
         poses_a[1:],
         poses_b[:-1],
         poses_b[1:],
-        strict=True,
     ):
         yaw_delta_a = float(wrap_angle(end_a[2] - start_a[2]))
         yaw_delta_b = float(wrap_angle(end_b[2] - start_b[2]))
@@ -667,7 +665,7 @@ def prepare_occluder_collision_sweep(
                 motion_radius_m=motion_radius_m,
             )
             for start_pose, end_pose in zip(
-                dense_poses[:-1], dense_poses[1:], strict=True
+                dense_poses[:-1], dense_poses[1:]
             )
         ],
         dtype=np.float64,

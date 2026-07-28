@@ -1,0 +1,177 @@
+schema_version: "4.0.0"
+matrix_version: "sop16_experiment_matrix_v1"
+matrix_name: "sop16-sensitivity"
+scientific_status: "production_evaluation"
+closed_loop_config: "../closed_loop_production.yaml"
+required_target_type_policy: "human_target_with_contextual_dynamic_objects"
+seeds: [7, 11, 17]
+strategies: [never, always, visible, swept, entropy, learned, oracle]
+experiments:
+  - experiment_id: "scenario-bank-m8"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/scenario-bank-m8/seed-{seed}"
+    parameters: {axis: "scenario_bank_m", value: 8}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at scenario-bank size 8."]
+  - experiment_id: "scenario-bank-m16"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/scenario-bank-m16/seed-{seed}"
+    parameters: {axis: "scenario_bank_m", value: 16}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at scenario-bank size 16."]
+  - experiment_id: "scenario-bank-m32"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/scenario-bank-m32/seed-{seed}"
+    parameters: {axis: "scenario_bank_m", value: 32}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at scenario-bank size 32."]
+  - experiment_id: "posterior-tau-01"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/posterior-tau-01/seed-{seed}"
+    parameters: {axis: "posterior_tau", value: 0.1}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at posterior temperature 0.1."]
+  - experiment_id: "posterior-tau-02"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/posterior-tau-02/seed-{seed}"
+    parameters: {axis: "posterior_tau", value: 0.2}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at posterior temperature 0.2."]
+  - experiment_id: "posterior-tau-05"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/posterior-tau-05/seed-{seed}"
+    parameters: {axis: "posterior_tau", value: 0.5}
+    runtime_overrides: {}
+    claims: ["Measure decision stability at posterior temperature 0.5."]
+  - experiment_id: "composition-balanced"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/composition-balanced/seed-{seed}"
+    parameters: {axis: "scenario_composition", value: "balanced"}
+    runtime_overrides: {}
+    claims: ["Measure sensitivity to balanced scenario composition."]
+  - experiment_id: "composition-hard-negative"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/composition-hard-negative/seed-{seed}"
+    parameters: {axis: "scenario_composition", value: "hard_negative"}
+    runtime_overrides: {}
+    claims: ["Measure sensitivity to hard-negative scenario composition."]
+  - experiment_id: "signature-full"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/signature-full/seed-{seed}"
+    parameters: {axis: "signature_feature", value: "full"}
+    runtime_overrides: {}
+    claims: ["Measure decision stability with full signature features."]
+  - experiment_id: "signature-ablated"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "value_without_signature"
+    suite_pattern: "sensitivity/signature-ablated/seed-{seed}"
+    parameters: {axis: "signature_feature", value: "without_signature"}
+    runtime_overrides: {}
+    claims: ["Measure decision stability without signature features."]
+  - experiment_id: "prior-uniform"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/prior-uniform/seed-{seed}"
+    parameters: {axis: "world_prior", value: "uniform"}
+    runtime_overrides: {}
+    claims: ["Measure sensitivity to a uniform world prior."]
+  - experiment_id: "prior-non-uniform"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/prior-non-uniform/seed-{seed}"
+    parameters: {axis: "world_prior", value: "non_uniform"}
+    runtime_overrides: {}
+    claims: ["Measure sensitivity to a non-uniform world prior."]
+  - experiment_id: "verification-cost-05"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verification-cost-05/seed-{seed}"
+    parameters: {axis: "verification_cost_scale", value: 0.5}
+    runtime_overrides: {}
+    claims: ["Measure policy response to verification-cost scale 0.5."]
+  - experiment_id: "verification-cost-10"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verification-cost-10/seed-{seed}"
+    parameters: {axis: "verification_cost_scale", value: 1.0}
+    runtime_overrides: {}
+    claims: ["Measure policy response to verification-cost scale 1.0."]
+  - experiment_id: "verification-cost-20"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verification-cost-20/seed-{seed}"
+    parameters: {axis: "verification_cost_scale", value: 2.0}
+    runtime_overrides: {}
+    claims: ["Measure policy response to verification-cost scale 2.0."]
+  - experiment_id: "verify-margin-000"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verify-margin/seed-{seed}"
+    parameters: {axis: "verify_margin", value: 0.0}
+    runtime_overrides: {verify_margin: 0.0}
+    claims: ["Scan the safety-efficiency operating point at verify margin 0.0."]
+  - experiment_id: "verify-margin-001"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verify-margin/seed-{seed}"
+    parameters: {axis: "verify_margin", value: 0.01}
+    runtime_overrides: {verify_margin: 0.01}
+    claims: ["Scan the safety-efficiency operating point at verify margin 0.01."]
+  - experiment_id: "verify-margin-005"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/verify-margin/seed-{seed}"
+    parameters: {axis: "verify_margin", value: 0.05}
+    runtime_overrides: {verify_margin: 0.05}
+    claims: ["Scan the safety-efficiency operating point at verify margin 0.05."]
+  - experiment_id: "risk-weight-05"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/risk-weight/seed-{seed}"
+    parameters: {axis: "risk_weight", value: 0.5}
+    runtime_overrides: {risk_weight: 0.5}
+    claims: ["Scan the safety-efficiency operating point at risk weight 0.5."]
+  - experiment_id: "risk-weight-10"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/risk-weight/seed-{seed}"
+    parameters: {axis: "risk_weight", value: 1.0}
+    runtime_overrides: {risk_weight: 1.0}
+    claims: ["Scan the safety-efficiency operating point at risk weight 1.0."]
+  - experiment_id: "risk-weight-20"
+    category: "sensitivity"
+    risk_method: "risk_calibration"
+    value_method: "learned_value"
+    suite_pattern: "sensitivity/risk-weight/seed-{seed}"
+    parameters: {axis: "risk_weight", value: 2.0}
+    runtime_overrides: {risk_weight: 2.0}
+    claims: ["Scan the safety-efficiency operating point at risk weight 2.0."]

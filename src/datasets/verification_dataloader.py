@@ -177,6 +177,14 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _sha256_file(path: Path, block_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _domain_digest(domain: bytes, payload: bytes) -> str:
     digest = hashlib.sha256()
     digest.update(domain)
@@ -289,10 +297,10 @@ def _semantic_digest(
     digest.update(encoded)
     for name in _NUMERIC_NAMES:
         name_bytes = name.encode("ascii")
-        raw = arrays[name].tobytes(order="C")
+        raw = memoryview(arrays[name]).cast("B")
         digest.update(len(name_bytes).to_bytes(4, "big"))
         digest.update(name_bytes)
-        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(arrays[name].nbytes.to_bytes(8, "big"))
         digest.update(raw)
     return digest.hexdigest()
 
@@ -358,7 +366,6 @@ def write_verification_shard(
         payload_path = staging / _PAYLOAD_NAME
         with payload_path.open("wb") as handle:
             np.savez_compressed(handle, **arrays)
-        payload_bytes = payload_path.read_bytes()
         (staging / _MANIFEST_NAME).write_bytes(manifest_bytes)
         summary = {
             "schema_version": SCHEMA_VERSION,
@@ -377,7 +384,7 @@ def write_verification_shard(
                 "summary": _SUMMARY_NAME,
             },
             "checksums": {
-                "payload_sha256": _sha256(payload_bytes),
+                "payload_sha256": _sha256_file(payload_path),
                 "manifest_sha256": _sha256(manifest_bytes),
             },
             "manifest_digest": manifest_digest,
@@ -591,9 +598,9 @@ def load_verification_shard(
         "manifest_sha256",
     }:
         raise ValueError("summary checksum keys are invalid")
-    payload_bytes = (root / _PAYLOAD_NAME).read_bytes()
+    payload_path = root / _PAYLOAD_NAME
     manifest_rows, manifest_bytes = _load_manifest(root / _MANIFEST_NAME)
-    if _sha256(payload_bytes) != checksums["payload_sha256"]:
+    if _sha256_file(payload_path) != checksums["payload_sha256"]:
         raise ValueError("payload checksum mismatch")
     if _sha256(manifest_bytes) != checksums["manifest_sha256"]:
         raise ValueError("manifest checksum mismatch")

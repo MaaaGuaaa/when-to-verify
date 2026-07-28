@@ -1,0 +1,10 @@
+schema_version: "4.0.0"
+closed_loop_version: "sop15_toy_closed_loop_v1"
+future_horizon_s: 6.4
+execute_step_s: 0.2
+verify_step_s: 0.6
+risk_weight: 1.0
+verify_margin: 0.01
+collision_risk_threshold: 0.7
+near_miss_risk_threshold: 0.4
+max_decisions: 32

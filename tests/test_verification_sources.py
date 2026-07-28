@@ -45,17 +45,17 @@ def _batch_handoff():
                     "dt_s": 0.2,
                     "external_handoff_digest_sha256": "9" * 64,
                     "first_pose_time_s": 0.2,
-                    "last_pose_time_s": 3.0,
+                    "last_pose_time_s": 6.4,
                     "pose_time_layout_version": "future_endpoints_dt_to_horizon_v1",
                     "pose_time_offsets_sha256": "c" * 64,
                     "trajectory_bank_version": "sop04_audited_bank_v2",
-                    "trajectory_steps": 15,
+                    "trajectory_steps": 32,
                 },
             }
         },
         "counts": {"events": 2, "planned_events": 2, "shards": 2},
         "handoff_version": "sop05_batch_index_handoff_v1",
-        "schema_version": "3.0.0",
+        "schema_version": "4.0.0",
         "split": "train",
         "shards": [
             {
@@ -106,7 +106,7 @@ def _collection_handoff():
             }
         },
         "sample_count": 11,
-        "schema_version": "3.0.0",
+        "schema_version": "4.0.0",
         "shard_count": 2,
         "shards": [
             {"relative_root": "shard-00000", "shard_index": 0},
@@ -130,7 +130,7 @@ def _heldout_handoffs(split):
     launch = {
         "artifact_role": f"sop07_{split}_batch_launch_manifest",
         "code_commit": "f" * 40,
-        "schema_version": "3.0.0",
+        "schema_version": "4.0.0",
         "source_sop05_batch": {
             "batch_semantic_digest_sha256": BATCH_DIGEST,
             "event_count": 2,
@@ -336,8 +336,8 @@ def test_snippet_geometry_is_compared_to_nested_record_footprint():
         provenance={},
     )
     record = EventTargetMotionRecord(
-        schema_version="3.0.0",
-        layout_version="history8_current7_future15_v1",
+        schema_version="4.0.0",
+        layout_version="event_target_motion_history8_future32_v2",
         generated_event_id="event-a",
         world_id="world-a",
         base_state_id="base-a",
@@ -354,7 +354,7 @@ def test_snippet_geometry_is_compared_to_nested_record_footprint():
         target_type_policy_digest="policy-a",
         history_poses=np.zeros((8, 3), dtype=np.float32),
         current_pose=np.zeros(3, dtype=np.float32),
-        future_poses=np.zeros((15, 3), dtype=np.float32),
+        future_poses=np.zeros((32, 3), dtype=np.float32),
         history_array_digest="history-a",
         future_array_digest="future-a",
         record_digest="record-a",

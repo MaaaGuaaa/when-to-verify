@@ -1,4 +1,4 @@
-schema_version: "3.0.0"
+schema_version: "4.0.0"
 model:
   version: verification_concat_cnn_v0
   spatial_channels: [8, 16, 32]

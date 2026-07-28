@@ -147,7 +147,7 @@ def test_training_cli_writes_atomic_smoke_only_handoff_and_refuses_overwrite(
     )
     summary = json.loads((shard / "summary.json").read_text())
     handoff = {
-        "schema_version": "3.0.0",
+        "schema_version": "4.0.0",
         "handoff_version": "verification_collection_handoff_v1",
         "collection_state": "complete",
         "scientific_status": "toy_smoke_only",
@@ -192,6 +192,8 @@ def test_training_cli_writes_atomic_smoke_only_handoff_and_refuses_overwrite(
         str(model_path),
         "--code-version",
         "1" * 40,
+        "--seed",
+        "17",
     ]
     module = _module()
 
@@ -201,6 +203,7 @@ def test_training_cli_writes_atomic_smoke_only_handoff_and_refuses_overwrite(
         "manifest.json",
         "metrics.json",
         "training_report.json",
+        "COMPLETE.json",
     }
     metrics = json.loads((output / "metrics.json").read_text())
     report = json.loads((output / "training_report.json").read_text())
@@ -208,5 +211,48 @@ def test_training_cli_writes_atomic_smoke_only_handoff_and_refuses_overwrite(
     assert metrics["paper_thresholds_evaluated"] is False
     assert report["collection_semantic_digest"] == "e" * 64
     assert report["sample_count"] == 6
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["seed"] == 17
+    assert manifest["model_config"]["training"]["seed"] == 17
     with pytest.raises(FileExistsError, match="overwrite"):
         module.main(args)
+
+
+def test_training_cli_accepts_release_calibration_mode_and_rejects_mixed_inputs():
+    module = _module()
+    common = [
+        "--output-dir",
+        "/tmp/output",
+        "--base-config",
+        "/tmp/base.yaml",
+        "--actions-config",
+        "/tmp/actions.yaml",
+        "--model-config",
+        "/tmp/model.yaml",
+        "--code-version",
+        "1" * 40,
+    ]
+    parsed = module._parser().parse_args(
+        [
+            "--release-dir",
+            "/tmp/release",
+            "--value-calibration",
+            "/tmp/calibration",
+            *common,
+        ]
+    )
+    module._validate_input_args(parsed)
+    assert parsed.release_dir == Path("/tmp/release")
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args(
+            [
+                "--release-dir",
+                "/tmp/release",
+                "--shard-dir",
+                "/tmp/shard",
+                "--value-calibration",
+                "/tmp/calibration",
+                *common,
+            ]
+        )

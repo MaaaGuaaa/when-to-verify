@@ -92,6 +92,16 @@ held-out 条目必须同时严格加载 mother root 和 final root，并检查�
 final.source_publication_semantic_digest == mother.publication_semantic_digest
 ```
 
+### Complete-mother 的 bounded resolution
+
+complete-mother 的 SOP06/SOP07 实现先认证母产物的事件元数据、轨迹 collection
+digest、target-motion payload digest 和 completion marker；随后按输出 shard 只加载该
+boundary 所需的 `BaseState`、`OracleWorld` 与轨迹数组。每个已加载 payload 仍必须校验
+source index、mother ID、state digest、world semantic digest、trajectory ID 和 split。
+
+这只是读取策略，不能用来绕过双 root、digest、source family 或 final release identity
+校验；也不允许向 SOP06 renderer 暴露 oracle future。
+
 ## 从 finalized record 构造 SOP06
 
 1. 扩展 final-scenario loader，使其返回已经校验过的 `history_poses`、`future_poses`、

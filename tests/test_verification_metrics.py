@@ -103,6 +103,11 @@ def test_metrics_match_group_local_hand_calculation_and_slice_counts():
     assert report["sample_count"] == 6
     assert report["group_count"] == 2
     assert report["useful_f1"] == pytest.approx(6.0 / 7.0)
+    assert report["useful_brier"] == pytest.approx(0.47 / 6.0)
+    assert report["useful_ece"] == pytest.approx(1.3 / 6.0)
+    assert sum(
+        row["sample_count"] for row in report["useful_calibration_bins"]
+    ) == 6
     assert report["value_mse"] == pytest.approx(1.0 / 3.0)
     assert report["value_huber"] == pytest.approx(1.0 / 6.0)
     assert report["pairwise_accuracy"] == pytest.approx(5.0 / 6.0)
@@ -147,7 +152,7 @@ def test_rank_correlations_and_pairwise_tie_policy_are_explicit():
     assert kendall_tau_b(np.ones(3), np.ones(3)) == pytest.approx(0.0)
 
 
-def test_checkpoint_manifest_v2_binds_all_frozen_inputs_and_rejects_legacy():
+def test_checkpoint_manifest_v3_binds_all_frozen_inputs_and_rejects_legacy():
     config = load_verify_model_config(ROOT / "configs/verify_model.yaml")
     model_config = asdict(config)
     manifest = build_verification_checkpoint_manifest(
@@ -159,6 +164,8 @@ def test_checkpoint_manifest_v2_binds_all_frozen_inputs_and_rejects_legacy():
     )
 
     assert manifest["manifest_version"] == VERIFICATION_CHECKPOINT_MANIFEST_VERSION
+    assert manifest["value_calibration_digest"] is None
+    assert manifest["reject_cost"] is None
     validated = validate_verification_checkpoint_manifest(
         manifest,
         expected_input_manifest_digest="a" * 64,
@@ -171,6 +178,7 @@ def test_checkpoint_manifest_v2_binds_all_frozen_inputs_and_rejects_legacy():
 
     for field, invalid, match in (
         ("manifest_version", "verification_checkpoint_manifest_v1", "legacy"),
+        ("manifest_version", "verification_checkpoint_manifest_v2", "legacy"),
         ("schema_version", "2.0.0", "schema"),
         ("history_channels", ["wrong"], "channel"),
         ("action_order", list(reversed(CANONICAL_ACTION_IDS)), "action"),
@@ -185,4 +193,48 @@ def test_checkpoint_manifest_v2_binds_all_frozen_inputs_and_rejects_legacy():
                 expected_model_config=model_config,
                 expected_seed=42,
                 expected_code_version="c" * 40,
+            )
+
+
+def test_checkpoint_manifest_v3_binds_value_calibration_as_an_atomic_pair():
+    config = load_verify_model_config(ROOT / "configs/verify_model.yaml")
+    model_config = asdict(config)
+    manifest = build_verification_checkpoint_manifest(
+        input_manifest_digest="a" * 64,
+        split_digests={"train": "b" * 64},
+        model_config=model_config,
+        seed=42,
+        code_version="c" * 40,
+        value_calibration_digest="d" * 64,
+        reject_cost=0.3,
+    )
+
+    validated = validate_verification_checkpoint_manifest(
+        manifest,
+        expected_input_manifest_digest="a" * 64,
+        expected_split_digests={"train": "b" * 64},
+        expected_model_config=model_config,
+        expected_seed=42,
+        expected_code_version="c" * 40,
+        expected_value_calibration_digest="d" * 64,
+        expected_reject_cost=0.3,
+    )
+    assert validated["value_calibration_digest"] == "d" * 64
+    assert validated["reject_cost"] == pytest.approx(0.3)
+
+    for changed in (
+        {**manifest, "value_calibration_digest": None},
+        {**manifest, "reject_cost": None},
+        {**manifest, "reject_cost": 0.4},
+    ):
+        with pytest.raises(ValueError, match="calibration|reject cost"):
+            validate_verification_checkpoint_manifest(
+                changed,
+                expected_input_manifest_digest="a" * 64,
+                expected_split_digests={"train": "b" * 64},
+                expected_model_config=model_config,
+                expected_seed=42,
+                expected_code_version="c" * 40,
+                expected_value_calibration_digest="d" * 64,
+                expected_reject_cost=0.3,
             )

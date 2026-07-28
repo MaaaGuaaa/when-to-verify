@@ -24,6 +24,14 @@ from .trajectory_sampler import CandidateRollout, sample_candidate_rollouts
 
 
 REPLANNING_VERSION = "post_action_anchored_sampler_v1"
+POST_PLAN_STATUS_FEASIBLE = "feasible_plan"
+POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN = "safe_stop_no_feasible_plan"
+POST_PLAN_STATUSES = frozenset(
+    {
+        POST_PLAN_STATUS_FEASIBLE,
+        POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN,
+    }
+)
 
 
 def _finite_real(value: Any, *, name: str) -> float:
@@ -117,6 +125,7 @@ class ReplanningResult:
     candidates: tuple[ReplannedCandidate, ...]
     reject_available: bool
     rejection_counts: Mapping[str, int]
+    plan_status: str = POST_PLAN_STATUS_FEASIBLE
 
     def __post_init__(self) -> None:
         if self.version != REPLANNING_VERSION:
@@ -129,6 +138,17 @@ class ReplanningResult:
             not isinstance(item, ReplannedCandidate) for item in self.candidates
         ):
             raise TypeError("candidates must be a tuple of ReplannedCandidate")
+        if self.plan_status not in POST_PLAN_STATUSES:
+            raise ValueError("unsupported post-verification plan status")
+        if (
+            self.plan_status == POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN
+            and self.candidates
+        ):
+            raise ValueError(
+                "safe-stop no-feasible-plan results must not expose trajectories"
+            )
+        if self.plan_status == POST_PLAN_STATUS_FEASIBLE and not self.candidates:
+            raise ValueError("feasible-plan results must expose trajectories")
         if self.reject_available is not True:
             raise ValueError("reject must remain available after verification")
         counts = dict(self.rejection_counts)
@@ -342,6 +362,16 @@ def generate_replanned_candidates(
         raise RuntimeError("post-action replanning must retain exactly one stop")
     stop = stop_candidates[0]
     non_stop = [item for item in candidates if item is not stop]
+    if not non_stop:
+        return ReplanningResult(
+            version=REPLANNING_VERSION,
+            post_action_pose=post,
+            task_anchor_pose=anchor,
+            candidates=(),
+            reject_available=True,
+            rejection_counts=report.rejection_counts,
+            plan_status=POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN,
+        )
     if max_candidates is None:
         selected = tuple(non_stop + [stop])
     elif max_candidates == 1:
@@ -359,6 +389,9 @@ def generate_replanned_candidates(
 
 
 __all__ = (
+    "POST_PLAN_STATUSES",
+    "POST_PLAN_STATUS_FEASIBLE",
+    "POST_PLAN_STATUS_SAFE_STOP_NO_FEASIBLE_PLAN",
     "REPLANNING_VERSION",
     "ReplannedCandidate",
     "ReplanningResult",

@@ -124,7 +124,7 @@ def test_evaluation_cli_writes_metrics_without_refitting_or_new_checkpoint(tmp_p
     )
     summary = json.loads((shard / "summary.json").read_text())
     handoff = {
-        "schema_version": "3.0.0",
+        "schema_version": "4.0.0",
         "handoff_version": "verification_collection_handoff_v1",
         "collection_state": "complete",
         "scientific_status": "test_smoke_only",
@@ -183,15 +183,96 @@ def test_evaluation_cli_writes_metrics_without_refitting_or_new_checkpoint(tmp_p
 
     assert module.main(args) == 0
     assert {path.name for path in output.iterdir()} == {
+        "COMPLETE.json",
         "evaluation_report.json",
         "metrics.json",
+        "predictions.jsonl",
     }
     assert checkpoint_path.read_bytes() == checkpoint_before
     metrics = json.loads((output / "metrics.json").read_text())
     report = json.loads((output / "evaluation_report.json").read_text())
     assert metrics["split"] == "test"
     assert metrics["paper_thresholds_evaluated"] is False
+    assert "useful_brier" in metrics["learned"]
+    assert "useful_ece" in metrics["learned"]
+    assert sum(
+        row["sample_count"]
+        for row in metrics["learned"]["useful_calibration_bins"]
+    ) == 6
+    assert set(metrics["learned"]["slices"]) == {
+        "action",
+        "source_mode",
+        "blind_type",
+        "target_object_type",
+        "target_footprint_kind",
+    }
     assert report["sample_count"] == 6
     assert report["training_input_manifest_digest"] == "a" * 64
+    predictions = [
+        json.loads(line)
+        for line in (output / "predictions.jsonl").read_text().splitlines()
+    ]
+    assert len(predictions) == 6
+    assert {row["sample_id"] for row in predictions} == {
+        sample.sample_id for sample in samples
+    }
+    assert all(
+        {
+            "sample_id",
+            "ranking_group_id",
+            "action_id",
+            "value_target",
+            "value_prediction",
+            "useful_target",
+            "useful_probability",
+        }.issubset(row)
+        for row in predictions
+    )
     with pytest.raises(FileExistsError, match="overwrite"):
         module.main(args)
+
+
+def test_evaluation_cli_accepts_release_calibration_mode_and_rejects_mixed_inputs():
+    module = _module()
+    common = [
+        "--split",
+        "test",
+        "--checkpoint",
+        "/tmp/checkpoint.pt",
+        "--checkpoint-manifest",
+        "/tmp/manifest.json",
+        "--output-dir",
+        "/tmp/output",
+        "--base-config",
+        "/tmp/base.yaml",
+        "--actions-config",
+        "/tmp/actions.yaml",
+        "--model-config",
+        "/tmp/model.yaml",
+        "--expected-code-version",
+        "1" * 40,
+    ]
+    parsed = module._parser().parse_args(
+        [
+            "--release-dir",
+            "/tmp/release",
+            "--value-calibration",
+            "/tmp/calibration",
+            *common,
+        ]
+    )
+    module._validate_input_args(parsed)
+    assert parsed.release_dir == Path("/tmp/release")
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args(
+            [
+                "--release-dir",
+                "/tmp/release",
+                "--shard-dir",
+                "/tmp/shard",
+                "--value-calibration",
+                "/tmp/calibration",
+                *common,
+            ]
+        )

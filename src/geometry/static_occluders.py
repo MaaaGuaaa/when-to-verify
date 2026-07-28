@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, TypeAlias
+from typing import Any, Union
 
 import numpy as np
 
@@ -107,7 +107,7 @@ class CircleOccluder:
         )
 
 
-StaticOccluder: TypeAlias = RectangleOccluder | CircleOccluder
+StaticOccluder = Union[RectangleOccluder, CircleOccluder]
 
 
 def _validate_occluder(occluder: object) -> StaticOccluder:

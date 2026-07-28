@@ -34,7 +34,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 - 按冻结 split policy 先切分，再在各 split 内独立建 snippet、base state 和样本
 - SOP05 后半段的 A/B 单场景合成、每个最终场景一份 SOP06 历史 BEV、SOP07
   隐藏风险 GT、occupancy baseline、轨迹条件风险模型和校准
-- scenario bank、验证动作、验证后重规划、净验证价值 `G*` 和价值模型
+- SOP5 采样子事件、验证动作、验证后重规划、净验证价值 `G*` 和价值模型
 - `execute / verify / reject` 离线或轻量 2D 闭环
 - 可追溯配置、manifest、指标、案例图、失败样本和实验汇总
 
@@ -44,7 +44,7 @@ _基于 `event_centered_blind_spot_implementation_spec.md` 与 `parallel_acceler
 - 不做端到端强化学习控制
 - 不让 Social-STGCNN、Trajectron++、Arena ROS2、JRDB 或复杂 attention 阻塞 P0 主线
 - 不把 continuous risk 称为真实概率
-- 不把 scenario bank 或 `G*` 称为严格 Bayes ground truth
+- 不把单子事件 realized `G*` 称为严格 Bayes ground truth
 - 不声称无条件安全保证或半合成分布等价于真实世界
 
 ### 1.4 当前环境约束
@@ -328,7 +328,7 @@ flowchart LR
 ### 4.4 G3：验证价值门禁
 
 - 6 个验证 primitive
-- scenario bank `M=8` 或 `16`
+- 每个 SOP5 母事件只消费一个已采样子事件
 - 最低 verification samples `≥ 10,000`
 - 正价值和负价值样本各不少于 20%
 - Useful-action F1 `≥ 0.65`
@@ -348,7 +348,7 @@ flowchart LR
 
 - 主结果至少 1–3 个种子，理想为 3 个
 - 至少一套完整消融
-- scenario bank `M`、posterior temperature、验证成本敏感性可追溯
+- SOP5 扰动采样分布、响应阈值和验证成本敏感性可追溯
 - 所有表格和图从结构化结果自动生成
 - 所有数字可追溯到 config、manifest、seed、checkpoint 和 metrics
 - 失败样本不被静默丢弃
@@ -1300,7 +1300,7 @@ python scripts/10_eval_offline.py \
 
 - **优先级：** P0
 - **依赖：** SOP-02、04、06
-- **输出：** 6 个 verification primitive、post-action FOV、observation signature 和 replanned candidate set
+- **输出：** 6 个 verification primitive、时序 observation trace、响应分支和 replanned candidate set
 
 ### 文件
 
@@ -1314,18 +1314,19 @@ python scripts/10_eval_offline.py \
 
 ### SOP
 
-- [ ] 实现 yaw left/right 10°、yaw left/right 20°、forward peek、stop scan
+- [ ] 实现 arc left/right 30°、arc left/right 45°、forward peek、stop scan
 - [ ] 每个 action 明确 duration、distance、yaw 和运动可行性
-- [ ] 从完整 oracle world 仅在标签生成阶段 ray cast post-action observation
-- [ ] post-action ray cast 和 collision filtering 使用完整
-      `dynamic_object_trajectories/specs`，支持旋转矩形和多对象遮挡
+- [ ] 以 SOP5 已采样子事件的 oracle world 为唯一实现，仅在标签生成阶段模拟
+      action trace 上的时序观测
+- [ ] action trace 可因新观测转入 observe-and-replan 或 emergency-brake 分支，
+      不强制执行完整 primitive
+- [ ] 观测模拟使用该子事件的完整 `dynamic_object_trajectories/specs`，支持旋转矩形
+      和多对象遮挡；动作预执行可行性不得使用当前隐藏对象
 - [ ] 生成预期可见区域几何 mask；该 mask 不含 oracle occupancy
-- [ ] 计算 observation signature 的 7 类特征
-- [ ] signature 只使用 post-action 可观察内容，不使用隐藏 object type、footprint、
-      critical object ID 或其他 oracle metadata
-- [ ] 用 train statistics 标准化 signature；统计量不从 val/test 拟合
-- [ ] 以新机器人位姿为起点，以原 nominal endpoint/direction 为任务锚点
+- [ ] 以实际响应分支终点为起点，以原 nominal endpoint/direction 为任务锚点
 - [ ] 使用同一差速 sampler 重生成候选集并过滤静态碰撞
+- [ ] 输出与原 horizon 对齐的完整策略轨迹；禁止把半截轨迹直接交给轨迹风险模型
+- [ ] 若安全刹停后无法规划未来轨迹，保留显式 safe-stop/no-plan 状态并走价值旁路
 - [ ] 保留 stop/reject；禁止拼接原轨迹剩余部分
 
 ### 验收
@@ -1333,64 +1334,52 @@ python scripts/10_eval_offline.py \
 - 6 个 action 位姿变化与解析值一致
 - yaw action 不产生非法侧移
 - verification FOV mask 仅表达几何可见潜力
-- 一个 action 能看到 toy 冲突动态对象（包含矩形对象用例），另一个只看到无关区域
-- verify 后所有候选轨迹起点等于 post-action pose
+- 一个 action 能在执行途中看到 toy 冲突动态对象并触发响应（包含矩形对象用例）
+- verify 后所有候选轨迹起点等于实际响应分支终点
 - 原始轨迹剩余 poses 不出现在 replanned set
-- signature 标准化只使用 train 统计量
+- 安全刹停且无未来规划时，不构造或评估半截策略轨迹
 
 ---
 
-## ✍️ 18. SOP-12：Scenario Bank、posterior 与净验证价值 G*
+## ✍️ 18. SOP-12：SOP5 采样实现与净验证价值 G*
 
 ### 目标与依赖
 
 - **优先级：** P0
 - **依赖：** SOP-05、06、07、11
-- **输出：** observation-consistent scenario bank、exact/soft posterior、`br_before`、`post_risk`、`G*`
+- **输出：** 单个采样子事件上的 `br_before`、`post_risk`、`G*` 和停车旁路审计
 
 ### 文件
 
-- Create: `src/generation/scenario_bank.py`
 - Create: `src/generation/verification_gt.py`
-- Create: `src/generation/observation_posterior.py`
 - Create: `configs/verification_gt.yaml`
-- Create: `tests/test_scenario_bank.py`
-- Create: `tests/test_observation_posterior.py`
 - Create: `tests/test_verification_gt.py`
 
 ### SOP
 
-- [ ] 生成 `M=16` 默认 bank，并支持 `M=8/32`
-- [ ] 默认组成：1 当前 world、2 empty、5 temporal、4 spatial、2 speed、2 irrelevant
-- [ ] 断言所有 world 当前 visible occupancy 完全一致
-- [ ] 断言 world 差异只在 unknown/future，不违反静态几何
-- [ ] 断言每个 world 内 `dynamic_object_trajectories/specs` key 对齐；跨 variant 只允许
-      计划定义的 target 缺失/状态变化，非目标动态对象不得被删除或改型
-- [ ] 先实现 exact discrete posterior，作为 toy 真值
-- [ ] 再实现标准化 signature + `tau_o=0.2` 的 soft posterior
-- [ ] 计算不验证时 `min(mean execute loss, reject cost)`
-- [ ] 对每个 world/action 生成 post observation 和 replanned set
-- [ ] 对 posterior world loss 取最佳 replanned trajectory 或 reject
+- [ ] 一个 SOP5 母事件只消费其已经扰动并采样出的一个子事件；SOP12 不再生成额外
+      world variant、scenario bank 或 posterior
+- [ ] 计算不验证时 `min(realized execute loss, reject cost)`
+- [ ] 对该采样子事件和每个 action 生成一次时序观测、响应分支和 replanned set
+- [ ] 对完整、时间对齐的策略轨迹计算 realized loss，并取最佳策略或 reject
+- [ ] 安全刹停且无可行未来规划时，直接令 post-decision risk 为 reject cost；不得把
+      半截轨迹送入轨迹风险模型
 - [ ] 只在 `PostRisk` 中加一次 action cost
 - [ ] 返回 `G*=br_before-post_risk` 和 `useful=int(G*>0)`
 
 ### 验收
 
-- toy exact posterior 的 `G*` 与人工枚举逐项一致
-- posterior 每行非负且和为 1
+- 生产生成接口不含 `M`、bank、posterior、signature normalizer 或下游扰动 seed
+- 同组六个动作绑定同一个 `sampled_child_world_id`，`br_before` 完全一致
 - 增大 action cost 时 `G*` 单调不增，下降量与成本增量一致
 - 完全揭示冲突 actor 的 action post-risk 低于无关 action
 - 空盲区验证通常为非正价值；若为正必须可由 task/reject cost 解释
-- verify 后使用新候选集
-- mixed circle/rectangle toy bank 的 `G*` 与人工枚举一致
-- 训练/验证/测试 bank 的 source snippet 与 seed namespace 隔离
-- `M=8/16/32` 和 `tau=0.1/0.2/0.5` 可配置
+- verify 后只使用从实际响应分支终点生成的新候选集
+- 安全停车旁路只评估 nominal baseline，不评估不存在的未来策略轨迹
+- mixed circle/rectangle 的 realized `G*` 与人工核算一致
 
-### 降级
-
-- soft posterior 排序不稳定时，以 exact grouping 作为主结果
-- realized decision gain 只能作为明确标注的降级目标
-- 无论降级与否都必须报告 M、tau 和 composition 敏感性
+历史 `scenario_bank` / `observation_posterior` 模块仅保留兼容与旧实验复核，不得被
+SOP11–13 的生产标签入口调用。
 
 ---
 
@@ -1418,6 +1407,8 @@ python scripts/10_eval_offline.py \
 - [ ] 存储 BEV、trajectory maps、预期 FOV mask、action vector、`G*`
 - [ ] 不存储 post-verification actor、oracle occupancy 或 world identity 特征
 - [ ] 保留 `br_before`、`post_risk` 供审计，不作为默认模型输入
+- [ ] `sampled_child_world_id` 仅进入 label audit 和 collection report，不进入模型输入
+- [ ] 数据集与 CLI 不暴露 bank size、posterior mode 或 posterior temperature
 - [ ] 按 split 写独立 shards 和 metadata
 - [ ] manifest 绑定 Schema `4.0.0`、target object type、footprint kind、
       source object ID 和上游 G2 digest
@@ -1439,9 +1430,13 @@ python scripts/10_eval_offline.py \
 
 ```bash
 python scripts/08_generate_verification_dataset.py \
-  --config configs/verification_gt.yaml \
+  --mode sop05-train \
+  --config configs/base.yaml \
+  --actions-config configs/verification_actions.yaml \
+  --gt-config configs/verification_gt.yaml \
   --split train \
-  --scenario-bank-size 16 \
+  --sample-count 60 \
+  --max-replan-candidates 4 \
   --seed 42 \
   --output-dir outputs/event_centered_blind_spot/schema-v3/verification-data/main-seed42-v1/train
 ```
@@ -1577,7 +1572,7 @@ python scripts/08_generate_verification_dataset.py \
 - [ ] 注册 Schema 4 long40 语义消融：主表默认 human target；所有 contextual dynamic
       objects 保留；非人 target 仅在显式扩展配置和样本充分时报告
 - [ ] 注册 controlled tests：same-area、temporal-safe、irrelevant-hidden、empty
-- [ ] 注册敏感性：`M={8,16,32}`、`tau={0.1,0.2,0.5}`、composition、signature、prior、cost scale
+- [ ] 注册敏感性：SOP5 扰动/采样概率、响应阈值、候选数和 verification cost scale
 - [ ] 每个 run 保存 config、manifest digest、seed、checkpoint、metrics 和失败计数
 - [ ] 每个结果记录 schema version、`dynamic_objects` config digest、解析后的
       target-type policy 及其 digest、按 type 样本数、geometry source 与 fallback 比例
@@ -1592,7 +1587,7 @@ python scripts/08_generate_verification_dataset.py \
 - 一套完整 risk/value/closed-loop 结果
 - 一套完整消融
 - safety-efficiency Pareto
-- scenario bank 和 verification cost 敏感性
+- SOP5 采样分布、响应阈值和 verification cost 敏感性
 - 5–10 个成功/失败案例
 - 所有数字可追溯至结构化 artifact
 - 所有主结果只能来自 Schema 4 long40 数据、checkpoint、calibration 和评测产物；
@@ -1639,11 +1634,11 @@ python scripts/08_generate_verification_dataset.py \
 
 ### 23.4 决策价值语义
 
-- `G*` 是 scenario-bank simulator-defined net decision value
+- `G*` 是 SOP5 已采样子事件上的 simulator-defined realized net decision value
 - `PostRisk` 已包含 action cost
 - 在线 `C_verify=C_no_verify-G_pred`，不得再加 action cost
 - verify 后必须重新规划
-- scenario bank 是经验隐藏世界集合，不是严格 posterior truth
+- 数据集总体表达结局不确定性；单条标签不构造或声称 posterior truth
 
 ### 23.5 生成器捷径
 
@@ -1679,9 +1674,9 @@ stress/OOD 层。不得跳过 blind-region/exact 约束直接保存，也不得�
 
 ### 24.4 验证价值线
 
-**触发：** 排序对 `M/tau` 极敏感或 value model 不学习。
+**触发：** 排序对 SOP5 结局分层或响应/成本参数极敏感，或 value model 不学习。
 
-**转向：** exact posterior → 检查 cost once → realized decision gain → 排序任务。soft posterior 降为消融。
+**转向：** 审计 SOP5 采样分布 → 检查 cost once 与停车旁路 → 调整排序任务。
 
 ### 24.5 闭环线
 
@@ -1768,7 +1763,7 @@ stress/OOD 层。不得跳过 blind-region/exact 约束直接保存，也不得�
 | trajectory-conditioned risk | SOP-09 | G2 |
 | conformal calibration | SOP-10 | G2 |
 | 验证动作/重规划 | SOP-11 | G3 |
-| scenario bank/G* | SOP-12 | G3 |
+| sampled-child realized G* | SOP-12 | G3 |
 | verification dataset | SOP-13 | G3 |
 | value model/ranking | SOP-14 | G3 |
 | execute/verify/reject | SOP-15 | G4 |
@@ -1795,7 +1790,7 @@ stress/OOD 层。不得跳过 blind-region/exact 约束直接保存，也不得�
 - [ ] SOP-09：risk model 小样本过拟合
 - [ ] SOP-10：达到 G2 或留下可复核失败证据
 - [ ] SOP-11：6 actions 与 post-verify replanning 正确
-- [ ] SOP-12：toy `G*` 人工枚举一致且 cost once
+- [ ] SOP-12：toy 单实现 `G*` 人工核算一致、停车旁路正确且 cost once
 - [ ] SOP-13：verification 数据无 oracle 泄漏
 - [ ] SOP-14：达到 G3 或留下可复核失败证据
 - [ ] SOP-15：闭环达到 G4
@@ -1811,7 +1806,7 @@ stress/OOD 层。不得跳过 blind-region/exact 约束直接保存，也不得�
 - 坐标、预处理、snippet、轨迹：原始规格第 4–7 节
 - 事件、移植、paired、BEV：原始规格第 8–11 节
 - 风险 GT、样本、模型、校准：原始规格第 12–15 节
-- scenario bank、验证动作、重规划、`G*`：原始规格第 16–22 节
+- SOP5 采样子事件、验证动作、重规划、`G*`：原始规格第 16–22 节
 - 数据规模、捷径防护、baseline、指标、敏感性：原始规格第 23–27 节
 - 工程结构、CLI、测试、实现顺序、失败判据：原始规格第 28–35 节
 - 并行原则、W0–W8、波次、关键路径和交付契约：并行计划第 1–17 节

@@ -1,23 +1,23 @@
 schema_version: "4.0.0"
-library_version: verification_actions_v2
+library_version: verification_actions_v3
 sensor_fov_deg: 360.0
 actions:
-  - action_id: arc_left_10
-    duration_s: 0.50
-    delta_forward_m: 0.25
-    delta_yaw_deg: 10.0
-  - action_id: arc_right_10
-    duration_s: 0.50
-    delta_forward_m: 0.25
-    delta_yaw_deg: -10.0
-  - action_id: arc_left_20
-    duration_s: 0.75
-    delta_forward_m: 0.40
-    delta_yaw_deg: 20.0
-  - action_id: arc_right_20
-    duration_s: 0.75
-    delta_forward_m: 0.40
-    delta_yaw_deg: -20.0
+  - action_id: arc_left_30
+    duration_s: 0.80
+    delta_forward_m: 0.45
+    delta_yaw_deg: 30.0
+  - action_id: arc_right_30
+    duration_s: 0.80
+    delta_forward_m: 0.45
+    delta_yaw_deg: -30.0
+  - action_id: arc_left_45
+    duration_s: 1.00
+    delta_forward_m: 0.60
+    delta_yaw_deg: 45.0
+  - action_id: arc_right_45
+    duration_s: 1.00
+    delta_forward_m: 0.60
+    delta_yaw_deg: -45.0
   - action_id: forward_peek
     duration_s: 0.80
     delta_forward_m: 0.30

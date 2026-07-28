@@ -36,6 +36,7 @@ def test_renderer_public_api_and_output_dataclass_exclude_oracle_inputs() -> Non
         "static_occupancy",
         "sensor_config",
         "config",
+        "scene_dynamic_history_observed",
     )
     assert parameters[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert all(
@@ -44,7 +45,9 @@ def test_renderer_public_api_and_output_dataclass_exclude_oracle_inputs() -> Non
     )
     assert all(
         parameter.default is inspect.Parameter.empty for parameter in parameters
+        if parameter.name != "scene_dynamic_history_observed"
     )
+    assert parameters[-1].default is None
     assert not any(
         token in parameter.name.lower()
         for parameter in parameters
@@ -57,6 +60,7 @@ def test_renderer_public_api_and_output_dataclass_exclude_oracle_inputs() -> Non
         "static_occupancy": np.ndarray,
         "sensor_config": StructuralBlindSpot | None,
         "config": Mapping[str, Any],
+        "scene_dynamic_history_observed": Mapping[str, np.ndarray] | None,
         "return": RenderedObservation,
     }
     assert is_dataclass(RenderedObservation)

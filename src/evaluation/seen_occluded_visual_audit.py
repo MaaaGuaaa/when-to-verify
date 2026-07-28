@@ -1040,7 +1040,7 @@ def _variant_evidence(
     if assessment.regime != SEEN_THEN_OCCLUDED:
         raise SeenOccludedAuditError(f"{kind} history regime changed")
     visibility = np.asarray(variant.visibility_sequence)
-    if visibility.shape != (16,) or visibility.dtype != np.bool_:
+    if visibility.shape != (33,) or visibility.dtype != np.bool_:
         raise SeenOccludedAuditError(f"{kind} visibility sequence is invalid")
     current_hidden = not bool(visibility[0])
     emerges = has_continuous_emergence(visibility, min_visible_frames=2)
@@ -1052,7 +1052,7 @@ def _variant_evidence(
         variant.target.future_poses,
     )
     stored = np.asarray(variant.clearance_sequence_m, dtype=np.float64)
-    if stored.shape != (15,) or not np.isfinite(stored).all():
+    if stored.shape != (32,) or not np.isfinite(stored).all():
         raise SeenOccludedAuditError(f"{kind} clearance sequence is invalid")
     if not np.allclose(recomputed, stored, rtol=0.0, atol=1e-6):
         raise SeenOccludedAuditError(f"{kind} clearance sequence drift")

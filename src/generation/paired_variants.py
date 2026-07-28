@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, replace
 from numbers import Real
@@ -61,7 +62,9 @@ from .history_visibility import (
     HistoryVisibilityAssessment,
     HistoryVisibilityPolicy,
     classify_history_visibility,
+    classify_sop05r_history,
     normalize_history_visibility_policy,
+    validate_sop05r_history_metadata,
 )
 from .occluder_sampler import (
     JOINT_MULTI_LOS_PLACEMENT_STRATEGY_VERSION,
@@ -78,6 +81,13 @@ from .structural_blindspot import (
     footprint_visibility_sequence,
     has_continuous_emergence,
 )
+from .sop05r_contracts import (
+    SOP05R_GENERATOR_VERSION,
+    SOP05R_HISTORY_POLICY_VERSION,
+    SOP05R_TRAJECTORY_COLLECTION_VERSION,
+)
+from .sop05r_trajectory_store import Sop05rTrajectoryStore
+from .sop05_input_adapter import SOP04_TRAJECTORY_BANK_VERSION
 
 
 VARIANT_ORDER = (
@@ -126,16 +136,348 @@ class PairGenerationError(ValueError):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class Sop06TrajectoryHandoff:
+    generator_algorithm_version: str
+    event_id: str
+    source_collection_version: str
+    collection_semantic_digest: str | None
+    shared_goal_world_pose: np.ndarray | None
+    nominal_trajectory: LocalTrajectory
+    alternative_trajectories: tuple[LocalTrajectory, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event_id, str) or not self.event_id:
+            raise ValueError("trajectory handoff event_id must be non-empty")
+        if not isinstance(self.nominal_trajectory, LocalTrajectory):
+            raise TypeError("trajectory handoff nominal must be a LocalTrajectory")
+        if not isinstance(self.alternative_trajectories, tuple) or any(
+            not isinstance(item, LocalTrajectory)
+            for item in self.alternative_trajectories
+        ):
+            raise TypeError("trajectory handoff alternatives must be a tuple")
+        candidate_ids = (
+            self.nominal_trajectory.trajectory_id,
+            *(item.trajectory_id for item in self.alternative_trajectories),
+        )
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("trajectory handoff IDs must be unique")
+        if self.shared_goal_world_pose is not None:
+            goal = np.asarray(self.shared_goal_world_pose)
+            if (
+                goal.shape != (3,)
+                or goal.dtype != np.float32
+                or not np.isfinite(goal).all()
+            ):
+                raise ValueError("trajectory handoff goal must be finite float32 [3]")
+            owned = np.array(goal, dtype=np.float32, order="C", copy=True)
+            owned.flags.writeable = False
+            object.__setattr__(self, "shared_goal_world_pose", owned)
+
+
+def resolve_sop06_trajectory_handoff(
+    *,
+    mother_event: GeneratedEvent,
+    legacy_trajectory: LocalTrajectory | None = None,
+    sop05r_trajectory_store: Sop05rTrajectoryStore | None = None,
+) -> Sop06TrajectoryHandoff:
+    """Resolve a trajectory source without mixing SOP04 and SOP05R lineages."""
+
+    if not isinstance(mother_event, GeneratedEvent):
+        raise TypeError("mother_event must be a GeneratedEvent")
+    algorithm = mother_event.world.metadata.get("generator_algorithm_version")
+    if algorithm == SOP05R_GENERATOR_VERSION:
+        if legacy_trajectory is not None:
+            raise PairGenerationError(
+                "sop05r_sop04_lookup_forbidden",
+                "SOP05R mothers must not use a SOP04 trajectory lookup",
+            )
+        if not isinstance(sop05r_trajectory_store, Sop05rTrajectoryStore):
+            raise PairGenerationError(
+                "sop05r_trajectory_store_required",
+                "SOP05R mother requires an authenticated trajectory store",
+            )
+        if sop05r_trajectory_store.manifest.get("collection_version") != (
+            SOP05R_TRAJECTORY_COLLECTION_VERSION
+        ):
+            raise PairGenerationError("sop05r_trajectory_collection_version_mismatch")
+        matches = tuple(
+            record
+            for record in sop05r_trajectory_store.records
+            if record.event_id == mother_event.generated_event_id
+        )
+        if len(matches) != 1:
+            raise PairGenerationError(
+                "sop05r_trajectory_event_join_invalid",
+                "SOP05R trajectory store must contain exactly one matching event",
+            )
+        record = matches[0]
+        metadata = mother_event.world.metadata
+        expected_goal = np.asarray(
+            metadata.get("local_goal_world_pose"), dtype=np.float32
+        )
+        if (
+            record.base_state_id != mother_event.world.base_state_id
+            or record.config_digest != metadata.get("config_digest")
+            or record.nominal_trajectory_id
+            != metadata.get("nominal_trajectory_id")
+            or list(record.alternative_trajectory_ids)
+            != metadata.get("alternative_trajectory_ids")
+            or expected_goal.shape != (3,)
+            or not np.array_equal(record.shared_goal_world_pose, expected_goal)
+        ):
+            raise PairGenerationError("sop05r_trajectory_event_metadata_mismatch")
+        by_id = {
+            route.trajectory.trajectory_id: route.trajectory
+            for route in record.routes
+        }
+        try:
+            nominal = by_id[record.nominal_trajectory_id]
+            alternatives = tuple(
+                by_id[trajectory_id]
+                for trajectory_id in record.alternative_trajectory_ids
+            )
+        except KeyError as exc:  # pragma: no cover - strict store loader guards this
+            raise PairGenerationError("sop05r_trajectory_membership_invalid") from exc
+        return Sop06TrajectoryHandoff(
+            generator_algorithm_version=SOP05R_GENERATOR_VERSION,
+            event_id=mother_event.generated_event_id,
+            source_collection_version=SOP05R_TRAJECTORY_COLLECTION_VERSION,
+            collection_semantic_digest=(
+                sop05r_trajectory_store.collection_semantic_digest
+            ),
+            shared_goal_world_pose=record.shared_goal_world_pose,
+            nominal_trajectory=nominal,
+            alternative_trajectories=alternatives,
+        )
+
+    if algorithm == SOP05_GENERATOR_ALGORITHM_VERSION:
+        if sop05r_trajectory_store is not None:
+            raise PairGenerationError("legacy_sop05r_trajectory_store_forbidden")
+        if not isinstance(legacy_trajectory, LocalTrajectory):
+            raise PairGenerationError("legacy_sop04_trajectory_required")
+        if legacy_trajectory.trajectory_id != (
+            mother_event.target_motion_record.trajectory_id
+        ):
+            raise PairGenerationError("legacy_sop04_trajectory_id_mismatch")
+        return Sop06TrajectoryHandoff(
+            generator_algorithm_version=SOP05_GENERATOR_ALGORITHM_VERSION,
+            event_id=mother_event.generated_event_id,
+            source_collection_version=SOP04_TRAJECTORY_BANK_VERSION,
+            collection_semantic_digest=None,
+            shared_goal_world_pose=None,
+            nominal_trajectory=legacy_trajectory,
+            alternative_trajectories=(),
+        )
+    raise PairGenerationError("unsupported_mother_generator_version")
+
+
 class _CandidateRejected(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
 
 
+def validate_sop05r_target_history_prefix(
+    *,
+    mother_target: TransplantedDynamicObject,
+    variant_target: TransplantedDynamicObject,
+    last_visible_index: int | None,
+) -> None:
+    """Require target-present SOP05R pairs to share their observed prefix."""
+
+    if not isinstance(mother_target, TransplantedDynamicObject) or not isinstance(
+        variant_target, TransplantedDynamicObject
+    ):
+        raise TypeError("SOP05R pair targets must be transplanted dynamic objects")
+    identity_fields = (
+        "target_dynamic_object_id",
+        "source_object_id",
+        "snippet_id",
+        "object_type",
+        "footprint_spec_digest",
+    )
+    identity_matches = all(
+        getattr(mother_target, field) == getattr(variant_target, field)
+        for field in identity_fields
+    )
+    try:
+        mother_spec = json.dumps(
+            mother_target.footprint_spec,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        variant_spec = json.dumps(
+            variant_target.footprint_spec,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PairGenerationError(
+            "sop05r_pair_target_spec_invalid",
+            "SOP05R pair target identity or footprint is invalid",
+        ) from exc
+    if not identity_matches or mother_spec != variant_spec:
+        raise PairGenerationError(
+            "sop05r_pair_target_identity_mismatch",
+            "SOP05R pair target identity or footprint differs from mother",
+        )
+    for label, target in (("mother", mother_target), ("variant", variant_target)):
+        history = target.history_poses
+        if (
+            not isinstance(history, np.ndarray)
+            or history.shape != (8, 3)
+            or history.dtype != np.float32
+            or not np.isfinite(history).all()
+        ):
+            raise PairGenerationError(
+                "sop05r_pair_history_invalid",
+                f"SOP05R {label} target history must be finite float32 (8, 3)",
+            )
+    if last_visible_index is None:
+        return
+    if isinstance(last_visible_index, (bool, np.bool_)) or not isinstance(
+        last_visible_index, (int, np.integer)
+    ):
+        raise TypeError("SOP05R last_visible_index must be an integer or None")
+    last_visible_index = int(last_visible_index)
+    if not 0 <= last_visible_index <= 5:
+        raise ValueError("SOP05R last_visible_index must leave two hidden frames")
+    prefix_end = last_visible_index + 1
+    mother_prefix = np.ascontiguousarray(
+        mother_target.history_poses[:prefix_end]
+    )
+    variant_prefix = np.ascontiguousarray(
+        variant_target.history_poses[:prefix_end]
+    )
+    if (
+        mother_prefix.dtype != variant_prefix.dtype
+        or mother_prefix.shape != variant_prefix.shape
+        or mother_prefix.tobytes(order="C") != variant_prefix.tobytes(order="C")
+    ):
+        raise PairGenerationError(
+            "sop05r_pair_visible_history_prefix_mismatch",
+            "SOP05R pair visible history prefix differs from mother",
+        )
+
+
+def _bind_sop05r_target_history_prefix(
+    mother_target: TransplantedDynamicObject,
+    variant_target: TransplantedDynamicObject,
+    *,
+    last_visible_index: int | None,
+) -> TransplantedDynamicObject:
+    history = variant_target.history_poses.copy()
+    if last_visible_index is not None:
+        history[: last_visible_index + 1] = mother_target.history_poses[
+            : last_visible_index + 1
+        ]
+    result = replace(
+        variant_target,
+        history_poses=history,
+        current_pose=history[-1].copy(),
+    )
+    validate_sop05r_target_history_prefix(
+        mother_target=mother_target,
+        variant_target=result,
+        last_visible_index=last_visible_index,
+    )
+    return result
+
+
+@dataclass(frozen=True)
+class _PairedHistoryPolicy:
+    version: str
+    payload: Mapping[str, object]
+    digest: str
+    sop05r: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return json.loads(json.dumps(self.payload, allow_nan=False))
+
+
+def _as_paired_history_policy(
+    policy: _PairedHistoryPolicy | HistoryVisibilityPolicy,
+) -> _PairedHistoryPolicy:
+    if isinstance(policy, _PairedHistoryPolicy):
+        return policy
+    if isinstance(policy, HistoryVisibilityPolicy):
+        return _PairedHistoryPolicy(
+            version=HISTORY_VISIBILITY_POLICY_VERSION,
+            payload=policy.as_dict(),
+            digest=policy.digest,
+            sop05r=False,
+        )
+    raise TypeError(
+        "history_visibility_policy must be a paired or legacy history policy"
+    )
+
+
+def _classify_paired_history(
+    visibility: np.ndarray,
+    policy: _PairedHistoryPolicy | HistoryVisibilityPolicy,
+) -> HistoryVisibilityAssessment:
+    policy = _as_paired_history_policy(policy)
+    if policy.sop05r:
+        return classify_sop05r_history(visibility)
+    normalized = normalize_history_visibility_policy(policy.payload)
+    return classify_history_visibility(visibility, normalized)
+
+
 def _mother_history_visibility_contract(
     mother_event: GeneratedEvent,
-) -> tuple[HistoryVisibilityPolicy, HistoryVisibilityAssessment]:
+) -> tuple[_PairedHistoryPolicy, HistoryVisibilityAssessment]:
     metadata = mother_event.world.metadata
+    if metadata.get("generator_algorithm_version") == SOP05R_GENERATOR_VERSION:
+        raw_policy = metadata.get("target_history_visibility_policy")
+        expected_policy = {
+            "version": SOP05R_HISTORY_POLICY_VERSION,
+            "history_steps": 8,
+            "min_trailing_hidden_frames": 2,
+            "weights": {
+                "seen_then_occluded": 0.8,
+                "unseen_in_history_window": 0.2,
+            },
+        }
+        if raw_policy != expected_policy:
+            raise PairGenerationError("mother_history_visibility_policy_invalid")
+        payload = json.loads(json.dumps(raw_policy, allow_nan=False))
+        digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+        ).hexdigest()
+        if metadata.get("target_history_visibility_policy_digest") != digest:
+            raise PairGenerationError(
+                "mother_history_visibility_policy_digest_mismatch"
+            )
+        try:
+            assessment = validate_sop05r_history_metadata(
+                mother_event.target_visibility_history,
+                metadata,
+            )
+        except (TypeError, ValueError) as exc:
+            raise PairGenerationError(
+                "mother_history_visibility_metadata_mismatch"
+            ) from exc
+        if assessment.regime not in HISTORY_VISIBILITY_REGIMES:
+            raise PairGenerationError("mother_history_visibility_ineligible")
+        return (
+            _PairedHistoryPolicy(
+                version=SOP05R_HISTORY_POLICY_VERSION,
+                payload=payload,
+                digest=digest,
+                sop05r=True,
+            ),
+            assessment,
+        )
+
     try:
         policy = normalize_history_visibility_policy(
             metadata.get("target_history_visibility_policy")
@@ -169,7 +511,15 @@ def _mother_history_visibility_contract(
         raise PairGenerationError(
             "mother_history_visibility_metadata_mismatch"
         )
-    return policy, assessment
+    return (
+        _PairedHistoryPolicy(
+            version=HISTORY_VISIBILITY_POLICY_VERSION,
+            payload=policy.as_dict(),
+            digest=policy.digest,
+            sop05r=False,
+        ),
+        assessment,
+    )
 
 
 @dataclass(frozen=True)
@@ -560,6 +910,14 @@ def _pair_environment(
     target_id = mother_event.target.target_dynamic_object_id
     target = mother_event.target
     record = mother_event.target_motion_record
+    if mother_event.world.metadata.get("generator_algorithm_version") == (
+        SOP05R_GENERATOR_VERSION
+    ):
+        target_policy_digest = mother_event.world.metadata.get(
+            "target_type_policy_digest"
+        )
+    else:
+        target_policy_digest = target.provenance.get("target_type_policy_digest")
     if (
         record.generated_event_id != mother_event.generated_event_id
         or record.target_dynamic_object_id != target_id
@@ -568,8 +926,7 @@ def _pair_environment(
         or record.object_type != target.object_type
         or record.footprint_spec != target.footprint_spec
         or record.footprint_spec_digest != target.footprint_spec_digest
-        or record.target_type_policy_digest
-        != target.provenance.get("target_type_policy_digest")
+        or record.target_type_policy_digest != target_policy_digest
         or not np.array_equal(record.history_poses, target.history_poses)
         or not np.array_equal(record.current_pose, target.current_pose)
         or not np.array_equal(record.future_poses, target.future_poses)
@@ -981,7 +1338,7 @@ def _variant_world(
     min_clearance_m: float | None,
     time_to_min_clearance_s: float | None,
     paired_config: PairedVariantConfig,
-    history_visibility_policy: HistoryVisibilityPolicy,
+    history_visibility_policy: _PairedHistoryPolicy,
     seed: int,
     transform_metadata: Mapping[str, object],
     environment: _PairEnvironment,
@@ -1039,7 +1396,7 @@ def _variant_world(
     history_assessment = (
         None
         if target_visibility_history is None
-        else classify_history_visibility(
+        else _classify_paired_history(
             target_visibility_history,
             history_visibility_policy,
         )
@@ -1119,7 +1476,7 @@ def _variant_world(
             else history_assessment.trailing_hidden_frames
         ),
         "target_history_visibility_policy_version": (
-            HISTORY_VISIBILITY_POLICY_VERSION
+            history_visibility_policy.version
         ),
         "target_history_visibility_policy": (
             history_visibility_policy.as_dict()
@@ -1156,7 +1513,7 @@ def _make_variant(
     trajectory: LocalTrajectory,
     pair_group_id: str,
     paired_config: PairedVariantConfig,
-    history_visibility_policy: HistoryVisibilityPolicy,
+    history_visibility_policy: _PairedHistoryPolicy,
     seed: int,
     environment: _PairEnvironment,
     transform_metadata: Mapping[str, object],
@@ -1258,6 +1615,104 @@ def _transformed_target(
     )
 
 
+def _sop05r_transformed_target(
+    mother_event: GeneratedEvent,
+    *,
+    radial_shift_m: float,
+    signed_arc_offset_m: float,
+    pivot_radius_m: float,
+    ray_direction: np.ndarray,
+) -> TransplantedDynamicObject:
+    full = _transformed_target(
+        mother_event.target,
+        radial_shift_m=radial_shift_m,
+        signed_arc_offset_m=signed_arc_offset_m,
+        pivot_radius_m=pivot_radius_m,
+        ray_direction=ray_direction,
+    )
+    last_visible = mother_event.world.metadata.get(
+        "target_history_last_visible_index"
+    )
+    if last_visible is None:
+        return _bind_sop05r_target_history_prefix(
+            mother_event.target,
+            full,
+            last_visible_index=None,
+        )
+    last_visible = int(last_visible)
+    mother_poses = np.vstack(
+        (mother_event.target.history_poses, mother_event.target.future_poses)
+    ).astype(np.float64)
+    full_poses = np.vstack((full.history_poses, full.future_poses)).astype(np.float64)
+    conflict_combined_index = min(
+        mother_poses.shape[0] - 1,
+        mother_event.target.history_poses.shape[0] + mother_event.conflict_index,
+    )
+    ramp_intervals = max(1, conflict_combined_index - last_visible)
+    weights = np.clip(
+        (np.arange(mother_poses.shape[0], dtype=np.float64) - last_visible)
+        / ramp_intervals,
+        0.0,
+        1.0,
+    )
+    blended = mother_poses.copy()
+    blended[:, :2] += weights[:, None] * (
+        full_poses[:, :2] - mother_poses[:, :2]
+    )
+    angle = signed_arc_offset_m / pivot_radius_m
+    blended[:, 2] = wrap_angle(mother_poses[:, 2] + weights * angle)
+    blended = blended.astype(np.float32)
+    history_steps = mother_event.target.history_poses.shape[0]
+    result = replace(
+        full,
+        history_poses=blended[:history_steps],
+        current_pose=blended[history_steps - 1].copy(),
+        future_poses=blended[history_steps:],
+        provenance={
+            **full.provenance,
+            "paired_transform": {
+                **full.provenance["paired_transform"],
+                "prefix_preserving_ramp": "last_visible_to_conflict_v1",
+                "last_visible_index": last_visible,
+                "full_transform_combined_index": conflict_combined_index,
+            },
+        },
+    )
+    validate_sop05r_target_history_prefix(
+        mother_target=mother_event.target,
+        variant_target=result,
+        last_visible_index=last_visible,
+    )
+    return result
+
+
+def _geometric_target(
+    mother_event: GeneratedEvent,
+    *,
+    radial_shift_m: float,
+    signed_arc_offset_m: float,
+    pivot_radius_m: float,
+    ray_direction: np.ndarray,
+) -> TransplantedDynamicObject:
+    if mother_event.world.metadata.get("generator_algorithm_version") == (
+        SOP05R_GENERATOR_VERSION
+    ):
+        return _sop05r_transformed_target(
+            mother_event,
+            radial_shift_m=radial_shift_m,
+            signed_arc_offset_m=signed_arc_offset_m,
+            pivot_radius_m=pivot_radius_m,
+            ray_direction=ray_direction,
+        )
+    return _transformed_target(
+        mother_event.target,
+        radial_shift_m=radial_shift_m,
+        signed_arc_offset_m=signed_arc_offset_m,
+        pivot_radius_m=pivot_radius_m,
+        ray_direction=ray_direction,
+    )
+
+
 def _transform_parameter_grid(
     mother_event: GeneratedEvent,
     paired_config: PairedVariantConfig,
@@ -1313,8 +1768,8 @@ def _geometric_candidate_pool(
     )
     candidates = []
     for radial, signed_arc in parameters:
-        target = _transformed_target(
-            mother_event.target,
+        target = _geometric_target(
+            mother_event,
             radial_shift_m=radial,
             signed_arc_offset_m=signed_arc,
             pivot_radius_m=pivot_radius,
@@ -1390,13 +1845,16 @@ def _geometric_variant(
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
-    history_visibility_policy: HistoryVisibilityPolicy,
+    history_visibility_policy: _PairedHistoryPolicy | HistoryVisibilityPolicy,
     required_history_regime: str | None = None,
     pair_group_id: str,
     seed: int,
     environment: _PairEnvironment,
     candidate_pool: _GeometricCandidatePool,
 ) -> tuple[PairedVariant | None, str | None]:
+    history_visibility_policy = _as_paired_history_policy(
+        history_visibility_policy
+    )
     candidates = _ranked_geometric_candidates(
         mother_event=mother_event,
         paired_config=paired_config,
@@ -1405,13 +1863,27 @@ def _geometric_variant(
     )
     last_reason = f"{variant_kind}_clearance_unavailable"
     for _, radial, signed_arc, _ in candidates[:256]:
-        target = _transformed_target(
-            mother_event.target,
+        target = _geometric_target(
+            mother_event,
             radial_shift_m=radial,
             signed_arc_offset_m=signed_arc,
             pivot_radius_m=candidate_pool.pivot_radius_m,
             ray_direction=candidate_pool.ray_direction,
         )
+        if history_visibility_policy.sop05r:
+            try:
+                target = _bind_sop05r_target_history_prefix(
+                    mother_event.target,
+                    target,
+                    last_visible_index=(
+                        mother_event.world.metadata.get(
+                            "target_history_last_visible_index"
+                        )
+                    ),
+                )
+            except PairGenerationError as exc:
+                last_reason = exc.reason
+                continue
         try:
             history_visibility, visibility = _validate_target_candidate(
                 target,
@@ -1424,7 +1896,7 @@ def _geometric_variant(
         except _CandidateRejected as exc:
             last_reason = exc.reason
             continue
-        if required_history_regime is not None and classify_history_visibility(
+        if required_history_regime is not None and _classify_paired_history(
             history_visibility,
             history_visibility_policy,
         ).regime != required_history_regime:
@@ -1479,6 +1951,109 @@ def _paths_spatially_intersect(
     )
 
 
+def _sop05r_temporal_target(
+    mother_event: GeneratedEvent,
+    *,
+    temporal_offset_s: float,
+    history_dt_s: float,
+    future_dt_s: float,
+) -> TransplantedDynamicObject:
+    target = mother_event.target
+    last_visible = mother_event.world.metadata.get(
+        "target_history_last_visible_index"
+    )
+    last_visible = -1 if last_visible is None else int(last_visible)
+    history_times = (
+        np.arange(target.history_poses.shape[0], dtype=np.float64)
+        - (target.history_poses.shape[0] - 1)
+    ) * history_dt_s
+    future_times = (
+        np.arange(1, target.future_poses.shape[0] + 1, dtype=np.float64)
+        * future_dt_s
+    )
+    times = np.concatenate((history_times, future_times))
+    poses = np.vstack((target.history_poses, target.future_poses)).astype(np.float64)
+    blind_entry_time = (
+        history_times[0]
+        if last_visible < 0
+        else history_times[last_visible]
+    )
+    ramp_end_time = max(mother_event.conflict_time_s, blind_entry_time + future_dt_s)
+    ramp_window_s = ramp_end_time - blind_entry_time
+    offset_magnitude = abs(float(temporal_offset_s))
+    ramp_duration_s = min(
+        0.5 * ramp_window_s,
+        max(future_dt_s, ramp_window_s - offset_magnitude),
+    )
+    peak_lag_rate = offset_magnitude / (ramp_window_s - ramp_duration_s)
+    elapsed = np.clip(times - blind_entry_time, 0.0, ramp_window_s)
+    lag_magnitude = np.empty_like(elapsed)
+    ramp_up = elapsed <= ramp_duration_s
+    ramp_down = elapsed >= ramp_window_s - ramp_duration_s
+    plateau = ~(ramp_up | ramp_down)
+    lag_magnitude[ramp_up] = (
+        0.5
+        * peak_lag_rate
+        * elapsed[ramp_up] ** 2
+        / ramp_duration_s
+    )
+    lag_magnitude[plateau] = peak_lag_rate * (
+        elapsed[plateau] - 0.5 * ramp_duration_s
+    )
+    remaining = ramp_window_s - elapsed[ramp_down]
+    lag_magnitude[ramp_down] = offset_magnitude - (
+        0.5 * peak_lag_rate * remaining**2 / ramp_duration_s
+    )
+    lag = np.sign(temporal_offset_s) * lag_magnitude
+    if temporal_offset_s > 0.0 and times[-1] > ramp_end_time:
+        tail = times > ramp_end_time
+        tail_progress = (times[tail] - ramp_end_time) / (
+            times[-1] - ramp_end_time
+        )
+        tail_smooth = tail_progress**2 * (3.0 - 2.0 * tail_progress)
+        terminal_lag = temporal_offset_s * (
+            1.0 - future_dt_s / times[-1]
+        )
+        lag[tail] = temporal_offset_s + (
+            terminal_lag - temporal_offset_s
+        ) * tail_smooth
+    source_times = np.clip(
+        times - lag,
+        times[0],
+        times[-1],
+    )
+    delayed = np.empty_like(poses)
+    delayed[:, 0] = np.interp(source_times, times, poses[:, 0])
+    delayed[:, 1] = np.interp(source_times, times, poses[:, 1])
+    unwrapped_yaw = np.unwrap(poses[:, 2])
+    delayed[:, 2] = wrap_angle(np.interp(source_times, times, unwrapped_yaw))
+    delayed = delayed.astype(np.float32)
+    history_steps = target.history_poses.shape[0]
+    result = replace(
+        target,
+        history_poses=delayed[:history_steps],
+        current_pose=delayed[history_steps - 1].copy(),
+        future_poses=delayed[history_steps:],
+        provenance={
+            **target.provenance,
+            "paired_transform": {
+                "kind": "sop05r_prefix_preserving_temporal_delay_v1",
+                "temporal_offset_s": float(temporal_offset_s),
+                "mother_conflict_time_s": mother_event.conflict_time_s,
+                "terminal_lag_s": float(lag[-1]),
+                "last_visible_index": (
+                    None if last_visible < 0 else last_visible
+                ),
+            },
+        },
+    )
+    return _bind_sop05r_target_history_prefix(
+        target,
+        result,
+        last_visible_index=None if last_visible < 0 else last_visible,
+    )
+
+
 def _temporal_variant(
     *,
     mother_event: GeneratedEvent,
@@ -1488,56 +2063,71 @@ def _temporal_variant(
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig,
-    history_visibility_policy: HistoryVisibilityPolicy,
+    history_visibility_policy: _PairedHistoryPolicy | HistoryVisibilityPolicy,
     required_history_regime: str | None = None,
     pair_group_id: str,
     seed: int,
     environment: _PairEnvironment,
 ) -> tuple[PairedVariant | None, str | None]:
-    provenance = mother_event.target.provenance
-    required = {
-        "conflict_point",
-        "time_scale",
-        "target_type_policy_digest",
-        "seed",
-    }
-    crossing_direction = provenance.get(
-        "desired_crossing_direction", provenance.get("crossing_direction")
+    history_visibility_policy = _as_paired_history_policy(
+        history_visibility_policy
     )
-    if not required <= set(provenance) or crossing_direction is None:
-        return None, "mother_target_provenance_incomplete"
+    provenance = mother_event.target.provenance
+    is_sop05r = history_visibility_policy.sop05r
+    if not is_sop05r:
+        required = {
+            "conflict_point",
+            "time_scale",
+            "target_type_policy_digest",
+            "seed",
+        }
+        crossing_direction = provenance.get(
+            "desired_crossing_direction", provenance.get("crossing_direction")
+        )
+        if not required <= set(provenance) or crossing_direction is None:
+            return None, "mother_target_provenance_incomplete"
     horizon_s = environment.grid.future_steps * environment.future_dt_s
     last_reason = "temporal_offset_unavailable"
     last_transplant_reason: str | None = None
     transplanted_candidate_count = 0
     for offset in paired_config.temporal_offset_candidates_s:
         conflict_time = mother_event.conflict_time_s + offset
-        if not 0.0 < conflict_time <= horizon_s:
+        if conflict_time <= 0.0 or (
+            conflict_time > horizon_s and not (is_sop05r and offset > 0.0)
+        ):
             last_reason = "temporal_offset_out_of_horizon"
             continue
-        try:
-            target = transplant_snippet(
-                source_snippet,
-                conflict_point=provenance["conflict_point"],
-                conflict_time_s=conflict_time,
-                crossing_direction=crossing_direction,
-                time_scale=provenance["time_scale"],
+        if is_sop05r:
+            target = _sop05r_temporal_target(
+                mother_event,
+                temporal_offset_s=float(offset),
+                history_dt_s=float(base_config["bev"]["history_dt_s"]),
                 future_dt_s=environment.future_dt_s,
-                future_steps=environment.grid.future_steps,
-                base_state_id=mother_event.world.base_state_id,
-                trajectory_id=trajectory.trajectory_id,
-                target_type_policy_digest=provenance[
-                    "target_type_policy_digest"
-                ],
-                seed=provenance["seed"],
-                context_object_ids=tuple(
-                    oracle_context.dynamic_object_future
-                ),
             )
-        except TransplantError as exc:
-            last_reason = f"temporal_transplant:{exc.reason}"
-            last_transplant_reason = last_reason
-            continue
+        else:
+            try:
+                target = transplant_snippet(
+                    source_snippet,
+                    conflict_point=provenance["conflict_point"],
+                    conflict_time_s=conflict_time,
+                    crossing_direction=crossing_direction,
+                    time_scale=provenance["time_scale"],
+                    future_dt_s=environment.future_dt_s,
+                    future_steps=environment.grid.future_steps,
+                    base_state_id=mother_event.world.base_state_id,
+                    trajectory_id=trajectory.trajectory_id,
+                    target_type_policy_digest=provenance[
+                        "target_type_policy_digest"
+                    ],
+                    seed=provenance["seed"],
+                    context_object_ids=tuple(
+                        oracle_context.dynamic_object_future
+                    ),
+                )
+            except TransplantError as exc:
+                last_reason = f"temporal_transplant:{exc.reason}"
+                last_transplant_reason = last_reason
+                continue
         transplanted_candidate_count += 1
         target = replace(
             target,
@@ -1551,6 +2141,20 @@ def _temporal_variant(
                 },
             },
         )
+        if history_visibility_policy.sop05r:
+            try:
+                target = _bind_sop05r_target_history_prefix(
+                    mother_event.target,
+                    target,
+                    last_visible_index=(
+                        mother_event.world.metadata.get(
+                            "target_history_last_visible_index"
+                        )
+                    ),
+                )
+            except PairGenerationError as exc:
+                last_reason = exc.reason
+                continue
         clearances = _target_clearances(
             target, trajectory=trajectory, environment=environment
         )
@@ -1574,17 +2178,22 @@ def _temporal_variant(
         except _CandidateRejected as exc:
             last_reason = exc.reason
             continue
-        if required_history_regime is not None and classify_history_visibility(
+        if required_history_regime is not None and _classify_paired_history(
             history_visibility,
             history_visibility_policy,
         ).regime != required_history_regime:
             last_reason = "target_history_visibility_regime_changed"
             continue
         transform_metadata = {
-            "kind": "temporal_offset_v1",
+            "kind": (
+                "sop05r_prefix_preserving_temporal_delay_v1"
+                if is_sop05r
+                else "temporal_offset_v1"
+            ),
             "temporal_offset_s": float(offset),
             "mother_conflict_time_s": mother_event.conflict_time_s,
             "variant_conflict_time_s": float(conflict_time),
+            "collision_censored_by_horizon": bool(conflict_time > horizon_s),
         }
         return (
             _make_variant(
@@ -1638,6 +2247,43 @@ def _stamp_group_metadata(
             replace(variant, world=replace(variant.world, metadata=metadata))
         )
     return replace(group, variants=tuple(variants))
+
+
+def _stamp_sop05r_trajectory_handoff(
+    group: PairedEventGroup,
+    handoff: Sop06TrajectoryHandoff,
+) -> PairedEventGroup:
+    metadata_update = {
+        "sop05r_trajectory_collection_version": (
+            handoff.source_collection_version
+        ),
+        "sop05r_trajectory_collection_digest": (
+            handoff.collection_semantic_digest
+        ),
+        "sop05r_shared_goal_world_pose": [
+            float(value) for value in handoff.shared_goal_world_pose
+        ],
+        "sop05r_nominal_trajectory_id": (
+            handoff.nominal_trajectory.trajectory_id
+        ),
+        "sop05r_alternative_trajectory_ids": [
+            trajectory.trajectory_id
+            for trajectory in handoff.alternative_trajectories
+        ],
+    }
+    return replace(
+        group,
+        variants=tuple(
+            replace(
+                variant,
+                world=replace(
+                    variant.world,
+                    metadata={**variant.world.metadata, **metadata_update},
+                ),
+            )
+            for variant in group.variants
+        ),
+    )
 
 
 def assemble_paired_event_group(
@@ -1697,11 +2343,12 @@ def generate_paired_variants(
     mother_event: GeneratedEvent,
     source_snippet: MotionSnippet,
     base_state: BaseState,
-    trajectory: LocalTrajectory,
+    trajectory: LocalTrajectory | None,
     oracle_context: OracleContext,
     base_config: Mapping[str, Any],
     paired_config: PairedVariantConfig | Mapping[str, Any],
     seed: int,
+    sop05r_trajectory_store: Sop05rTrajectoryStore | None = None,
 ) -> PairedEventGroup:
     """Generate one six-position group, retaining policy-compliant partials."""
 
@@ -1709,8 +2356,6 @@ def generate_paired_variants(
         raise TypeError("mother_event must be a GeneratedEvent")
     if not isinstance(base_state, BaseState):
         raise TypeError("base_state must be a BaseState")
-    if not isinstance(trajectory, LocalTrajectory):
-        raise TypeError("trajectory must be a LocalTrajectory")
     if not isinstance(oracle_context, OracleContext):
         raise TypeError("oracle_context must be an OracleContext")
     if isinstance(seed, (bool, np.bool_)) or not isinstance(
@@ -1720,7 +2365,20 @@ def generate_paired_variants(
     mother_generator_version = mother_event.world.metadata.get(
         "generator_algorithm_version"
     )
-    if mother_generator_version != SOP05_GENERATOR_ALGORITHM_VERSION:
+    trajectory_handoff: Sop06TrajectoryHandoff | None = None
+    if mother_generator_version == SOP05R_GENERATOR_VERSION:
+        trajectory_handoff = resolve_sop06_trajectory_handoff(
+            mother_event=mother_event,
+            legacy_trajectory=trajectory,
+            sop05r_trajectory_store=sop05r_trajectory_store,
+        )
+        trajectory = trajectory_handoff.nominal_trajectory
+    elif mother_generator_version == SOP05_GENERATOR_ALGORITHM_VERSION:
+        if not isinstance(trajectory, LocalTrajectory):
+            raise TypeError("trajectory must be a LocalTrajectory")
+        if sop05r_trajectory_store is not None:
+            raise PairGenerationError("legacy_sop05r_trajectory_store_forbidden")
+    else:
         reason = (
             "retired_mother_generator_version"
             if mother_generator_version == "blind_reachability_first_v1"
@@ -1823,7 +2481,7 @@ def generate_paired_variants(
         )
         if variant is None:
             missing[kind] = str(reason)
-        elif classify_history_visibility(
+        elif _classify_paired_history(
             variant.target_visibility_history,
             history_visibility_policy,
         ).regime != mother_history_assessment.regime:
@@ -1847,7 +2505,7 @@ def generate_paired_variants(
     )
     if temporal is None:
         missing["temporal_safe"] = str(reason)
-    elif classify_history_visibility(
+    elif _classify_paired_history(
         temporal.target_visibility_history,
         history_visibility_policy,
     ).regime != mother_history_assessment.regime:
@@ -1876,12 +2534,23 @@ def generate_paired_variants(
             ),
         },
     )
-    return assemble_paired_event_group(
+    group = assemble_paired_event_group(
         pair_group_id=pair_id,
         variants=variants,
         missing_variant_reasons=missing,
         paired_config=normalized,
     )
+    if trajectory_handoff is None:
+        return group
+    last_visible_index = mother_history_assessment.last_visible_index
+    for variant in group.variants:
+        if variant.target is not None:
+            validate_sop05r_target_history_prefix(
+                mother_target=mother_event.target,
+                variant_target=variant.target,
+                last_visible_index=last_visible_index,
+            )
+    return _stamp_sop05r_trajectory_handoff(group, trajectory_handoff)
 
 
 def _joint_environment_anchor_schedule(

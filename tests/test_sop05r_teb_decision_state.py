@@ -364,6 +364,47 @@ def test_decision_state_rejects_occlude_then_seen_history() -> None:
         )
 
 
+def test_decision_state_accepts_initially_hidden_a_history() -> None:
+    from src.generation.sop05r_teb_decision_state import build_teb_decision_state
+
+    base_config, base_state, teb_config, task, result = _decision_fixture()
+    blocked = np.ones(40, dtype=np.bool_)
+    hidden_result = replace(
+        result,
+        placement=replace(
+            result.placement,
+            provenance={
+                **dict(result.placement.provenance),
+                "placement_selection_mode": "h0_hidden",
+            },
+        ),
+        visibility=classify_sop05r_seen_then_occluded_history(
+            blocked,
+            decision_index=7,
+            minimum_visible_frames=4,
+            minimum_occluded_frames=1,
+        ),
+    )
+
+    decision = build_teb_decision_state(
+        task_template=task,
+        placement_result=hidden_result,
+        source_base_state=base_state,
+        source_oracle_context=OracleContext(
+            base_state_id=base_state.state_id,
+            dynamic_object_history={},
+            dynamic_object_future={},
+            dynamic_object_specs={},
+        ),
+        base_config=base_config,
+        teb_config=teb_config,
+        seed=31,
+    )
+
+    assert not decision.target_visibility_history.any()
+    assert decision.provenance["placement_selection_mode"] == "h0_hidden"
+
+
 def test_decision_state_drops_visible_actor_without_complete_oracle_context() -> None:
     from src.generation.sop05r_teb_decision_state import build_teb_decision_state
 

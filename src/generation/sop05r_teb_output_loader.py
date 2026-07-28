@@ -13,8 +13,7 @@ import numpy as np
 
 from src.contracts import BaseState, build_grid_spec, load_dataclass, validate_base_state
 
-from .dynamic_object_transplant import TransplantedDynamicObject
-from .event_sampler import GeneratedEvent
+from .event_contracts import GeneratedEvent, TransplantedDynamicObject
 from .event_target_motion_shard import (
     LoadedEventTargetMotionShard,
     load_event_target_motion_shard,
@@ -102,6 +101,7 @@ def compute_sop05r_teb_publication_semantic_digest(
 @dataclass(frozen=True)
 class LoadedSop05rTebOutput:
     events: tuple[GeneratedEvent, ...]
+    event_evidence: Mapping[str, Mapping[str, object]]
     decision_states: Mapping[str, BaseState]
     trajectories: Sop05rTebTrajectoryStore
     target_motion: LoadedEventTargetMotionShard
@@ -111,6 +111,16 @@ class LoadedSop05rTebOutput:
     complete: bool
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "event_evidence",
+            MappingProxyType(
+                {
+                    event_id: MappingProxyType(dict(evidence))
+                    for event_id, evidence in self.event_evidence.items()
+                }
+            ),
+        )
         object.__setattr__(
             self,
             "decision_states",
@@ -295,6 +305,7 @@ def load_sop05r_teb_output(
         raise ValueError("SOP05R TEB nested event identity sets disagree")
 
     events: list[GeneratedEvent] = []
+    event_evidence: dict[str, Mapping[str, object]] = {}
     for row in rows:
         event_id = str(row["event_id"])
         motion = motion_by_event[event_id]
@@ -306,6 +317,39 @@ def load_sop05r_teb_output(
             or motion.world_id != row["world_id"]
         ):
             raise ValueError("SOP05R TEB event nested identity join mismatch")
+        collision_time = float(row["first_collision_time_after_decision_s"])
+        collision_point = np.asarray(row["collision_point_xy"], dtype=np.float64)
+        witness = row.get("occlusion_witness")
+        if (
+            not np.isfinite(collision_time)
+            or not np.isclose(
+                collision_time,
+                float(row["conflict_time_s"]),
+                rtol=0.0,
+                atol=1e-6,
+            )
+            or collision_point.shape != (2,)
+            or not np.isfinite(collision_point).all()
+            or not isinstance(witness, dict)
+            or set(witness) != {"time_s", "sample_index", "occluder_id"}
+            or isinstance(witness["sample_index"], bool)
+            or not isinstance(witness["sample_index"], int)
+            or not 0 <= witness["sample_index"] < grid.history_steps
+            or not isinstance(witness["occluder_id"], str)
+            or not witness["occluder_id"]
+            or not np.isfinite(float(witness["time_s"]))
+        ):
+            raise ValueError("SOP05R TEB event audit evidence is invalid")
+        expected_witness_time = (
+            int(witness["sample_index"]) - (grid.history_steps - 1)
+        ) * float(base_config["bev"]["future_dt_s"])
+        if not np.isclose(
+            float(witness["time_s"]),
+            expected_witness_time,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError("SOP05R TEB occlusion witness time is invalid")
         provenance = row.get("target_provenance")
         if not isinstance(provenance, dict):
             raise ValueError("SOP05R TEB target provenance must be a mapping")
@@ -332,6 +376,19 @@ def load_sop05r_teb_output(
         ):
             raise ValueError("SOP05R TEB visibility arrays have invalid shape")
         world = target_motion.worlds[motion.world_id]
+        if str(witness["occluder_id"]) not in {
+            str(item.get("occluder_id")) for item in world.occluders
+        }:
+            raise ValueError("SOP05R TEB witness references an unknown occluder")
+        event_evidence[event_id] = {
+            "first_collision_time_after_decision_s": collision_time,
+            "collision_point_xy": [float(value) for value in collision_point],
+            "occlusion_witness": {
+                "time_s": float(witness["time_s"]),
+                "sample_index": int(witness["sample_index"]),
+                "occluder_id": str(witness["occluder_id"]),
+            },
+        }
         events.append(
             GeneratedEvent(
                 generated_event_id=event_id,
@@ -387,6 +444,7 @@ def load_sop05r_teb_output(
             raise ValueError("SOP05R TEB completion marker mismatch")
     return LoadedSop05rTebOutput(
         events=tuple(events),
+        event_evidence=event_evidence,
         decision_states=decision_states,
         trajectories=trajectories,
         target_motion=target_motion,

@@ -1,4 +1,4 @@
-"""Behavioral tests for schema-v3 hidden-risk ground truth."""
+"""Behavioral tests for Schema 4 Long40 hidden-risk ground truth."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import math
 import numpy as np
 import pytest
 
-from src.contracts import GridSpec, LocalTrajectory, OracleWorld
+from src.contracts import SCHEMA_VERSION, GridSpec, LocalTrajectory, OracleWorld
 from src.geometry import CircleFootprint, RectangleFootprint
 from src.generation.risk_gt import (
     RISK_GT_VERSION,
@@ -17,18 +17,22 @@ from src.generation.risk_gt import (
 )
 
 
-def _grid() -> GridSpec:
+def _grid(*, future_steps: int = 32) -> GridSpec:
     return GridSpec(
         height=40,
         width=30,
         history_steps=8,
-        future_steps=15,
+        future_steps=future_steps,
         resolution_m=0.2,
     )
 
 
-def _trajectory(*, x: float = 0.0) -> LocalTrajectory:
-    grid = _grid()
+def _trajectory(
+    *,
+    x: float = 0.0,
+    grid: GridSpec | None = None,
+) -> LocalTrajectory:
+    grid = _grid() if grid is None else grid
     poses = np.zeros((grid.future_steps, 3), dtype=np.float32)
     poses[:, 0] = np.float32(x)
     zeros = np.zeros((grid.height, grid.width), dtype=np.float32)
@@ -65,8 +69,15 @@ def _rectangle_spec(
     }
 
 
-def _constant_poses(x: float, y: float = 0.0, yaw: float = 0.0) -> np.ndarray:
-    poses = np.empty((_grid().future_steps, 3), dtype=np.float32)
+def _constant_poses(
+    x: float,
+    y: float = 0.0,
+    yaw: float = 0.0,
+    *,
+    grid: GridSpec | None = None,
+) -> np.ndarray:
+    grid = _grid() if grid is None else grid
+    poses = np.empty((grid.future_steps, 3), dtype=np.float32)
     poses[:] = np.asarray([x, y, yaw], dtype=np.float32)
     return poses
 
@@ -74,8 +85,10 @@ def _constant_poses(x: float, y: float = 0.0, yaw: float = 0.0) -> np.ndarray:
 def _world(
     trajectories: dict[str, np.ndarray],
     specs: dict[str, dict[str, object]],
+    *,
+    grid: GridSpec | None = None,
 ) -> OracleWorld:
-    grid = _grid()
+    grid = _grid() if grid is None else grid
     return OracleWorld(
         world_id="world-risk-toy",
         base_state_id="base-risk-toy",
@@ -85,7 +98,7 @@ def _world(
         occluders=(),
         blind_spot_config={"kind": "toy"},
         random_seed=17,
-        metadata={"schema_version": "3.0.0"},
+        metadata={"schema_version": SCHEMA_VERSION},
     )
 
 
@@ -94,22 +107,29 @@ def _compute(
     *,
     hidden_object_ids: tuple[str, ...],
     robot_footprint=CircleFootprint(0.5),
+    grid: GridSpec | None = None,
+    trajectory: LocalTrajectory | None = None,
     **changes,
 ):
+    grid = _grid() if grid is None else grid
     kwargs = {
         "hidden_object_ids": hidden_object_ids,
         "robot_footprint": robot_footprint,
-        "grid": _grid(),
+        "grid": grid,
         "future_dt_s": 0.2,
         "sigma_distance_m": 0.5,
         "sigma_time_s": 2.0,
         "near_miss_distance_m": 0.35,
     }
     kwargs.update(changes)
-    return compute_hidden_risk_gt(_trajectory(), world, **kwargs)
+    return compute_hidden_risk_gt(
+        _trajectory(grid=grid) if trajectory is None else trajectory,
+        world,
+        **kwargs,
+    )
 
 
-def test_collision_uses_schema3_future_endpoint_time_and_forces_severity_one() -> None:
+def test_collision_uses_schema4_future_endpoint_time_and_forces_severity_one() -> None:
     world = _world(
         {"hidden": _constant_poses(0.8)},
         {"hidden": _circle_spec()},
@@ -117,15 +137,57 @@ def test_collision_uses_schema3_future_endpoint_time_and_forces_severity_one() -
 
     result = _compute(world, hidden_object_ids=("hidden",))
 
-    assert result.schema_version == "3.0.0"
+    assert result.schema_version == SCHEMA_VERSION == "4.0.0"
     assert result.pose_time_layout_version == "future_endpoints_dt_to_horizon_v1"
-    assert RISK_GT_VERSION == "hidden_risk_gt_schema3_v1"
+    assert RISK_GT_VERSION == "hidden_risk_gt_schema4_v2"
     assert result.collision_label == 1
     assert result.near_miss == 0
     assert result.risk_severity == 1.0
     assert result.first_collision_time == pytest.approx(0.2)
     assert result.time_to_min_clearance == pytest.approx(0.2)
     assert result.min_clearance == pytest.approx(-0.2)
+
+
+def test_collision_at_long40_final_endpoint_is_timestamped_at_6_4_seconds() -> None:
+    future = _constant_poses(2.0)
+    future[-1] = np.asarray([0.8, 0.0, 0.0], dtype=np.float32)
+    world = _world({"hidden": future}, {"hidden": _circle_spec()})
+
+    result = _compute(world, hidden_object_ids=("hidden",))
+
+    assert result.collision_label == 1
+    assert result.first_collision_time == pytest.approx(6.4)
+    assert result.time_to_min_clearance == pytest.approx(6.4)
+
+
+def test_pre_long40_future_layout_is_rejected() -> None:
+    legacy_grid = _grid(future_steps=15)
+    world = _world(
+        {"hidden": _constant_poses(2.0, grid=legacy_grid)},
+        {"hidden": _circle_spec()},
+        grid=legacy_grid,
+    )
+
+    with pytest.raises(ValueError, match="32 future endpoints"):
+        _compute(
+            world,
+            hidden_object_ids=("hidden",),
+            grid=legacy_grid,
+        )
+
+
+def test_non_long40_future_dt_is_rejected() -> None:
+    world = _world(
+        {"hidden": _constant_poses(2.0)},
+        {"hidden": _circle_spec()},
+    )
+
+    with pytest.raises(ValueError, match="future_dt_s must equal 0.2"):
+        _compute(
+            world,
+            hidden_object_ids=("hidden",),
+            future_dt_s=0.1,
+        )
 
 
 def test_zero_clearance_is_collision_and_near_miss_threshold_is_strict() -> None:

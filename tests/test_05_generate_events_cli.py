@@ -379,6 +379,75 @@ def test_teb_cli_dispatches_full_run_to_v3_producer(
     assert payload["requested_count"] == 20
 
 
+def test_teb_cli_dispatches_all_accepted_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli()
+    requests = []
+
+    def execute(request, *, progress_callback):
+        assert callable(progress_callback)
+        requests.append(request)
+        return SimpleNamespace(
+            run_state="complete",
+            output_dir=request.output_dir,
+            accepted_count=3,
+            requested_count=3,
+            publication_semantic_digest="d" * 64,
+            exit_code=0,
+        )
+
+    argv = _obstacle_first_teb_argv(tmp_path)
+    quota_index = argv.index("--accepted-quota")
+    del argv[quota_index : quota_index + 2]
+    argv.append("--all-accepted")
+    monkeypatch.setattr(cli, "execute_sop05r_teb_run", execute)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert cli.main() == 0
+    assert len(requests) == 1
+    assert requests[0].accepted_quota is None
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["accepted_count"] == payload["requested_count"] == 3
+
+
+def test_teb_cli_propagates_h0_hidden_placement_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _load_cli()
+    requests = []
+
+    def execute(request, *, progress_callback):
+        assert callable(progress_callback)
+        requests.append(request)
+        return SimpleNamespace(
+            run_state="complete",
+            output_dir=request.output_dir,
+            accepted_count=20,
+            requested_count=20,
+            publication_semantic_digest="d" * 64,
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(cli, "execute_sop05r_teb_run", execute)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _obstacle_first_teb_argv(
+            tmp_path,
+            "--placement-selection-mode",
+            "h0_hidden",
+        ),
+    )
+
+    assert cli.main() == 0
+    assert len(requests) == 1
+    assert requests[0].placement_selection_mode == "h0_hidden"
+
+
 def test_teb_cli_writes_parent_progress_to_stderr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

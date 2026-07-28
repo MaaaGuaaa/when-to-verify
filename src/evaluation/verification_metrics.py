@@ -16,6 +16,7 @@ from src.contracts import (
     SCHEMA_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
+    VerificationSample,
 )
 from src.datasets.verification_dataloader import VERIFICATION_SHARD_LAYOUT_VERSION
 from src.datasets.verification_dataset import VERIFICATION_DATASET_VERSION
@@ -23,7 +24,7 @@ from src.models.verification_model import VERIFICATION_MODEL_VERSION
 from src.planning.verification_actions import CANONICAL_ACTION_IDS
 
 
-VERIFICATION_CHECKPOINT_MANIFEST_VERSION = "verification_checkpoint_manifest_v2"
+VERIFICATION_CHECKPOINT_MANIFEST_VERSION = "verification_checkpoint_manifest_v3"
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MANIFEST_KEYS = frozenset(
     {
@@ -38,6 +39,8 @@ _MANIFEST_KEYS = frozenset(
         "action_order",
         "input_manifest_digest",
         "split_digests",
+        "value_calibration_digest",
+        "reject_cost",
         "model_config",
         "model_config_digest",
         "seed",
@@ -45,6 +48,12 @@ _MANIFEST_KEYS = frozenset(
     }
 )
 _SPLITS = frozenset({"train", "calibration", "val", "test"})
+_PROVENANCE_SLICE_FIELDS = (
+    "source_mode",
+    "blind_type",
+    "target_object_type",
+    "target_footprint_kind",
+)
 
 
 def _numeric_vector(value: object, *, name: str) -> np.ndarray:
@@ -198,6 +207,70 @@ def _huber(prediction: np.ndarray, target: np.ndarray, delta: float) -> float:
     return float(np.mean(losses, dtype=np.float64))
 
 
+def useful_probability_calibration(
+    useful_probability: object,
+    useful_target: object,
+    *,
+    bin_count: int = 10,
+) -> dict[str, object]:
+    """Return fixed-width reliability bins, ECE, and Brier score."""
+
+    probability = _numeric_vector(
+        useful_probability,
+        name="useful_probability",
+    )
+    target = _numeric_vector(useful_target, name="useful_target")
+    if probability.shape != target.shape:
+        raise ValueError("useful calibration vectors must align")
+    if np.any(probability < 0.0) or np.any(probability > 1.0):
+        raise ValueError("useful_probability must lie in [0,1]")
+    if not np.isin(target, (0.0, 1.0)).all():
+        raise ValueError("useful_target must be binary")
+    if isinstance(bin_count, bool) or not isinstance(bin_count, Integral):
+        raise TypeError("bin_count must be an integer")
+    bins_total = int(bin_count)
+    if bins_total <= 0:
+        raise ValueError("bin_count must be positive")
+    assignments = np.minimum(
+        np.floor(probability * bins_total).astype(np.int64),
+        bins_total - 1,
+    )
+    bins: list[dict[str, object]] = []
+    weighted_gap = 0.0
+    for index in range(bins_total):
+        mask = assignments == index
+        count = int(np.count_nonzero(mask))
+        if count:
+            confidence = float(np.mean(probability[mask], dtype=np.float64))
+            positive_rate = float(np.mean(target[mask], dtype=np.float64))
+            gap = abs(confidence - positive_rate)
+            weighted_gap += count * gap
+        else:
+            confidence = None
+            positive_rate = None
+            gap = None
+        bins.append(
+            {
+                "bin_index": index,
+                "lower_bound": float(index / bins_total),
+                "upper_bound": float((index + 1) / bins_total),
+                "upper_bound_inclusive": index == bins_total - 1,
+                "sample_count": count,
+                "mean_confidence": confidence,
+                "empirical_positive_rate": positive_rate,
+                "absolute_gap": gap,
+            }
+        )
+    return {
+        "bin_count": bins_total,
+        "bins": bins,
+        "ece": float(weighted_gap / probability.size),
+        "brier": float(
+            np.mean((probability - target) ** 2, dtype=np.float64)
+        ),
+    }
+
+
 def _flat_metrics(
     prediction: np.ndarray,
     probability: np.ndarray,
@@ -206,14 +279,50 @@ def _flat_metrics(
     *,
     huber_delta: float,
 ) -> dict[str, object]:
+    calibration = useful_probability_calibration(probability, useful)
     return {
         "sample_count": int(target.size),
         "useful_f1": _useful_f1(probability, useful),
+        "useful_brier": calibration["brier"],
+        "useful_ece": calibration["ece"],
+        "useful_calibration_bins": calibration["bins"],
         "value_mse": float(np.mean((prediction - target) ** 2, dtype=np.float64)),
         "value_huber": _huber(prediction, target, huber_delta),
         "spearman": spearman_correlation(prediction, target),
         "kendall_tau_b": kendall_tau_b(prediction, target),
     }
+
+
+def verification_slice_fields(
+    samples: Sequence[VerificationSample],
+    *,
+    require_complete: bool = False,
+) -> dict[str, tuple[str, ...]]:
+    """Extract the fixed experiment slices from safe sample provenance."""
+
+    if isinstance(samples, (str, bytes)) or not isinstance(samples, Sequence):
+        raise TypeError("samples must be a sequence")
+    rows = tuple(samples)
+    if not rows or any(not isinstance(row, VerificationSample) for row in rows):
+        raise ValueError("slice extraction requires VerificationSample values")
+    result: dict[str, tuple[str, ...]] = {
+        "action": tuple(row.verification_action_id for row in rows)
+    }
+    for field in _PROVENANCE_SLICE_FIELDS:
+        values: list[str] = []
+        for row in rows:
+            provenance = row.metadata.get("provenance")
+            raw = provenance.get(field) if isinstance(provenance, Mapping) else None
+            if isinstance(raw, str) and raw:
+                values.append(raw)
+            elif require_complete:
+                raise ValueError(
+                    f"verification sample provenance lacks required {field} slice"
+                )
+            else:
+                values.append("unavailable")
+        result[field] = tuple(values)
+    return result
 
 
 def _action_key(action_id: str) -> tuple[int, str]:
@@ -374,6 +483,27 @@ def _split_digest_map(value: object) -> dict[str, str]:
     }
 
 
+def _calibration_binding(
+    digest: object,
+    reject_cost: object,
+    *,
+    name: str,
+) -> tuple[str | None, float | None]:
+    if digest is None and reject_cost is None:
+        return None, None
+    if digest is None or reject_cost is None:
+        raise ValueError(f"{name} calibration digest and reject cost must be paired")
+    validated_digest = _digest(digest, name=f"{name} calibration digest")
+    if isinstance(reject_cost, (bool, np.bool_)) or not isinstance(
+        reject_cost, Real
+    ):
+        raise TypeError(f"{name} reject cost must be a real number")
+    cost = float(reject_cost)
+    if not np.isfinite(cost) or cost < 0.0:
+        raise ValueError(f"{name} reject cost must be finite and non-negative")
+    return validated_digest, cost
+
+
 def build_verification_checkpoint_manifest(
     *,
     input_manifest_digest: str,
@@ -381,8 +511,10 @@ def build_verification_checkpoint_manifest(
     model_config: Mapping[str, object],
     seed: int,
     code_version: str,
+    value_calibration_digest: str | None = None,
+    reject_cost: Real | None = None,
 ) -> dict[str, object]:
-    """Build deterministic v2 provenance for a schema-3 verification model."""
+    """Build deterministic v3 provenance for a Schema-4 verification model."""
 
     input_digest = _digest(
         input_manifest_digest, name="input_manifest_digest"
@@ -395,6 +527,11 @@ def build_verification_checkpoint_manifest(
         raise TypeError("seed must be an integer")
     if not isinstance(code_version, str) or not code_version:
         raise ValueError("code_version must be a non-empty string")
+    calibration_digest, calibrated_reject_cost = _calibration_binding(
+        value_calibration_digest,
+        reject_cost,
+        name="checkpoint",
+    )
     return {
         "manifest_version": VERIFICATION_CHECKPOINT_MANIFEST_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -407,6 +544,8 @@ def build_verification_checkpoint_manifest(
         "action_order": list(CANONICAL_ACTION_IDS),
         "input_manifest_digest": input_digest,
         "split_digests": splits,
+        "value_calibration_digest": calibration_digest,
+        "reject_cost": calibrated_reject_cost,
         "model_config": config,
         "model_config_digest": _sha256_json(config),
         "seed": int(seed),
@@ -422,14 +561,19 @@ def validate_verification_checkpoint_manifest(
     expected_model_config: Mapping[str, object],
     expected_seed: int,
     expected_code_version: str,
+    expected_value_calibration_digest: str | None = None,
+    expected_reject_cost: Real | None = None,
 ) -> dict[str, object]:
     """Reject legacy, incomplete, or context-mismatched checkpoint manifests."""
 
+    if isinstance(manifest, Mapping) and manifest.get("manifest_version") in {
+        "verification_checkpoint_manifest_v1",
+        "verification_checkpoint_manifest_v2",
+    }:
+        raise ValueError("legacy v1/v2 verification checkpoint is forbidden")
     if not isinstance(manifest, Mapping) or set(manifest) != _MANIFEST_KEYS:
         raise ValueError("checkpoint manifest keys are invalid")
     if manifest["manifest_version"] != VERIFICATION_CHECKPOINT_MANIFEST_VERSION:
-        if manifest["manifest_version"] == "verification_checkpoint_manifest_v1":
-            raise ValueError("legacy v1 verification checkpoint is forbidden")
         raise ValueError("unsupported verification checkpoint manifest version")
     if manifest["schema_version"] != SCHEMA_VERSION:
         raise ValueError("checkpoint schema mismatch")
@@ -462,6 +606,20 @@ def validate_verification_checkpoint_manifest(
     expected_splits = _split_digest_map(expected_split_digests)
     if actual_splits != expected_splits:
         raise ValueError("checkpoint split digests mismatch")
+    actual_calibration, actual_reject_cost = _calibration_binding(
+        manifest["value_calibration_digest"],
+        manifest["reject_cost"],
+        name="checkpoint",
+    )
+    expected_calibration, expected_cost = _calibration_binding(
+        expected_value_calibration_digest,
+        expected_reject_cost,
+        name="expected checkpoint",
+    )
+    if actual_calibration != expected_calibration:
+        raise ValueError("checkpoint value calibration digest mismatch")
+    if actual_reject_cost != expected_cost:
+        raise ValueError("checkpoint reject cost mismatch")
     actual_config = _canonical_copy(manifest["model_config"], name="model_config")
     expected_config = _canonical_copy(
         expected_model_config, name="expected_model_config"
@@ -492,5 +650,7 @@ __all__ = (
     "kendall_tau_b",
     "pairwise_ranking_accuracy",
     "spearman_correlation",
+    "useful_probability_calibration",
     "validate_verification_checkpoint_manifest",
+    "verification_slice_fields",
 )

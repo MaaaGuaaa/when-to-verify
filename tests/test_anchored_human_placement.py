@@ -637,6 +637,156 @@ def test_first_fit_orders_preferred_history_before_fallback_history(
     assert evaluation.result.visibility.preferred
 
 
+def test_h0_hidden_selection_uses_an_eligible_initially_blocked_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.generation import anchored_human_placement as placement_module
+    from src.generation.anchored_human_placement import (
+        VisibilityGuidedRotationAngles,
+        solve_anchored_human_placement,
+    )
+
+    base_config, base_state, oracle_context, teb_config = _m4_inputs()
+    template = next(
+        item.template
+        for item in iter_sop05r_teb_task_templates(
+            base_state=base_state,
+            oracle_context=oracle_context,
+            base_config=base_config,
+            teb_config=teb_config,
+            seed=9,
+        )
+        if item.template is not None
+    )
+    monkeypatch.setattr(
+        placement_module,
+        "construct_visibility_guided_rotation_angles",
+        lambda **_: VisibilityGuidedRotationAngles(
+            theta_align_rad=0.0,
+            signed_ab_rad=0.2,
+            half_plane_side=1,
+            angles_rad=(0.0, 1.0),
+            angular_margins_deg=(10.0, 20.0),
+            rejection_reason=None,
+        ),
+    )
+
+    def seen_and_h0_hidden(robot_positions, target_positions, occluders, *, epsilon_m):
+        del robot_positions, occluders, epsilon_m
+        blocked = np.zeros(target_positions.shape[:2], dtype=np.bool_)
+        blocked[0, 4] = True
+        blocked[1, (0, 7)] = True
+        blocker_indices = np.full(blocked.shape, -1, dtype=np.int16)
+        blocker_indices[0, 4] = 0
+        blocker_indices[1, (0, 7)] = 0
+        return blocked, blocker_indices
+
+    monkeypatch.setattr(
+        placement_module,
+        "_batched_centerline_blocking",
+        seen_and_h0_hidden,
+    )
+    monkeypatch.setattr(placement_module, "_physics_rejection", lambda **_: None)
+
+    default = solve_anchored_human_placement(
+        task_template=template,
+        snippet=_snippet(),
+        base_state=base_state,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        teb_config=teb_config,
+        seed=27,
+    )
+    hidden = solve_anchored_human_placement(
+        task_template=template,
+        snippet=_snippet(),
+        base_state=base_state,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        teb_config=teb_config,
+        seed=27,
+        selection_mode="h0_hidden",
+    )
+
+    assert default.result is not None
+    assert default.result.placement.rotation_rad == pytest.approx(0.0)
+    assert hidden.result is not None
+    assert hidden.result.placement.rotation_rad == pytest.approx(1.0)
+    assert 0 in hidden.result.visibility.blocked_indices
+    assert hidden.result.placement.provenance["candidate_search"] == (
+        "synchronized_half_plane_step_h0_hidden_v1"
+    )
+
+
+def test_h0_hidden_selection_prefers_more_fully_occluded_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.generation import anchored_human_placement as placement_module
+    from src.generation.anchored_human_placement import (
+        VisibilityGuidedRotationAngles,
+        solve_anchored_human_placement,
+    )
+
+    base_config, base_state, oracle_context, teb_config = _m4_inputs()
+    template = next(
+        item.template
+        for item in iter_sop05r_teb_task_templates(
+            base_state=base_state,
+            oracle_context=oracle_context,
+            base_config=base_config,
+            teb_config=teb_config,
+            seed=9,
+        )
+        if item.template is not None
+    )
+    monkeypatch.setattr(
+        placement_module,
+        "construct_visibility_guided_rotation_angles",
+        lambda **_: VisibilityGuidedRotationAngles(
+            theta_align_rad=0.0,
+            signed_ab_rad=0.2,
+            half_plane_side=1,
+            angles_rad=(0.0, 1.0),
+            angular_margins_deg=(10.0, 20.0),
+            rejection_reason=None,
+        ),
+    )
+
+    def partly_and_fully_hidden(
+        robot_positions, target_positions, occluders, *, epsilon_m
+    ):
+        del robot_positions, occluders, epsilon_m
+        blocked = np.zeros(target_positions.shape[:2], dtype=np.bool_)
+        blocked[0, (0, 7)] = True
+        blocked[1, :8] = True
+        blocker_indices = np.full(blocked.shape, -1, dtype=np.int16)
+        blocker_indices[blocked] = 0
+        return blocked, blocker_indices
+
+    monkeypatch.setattr(
+        placement_module,
+        "_batched_centerline_blocking",
+        partly_and_fully_hidden,
+    )
+    monkeypatch.setattr(placement_module, "_physics_rejection", lambda **_: None)
+
+    evaluation = solve_anchored_human_placement(
+        task_template=template,
+        snippet=_snippet(),
+        base_state=base_state,
+        oracle_context=oracle_context,
+        base_config=base_config,
+        teb_config=teb_config,
+        seed=27,
+        selection_mode="h0_hidden",
+    )
+
+    assert evaluation.result is not None
+    assert evaluation.result.placement.rotation_rad == pytest.approx(1.0)
+    assert evaluation.result.visibility.occluded_frames == 8
+    assert not evaluation.result.visibility.eligible
+
+
 def test_first_fit_rejects_history_without_seen_then_occluded_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

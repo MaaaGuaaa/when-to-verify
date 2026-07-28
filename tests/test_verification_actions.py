@@ -3,7 +3,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.contracts import GridSpec
+from src.contracts import (
+    GridSpec,
+    LONG40_FUTURE_STEPS,
+    SCHEMA_VERSION,
+)
 from src.geometry import (
     CircleFootprint,
     RectangleFootprint,
@@ -14,8 +18,10 @@ from src.planning.verification_actions import (
     action_cost,
     action_endpoint,
     check_action_feasibility,
+    check_action_trace_feasibility,
     load_verification_actions,
     sample_action_trace,
+    sample_state_aware_action_trace,
 )
 
 
@@ -28,7 +34,7 @@ def _grid() -> GridSpec:
         height=40,
         width=40,
         history_steps=8,
-        future_steps=15,
+        future_steps=LONG40_FUTURE_STEPS,
         resolution_m=0.1,
     )
 
@@ -36,7 +42,7 @@ def _grid() -> GridSpec:
 def _future_pose(x: float, y: float, yaw: float) -> np.ndarray:
     return np.tile(
         np.asarray([x, y, yaw], dtype=np.float32),
-        (16, 1),
+        (LONG40_FUTURE_STEPS + 1, 1),
     )
 
 
@@ -44,46 +50,59 @@ def test_canonical_action_order_vectors_and_analytic_endpoints():
     library = load_verification_actions(CONFIG)
     actions = library.actions
 
+    assert library.schema_version == SCHEMA_VERSION
+    assert library.library_version == "verification_actions_v3"
     assert tuple(action.action_id for action in actions) == CANONICAL_ACTION_IDS
     assert CANONICAL_ACTION_IDS == (
-        "yaw_left_10",
-        "yaw_right_10",
-        "yaw_left_20",
-        "yaw_right_20",
+        "arc_left_30",
+        "arc_right_30",
+        "arc_left_45",
+        "arc_right_45",
         "forward_peek",
         "stop_scan",
     )
+    assert library.sensor_fov_rad == pytest.approx(2.0 * np.pi)
     assert all(action.vector.shape == (3,) for action in actions)
     assert all(action.vector.dtype == np.float32 for action in actions)
 
-    start = np.asarray([1.0, 2.0, np.pi / 2.0], dtype=np.float32)
+    start = np.zeros(3, dtype=np.float32)
     by_id = library.by_id
-    np.testing.assert_allclose(
-        action_endpoint(start, by_id["yaw_left_10"]),
-        np.asarray([1.0, 2.0, np.pi / 2.0 + np.deg2rad(10.0)]),
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        action_endpoint(start, by_id["yaw_right_20"]),
-        np.asarray([1.0, 2.0, np.pi / 2.0 - np.deg2rad(20.0)]),
-        atol=1e-6,
-    )
+    left_endpoint = action_endpoint(start, by_id["arc_left_45"])
+    right_endpoint = action_endpoint(start, by_id["arc_right_45"])
+    assert left_endpoint[0] > 0.0
+    assert left_endpoint[1] > 0.20
+    assert right_endpoint[0] > 0.0
+    assert right_endpoint[1] < -0.20
+    np.testing.assert_allclose(left_endpoint[0], right_endpoint[0], atol=1e-6)
+    np.testing.assert_allclose(left_endpoint[1], -right_endpoint[1], atol=1e-6)
+    np.testing.assert_allclose(left_endpoint[2], np.deg2rad(45.0), atol=1e-6)
+    np.testing.assert_allclose(right_endpoint[2], -np.deg2rad(45.0), atol=1e-6)
+    assert action_endpoint(start, by_id["arc_left_30"])[1] > 0.10
+    assert action_endpoint(start, by_id["arc_right_30"])[1] < -0.10
     np.testing.assert_allclose(
         action_endpoint(start, by_id["forward_peek"]),
-        np.asarray([1.0, 2.30, np.pi / 2.0]),
+        np.asarray([0.30, 0.0, 0.0]),
         atol=1e-6,
     )
     np.testing.assert_allclose(action_endpoint(start, by_id["stop_scan"]), start)
 
-    yaw_trace = sample_action_trace(start, by_id["yaw_left_20"])
-    assert np.all(yaw_trace.poses[:, :2] == start[:2])
-    np.testing.assert_allclose(yaw_trace.poses[-1], action_endpoint(start, by_id["yaw_left_20"]))
-    assert yaw_trace.times_s[0] == 0.0
-    assert yaw_trace.times_s[-1] == by_id["yaw_left_20"].duration_s
+    arc_trace = sample_action_trace(start, by_id["arc_left_45"])
+    assert np.any(arc_trace.poses[:, :2] != start[:2])
+    np.testing.assert_allclose(
+        arc_trace.poses[-1], action_endpoint(start, by_id["arc_left_45"])
+    )
+    assert arc_trace.times_s[0] == 0.0
+    assert arc_trace.times_s[-1] == by_id["arc_left_45"].duration_s
+    assert np.max(np.abs(arc_trace.linear_velocities_mps)) <= 0.9
+    assert np.max(np.abs(arc_trace.angular_velocities_radps)) <= 0.8
+    assert all(
+        by_id[action_id].delta_forward_m > 0.0
+        for action_id in CANONICAL_ACTION_IDS[:5]
+    )
 
 
 def test_action_cost_uses_duration_distance_and_yaw_once():
-    action = load_verification_actions(CONFIG).by_id["yaw_left_20"]
+    action = load_verification_actions(CONFIG).by_id["arc_left_45"]
     cost = action_cost(
         action,
         {
@@ -92,7 +111,47 @@ def test_action_cost_uses_duration_distance_and_yaw_once():
             "lambda_yaw_per_deg": 0.0015,
         },
     )
-    assert cost == pytest.approx(0.04 * 0.75 + 0.0015 * 20.0)
+    assert cost == pytest.approx(0.04 * 1.00 + 0.05 * 0.60 + 0.0015 * 45.0)
+
+
+@pytest.mark.parametrize(
+    "robot_state",
+    (
+        [0.0, 0.0],
+        np.zeros(2, dtype=np.float64),
+        np.zeros(3, dtype=np.float32),
+        np.asarray([np.nan, 0.0], dtype=np.float32),
+    ),
+)
+def test_state_aware_trace_rejects_invalid_robot_state(robot_state):
+    action = load_verification_actions(CONFIG).by_id["stop_scan"]
+
+    with pytest.raises((TypeError, ValueError), match="robot_state"):
+        sample_state_aware_action_trace(
+            np.zeros(3, dtype=np.float32),
+            action,
+            robot_state=robot_state,
+            braking_deceleration_mps2=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("linear_deceleration", "angular_deceleration"),
+    ((0.0, 1.6), (-1.0, 1.6), (1.0, 0.0), (1.0, np.inf)),
+)
+def test_state_aware_trace_requires_positive_finite_deceleration(
+    linear_deceleration, angular_deceleration
+):
+    action = load_verification_actions(CONFIG).by_id["stop_scan"]
+
+    with pytest.raises(ValueError, match="finite|positive"):
+        sample_state_aware_action_trace(
+            np.zeros(3, dtype=np.float32),
+            action,
+            robot_state=np.zeros(2, dtype=np.float32),
+            braking_deceleration_mps2=linear_deceleration,
+            angular_deceleration_radps2=angular_deceleration,
+        )
 
 
 def test_static_and_typed_dynamic_feasibility_cover_rotated_rectangles():
@@ -150,18 +209,85 @@ def test_static_and_typed_dynamic_feasibility_cover_rotated_rectangles():
     assert safe.minimum_dynamic_clearance_m > 0.0
 
 
+def test_state_aware_feasibility_checks_the_initial_braking_motion():
+    grid = _grid()
+    action = load_verification_actions(CONFIG).by_id["stop_scan"]
+    robot = CircleFootprint(0.05)
+    obstacle = CircleFootprint(0.05)
+    empty = np.zeros((grid.height, grid.width), dtype=np.float32)
+    obstacle_poses = _future_pose(0.13, 0.0, 0.0)
+    legacy = check_action_feasibility(
+        np.zeros(3, dtype=np.float32),
+        action,
+        robot_footprint=robot,
+        static_occupancy=empty,
+        grid=grid,
+        dynamic_object_poses={"obstacle": obstacle_poses},
+        dynamic_object_footprints={"obstacle": obstacle},
+        dynamic_dt_s=0.2,
+    )
+    trace = sample_state_aware_action_trace(
+        np.zeros(3, dtype=np.float32),
+        action,
+        robot_state=np.asarray([0.4, 0.0], dtype=np.float32),
+        braking_deceleration_mps2=1.0,
+    )
+
+    state_aware = check_action_trace_feasibility(
+        trace,
+        robot_footprint=robot,
+        static_occupancy=empty,
+        grid=grid,
+        dynamic_object_poses={"obstacle": obstacle_poses},
+        dynamic_object_footprints={"obstacle": obstacle},
+        dynamic_dt_s=0.2,
+    )
+
+    assert legacy.feasible
+    assert not state_aware.feasible
+    assert state_aware.reason == "dynamic_collision"
+    assert state_aware.critical_object_id == "obstacle"
+
+
 def test_loader_rejects_duplicate_or_noncanonical_action_ids(tmp_path: Path):
     bad = tmp_path / "bad.yaml"
     bad.write_text(
         """
-schema_version: "3.0.0"
-library_version: verification_actions_v1
+schema_version: "4.0.0"
+library_version: verification_actions_v3
+sensor_fov_deg: 360.0
 actions:
-  - {action_id: yaw_left_10, duration_s: 0.5, delta_forward_m: 0.0, delta_yaw_deg: 10.0}
-  - {action_id: yaw_left_10, duration_s: 0.5, delta_forward_m: 0.0, delta_yaw_deg: -10.0}
+  - {action_id: arc_left_30, duration_s: 0.80, delta_forward_m: 0.45, delta_yaw_deg: 30.0}
+  - {action_id: arc_left_30, duration_s: 0.80, delta_forward_m: 0.45, delta_yaw_deg: -30.0}
 """.lstrip(),
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError, match="canonical action IDs"):
+        load_verification_actions(bad)
+
+
+def test_loader_rejects_changed_v3_action_duration(tmp_path: Path):
+    bad = tmp_path / "bad-duration.yaml"
+    payload = CONFIG.read_text(encoding="utf-8").replace(
+        "duration_s: 0.80",
+        "duration_s: 0.81",
+        1,
+    )
+    bad.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="frozen action"):
+        load_verification_actions(bad)
+
+
+@pytest.mark.parametrize("sensor_fov_deg", (0.0, 240.0, 360.1, ".nan"))
+def test_loader_rejects_invalid_sensor_fov(tmp_path: Path, sensor_fov_deg):
+    bad = tmp_path / "bad-fov.yaml"
+    payload = CONFIG.read_text(encoding="utf-8").replace(
+        "sensor_fov_deg: 360.0",
+        f"sensor_fov_deg: {sensor_fov_deg}",
+    )
+    bad.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sensor_fov_deg"):
         load_verification_actions(bad)

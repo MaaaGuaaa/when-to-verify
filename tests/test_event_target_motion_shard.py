@@ -166,6 +166,34 @@ def _rewrite_manifest(path: Path, mutate) -> None:
     )
 
 
+def test_selection_reader_loads_only_requested_oracle_world(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _sut()
+    first = _record(module, "a")
+    second = _record(module, "b")
+    root = tmp_path / "selection"
+    _write(module, root, [first, second], [_world(first, _grid()), _world(second, _grid())])
+    calls: list[Path] = []
+    original_load = module.load_dataclass
+
+    def tracked_load(path):
+        calls.append(Path(path))
+        return original_load(path)
+
+    monkeypatch.setattr(module, "load_dataclass", tracked_load)
+    reader = module.load_event_target_motion_selection(root)
+
+    assert calls == []
+    loaded = reader.load_records_and_worlds((first.generated_event_id,), grid=_grid())
+
+    assert len(loaded) == 1
+    assert loaded[0][0].generated_event_id == first.generated_event_id
+    assert loaded[0][1].world_id == first.world_id
+    assert calls == [root / "oracle_worlds" / f"{first.world_id}.npz"]
+
+
 def test_factory_freezes_contract_and_owns_c_contiguous_float32_copies() -> None:
     module = _sut()
     base_history, base_current, base_future = _motion()

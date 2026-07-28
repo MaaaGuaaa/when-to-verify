@@ -1,0 +1,6 @@
+schema_version: "4.0.0"
+matrix_version: "sop16_toy_matrix_v1"
+closed_loop_config: "../closed_loop.yaml"
+seeds: [7, 11]
+strategies: [never, always, visible, swept, entropy, learned, oracle]
+episode_count: 6

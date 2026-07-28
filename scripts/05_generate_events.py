@@ -18,6 +18,9 @@ if str(_ROOT) not in sys.path:
 from src.datasets.split_manager import SPLIT_NAMES  # noqa: E402
 from src.contracts import ContractError  # noqa: E402
 from src.generation.event_sampler import GeneratorConfigError  # noqa: E402
+from src.generation.anchored_human_placement import (  # noqa: E402
+    PLACEMENT_SELECTION_MODES,
+)
 from src.generation.sop05_input_adapter import Sop05InputError  # noqa: E402
 from src.generation.sop05_run import (  # noqa: E402
     SOP05_RUN_VERSION,
@@ -131,9 +134,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verification-action-config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=_nonnegative_int, required=True)
-    parser.add_argument("--accepted-quota", type=_positive_int, required=True)
+    parser.add_argument("--accepted-quota", type=_positive_int)
+    parser.add_argument(
+        "--all-accepted",
+        action="store_true",
+        help=(
+            "obstacle_first_teb only: process every requested BaseState and "
+            "publish every accepted M6 mother"
+        ),
+    )
     parser.add_argument("--events-per-pair", type=_positive_int)
     parser.add_argument("--max-base-states", type=_positive_int, required=True)
+    parser.add_argument("--base-state-start", type=_nonnegative_int, default=0)
+    parser.add_argument("--exclude-existing-output", type=Path)
+    parser.add_argument("--resume-publish-staging", type=Path)
+    parser.add_argument(
+        "--placement-selection-mode",
+        choices=PLACEMENT_SELECTION_MODES,
+        default="seen_first",
+    )
     parser.add_argument("--trajectory-count", type=_positive_int)
     parser.add_argument("--max-pairs", type=_positive_int)
     parser.add_argument("--checksum-workers", type=_positive_int, default=8)
@@ -160,6 +179,27 @@ def _validate_mode_arguments(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ) -> None:
+    if args.generator_mode == "obstacle_first_teb":
+        if args.all_accepted == (args.accepted_quota is not None):
+            parser.error(
+                "obstacle_first_teb mode requires exactly one of "
+                "--accepted-quota or --all-accepted"
+            )
+    elif args.all_accepted:
+        parser.error("--all-accepted is only supported by obstacle_first_teb mode")
+    elif args.accepted_quota is None:
+        parser.error("--accepted-quota is required for this generator mode")
+    if args.generator_mode != "obstacle_first_teb" and (
+        args.base_state_start != 0
+        or args.exclude_existing_output is not None
+        or args.resume_publish_staging is not None
+        or args.placement_selection_mode != "seen_first"
+    ):
+        parser.error(
+            "--base-state-start, --exclude-existing-output, and "
+            "--resume-publish-staging, and --placement-selection-mode h0_hidden "
+            "are only supported by obstacle_first_teb mode"
+        )
     if args.generator_mode == "legacy":
         missing = [
             option
@@ -216,6 +256,7 @@ def _validate_mode_arguments(
 
 
 def _run_legacy(args: argparse.Namespace) -> tuple[dict[str, object], int]:
+    assert args.accepted_quota is not None
     request = Sop05RunRequest(
         sop03_root=args.sop03_root,
         sop04_root=args.sop04_root,
@@ -259,6 +300,7 @@ def _run_legacy(args: argparse.Namespace) -> tuple[dict[str, object], int]:
 def _run_obstacle_first(
     args: argparse.Namespace,
 ) -> tuple[dict[str, object], int]:
+    assert args.accepted_quota is not None
     request = Sop05rRunRequest(
         sop03_root=args.sop03_root,
         split=args.split,
@@ -320,6 +362,10 @@ def _run_obstacle_first_teb(
         seed=args.seed,
         accepted_quota=args.accepted_quota,
         max_base_states=args.max_base_states,
+        base_state_start=args.base_state_start,
+        exclude_existing_output=args.exclude_existing_output,
+        resume_staging_root=args.resume_publish_staging,
+        placement_selection_mode=args.placement_selection_mode,
         checksum_workers=args.checksum_workers,
         workers=args.workers,
         git_executable=args.git_executable,

@@ -22,7 +22,7 @@ from src.geometry import (
 )
 from src.utils.seeding import derive_seed
 
-from .dynamic_object_transplant import footprint_from_spec
+from .event_contracts import footprint_from_spec
 from .history_visibility import (
     SeenThenOccludedHistoryAssessment,
     classify_sop05r_seen_then_occluded_history,
@@ -36,6 +36,14 @@ from .sop05r_contracts import (
     Sop05rTebConfig,
 )
 from .sop05r_teb_templates import Sop05rTebTaskTemplate
+
+
+PLACEMENT_SELECTION_MODES = ("seen_first", "h0_hidden")
+_CANDIDATE_SEARCH_BY_SELECTION_MODE = {
+    "seen_first": "synchronized_half_plane_step_seen_then_occlude_v5",
+    "h0_hidden": "synchronized_half_plane_step_h0_hidden_v1",
+}
+
 
 def _readonly_array(
     value: object,
@@ -931,6 +939,7 @@ def solve_anchored_human_placement(
     base_config: Mapping[str, object],
     teb_config: Sop05rTebConfig,
     seed: int,
+    selection_mode: str = "seen_first",
 ) -> AnchoredPlacementEvaluation:
     """Return the first physical M5 candidate from half-plane margin samples."""
 
@@ -945,6 +954,10 @@ def solve_anchored_human_placement(
         raise ValueError("oracle context must belong to the supplied base state")
     if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
         raise TypeError("seed must be an integer")
+    if selection_mode not in PLACEMENT_SELECTION_MODES:
+        raise ValueError(
+            "selection_mode must be one of " + ", ".join(PLACEMENT_SELECTION_MODES)
+        )
 
     route_indices = _route_anchor_indices(task_template, teb_config)
     rng = np.random.default_rng(
@@ -1037,8 +1050,13 @@ def solve_anchored_human_placement(
                 candidate_counts["fallback_seen_then_occluded"] += len(
                     visibility_batch.fallback_indices
                 )
-                for history_assessment in visibility_batch.history_assessments:
-                    if history_assessment.eligible:
+                for angle_index, history_assessment in enumerate(
+                    visibility_batch.history_assessments
+                ):
+                    if history_assessment.eligible or (
+                        selection_mode == "h0_hidden"
+                        and bool(visibility_batch.blocked[angle_index, 0])
+                    ):
                         continue
                     rejection_counts[
                         (
@@ -1050,10 +1068,31 @@ def solve_anchored_human_placement(
                             else "window_occlusion_missing"
                         )
                     ] += 1
-                for angle_index in (
-                    *visibility_batch.preferred_indices,
-                    *visibility_batch.fallback_indices,
-                ):
+                if selection_mode == "h0_hidden":
+                    eligible_indices = tuple(
+                        sorted(
+                            (
+                                angle_index
+                                for angle_index in range(
+                                    len(visibility_batch.history_assessments)
+                                )
+                                if bool(visibility_batch.blocked[angle_index, 0])
+                            ),
+                            key=lambda angle_index: (
+                                -visibility_batch.history_assessments[
+                                    angle_index
+                                ].occluded_frames,
+                                angle_index,
+                            ),
+                        )
+                    )
+                    candidate_counts["h0_hidden_candidates"] += len(eligible_indices)
+                else:
+                    eligible_indices = (
+                        *visibility_batch.preferred_indices,
+                        *visibility_batch.fallback_indices,
+                    )
+                for angle_index in eligible_indices:
                     history_assessment = visibility_batch.history_assessments[angle_index]
                     attempted_candidates += 1
                     candidate_counts["tested_candidates"] += 1
@@ -1094,9 +1133,10 @@ def solve_anchored_human_placement(
                         provenance={
                             "placement_version": teb_config.placement.version,
                             "seed": int(seed),
-                        "candidate_search": (
-                            "synchronized_half_plane_step_seen_then_occlude_v5"
-                        ),
+                            "candidate_search": _CANDIDATE_SEARCH_BY_SELECTION_MODE[
+                                selection_mode
+                            ],
+                            "placement_selection_mode": selection_mode,
                             "decision_time_s": 0.0,
                             "visible_history_frames": history_assessment.visible_frames,
                             "occluded_history_frames": history_assessment.occluded_frames,

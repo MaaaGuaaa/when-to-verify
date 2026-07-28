@@ -19,6 +19,9 @@ import numpy as np
 from src.contracts import (
     DYNAMIC_OBJECT_TYPES,
     HISTORY_CHANNELS,
+    LONG40_FUTURE_STEPS,
+    LONG40_HISTORY_STEPS,
+    LONG40_SAMPLE_DT_S,
     POSE_TIME_LAYOUT_VERSION,
     SCHEMA_VERSION,
     TRAJECTORY_CHANNELS,
@@ -419,6 +422,7 @@ class RiskBuildInput:
     hidden_object_ids: tuple[str, ...]
     sensor_config: StructuralBlindSpot | None
     provenance: Mapping[str, object]
+    scene_dynamic_history_observed: Mapping[str, np.ndarray] | None = None
 
 
 def _canonical_paired_config(value: PairedVariantConfig) -> PairedVariantConfig:
@@ -1058,6 +1062,31 @@ def _normalized_risk_config(value: Mapping[str, object]) -> dict[str, object]:
     return config
 
 
+def _validated_long40_base_config(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("base_config must be a mapping")
+    config = dict(value)
+    if config.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
+    bev = config.get("bev")
+    if not isinstance(bev, Mapping):
+        raise TypeError("base_config.bev must be a mapping")
+    expected = {
+        "history_steps": LONG40_HISTORY_STEPS,
+        "history_dt_s": LONG40_SAMPLE_DT_S,
+        "future_steps": LONG40_FUTURE_STEPS,
+        "future_dt_s": LONG40_SAMPLE_DT_S,
+    }
+    for field, required in expected.items():
+        if bev.get(field) != required:
+            raise ValueError(
+                f"base_config.bev.{field} must equal {required}"
+            )
+    return config
+
+
 def _validate_source_join(source: RiskBuildInput) -> None:
     _require_nonempty_string(source.sample_id, name="sample_id")
     _require_nonempty_string(source.pair_group_id, name="pair_group_id")
@@ -1077,23 +1106,36 @@ def _validate_source_join(source: RiskBuildInput) -> None:
     history_ids = set(source.scene_dynamic_history)
     spec_ids = set(source.scene_dynamic_specs)
     world_ids = set(source.oracle_world.dynamic_object_trajectories)
-    if history_ids != spec_ids or not world_ids.issubset(history_ids):
-        raise ValueError(
-            "scene history/spec IDs must contain oracle_world object IDs"
-        )
+    if history_ids != spec_ids:
+        raise ValueError("scene history/spec IDs must match")
     if set(source.oracle_world.dynamic_object_specs) != world_ids:
         raise ValueError("oracle_world trajectory/spec IDs must match")
-    for object_id in sorted(world_ids):
+    if not isinstance(source.hidden_object_ids, tuple):
+        raise TypeError("hidden_object_ids must be an explicit tuple")
+    if not set(source.hidden_object_ids).issubset(world_ids):
+        raise ValueError("hidden_object_ids must have oracle trajectories")
+    for object_id in sorted(world_ids & history_ids):
         if source.scene_dynamic_specs[object_id] != source.oracle_world.dynamic_object_specs[
             object_id
         ]:
             raise ValueError("scene and oracle_world footprint specs must match")
-    if not isinstance(source.hidden_object_ids, tuple):
-        raise TypeError("hidden_object_ids must be an explicit tuple")
-    if not set(source.hidden_object_ids).issubset(world_ids):
-        raise ValueError(
-            "hidden_object_ids must have history, specs, and oracle trajectories"
-        )
+    observed = source.scene_dynamic_history_observed
+    if observed is not None:
+        if not isinstance(observed, Mapping) or set(observed) != history_ids:
+            raise ValueError(
+                "scene observed-history IDs must match scene history IDs"
+            )
+        history_steps = source.base_state.robot_history.shape[0]
+        for object_id in sorted(history_ids):
+            mask = observed[object_id]
+            if (
+                not isinstance(mask, np.ndarray)
+                or mask.dtype != np.bool_
+                or mask.shape != (history_steps,)
+            ):
+                raise ValueError(
+                    "scene observed-history values must be boolean history masks"
+                )
 
 
 def _validate_declared_hidden_visibility(
@@ -1106,6 +1148,11 @@ def _validate_declared_hidden_visibility(
         -1, HISTORY_CHANNELS.index("past_visible_mask")
     ] > 0.5
     for object_id in sorted(source.hidden_object_ids):
+        if object_id not in source.scene_dynamic_history:
+            continue
+        observed = source.scene_dynamic_history_observed
+        if observed is not None and not bool(observed[object_id][-1]):
+            continue
         footprint = footprint_from_spec(source.scene_dynamic_specs[object_id])
         current_pose = source.scene_dynamic_history[object_id][-1]
         footprint_mask = rasterize_footprint(footprint, current_pose, grid)
@@ -1800,26 +1847,29 @@ def build_risk_sample(
     *,
     base_config: Mapping[str, object],
     risk_config: Mapping[str, object],
+    rendered_observation: RenderedObservation | None = None,
 ) -> RiskSample:
-    """Render a general history-only source and compute its hidden-risk labels."""
+    """Build one sample from a fresh or already-persisted SOP06 observation."""
 
     if not isinstance(source, RiskBuildInput):
         raise TypeError("source must be a RiskBuildInput")
-    if not isinstance(base_config, Mapping):
-        raise TypeError("base_config must be a mapping")
-    base_config_dict = dict(base_config)
-    if base_config_dict.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"base_config schema_version must be {SCHEMA_VERSION}")
+    base_config_dict = _validated_long40_base_config(base_config)
     normalized_risk = _normalized_risk_config(risk_config)
     _validate_source_join(source)
-    rendered = render_observation(
-        source.base_state,
-        scene_dynamic_history=source.scene_dynamic_history,
-        scene_dynamic_specs=source.scene_dynamic_specs,
-        static_occupancy=source.observed_static_occupancy,
-        sensor_config=source.sensor_config,
-        config=base_config_dict,
-    )
+    if rendered_observation is None:
+        rendered = render_observation(
+            source.base_state,
+            scene_dynamic_history=source.scene_dynamic_history,
+            scene_dynamic_specs=source.scene_dynamic_specs,
+            static_occupancy=source.observed_static_occupancy,
+            sensor_config=source.sensor_config,
+            config=base_config_dict,
+            scene_dynamic_history_observed=source.scene_dynamic_history_observed,
+        )
+    elif isinstance(rendered_observation, RenderedObservation):
+        rendered = rendered_observation
+    else:
+        raise TypeError("rendered_observation must be a RenderedObservation or None")
     sample, _, _ = _build_risk_sample_and_optional_sidecar_from_rendered(
         source,
         rendered,

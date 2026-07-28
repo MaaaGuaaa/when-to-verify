@@ -615,6 +615,67 @@ def test_scene_history_uses_total_occupancy_for_visibility_and_masks_hidden_dyna
     assert current_occupied[static.astype(bool) & visible[-1].astype(bool)].all()
 
 
+def test_unobserved_dynamic_pose_never_enters_visibility_occupancy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _toy_config()
+    grid = build_grid_spec(config)
+    static = np.zeros((9, 9), dtype=np.float32)
+    static[:, 5] = 1.0
+    context_id = "context-rectangle"
+    target_id = "partly-observed-circle"
+    context_history = np.tile(
+        np.array([-2.0, 2.0, 0.0], dtype=np.float32),
+        (3, 1),
+    )
+    target_history = np.array(
+        [
+            [-2.0, -2.0, 0.0],
+            [2.0, -2.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    base_state = replace(
+        _empty_base_state(static),
+        dynamic_object_ids=(context_id,),
+        visible_dynamic_object_history={context_id: context_history.copy()},
+        visible_dynamic_object_specs={context_id: _rectangle_spec()},
+    )
+    captured = _spy_on_total_occupancy(monkeypatch)
+
+    rendered = render_observation(
+        base_state,
+        scene_dynamic_history={
+            context_id: context_history,
+            target_id: target_history,
+        },
+        scene_dynamic_specs={
+            context_id: _rectangle_spec(),
+            target_id: _circle_spec(),
+        },
+        static_occupancy=static,
+        sensor_config=None,
+        config=config,
+        scene_dynamic_history_observed={
+            context_id: np.ones(3, dtype=np.bool_),
+            target_id: np.array([True, False, False], dtype=np.bool_),
+        },
+    )
+
+    target_current = rasterize_footprint(
+        CircleFootprint(0.35),
+        target_history[-1],
+        grid,
+    )
+    assert target_current.any()
+    assert not captured[-1][target_current].any()
+    dynamic = rendered.bev_history[
+        :, HISTORY_CHANNELS.index("past_dynamic_occupancy")
+    ].astype(bool)
+    assert not dynamic[-1][target_current].any()
+
+
 def test_renderer_circle_footprint_mask_is_yaw_invariant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

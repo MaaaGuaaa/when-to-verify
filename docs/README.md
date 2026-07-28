@@ -1,14 +1,33 @@
 # 当前项目文档入口
 
-_Schema 4 Long40 与 SOP08 occupancy baseline 的现行文档索引，更新于 2026-07-27_
+_事件中心盲区风险与主动验证项目的当前权威文档索引，更新于 2026-07-15_
 
-## 权威文档
+---
 
-1. [Long40 统一时间与数据契约](./long40_system_contract.md)：统一时间轴、数组形状、版本和跨 SOP 约束。
-2. [M5 可见性引导放置设计](./superpowers/specs/2026-07-26-sop05r-m5-constructive-visibility-placement-design.md)：当前可见性引导放置设计。
+## 📋 权威文档
 
-## 当前实现边界
+后续 Agent 只应从以下三份文档开始工作：
 
-现行可执行入口覆盖记录切分、THOR 索引、Long40 snippet、base-state 提取、SOP05R lightweight-TEB 事件生成，以及消费已认证 Long40 risk shard/seal/sidecar 的 SOP08 occupancy baseline。SOP06/SOP07 生产器仍需按 Long40 重建，不得恢复已退役的短时域实现；SOP09 至 SOP13 仍退出活跃树。
+1. [`event_centered_blind_spot_implementation_spec.md`](./event_centered_blind_spot_implementation_spec.md)  
+   定义研究目标、方法语义、数据契约、风险与验证价值公式、评价指标及论文主张边界。
+2. [`parallel_acceleration_implementation_plan.md`](./parallel_acceleration_implementation_plan.md)  
+   定义 W0–W8 工作流、并行波次、最低/理想验收线、Go/No-Go 和降级策略。
+3. [`event_centered_blind_spot_agent_sops.md`](./event_centered_blind_spot_agent_sops.md)  
+   将前两份文档拆分为 SOP-00～SOP-16，可直接派发给实现 Agent。
 
-实现、配置和测试必须以 Schema 4、8 帧历史、32 个未来端点和 6.4 秒未来窗口为准。已退役契约不得作为兼容回退或 fixture 重新引入。
+环境与跨服务器复现请使用
+[`environment_reproduction.md`](./environment_reproduction.md)。该文档明确区分
+已经由 SOP-01～07 验证的数据管线环境，以及尚待 SOP-08 训练入口冻结的 GPU 训练环境。
+
+权威顺序为：方法规格 → 并行计划 → Agent SOP。出现科学语义冲突时以方法规格为准；出现任务组织冲突时以 Agent SOP 中明确记录的冻结决策为准。
+
+## 🔄 推荐工作方式
+
+1. 总控 Agent 从 `event_centered_blind_spot_agent_sops.md` 选择一个依赖已满足的 SOP
+2. 只把该 SOP 的允许文件、步骤和验收标准派发给执行 Agent
+3. 执行 Agent 按 handoff 模板返回测试、产物、指标和限制
+4. 通过对应 G0–G5 门禁后再启动下游任务
+
+## 📦 历史文档
+
+2026-07-14 及更早的设计、执行计划和交接记录已归档到 [`../documents_old/`](../documents_old/README.md)。这些文件用于追溯既有实验和决策，不再作为新实现的默认入口。

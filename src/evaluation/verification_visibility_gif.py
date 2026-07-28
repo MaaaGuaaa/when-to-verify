@@ -20,7 +20,7 @@ from src.generation.counterfactual_verify import (
     CounterfactualObservationTrace,
     simulate_counterfactual_observation_trace,
 )
-from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_contracts import footprint_from_spec
 from src.planning.verification_actions import (
     ActionTrace,
     VerificationAction,

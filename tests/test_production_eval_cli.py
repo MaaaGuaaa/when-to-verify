@@ -92,7 +92,7 @@ def _table(
         "checkpoint_digest": checkpoint_digest,
         "checkpoint_digest_kind": (
             "occupancy_checkpoint_semantic_sha256"
-            if checkpoint_layout_version == "occupancy_baseline_checkpoint_v2"
+            if checkpoint_layout_version == "occupancy_baseline_checkpoint_v3"
             else "risk_checkpoint_semantic_sha256"
         ),
         "risk_dataset_family_layout_version": "risk_dataset_family_v1",
@@ -109,7 +109,7 @@ def _table(
         "semantic_digest": TABLE_DIGEST,
         "rows": [{"sample_id": f"{split}-0", "q90": 0.4}],
     }
-    if checkpoint_layout_version == "occupancy_baseline_checkpoint_v2":
+    if checkpoint_layout_version == "occupancy_baseline_checkpoint_v3":
         table["prediction_semantics"] = (
             "scalar_baseline_score_repeated_for_common_calibration"
         )
@@ -132,7 +132,7 @@ def _artifact(
         "checkpoint_digest": checkpoint_digest,
         "checkpoint_digest_kind": (
             "occupancy_checkpoint_semantic_sha256"
-            if checkpoint_layout_version == "occupancy_baseline_checkpoint_v2"
+            if checkpoint_layout_version == "occupancy_baseline_checkpoint_v3"
             else "risk_checkpoint_semantic_sha256"
         ),
         "risk_dataset_family_layout_version": "risk_dataset_family_v1",
@@ -150,7 +150,7 @@ def _artifact(
         "grouped": {"group_dimensions": []},
         "semantic_digest": ARTIFACT_DIGEST,
     }
-    if checkpoint_layout_version == "occupancy_baseline_checkpoint_v2":
+    if checkpoint_layout_version == "occupancy_baseline_checkpoint_v3":
         artifact["prediction_semantics"] = (
             "scalar_baseline_score_repeated_for_common_calibration"
         )
@@ -259,6 +259,7 @@ def test_production_calibration_publishes_family_bound_manifest(
         (output_dir / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["artifact_kind"] == "sop10_production_calibration"
+    assert manifest["schema_version"] == SCHEMA_VERSION
     assert manifest["risk_dataset_family_layout_version"] == (
         "risk_dataset_family_v1"
     )
@@ -458,6 +459,7 @@ def test_production_eval_publishes_family_and_isolation_metadata(
         (output_dir / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["artifact_kind"] == "sop10_production_offline_evaluation"
+    assert manifest["schema_version"] == SCHEMA_VERSION
     assert manifest["risk_dataset_family_layout_version"] == (
         "risk_dataset_family_v1"
     )
@@ -491,13 +493,13 @@ def test_production_baseline_rejects_different_dataset_family(
     baseline_table = _table(
         "test",
         method_id="occupancy-b3",
-        checkpoint_layout_version="occupancy_baseline_checkpoint_v2",
+        checkpoint_layout_version="occupancy_baseline_checkpoint_v3",
         checkpoint_digest="4" * 64,
     )
     main_artifact = _artifact()
     baseline_artifact = _artifact(
         method_id="occupancy-b3",
-        checkpoint_layout_version="occupancy_baseline_checkpoint_v2",
+        checkpoint_layout_version="occupancy_baseline_checkpoint_v3",
         checkpoint_digest="4" * 64,
         family_digest="9" * 64,
     )

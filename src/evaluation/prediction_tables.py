@@ -57,10 +57,18 @@ from src.models.occupancy_baseline import (
 from src.utils.atomic_publish import atomic_rename_noreplace
 
 
-PREDICTION_PROTOCOL_LAYOUT_VERSION = "shared_risk_prediction_protocol_v1"
+PREDICTION_PROTOCOL_LAYOUT_VERSION = "shared_risk_prediction_protocol_v2"
 PREDICTION_COHORT_BINDING_LAYOUT_VERSION = "shared_prediction_cohort_binding_v1"
-UNIFIED_PREDICTION_COLLECTION_LAYOUT_VERSION = "unified_prediction_collection_v1"
-UNIFIED_PREDICTION_METHODS = ("risk-r0", "risk-r1", "B1", "B2", "B3", "B4")
+UNIFIED_PREDICTION_COLLECTION_LAYOUT_VERSION = "unified_prediction_collection_v2"
+UNIFIED_PREDICTION_METHODS = (
+    "risk-r0",
+    "risk-r1",
+    "risk-r2",
+    "B1",
+    "B2",
+    "B3",
+    "B4",
+)
 _PREDICTION_FIELDS = ("p_collision", "q50", "q80", "q90", "q95")
 _PROTOCOL_KEYS = frozenset(
     {
@@ -71,6 +79,7 @@ _PROTOCOL_KEYS = frozenset(
         "global_calibration_rule",
         "grouped_calibration",
         "baseline_quantile_proxy_policy",
+        "required_methods",
         "protocol_digest_sha256",
     }
 )
@@ -152,6 +161,7 @@ class PredictionMethodArtifact:
         expected = {
             "risk-r0": (RISK_CHECKPOINT_LAYOUT_VERSION, "risk_checkpoint_semantic_sha256"),
             "risk-r1": (RISK_CHECKPOINT_LAYOUT_VERSION, "risk_checkpoint_semantic_sha256"),
+            "risk-r2": (RISK_CHECKPOINT_LAYOUT_VERSION, "risk_checkpoint_semantic_sha256"),
             "B1": (BASELINE_SPEC_LAYOUT_VERSION, "baseline_spec_sha256"),
             "B2": (BASELINE_SPEC_LAYOUT_VERSION, "baseline_spec_sha256"),
             "B3": (
@@ -206,7 +216,7 @@ def baseline_spec_digest(
 
 def _protocol_digest(protocol: Mapping[str, object]) -> str:
     return _semantic_digest(
-        b"shared-risk-prediction-protocol-v1\0",
+        b"shared-risk-prediction-protocol-v2\0",
         {
             key: protocol[key]
             for key in _PROTOCOL_KEYS
@@ -222,7 +232,7 @@ def build_prediction_protocol(
     min_group_size: int,
     group_dimensions: Sequence[str] = GROUP_DIMENSIONS,
 ) -> dict[str, object]:
-    """Freeze one calibration protocol shared by all six methods."""
+    """Freeze one calibration protocol shared by all seven methods."""
 
     alpha_value = float(alpha)
     if not math.isfinite(alpha_value) or not 0.0 < alpha_value < 1.0:
@@ -257,6 +267,7 @@ def build_prediction_protocol(
         "baseline_quantile_proxy_policy": (
             "q50=q80=q90=q95=raw_score_before_conformal"
         ),
+        "required_methods": list(UNIFIED_PREDICTION_METHODS),
     }
     protocol["protocol_digest_sha256"] = _protocol_digest(protocol)
     return validate_prediction_protocol(protocol)
@@ -289,6 +300,8 @@ def validate_prediction_protocol(
         "q50=q80=q90=q95=raw_score_before_conformal"
     ):
         raise PredictionTableContractError("baseline quantile proxy policy mismatch")
+    if result["required_methods"] != list(UNIFIED_PREDICTION_METHODS):
+        raise PredictionTableContractError("required prediction methods mismatch")
     grouped = result["grouped_calibration"]
     if not isinstance(grouped, dict) or set(grouped) != {
         "layout_version",
@@ -550,10 +563,13 @@ def score_unified_prediction_batch(
     sigma_time_s: float,
     device: str | torch.device,
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Score R0/R1 and B1--B4 from one shared label-free input batch."""
+    """Score R0/R1/R2 and B1--B4 from one shared label-free input batch."""
 
-    if set(risk_models) != {"risk-r0", "risk-r1"}:
-        raise PredictionTableContractError("risk_models must contain risk-r0 and risk-r1")
+    expected_risk_models = {"risk-r0", "risk-r1", "risk-r2"}
+    if set(risk_models) != expected_risk_models:
+        raise PredictionTableContractError(
+            "risk_models must contain risk-r0, risk-r1, and risk-r2"
+        )
     if not isinstance(occupancy_model, ConvGRUOccupancyPredictor):
         raise PredictionTableContractError("occupancy_model has the wrong type")
     if not isinstance(learned_aggregator, LearnedOccupancyRiskAggregator):
@@ -578,7 +594,7 @@ def score_unified_prediction_batch(
     result: dict[str, dict[str, torch.Tensor]] = {}
     risk_modes = {name: model.training for name, model in risk_models.items()}
     try:
-        for method in ("risk-r0", "risk-r1"):
+        for method in ("risk-r0", "risk-r1", "risk-r2"):
             model = risk_models[method]
             model.eval()
             with torch.no_grad():
@@ -630,10 +646,10 @@ def validate_shared_prediction_tables(
     expected_protocol: Mapping[str, object],
     expected_sidecar_collection_digest_sha256: str,
 ) -> dict[str, dict[str, Any]]:
-    """Validate six tables against one method-independent cohort and protocol."""
+    """Validate seven tables against one method-independent cohort and protocol."""
 
     if not isinstance(tables, Mapping) or set(tables) != set(UNIFIED_PREDICTION_METHODS):
-        raise PredictionTableContractError("prediction tables must cover all six methods")
+        raise PredictionTableContractError("prediction tables must cover all seven methods")
     family = _validate_sources(
         dataset_family=dataset_family,
         dataset=dataset,
@@ -673,6 +689,12 @@ def validate_shared_prediction_tables(
                 "native_model_quantiles",
             ),
             "risk-r1": (
+                RISK_CHECKPOINT_LAYOUT_VERSION,
+                "risk_checkpoint_semantic_sha256",
+                "risk_model_collision_and_quantile_heads",
+                "native_model_quantiles",
+            ),
+            "risk-r2": (
                 RISK_CHECKPOINT_LAYOUT_VERSION,
                 "risk_checkpoint_semantic_sha256",
                 "risk_model_collision_and_quantile_heads",
@@ -792,7 +814,7 @@ def _source_values(
 
 def _collection_manifest_digest(manifest: Mapping[str, object]) -> str:
     return _semantic_digest(
-        b"unified-prediction-collection-v1\0",
+        b"unified-prediction-collection-v2\0",
         {
             key: value
             for key, value in manifest.items()
@@ -969,7 +991,7 @@ def publish_unified_prediction_collection(
     split_sources: Mapping[str, Mapping[str, object]],
     tables_by_split: Mapping[str, Mapping[str, Mapping[str, Any]]],
 ) -> Path:
-    """Atomically publish six calibration tables or the complete two-split bundle."""
+    """Atomically publish seven calibration tables or the complete two-split bundle."""
 
     output = Path(os.path.abspath(os.fspath(output_dir)))
     if os.path.lexists(output):

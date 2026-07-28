@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Produce shared R0/R1/B1--B4 calibration or complete prediction bundles."""
+"""Produce shared R0/R1/R2/B1--B4 prediction bundles."""
 
 from __future__ import annotations
 
@@ -58,15 +58,17 @@ from src.models.occupancy_baseline import (  # noqa: E402
     FUTURE_STEPS,
     LearnedOccupancyRiskAggregator,
 )
-from src.models.risk_model import load_risk_checkpoint  # noqa: E402
 from src.training.occupancy_trainer import (  # noqa: E402
     FORMAL_PRODUCTION_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION,
     load_formal_production_occupancy_checkpoint,
     validate_formal_occupancy_training_publication,
 )
+from src.training.risk_trainer import (  # noqa: E402
+    load_production_risk_training_publication,
+)
 
 
-PREDICTION_PRODUCER_VERSION = "sop10_unified_prediction_producer_v1"
+PREDICTION_PRODUCER_VERSION = "sop10_unified_prediction_producer_v2"
 
 
 class PredictionProducerError(ValueError):
@@ -80,6 +82,7 @@ class PredictionProducerRequest:
     prediction_protocol: Path
     risk_r0_training_root: Path
     risk_r1_training_root: Path
+    risk_r2_training_root: Path
     occupancy_training_root: Path
     calibration_dataset_seal_root: Path
     calibration_risk_collection_root: Path
@@ -196,24 +199,33 @@ def _load_selected_risk_model(
     dataset_family: LoadedRiskDatasetFamily,
     seed: int,
 ) -> tuple[torch.nn.Module, PredictionMethodArtifact]:
-    if root.is_symlink() or not root.is_dir():
-        raise PredictionProducerError(f"{method_id} training root is invalid")
-    manifest = _read_json(root / "training_manifest.json", label=f"{method_id} manifest")
-    marker = _read_json(root / ".producer-complete", label=f"{method_id} marker")
-    checksums = _parse_checksums(root / "checksums.sha256")
+    try:
+        publication = load_production_risk_training_publication(
+            root,
+            checkpoint_role="best",
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise PredictionProducerError(
+            f"{method_id} training publication is invalid: {exc}"
+        ) from exc
+    manifest = publication.manifest
     if manifest.get("mode") != "production" or manifest.get("stage") != "formal_50k":
         raise PredictionProducerError(f"{method_id} is not a formal production training")
     expected_variant = method_id.removeprefix("risk-")
     if manifest.get("variant") != expected_variant:
         raise PredictionProducerError(f"{method_id} training variant mismatch")
-    if marker.get("semantic_digest_sha256") != manifest.get("semantic_digest_sha256"):
-        raise PredictionProducerError(f"{method_id} completion marker mismatch")
-    checkpoint_path = root / "best_checkpoint.pt"
-    if "best_checkpoint.pt" not in checksums or _sha256_file(checkpoint_path) != checksums[
-        "best_checkpoint.pt"
-    ]:
-        raise PredictionProducerError(f"{method_id} best checkpoint checksum mismatch")
-    model, checkpoint = load_risk_checkpoint(checkpoint_path, expected_mode="production")
+    model = publication.model
+    checkpoint = publication.checkpoint
+    model_config = checkpoint.get("model_config")
+    if method_id == "risk-r2" and (
+        not isinstance(model_config, Mapping)
+        or model_config.get("variant") != "r2"
+        or model_config.get("r2_fusion_mode") != "cross_attention"
+        or model_config.get("occupancy_aux_enabled") is not True
+    ):
+        raise PredictionProducerError(
+            "risk-r2 requires the cross-attention model with occupancy auxiliary"
+        )
     provenance = checkpoint["provenance"]
     if (
         provenance.get("risk_dataset_manifest_digest")
@@ -237,9 +249,6 @@ def _load_selected_risk_model(
         checkpoint.get("checkpoint_semantic_digest_sha256"),
         label=f"{method_id} checkpoint digest",
     )
-    bindings = manifest.get("artifact_semantic_bindings")
-    if not isinstance(bindings, Mapping) or bindings.get("best_checkpoint.pt") != digest:
-        raise PredictionProducerError(f"{method_id} manifest checkpoint binding mismatch")
     return model, PredictionMethodArtifact(
         method_id=method_id,
         layout_version="risk_model_checkpoint_v2",
@@ -297,6 +306,7 @@ def _load_selected_occupancy_models(
     if future_steps != FUTURE_STEPS or config.get("future_steps") != future_steps:
         raise PredictionProducerError("occupancy checkpoint future_steps mismatch")
     model = ConvGRUOccupancyPredictor(
+        state_channels=int(model_spec["state_channels"]),
         hidden_channels=int(model_spec["hidden_channels"]),
         future_steps=int(future_steps),
         kernel_size=int(model_spec["convgru_kernel_size"]),
@@ -356,6 +366,12 @@ def _load_selected_models(request: PredictionProducerRequest) -> _SelectedModels
         dataset_family=family,
         seed=request.seed,
     )
+    r2_model, r2_artifact = _load_selected_risk_model(
+        request.risk_r2_training_root,
+        method_id="risk-r2",
+        dataset_family=family,
+        seed=request.seed,
+    )
     occupancy_model, aggregator, occupancy_artifacts, parameters = (
         _load_selected_occupancy_models(
             request.occupancy_training_root,
@@ -368,6 +384,7 @@ def _load_selected_models(request: PredictionProducerRequest) -> _SelectedModels
     artifacts: dict[str, PredictionMethodArtifact] = {
         "risk-r0": r0_artifact,
         "risk-r1": r1_artifact,
+        "risk-r2": r2_artifact,
         "B1": PredictionMethodArtifact(
             method_id="B1",
             layout_version=BASELINE_SPEC_LAYOUT_VERSION,
@@ -401,7 +418,11 @@ def _load_selected_models(request: PredictionProducerRequest) -> _SelectedModels
     return _SelectedModels(
         dataset_family=family,
         protocol=protocol,
-        risk_models={"risk-r0": r0_model, "risk-r1": r1_model},
+        risk_models={
+            "risk-r0": r0_model,
+            "risk-r1": r1_model,
+            "risk-r2": r2_model,
+        },
         occupancy_model=occupancy_model,
         learned_aggregator=aggregator,
         method_artifacts=artifacts,
@@ -780,6 +801,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prediction-protocol", type=Path, required=True)
     parser.add_argument("--risk-r0-training-root", type=Path, required=True)
     parser.add_argument("--risk-r1-training-root", type=Path, required=True)
+    parser.add_argument("--risk-r2-training-root", type=Path, required=True)
     parser.add_argument("--occupancy-training-root", type=Path, required=True)
     for split in ("calibration", "test"):
         required = split == "calibration"

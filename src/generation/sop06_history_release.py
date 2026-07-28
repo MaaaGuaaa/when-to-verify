@@ -31,7 +31,7 @@ from .sop06_finalized_source import (
     Sop06FinalizedSource,
     load_sop06_finalized_source,
 )
-from .sop06_pipeline import render_sop06_single_input
+from .sop06_single import render_sop06_single_input
 
 
 SOP06_HISTORY_RELEASE_VERSION = "sop06_history_bev_release_v1"

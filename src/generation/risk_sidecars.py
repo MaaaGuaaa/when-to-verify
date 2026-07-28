@@ -23,7 +23,7 @@ from src.geometry import (
     rasterize_footprint,
 )
 
-from .dynamic_object_transplant import footprint_from_spec
+from .event_contracts import footprint_from_spec
 
 
 RISK_LABEL_SIDECAR_VERSION = "risk_label_sidecar_v1"

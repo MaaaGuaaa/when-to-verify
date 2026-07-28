@@ -19,7 +19,7 @@ from src.generation.sop05_partial_m6_final import (
 from src.generation.sop05_seen_prior import load_seen_prior_config
 from src.generation.sop05_unseen_prior import normalize_unseen_prior_config
 from src.generation.sop06_finalized_source import load_sop06_finalized_source
-from src.generation.sop06_pipeline import (
+from src.generation.sop06_single import (
     render_sop06_single_input,
     render_sop06_single_publication,
 )

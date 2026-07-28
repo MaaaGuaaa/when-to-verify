@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from src.calibration.split_conformal import validate_prediction_table
-from src.contracts import HISTORY_CHANNELS
+from src.contracts import HISTORY_CHANNELS, STATE_CHANNELS
 from src.evaluation.risk_baselines import (
     fit_toy_learned_aggregator,
     fit_toy_occupancy_model,
@@ -27,10 +27,17 @@ from tests.fixtures.formal_risk_publication import (
 )
 
 
-def _stationary_toy_batch() -> tuple[torch.Tensor, torch.Tensor]:
+def _stationary_toy_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = 8
     history = torch.zeros(batch_size, 8, len(HISTORY_CHANNELS), 6, 6, dtype=torch.float32)
     target = torch.zeros(batch_size, 15, 6, 6, dtype=torch.float32)
+    state = torch.zeros(
+        batch_size,
+        len(STATE_CHANNELS),
+        6,
+        6,
+        dtype=torch.float32,
+    )
     dynamic = HISTORY_CHANNELS.index("past_dynamic_occupancy")
     visible = HISTORY_CHANNELS.index("past_visible_mask")
     for row in range(batch_size):
@@ -39,17 +46,18 @@ def _stationary_toy_batch() -> tuple[torch.Tensor, torch.Tensor]:
         history[row, :, dynamic, y, x] = 1.0
         history[row, :, visible] = 1.0
         target[row, :, y, x] = 1.0
-    return history, target
+    return history, state, target
 
 
 def test_convgru_materially_reduces_toy_occupancy_loss() -> None:
     torch.manual_seed(17)
-    history, target = _stationary_toy_batch()
+    history, state, target = _stationary_toy_batch()
     model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=15)
 
     report = fit_toy_occupancy_model(
         model,
         history,
+        state,
         target,
         steps=50,
         learning_rate=0.02,
@@ -59,7 +67,7 @@ def test_convgru_materially_reduces_toy_occupancy_loss() -> None:
     assert report["steps"] == 50
     assert all(torch.isfinite(torch.tensor(report["loss_history"])))
     with torch.no_grad():
-        predicted_positive = model(history) >= 0.5
+        predicted_positive = model(history, state) >= 0.5
     truth = target > 0.5
     true_positive = torch.logical_and(predicted_positive, truth).sum()
     positive_recall = true_positive / truth.sum()
@@ -387,7 +395,7 @@ def test_training_cli_writes_deterministic_toy_artifact_without_oracle_inputs(
             assert validated["method_id"] == method
             assert len(validated["rows"]) == expected_counts[split]
             assert validated["checkpoint_layout_version"] == (
-                "occupancy_baseline_checkpoint_v2"
+                "occupancy_baseline_checkpoint_v3"
             )
             assert validated["checkpoint_digest"] == checkpoint_digest
             assert validated["checkpoint_digest_kind"] == (

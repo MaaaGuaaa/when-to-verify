@@ -1,4 +1,4 @@
-"""Deterministic, fail-closed NPZ + JSONL storage for schema-v3 RiskSample shards."""
+"""Deterministic, fail-closed NPZ + JSONL storage for RiskSample shards."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from src.contracts import GridSpec, RiskSample, SCHEMA_VERSION
-from src.datasets.risk_dataset import validate_risk_sample_for_publication
+from src.datasets.risk_sample_validation import validate_risk_sample_for_publication
 from src.datasets.split_manager import (
     SplitAuditPolicy,
     SplitLeakageError,

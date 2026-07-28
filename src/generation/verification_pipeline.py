@@ -26,7 +26,6 @@ from src.datasets.verification_dataset import (
     VerificationGroupInput,
     build_verification_samples,
 )
-from src.datasets.verification_sources import VerificationSourceEvent
 from src.geometry import (
     RectangleFootprint,
     inflate_footprint,
@@ -38,10 +37,7 @@ from src.generation.counterfactual_verify import (
 )
 from src.generation.event_contracts import footprint_from_spec
 from src.generation.observation_renderer import render_observation
-from src.generation.sop06_pipeline import (
-    Sop06SinglePublication,
-    render_sop06_mother_event,
-)
+from src.generation.sop06_single import Sop06SinglePublication
 from src.generation.structural_blindspot import StructuralBlindSpot
 from src.generation.verification_gt import (
     SampledVerificationValueResult,
@@ -137,26 +133,6 @@ def _robot_footprint(config: Mapping[str, Any]):
     )
 
 
-def _current_pose_map(
-    source: VerificationSourceEvent,
-) -> dict[str, np.ndarray]:
-    record = source.event.target_motion_record
-    world = source.event.world
-    result: dict[str, np.ndarray] = {}
-    for object_id in sorted(world.dynamic_object_trajectories):
-        if object_id == record.target_dynamic_object_id:
-            value = record.current_pose
-        elif object_id in source.oracle_context.dynamic_object_history:
-            value = source.oracle_context.dynamic_object_history[object_id][-1]
-        elif object_id in source.base_state.visible_dynamic_object_history:
-            value = source.base_state.visible_dynamic_object_history[object_id][-1]
-        else:
-            raise ValueError(f"no current pose source for dynamic object {object_id!r}")
-        result[object_id] = np.array(
-            value, dtype=ARRAY_DTYPE, order="C", copy=True
-        )
-    return result
-
 
 def _verification_sensor_geometry(
     world: OracleWorld,
@@ -186,114 +162,6 @@ def _verification_sensor_geometry(
         raise ValueError("verification sensor geometry must be finite and positive")
     return fov, sensor_range
 
-
-def build_real_verification_input(
-    source: VerificationSourceEvent,
-    *,
-    base_config: Mapping[str, Any],
-    action_library: VerificationActionLibrary,
-    sop05_batch_digest: str,
-    sop07_collection_digest: str,
-    scientific_status: str,
-    cross_split_status: str,
-) -> VerificationPipelineInput:
-    """Render deployment history and retain oracle state only in label fields."""
-
-    if not isinstance(source, VerificationSourceEvent):
-        raise TypeError("source must be a VerificationSourceEvent")
-    if not isinstance(action_library, VerificationActionLibrary):
-        raise TypeError("action_library must be a VerificationActionLibrary")
-    config = dict(base_config)
-    validate_config(config)
-    grid = build_grid_spec(config)
-    sensor_fov, sensor_range = _verification_sensor_geometry(
-        source.event.world,
-        grid,
-        action_library=action_library,
-    )
-    verification_sensor = StructuralBlindSpot(
-        forward_fov_deg=float(np.rad2deg(sensor_fov)),
-        range_m=sensor_range,
-    )
-    rendered = render_sop06_mother_event(
-        record=source.event.target_motion_record,
-        world=source.event.world,
-        base_state=source.base_state,
-        oracle_context=source.oracle_context,
-        config=config,
-        sensor_config_override=verification_sensor,
-    )
-    visible = (
-        rendered.state_channels[STATE_CHANNELS.index("current_visible_free")] != 0.0
-    ) | (
-        rendered.state_channels[
-            STATE_CHANNELS.index("current_visible_occupied")
-        ]
-        != 0.0
-    )
-    age = rendered.state_channels[STATE_CHANNELS.index("occlusion_age_map")]
-    event_id = source.event.generated_event_id
-    split = source.base_state.split
-    if split not in {"train", "calibration", "val", "test"}:
-        raise ValueError("real verification source split is unsupported")
-    expected_status = f"{split}_smoke_only"
-    if scientific_status != expected_status:
-        raise ValueError("real verification scientific status differs from split")
-    if cross_split_status not in {"NOT_PROVEN", "PROVEN"}:
-        raise ValueError("real verification cross-split status is invalid")
-    source_mode = "sop05-train" if split == "train" else "sop05-heldout"
-    namespace = f"sop05/{split}/{event_id}"
-    provenance = {
-        "source_mode": source_mode,
-        "scientific_status": scientific_status,
-        "cross_split_status": cross_split_status,
-        "source_event_id": event_id,
-        "source_snippet_id": source.source_snippet.snippet_id,
-        "source_trajectory_id": source.nominal_trajectory.trajectory_id,
-        "sop05_batch_digest": sop05_batch_digest,
-        "sop07_collection_digest": sop07_collection_digest,
-        "source_artifact_digest": stable_digest(
-            sop05_batch_digest,
-            source.shard.publication_semantic_digest,
-            event_id,
-            size=16,
-        ),
-        "verification_sensor_fov_deg": float(np.rad2deg(sensor_fov)),
-        "verification_sensor_range_m": sensor_range,
-    }
-    return VerificationPipelineInput(
-        split=split,
-        base_state_id=source.base_state.state_id,
-        source_namespace=namespace,
-        grid=grid,
-        nominal_trajectory=source.nominal_trajectory,
-        current_world=source.event.world,
-        current_dynamic_poses=_current_pose_map(source),
-        target_object_id=source.event.target.target_dynamic_object_id,
-        robot_pose=np.array(
-            source.base_state.robot_history[-1],
-            dtype=ARRAY_DTYPE,
-            order="C",
-            copy=True,
-        ),
-        robot_state=np.array(
-            source.base_state.robot_state,
-            dtype=ARRAY_DTYPE,
-            order="C",
-            copy=True,
-        ),
-        current_visible_mask=np.asarray(visible, dtype=bool, order="C"),
-        current_age_map=np.array(age, dtype=ARRAY_DTYPE, order="C", copy=True),
-        bev_history=np.array(
-            rendered.bev_history, dtype=ARRAY_DTYPE, order="C", copy=True
-        ),
-        state_channels=np.array(
-            rendered.state_channels, dtype=ARRAY_DTYPE, order="C", copy=True
-        ),
-        sensor_fov_rad=sensor_fov,
-        sensor_range_m=sensor_range,
-        provenance=provenance,
-    )
 
 
 def build_finalized_verification_input(
@@ -887,7 +755,6 @@ __all__ = (
     "VerificationPipelineInput",
     "VerificationSourceIneligibleError",
     "build_finalized_verification_input",
-    "build_real_verification_input",
     "build_verification_toy_input",
     "generate_verification_group",
 )

@@ -21,7 +21,7 @@ from src.datasets.sidecar_writer import (
 from src.datasets.sop06_history_bev import load_sop06_history_shard
 from src.generation.observation_renderer import RenderedObservation
 from src.generation.risk_sidecars import build_risk_label_sidecar
-from src.generation.sop06_pipeline import build_sop06_single_risk_input
+from src.generation.sop06_single import build_sop06_single_risk_input
 from src.generation.sop07_risk_release import (
     Sop07ShardBinding,
     _complete_mother_lineage_from_payload,

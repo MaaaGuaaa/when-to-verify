@@ -1,4 +1,4 @@
-"""Immutable global leakage evidence for schema-v3 SOP07 risk shards."""
+"""Immutable global leakage evidence for current-schema SOP07 risk shards."""
 
 from __future__ import annotations
 

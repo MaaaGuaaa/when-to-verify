@@ -1,4 +1,4 @@
-"""Deterministic filters for candidate differential-drive trajectories."""
+"""Deterministic filters for Long40 candidate differential-drive trajectories."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from src.geometry import (
     rasterize_footprint,
 )
 
-from .trajectory_sampler import CandidateRollout
+from .trajectory_contracts import CandidateRollout
 
 
 def _inflated_robot_footprint(config: dict) -> Footprint:

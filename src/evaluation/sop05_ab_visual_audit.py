@@ -19,7 +19,7 @@ from src.geometry import (
     inflate_footprint,
     rasterize_occluder,
 )
-from src.generation.dynamic_object_transplant import footprint_from_spec
+from src.generation.event_contracts import footprint_from_spec
 from src.generation.sop05_seen_prior import (
     SeenPriorContextSweep,
     SeenPriorEnvironment,

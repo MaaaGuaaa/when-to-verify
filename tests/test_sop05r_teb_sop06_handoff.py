@@ -7,7 +7,7 @@ from src.generation.sop05r_teb_event_sampler import build_sop05r_teb_mother
 from src.generation.sop05r_teb_output_loader import load_sop05r_teb_output
 from src.generation.sop05r_teb_run import publish_sop05r_teb_run
 from src.generation.sop05r_teb_templates import iter_sop05r_teb_task_templates
-from src.generation.sop06_pipeline import (
+from src.generation.sop06_single import (
     render_sop06_teb_target_pair,
     resolve_sop06_teb_handoff,
 )

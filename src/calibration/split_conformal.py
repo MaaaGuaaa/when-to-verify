@@ -38,9 +38,9 @@ PREDICTION_TABLE_LAYOUT_VERSION = "risk_prediction_table_v2"
 PREDICTION_COHORT_LAYOUT_VERSION = "risk_prediction_cohort_v1"
 CALIBRATION_ARTIFACT_LAYOUT_VERSION = "risk_calibration_v3"
 RISK_CHECKPOINT_LAYOUT_VERSION = "risk_model_checkpoint_v2"
-OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = "occupancy_baseline_checkpoint_v2"
+OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = "occupancy_baseline_checkpoint_v3"
 FORMAL_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = (
-    "sop08_formal_occupancy_checkpoint_v1"
+    "sop08_formal_occupancy_checkpoint_v2"
 )
 BASELINE_SPEC_LAYOUT_VERSION = "deterministic_occupancy_baseline_spec_v1"
 CHECKPOINT_LAYOUT_VERSIONS = frozenset(

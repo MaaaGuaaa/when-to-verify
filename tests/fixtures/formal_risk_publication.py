@@ -1,7 +1,7 @@
 """Compact formal SOP03/SOP07 publication fixture for dataset-seal tests.
 
 The fixture deliberately exercises the real ``write_risk_shard`` API.  It
-publishes two contiguous immutable schema-3 shards containing twelve samples,
+publishes two contiguous immutable Schema 4 shards containing twelve samples,
 then writes a compact handoff with the same identity fields as the accepted
 SOP07 collection handoff.
 """
@@ -36,14 +36,15 @@ from src.datasets.sidecar_writer import (
     write_risk_sidecar_pair_completion_marker,
     write_risk_sidecar_shard,
 )
-from src.datasets.sop03_publication import publish_checksum_envelope
+from src.datasets.risk_sample_validation import (
+    RISK_SAMPLE_RENDERER_LAYOUT_VERSION,
+)
 from src.generation.risk_sidecars import RiskLabelSidecar
 from src.geometry import (
     RectangleFootprint,
     inflate_footprint,
     rasterize_footprint,
 )
-from src.generation.observation_renderer import RENDERER_LAYOUT_VERSION
 from src.generation.risk_gt import RISK_GT_VERSION
 from src.planning.differential_drive import rollout_constant_control
 from src.utils.config import DEFAULT_CONFIG, config_digest, load_config
@@ -94,6 +95,55 @@ def sha256_bytes(payload: bytes) -> str:
 
 def sha256_file(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
+
+
+def publish_checksum_envelope(root: str | Path, *, workers: int) -> dict[str, object]:
+    """Publish the compact checksum envelope required by the seal fixture."""
+
+    root_path = Path(root)
+    if not root_path.is_dir() or root_path.is_symlink():
+        raise ValueError("artifact root must be a direct directory")
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    marker_name = ".producer-complete"
+    manifest_name = "artifact_checksums.sha256"
+    summary_name = "artifact_checksum_summary.json"
+    for name in (marker_name, manifest_name, summary_name):
+        if (root_path / name).exists():
+            raise ValueError(f"{name} already exists")
+
+    payloads: list[tuple[str, Path]] = []
+    excluded = {marker_name, manifest_name, summary_name}
+    for path in root_path.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("publication payload must not contain symlinks")
+        if path.is_file():
+            relative = path.relative_to(root_path).as_posix()
+            if relative not in excluded:
+                payloads.append((relative, path))
+    payloads.sort()
+    entries = [(marker_name, sha256_bytes(b""))]
+    entries.extend((relative, sha256_file(path)) for relative, path in payloads)
+    entries.sort()
+
+    manifest_path = root_path / manifest_name
+    manifest_path.write_text(
+        "".join(f"{digest}  {relative}\n" for relative, digest in entries),
+        encoding="utf-8",
+    )
+    summary: dict[str, object] = {
+        "checksum_algorithm": "sha256",
+        "checksum_manifest": manifest_name,
+        "checksum_manifest_sha256": sha256_file(manifest_path),
+        "covered_file_count": len(entries),
+        "covered_total_bytes": sum(path.stat().st_size for _, path in payloads),
+        "excluded_paths": [summary_name, manifest_name],
+        "hash_workers": workers,
+        "status": "complete",
+    }
+    write_canonical_json(root_path / summary_name, summary)
+    (root_path / marker_name).write_bytes(b"")
+    return summary
 
 
 def _framed_domain_digest(domain: bytes, value: object) -> str:
@@ -222,7 +272,6 @@ def _base_config(*, history_steps: int = 2, future_steps: int = 3) -> dict[str, 
             "future_dt_s": 0.2,
         }
     )
-    config["trajectories"]["horizon_s"] = 0.2 * future_steps  # type: ignore[index]
     return config
 
 
@@ -398,7 +447,7 @@ def _sample(
         metadata={
             "schema_version": SCHEMA_VERSION,
             "renderer": {
-                "renderer_layout_version": RENDERER_LAYOUT_VERSION,
+                "renderer_layout_version": RISK_SAMPLE_RENDERER_LAYOUT_VERSION,
                 "base_state_id": base_state_id,
                 "sensor_config_digest": f"sensor-{index:03d}",
                 "static_occupancy_digest": f"static-{index:03d}",
@@ -783,6 +832,7 @@ __all__ = [
     "canonical_json",
     "create_formal_risk_publication",
     "heldout_collection_semantic_digest",
+    "publish_checksum_envelope",
     "resign_dataset_seal",
     "rewrite_collection_handoff",
     "sha256_file",

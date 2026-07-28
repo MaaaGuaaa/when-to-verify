@@ -8,7 +8,7 @@ import pytest
 
 import src.generation.verification_pipeline as verification_pipeline
 from src.contracts import BaseState, STATE_CHANNELS, validate_verification_sample
-from src.generation.sop06_pipeline import (
+from src.generation.sop06_single import (
     Sop06SinglePublication,
     Sop06SingleRendererInput,
 )

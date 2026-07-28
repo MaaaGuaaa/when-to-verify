@@ -19,8 +19,9 @@ from src.geometry import (
 )
 
 from .query_maps import build_local_trajectory
+from .trajectory_contracts import CandidateRollout
 from .trajectory_filters import filter_trajectory_candidates
-from .trajectory_sampler import CandidateRollout, sample_candidate_rollouts
+from .trajectory_sampler import sample_candidate_rollouts
 
 
 REPLANNING_VERSION = "post_action_anchored_sampler_v1"

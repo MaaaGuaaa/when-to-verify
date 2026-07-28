@@ -1,7 +1,4 @@
-# Frozen global configuration for the event-centered blind-spot risk project.
-# Owned by SOP-00. Any change to coordinates, tensor dimensions, risk formula
-# constants, or G* cost semantics is a schema change and must be recorded in
-# DECISIONS.md before other workflows adopt it.
+# Frozen global configuration for the active Long40 SOP-01 through SOP-06 path.
 
 seed: 42
 schema_version: "4.0.0"

@@ -144,6 +144,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return parsed
+
+
 def _load_yaml_mapping(path: Path) -> dict[str, object]:
     with path.open("r", encoding="utf-8") as handle:
         value = yaml.safe_load(handle)
@@ -248,6 +255,7 @@ def _effective_config(args: argparse.Namespace) -> dict[str, object]:
     if raw.get("mode") == "production":
         config = _load_production_config(args.config)
         for argument, field in (
+            (args.seed, "seed"),
             (args.variant, "variant"),
             (args.stage, "stage"),
             (args.max_samples, "max_samples"),
@@ -289,6 +297,7 @@ def _effective_config(args: argparse.Namespace) -> dict[str, object]:
         return config
     config = _load_config(args.config)
     for argument, field in (
+        (args.seed, "seed"),
         (args.optimization_steps, "optimization_steps"),
         (args.train_count, "train_count"),
         (args.validation_count, "validation_count"),
@@ -308,13 +317,14 @@ def _config_digest(config: Mapping[str, object]) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train SOP09 R0/R1 with strict toy/production provenance."
+        description="Train SOP09 R0/R1/R2 with strict toy/production provenance."
     )
     parser.add_argument(
         "--config", type=Path, default=_ROOT / "configs/risk_model.yaml"
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--code-commit", default="unversioned")
+    parser.add_argument("--seed", type=_nonnegative_int)
     parser.add_argument("--optimization-steps", type=_positive_int)
     parser.add_argument("--train-count", type=_positive_int)
     parser.add_argument("--validation-count", type=_positive_int)

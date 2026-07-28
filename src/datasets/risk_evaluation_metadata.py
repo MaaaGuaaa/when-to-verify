@@ -23,7 +23,6 @@ from src.contracts import (
     TRAJECTORY_CHANNELS,
     RiskSample,
 )
-from src.generation.observation_renderer import RenderedObservation
 from src.generation.risk_gt import RiskGroundTruth
 from src.geometry import (
     CircleFootprint,
@@ -35,6 +34,7 @@ from src.utils.config import config_digest
 
 if TYPE_CHECKING:
     from src.datasets.risk_dataset import RiskBuildInput
+    from src.generation.observation_renderer import RenderedObservation
 
 
 RISK_EVALUATION_RECORD_LAYOUT_VERSION = "risk_evaluation_record_v1"
@@ -625,12 +625,15 @@ def derive_production_evaluation_record(
     """
 
     from src.datasets.risk_dataset import RiskBuildInput as RiskBuildInputType
+    from src.generation.observation_renderer import (
+        RenderedObservation as RenderedObservationType,
+    )
 
     if not isinstance(sample, RiskSample):
         raise TypeError("sample must be a RiskSample")
     if not isinstance(source, RiskBuildInputType):
         raise TypeError("source must be a RiskBuildInput")
-    if not isinstance(rendered, RenderedObservation):
+    if not isinstance(rendered, RenderedObservationType):
         raise TypeError("rendered must be a RenderedObservation")
     _join_ground_truth(sample, ground_truth)
     identity = _joined_identity(sample, source)

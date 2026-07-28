@@ -37,6 +37,15 @@
   },
   "prediction_key": "q90",
   "prediction_table_layout_version": "risk_prediction_table_v2",
-  "protocol_digest_sha256": "1552f082c5b183c6ef9164ea2a4ec911065697248319f4b21cd90c6d6e11732f",
-  "protocol_layout_version": "shared_risk_prediction_protocol_v1"
+  "protocol_digest_sha256": "855a96bf9a40d67a4306463e7dea5e39f73af7c1bc225c18bef1e8fa87c558f2",
+  "protocol_layout_version": "shared_risk_prediction_protocol_v2",
+  "required_methods": [
+    "risk-r0",
+    "risk-r1",
+    "risk-r2",
+    "B1",
+    "B2",
+    "B3",
+    "B4"
+  ]
 }

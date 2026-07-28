@@ -20,9 +20,11 @@ from src.contracts import (
     SCHEMA_VERSION,
 )
 from src.datasets.shard_writer import load_risk_shard, write_risk_shard
+from src.datasets.risk_sample_validation import (
+    RISK_SAMPLE_RENDERER_LAYOUT_VERSION,
+)
 from src.datasets.split_manager import freeze_preassigned_split, write_split_artifacts
 from src.datasets.thor_split import THOR_RECORDING_GENERALIZATION_POLICY
-from src.generation.observation_renderer import RENDERER_LAYOUT_VERSION
 from src.generation.risk_gt import RISK_GT_VERSION
 
 
@@ -82,7 +84,7 @@ def _sample(
         metadata={
             "schema_version": SCHEMA_VERSION,
             "renderer": {
-                "renderer_layout_version": RENDERER_LAYOUT_VERSION,
+                "renderer_layout_version": RISK_SAMPLE_RENDERER_LAYOUT_VERSION,
                 "base_state_id": base_state_id,
                 "sensor_config_digest": f"sensor-{split}",
                 "static_occupancy_digest": f"static-{split}",

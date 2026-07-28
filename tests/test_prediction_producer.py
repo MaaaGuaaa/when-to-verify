@@ -1,4 +1,4 @@
-"""Unified six-method prediction producer behavior."""
+"""Unified seven-method prediction producer behavior."""
 
 from __future__ import annotations
 
@@ -60,12 +60,29 @@ def _query_inputs(batch_size: int = 3, grid_size: int = 8):
     }
 
 
-def test_one_batch_scores_all_six_methods_without_label_arguments() -> None:
+def test_one_batch_scores_all_seven_methods_without_label_arguments() -> None:
     torch.manual_seed(7)
+    assert UNIFIED_PREDICTION_METHODS == (
+        "risk-r0",
+        "risk-r1",
+        "risk-r2",
+        "B1",
+        "B2",
+        "B3",
+        "B4",
+    )
     result = score_unified_prediction_batch(
         risk_models={
             "risk-r0": RiskModel(variant="r0", hidden_channels=2),
             "risk-r1": RiskModel(variant="r1", hidden_channels=2),
+            "risk-r2": RiskModel(
+                variant="r2",
+                r2_d_model=32,
+                r2_nhead=4,
+                r2_num_decoder_layers=1,
+                r2_dim_feedforward=64,
+                occupancy_aux_enabled=True,
+            ),
         },
         occupancy_model=ConvGRUOccupancyPredictor(
             hidden_channels=2,
@@ -109,6 +126,16 @@ def producer_module():
         yield module
     finally:
         sys.modules.pop(spec.name, None)
+
+
+def test_cli_requires_the_formal_r2_training_publication(producer_module) -> None:
+    actions = {
+        action.dest: action
+        for action in producer_module._parser()._actions
+        if action.dest != "help"
+    }
+
+    assert actions["risk_r2_training_root"].required is True
 
 
 def test_complete_stage_authenticates_calibration_before_opening_test(
@@ -347,8 +374,8 @@ def test_risk_checkpoint_must_bind_family_train_and_validation_members(
         "semantic_digest_sha256": "d" * 64,
         "artifact_semantic_bindings": {"best_checkpoint.pt": "e" * 64},
     }
-    marker = {"semantic_digest_sha256": "d" * 64}
     checkpoint = {
+        "model_config": {"variant": "r0"},
         "provenance": {
             "model_variant": "r0",
             "risk_dataset_family_digest": "a" * 64,
@@ -362,19 +389,14 @@ def test_risk_checkpoint_must_bind_family_train_and_validation_members(
     }
     monkeypatch.setattr(
         producer_module,
-        "_read_json",
-        lambda path, **kwargs: manifest if path.name == "training_manifest.json" else marker,
-    )
-    monkeypatch.setattr(
-        producer_module,
-        "_parse_checksums",
-        lambda path: {"best_checkpoint.pt": "2" * 64},
-    )
-    monkeypatch.setattr(producer_module, "_sha256_file", lambda path: "2" * 64)
-    monkeypatch.setattr(
-        producer_module,
-        "load_risk_checkpoint",
-        lambda path, **kwargs: (torch.nn.Identity(), checkpoint),
+        "load_production_risk_training_publication",
+        lambda value, *, checkpoint_role: SimpleNamespace(
+            root=value,
+            manifest=manifest,
+            model=torch.nn.Identity(),
+            checkpoint=checkpoint,
+            checkpoint_filename=f"{checkpoint_role}_checkpoint.pt",
+        ),
     )
 
     with pytest.raises(
@@ -387,6 +409,148 @@ def test_risk_checkpoint_must_bind_family_train_and_validation_members(
             dataset_family=family,
             seed=42,
         )
+
+
+@pytest.mark.parametrize(
+    ("fusion_mode", "occupancy_aux_enabled", "accepted"),
+    [
+        ("cross_attention", False, False),
+        ("concat", True, False),
+        ("cross_attention", True, True),
+    ],
+)
+def test_formal_risk_r2_requires_cross_attention_with_occupancy_auxiliary(
+    producer_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fusion_mode: str,
+    occupancy_aux_enabled: bool,
+    accepted: bool,
+) -> None:
+    root = tmp_path / "risk-r2"
+    root.mkdir()
+    family = SimpleNamespace(
+        risk_dataset_family_digest="a" * 64,
+        members={
+            "train": {"risk_dataset_manifest_digest": "b" * 64},
+            "val": {"risk_dataset_manifest_digest": "c" * 64},
+        },
+    )
+    manifest = {
+        "mode": "production",
+        "stage": "formal_50k",
+        "variant": "r2",
+        "semantic_digest_sha256": "d" * 64,
+        "artifact_semantic_bindings": {"best_checkpoint.pt": "e" * 64},
+    }
+    checkpoint = {
+        "model_config": {
+            "variant": "r2",
+            "r2_fusion_mode": fusion_mode,
+            "occupancy_aux_enabled": occupancy_aux_enabled,
+        },
+        "provenance": {
+            "model_variant": "r2",
+            "risk_dataset_family_digest": "a" * 64,
+            "risk_dataset_manifest_digest": "b" * 64,
+            "validation_risk_dataset_manifest_digest": "c" * 64,
+            "global_cross_split_leakage": "PROVEN",
+            "scientific_claim_eligible": True,
+            "seed": 42,
+        },
+        "checkpoint_semantic_digest_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        producer_module,
+        "load_production_risk_training_publication",
+        lambda value, *, checkpoint_role: SimpleNamespace(
+            root=value,
+            manifest=manifest,
+            model=torch.nn.Identity(),
+            checkpoint=checkpoint,
+            checkpoint_filename=f"{checkpoint_role}_checkpoint.pt",
+        ),
+    )
+
+    if accepted:
+        _, artifact = producer_module._load_selected_risk_model(
+            root,
+            method_id="risk-r2",
+            dataset_family=family,
+            seed=42,
+        )
+        assert artifact.method_id == "risk-r2"
+        return
+    with pytest.raises(
+        producer_module.PredictionProducerError,
+        match="cross-attention model with occupancy auxiliary",
+    ):
+        producer_module._load_selected_risk_model(
+            root,
+            method_id="risk-r2",
+            dataset_family=family,
+            seed=42,
+        )
+
+
+def test_risk_checkpoint_loader_delegates_to_snapshot_validated_publication(
+    producer_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "risk-r0"
+    root.mkdir()
+    family = SimpleNamespace(
+        risk_dataset_family_digest="a" * 64,
+        members={
+            "train": {"risk_dataset_manifest_digest": "b" * 64},
+            "val": {"risk_dataset_manifest_digest": "c" * 64},
+        },
+    )
+    checkpoint = {
+        "model_config": {"variant": "r0"},
+        "provenance": {
+            "model_variant": "r0",
+            "risk_dataset_family_digest": "a" * 64,
+            "risk_dataset_manifest_digest": "b" * 64,
+            "validation_risk_dataset_manifest_digest": "c" * 64,
+            "global_cross_split_leakage": "PROVEN",
+            "scientific_claim_eligible": True,
+            "seed": 42,
+        },
+        "checkpoint_semantic_digest_sha256": "e" * 64,
+    }
+    calls: list[tuple[Path, str]] = []
+    publication = SimpleNamespace(
+        root=root,
+        manifest={
+            "mode": "production",
+            "stage": "formal_50k",
+            "variant": "r0",
+        },
+        model=torch.nn.Identity(),
+        checkpoint=checkpoint,
+        checkpoint_filename="best_checkpoint.pt",
+    )
+    monkeypatch.setattr(
+        producer_module,
+        "load_production_risk_training_publication",
+        lambda value, *, checkpoint_role: (
+            calls.append((value, checkpoint_role)) or publication
+        ),
+        raising=False,
+    )
+
+    model, artifact = producer_module._load_selected_risk_model(
+        root,
+        method_id="risk-r0",
+        dataset_family=family,
+        seed=42,
+    )
+
+    assert model is publication.model
+    assert artifact.digest_sha256 == "e" * 64
+    assert calls == [(root, "best")]
 
 
 def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
@@ -419,6 +583,7 @@ def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
         },
         "model_spec": {
             "hidden_channels": 2,
+            "state_channels": 9,
             "convgru_kernel_size": 3,
             "learned_aggregator_hidden_dim": 4,
             "future_steps": 32,
@@ -492,6 +657,7 @@ def test_occupancy_checkpoint_loader_uses_bound_long40_horizon(
         },
         "model_spec": {
             "hidden_channels": 2,
+            "state_channels": 9,
             "convgru_kernel_size": 3,
             "learned_aggregator_hidden_dim": 4,
             "future_steps": 32,

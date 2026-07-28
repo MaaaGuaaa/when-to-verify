@@ -27,9 +27,14 @@ def _split_provenance() -> dict[str, object]:
     }
 
 
-def _recording(*, sample_count: int = 45) -> RecordingIndex:
+def _recording(
+    *,
+    sample_count: int = 45,
+    recording_id: str = "toy-recording",
+    session_id: str = "toy-session",
+) -> RecordingIndex:
     timestamps = np.arange(sample_count, dtype=np.float64) * 0.2
-    object_id = "toy-recording::Helmet_1"
+    object_id = f"{recording_id}::Helmet_1"
     poses = np.column_stack(
         (
             2.0 + timestamps,
@@ -53,25 +58,29 @@ def _recording(*, sample_count: int = 45) -> RecordingIndex:
         },
     )
     return RecordingIndex(
-        recording_id="toy-recording",
-        session_id="toy-session",
+        recording_id=recording_id,
+        session_id=session_id,
         timestamps=timestamps,
         robot_pose=np.zeros((sample_count, 3), dtype=np.float32),
         robot_twist=np.zeros((sample_count, 2), dtype=np.float32),
         robot_segment_ids=np.zeros(sample_count, dtype=np.int32),
         dynamic_objects={object_id: track},
         static_map=None,
-        source_file="THOR-Magni_toy-recording.csv",
+        source_file=f"THOR-Magni_{recording_id}.csv",
         dt_s=0.2,
     )
 
 
-def _build(recording: RecordingIndex | None = None):
+def _build(
+    recording: RecordingIndex | None = None,
+    *,
+    split: str = "train",
+):
     from src.datasets.long_snippet_library import build_long_snippet_library
 
     return build_long_snippet_library(
         [_recording() if recording is None else recording],
-        split="train",
+        split=split,
         object_type="human",
         stride_s=0.2,
         min_mean_speed_mps=0.30,
@@ -200,13 +209,13 @@ def test_long_loader_rejects_mixed_layout_and_tampering(tmp_path, mutation, erro
         arrays = {key: payload[key].copy() for key in payload.files if key != "meta_json"}
         metadata = json.loads(str(payload["meta_json"]))
     if mutation == "layout":
-        arrays["positions"] = arrays["positions"][:, :23]
-        arrays["velocities"] = arrays["velocities"][:, :23]
-        arrays["headings"] = arrays["headings"][:, :23]
-        arrays["relative_time_s"] = arrays["relative_time_s"][:23]
-        metadata["motion_snippet_layout_version"] = "history8_current7_future15_v1"
-        metadata["sample_count"] = 23
-        metadata["future_steps"] = 15
+        arrays["positions"] = arrays["positions"][:, :39]
+        arrays["velocities"] = arrays["velocities"][:, :39]
+        arrays["headings"] = arrays["headings"][:, :39]
+        arrays["relative_time_s"] = arrays["relative_time_s"][:39]
+        metadata["motion_snippet_layout_version"] = "unsupported_layout_v1"
+        metadata["sample_count"] = 39
+        metadata["future_steps"] = 31
     elif mutation == "time":
         arrays["relative_time_s"][8] = 0.11
     elif mutation == "array":
@@ -247,6 +256,56 @@ def test_long_artifact_loader_checks_sidecars_and_checksum_envelope(tmp_path):
     paths["summary"].write_text("{}\n", encoding="utf-8")
     with pytest.raises(ThorDataError, match="checksum"):
         load_long_snippet_artifact(paths["directory"])
+
+
+def test_source_overlap_audit_detects_recording_and_object_reuse():
+    from src.datasets.motion_snippet_utils import audit_snippet_source_overlap
+
+    train = _build(split="train")
+    test = _build(split="test")
+
+    report = audit_snippet_source_overlap([train, test])
+
+    assert report["status"] == "leakage_detected"
+    assert report["total_overlap_count"] > 0
+    assert report["fields"]["recording"]["overlap_count"] == 1
+    assert report["fields"]["object"]["overlaps"] == [
+        {
+            "value": "toy-recording::Helmet_1",
+            "splits": ["test", "train"],
+        }
+    ]
+
+
+def test_source_overlap_audit_reports_allowed_session_overlap():
+    from src.datasets.motion_snippet_utils import audit_snippet_source_overlap
+    from src.datasets.split_manager import SplitAuditPolicy
+
+    train = _build(
+        _recording(recording_id="recording-a"),
+        split="train",
+    )
+    test = _build(
+        _recording(recording_id="recording-b"),
+        split="test",
+    )
+    policy = SplitAuditPolicy(
+        evaluation_scope="unseen_recording_within_known_sessions",
+        required_fields=("recording", "session"),
+        allowed_overlap_fields=("session",),
+        unavailable_fields=("participant",),
+    )
+
+    report = audit_snippet_source_overlap([train, test], policy=policy)
+
+    assert report["status"] == "ok"
+    assert report["fields"]["recording"]["overlap_count"] == 0
+    assert report["fields"]["session"]["overlaps"] == [
+        {"value": "toy-session", "splits": ["test", "train"]}
+    ]
+    assert report["fields"]["object"]["overlap_count"] == 0
+    assert report["allowed_overlap_count"] == 1
+    assert report["disallowed_overlap_count"] == 0
 
 
 def test_long_snippet_library_cli_recrops_human_from_recording_indexes(tmp_path):

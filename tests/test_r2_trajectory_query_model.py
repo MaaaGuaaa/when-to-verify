@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+import yaml
 
 from src.contracts import SCHEMA_VERSION
 from src.datasets.risk_dataloader import RiskDataContractError
@@ -166,6 +167,61 @@ def test_r2_backward_has_finite_trajectory_gradients_and_is_trajectory_sensitive
     assert float(delta) > 1e-8
 
 
+def test_r1_fuses_aligned_spatial_features_before_global_pooling():
+    model = RiskModel(variant="r1", hidden_channels=4).eval()
+    inputs = _inputs(batch_size=2, height=16, width=12)
+    observed: dict[str, tuple[int, ...]] = {}
+
+    def capture_spatial_fusion(_module, arguments):
+        observed["spatial_fusion_input"] = tuple(arguments[0].shape)
+
+    def capture_pool(_module, arguments):
+        observed["pool_input"] = tuple(arguments[0].shape)
+
+    fusion_handle = model.r1_spatial_fusion.register_forward_pre_hook(
+        capture_spatial_fusion
+    )
+    pool_handle = model.pool.register_forward_pre_hook(capture_pool)
+    try:
+        output = model(inputs)
+    finally:
+        fusion_handle.remove()
+        pool_handle.remove()
+
+    assert observed == {
+        "spatial_fusion_input": (2, 8, 16, 12),
+        "pool_input": (2, 8, 16, 12),
+    }
+    assert model.export_config()["r1_fusion_mode"] == "spatial_concat_before_pool"
+    assert output["quantiles"].shape == (2, 4)
+
+
+def test_r2_query_bins_cover_the_full_long40_horizon():
+    model = RiskModel(
+        variant="r2",
+        r2_d_model=32,
+        r2_nhead=4,
+        r2_num_decoder_layers=1,
+        r2_dim_feedforward=64,
+        r2_query_bins=8,
+    )
+    backbone = model.r2_model
+    trajectory_features = torch.zeros((1, 32, 4, 4), dtype=torch.float32)
+    trajectory_channels = torch.zeros((1, 4, 4, 4), dtype=torch.float32)
+    for row, column, arrival_s in ((0, 0, 0.2), (1, 1, 3.2), (3, 3, 6.4)):
+        trajectory_channels[0, 0, row, column] = 1.0
+        trajectory_channels[0, 1, row, column] = arrival_s
+
+    _, valid = backbone._trajectory_queries(
+        trajectory_features,
+        trajectory_channels,
+    )
+
+    assert valid[0, 0]
+    assert valid[0, 4]
+    assert valid[0, 7]
+
+
 def test_r2_auxiliary_branch_is_trajectory_invariant_and_uses_existing_risk_loss():
     model = RiskModel(variant="r2", occupancy_aux_enabled=True).eval()
     inputs = _inputs(batch_size=2, height=32, width=32)
@@ -246,11 +302,14 @@ def test_r0_r1_legacy_configs_and_checkpoints_remain_round_trippable(
     tmp_path, variant
 ):
     model = RiskModel(variant=variant, hidden_channels=4).eval()
-    assert model.export_config() == {
+    expected_config = {
         "variant": variant,
         "hidden_channels": 4,
         "history_steps": 8,
     }
+    if variant == "r1":
+        expected_config["r1_fusion_mode"] = "spatial_concat_before_pool"
+    assert model.export_config() == expected_config
     path = tmp_path / f"{variant}.pt"
     provenance = _toy_provenance(variant)
     save_risk_checkpoint(path, model=model, mode="toy", provenance=provenance)
@@ -405,16 +464,115 @@ def test_r2_configs_and_cli_variant_are_accepted_by_the_training_entry():
     )
     assert toy_config["variants"] == ["r0", "r1", "r2"]
     assert production_config["variant"] == "r2"
-    assert production_config["occupancy_aux_enabled"] is False
-    assert production_config["lambda_occupancy_aux"] == 0.0
-    auxiliary_config = training_entry._load_production_config(
-        ROOT / "configs" / "risk_model_r2_aux_production.yaml"
+    assert production_config["r2_fusion_mode"] == "cross_attention"
+    assert production_config["occupancy_aux_enabled"] is True
+    assert production_config["lambda_occupancy_aux"] == pytest.approx(0.2)
+    no_aux_config = training_entry._load_production_config(
+        ROOT / "configs" / "risk_model_r2_no_aux_production.yaml"
     )
     concat_config = training_entry._load_production_config(
         ROOT / "configs" / "risk_model_r2_concat_control_production.yaml"
     )
-    assert auxiliary_config["occupancy_aux_enabled"] is True
+    r0_config = training_entry._load_production_config(
+        ROOT / "configs" / "risk_model_r0_production.yaml"
+    )
+    r1_config = training_entry._load_production_config(
+        ROOT / "configs" / "risk_model_r1_production.yaml"
+    )
+    assert no_aux_config["occupancy_aux_enabled"] is False
+    assert no_aux_config["lambda_occupancy_aux"] == 0.0
+    assert r0_config["variant"] == "r0"
+    assert r1_config["variant"] == "r1"
     assert concat_config["r2_fusion_mode"] == "concat"
+    assert concat_config["occupancy_aux_enabled"] is True
+    occupancy_config = yaml.safe_load(
+        (ROOT / "configs" / "occupancy_baseline_production.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert occupancy_config["hidden_channels"] >= 8
+    assert occupancy_config["learned_aggregator_hidden_dim"] >= 32
+    matrix = yaml.safe_load(
+        (ROOT / "configs" / "risk_experiment_matrix.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert matrix["layout_version"] == "risk_experiment_matrix_v1"
+    assert matrix["schema_version"] == SCHEMA_VERSION
+    assert matrix["seeds"] == [42, 43, 44]
+    assert matrix["prediction_protocol"] == (
+        "configs/prediction_protocol_production.json"
+    )
+    assert matrix["stage_sample_limits"] == {
+        "one_shard_smoke": "one_authenticated_shard",
+        "real_1k_overfit": 1000,
+        "formal_50k": 50_000,
+    }
+    assert matrix["formal_methods"] == [
+        "risk-r0",
+        "risk-r1",
+        "risk-r2",
+        "B1",
+        "B2",
+        "B3",
+        "B4",
+    ]
+    expected_risk_experiments = {
+        "R0": ("r0", None, False, "risk-r0"),
+        "R1": ("r1", None, False, "risk-r1"),
+        "R2": ("r2", "cross_attention", True, "risk-r2"),
+        "R2-no-aux": ("r2", "cross_attention", False, None),
+        "R2-concat": ("r2", "concat", True, None),
+    }
+    assert [item["name"] for item in matrix["risk_experiments"]] == list(
+        expected_risk_experiments
+    )
+    for experiment in matrix["risk_experiments"]:
+        variant, fusion, auxiliary, method_id = expected_risk_experiments[
+            experiment["name"]
+        ]
+        loaded = training_entry._load_production_config(
+            ROOT / experiment["config"]
+        )
+        assert experiment["formal_method_id"] == method_id
+        assert loaded["variant"] == variant
+        assert loaded["occupancy_aux_enabled"] is auxiliary
+        if fusion is not None:
+            assert loaded["r2_fusion_mode"] == fusion
+    concat_experiment = next(
+        item for item in matrix["risk_experiments"] if item["name"] == "R2-concat"
+    )
+    assert concat_experiment["role"] == "exploratory_unmatched_fusion_control"
+    assert concat_experiment["claim_policy"] == (
+        "must_not_support_cross_attention_superiority_claims"
+    )
+    assert matrix["occupancy_experiments"] == [
+        {
+            "name": "B1",
+            "role": "last_observation_hold_hand_aggregation",
+            "config": "configs/occupancy_baseline_production.yaml",
+            "formal_method_id": "B1",
+        },
+        {
+            "name": "B2",
+            "role": "age_decay_hand_aggregation",
+            "config": "configs/occupancy_baseline_production.yaml",
+            "formal_method_id": "B2",
+        },
+        {
+            "name": "B3",
+            "role": "convgru_history_scene_state_occupancy_hand_aggregation",
+            "config": "configs/occupancy_baseline_production.yaml",
+            "formal_method_id": "B3",
+        },
+        {
+            "name": "B4",
+            "role": "convgru_history_scene_state_occupancy_learned_aggregation",
+            "config": "configs/occupancy_baseline_production.yaml",
+            "formal_method_id": "B4",
+        },
+    ]
+    assert not (ROOT / "configs" / "risk_model_r2_aux_production.yaml").exists()
     parsed = training_entry._parser().parse_args(
         [
             "--output-dir",
@@ -427,6 +585,17 @@ def test_r2_configs_and_cli_variant_are_accepted_by_the_training_entry():
     )
     assert parsed.variant == "r2"
     assert parsed.train_occupancy_sidecar_root == Path("r2-sidecars")
+    seeded = training_entry._parser().parse_args(
+        [
+            "--config",
+            str(ROOT / "configs" / "risk_model_r2_production.yaml"),
+            "--output-dir",
+            "r2-seed-43-output",
+            "--seed",
+            "43",
+        ]
+    )
+    assert training_entry._effective_config(seeded)["seed"] == 43
 
 
 def test_r2_concat_control_uses_the_same_auxiliary_target_contract():

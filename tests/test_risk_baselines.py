@@ -94,8 +94,8 @@ def test_baseline_registry_freezes_b1_through_b4_semantics() -> None:
     assert BASELINE_SPECS == {
         "B1": "last_observation_hold+hand_aggregation",
         "B2": "age_decay+hand_aggregation",
-        "B3": "convgru_occupancy+hand_aggregation",
-        "B4": "convgru_occupancy+learned_aggregation",
+        "B3": "convgru_history_scene_state_occupancy+hand_aggregation",
+        "B4": "convgru_history_scene_state_occupancy+learned_aggregation",
     }
 
 
@@ -268,9 +268,9 @@ def test_checkpoint_provenance_is_toy_only_and_fail_closed() -> None:
         expected_model_state_digest=checkpoint["model_state_digest_sha256"],
     )
 
-    assert validated["checkpoint_layout_version"].endswith("_v2")
+    assert validated["checkpoint_layout_version"].endswith("_v3")
     for key, value in (
-        ("checkpoint_layout_version", "occupancy_baseline_checkpoint_v1"),
+        ("checkpoint_layout_version", "occupancy_baseline_checkpoint_v2"),
         ("mode", "production"),
         ("schema_version", "2.0.0"),
         ("channel_spec", list(reversed(INPUT_CHANNELS))),
@@ -344,14 +344,16 @@ def test_toy_checkpoint_rejects_every_production_provenance_field_after_redigest
 
 def test_checkpoint_semantic_digest_covers_all_frozen_provenance_fields() -> None:
     checkpoint = {
-        "checkpoint_layout_version": "occupancy_baseline_checkpoint_v2",
+        "checkpoint_layout_version": "occupancy_baseline_checkpoint_v3",
         "mode": "toy",
         "schema_version": SCHEMA_VERSION,
         "channel_spec": list(INPUT_CHANNELS),
         "toy_dataset_manifest_digest": "a" * 64,
         "config_digest": "c" * 64,
         "seed": 0,
-        "model_variant": "convgru_hidden_occupancy+B4_learned_aggregator",
+        "model_variant": (
+            "convgru_history_scene_state_occupancy+B4_learned_aggregator"
+        ),
         "model_state_digest_sha256": "d" * 64,
     }
     reference = occupancy_checkpoint_semantic_digest(checkpoint)
@@ -380,9 +382,10 @@ def test_checkpoint_round_trip_reproduces_identical_predictions(tmp_path) -> Non
     model = ConvGRUOccupancyPredictor(hidden_channels=4, future_steps=32)
     aggregator = LearnedOccupancyRiskAggregator(future_steps=32, hidden_dim=8)
     history = torch.rand(2, 8, len(HISTORY_CHANNELS), 5, 5, dtype=torch.float32)
+    state = torch.rand(2, len(STATE_CHANNELS), 5, 5, dtype=torch.float32)
     footprint = torch.ones(2, 32, 5, 5, dtype=torch.float32)
     with torch.no_grad():
-        expected_occupancy = model(history)
+        expected_occupancy = model(history, state)
         expected_risk = aggregator(expected_occupancy, footprint)
     checkpoint = build_occupancy_checkpoint(
         model=model,
@@ -407,7 +410,7 @@ def test_checkpoint_round_trip_reproduces_identical_predictions(tmp_path) -> Non
     )
 
     with torch.no_grad():
-        actual_occupancy = reloaded_model(history)
+        actual_occupancy = reloaded_model(history, state)
         actual_risk = reloaded_aggregator(actual_occupancy, footprint)
     torch.testing.assert_close(actual_occupancy, expected_occupancy, rtol=0.0, atol=0.0)
     torch.testing.assert_close(actual_risk, expected_risk, rtol=0.0, atol=0.0)

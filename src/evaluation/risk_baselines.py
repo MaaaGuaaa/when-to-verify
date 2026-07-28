@@ -45,8 +45,10 @@ from src.models.occupancy_baseline import (
 )
 
 
-OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = "occupancy_baseline_checkpoint_v2"
-OCCUPANCY_MODEL_VARIANT = "convgru_hidden_occupancy+B4_learned_aggregator"
+OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = "occupancy_baseline_checkpoint_v3"
+OCCUPANCY_MODEL_VARIANT = (
+    "convgru_history_scene_state_occupancy+B4_learned_aggregator"
+)
 _CHECKPOINT_SEMANTIC_FIELDS: tuple[str, ...] = (
     "checkpoint_layout_version",
     "mode",
@@ -98,8 +100,8 @@ _CHECKPOINT_TOP_LEVEL_FIELDS = frozenset(
 BASELINE_SPECS: dict[str, str] = {
     "B1": "last_observation_hold+hand_aggregation",
     "B2": "age_decay+hand_aggregation",
-    "B3": "convgru_occupancy+hand_aggregation",
-    "B4": "convgru_occupancy+learned_aggregation",
+    "B3": "convgru_history_scene_state_occupancy+hand_aggregation",
+    "B4": "convgru_history_scene_state_occupancy+learned_aggregation",
 }
 
 
@@ -492,7 +494,7 @@ def score_production_occupancy_baseline(
                     a_max_s=b2_a_max_s,
                 )(state)
             else:
-                probability = occupancy_model(history)
+                probability = occupancy_model(history, state)
             if method == "B4":
                 score = learned_aggregator(probability, footprints)
             else:
@@ -517,6 +519,7 @@ def score_production_occupancy_baseline(
 def fit_toy_occupancy_model(
     model: nn.Module,
     bev_history: torch.Tensor,
+    state_channels: torch.Tensor,
     hidden_risk_occupancy: torch.Tensor,
     *,
     steps: int,
@@ -544,12 +547,15 @@ def fit_toy_occupancy_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=float(learning_rate))
     with torch.no_grad():
         initial_loss = float(
-            loss_function(model.predict_logits(bev_history), hidden_risk_occupancy)
+            loss_function(
+                model.predict_logits(bev_history, state_channels),
+                hidden_risk_occupancy,
+            )
         )
     loss_history: list[float] = []
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
-        logits = model.predict_logits(bev_history)
+        logits = model.predict_logits(bev_history, state_channels)
         if tuple(logits.shape) != tuple(hidden_risk_occupancy.shape):
             raise ValueError("model logits and hidden_risk_occupancy must have the same shape")
         loss = loss_function(logits, hidden_risk_occupancy)
@@ -558,7 +564,12 @@ def fit_toy_occupancy_model(
         loss_history.append(float(loss.detach()))
     model.eval()
     with torch.no_grad():
-        final_loss = float(loss_function(model.predict_logits(bev_history), hidden_risk_occupancy))
+        final_loss = float(
+            loss_function(
+                model.predict_logits(bev_history, state_channels),
+                hidden_risk_occupancy,
+            )
+        )
     return {
         "initial_loss": initial_loss,
         "final_loss": final_loss,

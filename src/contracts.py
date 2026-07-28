@@ -9,8 +9,8 @@ Key guarantees enforced here:
 - A single ``SCHEMA_VERSION`` string stamps every serialized artifact.
 - Observed state, oracle context, and oracle world are three distinct types so
   that future/hidden information can never leak into a model input object.
-- ``RiskSample`` and ``VerificationSample`` carry only deployment-available
-  inputs, supervision labels, and provenance metadata.
+- ``RiskSample`` carries only deployment-available inputs, supervision labels,
+  and provenance metadata.
 - Serialization uses ``.npz`` with numeric arrays plus an embedded JSON metadata
   string. ``allow_pickle`` is never used, so no Python object arrays are stored.
 """
@@ -212,7 +212,7 @@ class RiskSample:
 
 @dataclass(frozen=True)
 class VerificationSample:
-    """Verification-value training sample (inputs + net-value targets)."""
+    """Verification-value training sample with deployment-safe inputs and labels."""
 
     sample_id: str
     split: str
@@ -222,7 +222,7 @@ class VerificationSample:
     bev_history: np.ndarray  # [K, N_HISTORY_CHANNELS, H, W]
     state_channels: np.ndarray  # [N_STATE_CHANNELS, H, W]
     trajectory_channels: np.ndarray  # [N_TRAJECTORY_CHANNELS, H, W]
-    verification_fov_mask: np.ndarray  # [1, H, W] expected-visible geometry only
+    verification_fov_mask: np.ndarray  # [1, H, W]
     verification_action_vector: np.ndarray  # [ACTION_VECTOR_DIM]
     value_target: float
     useful_target: int
@@ -443,7 +443,8 @@ def validate_risk_sample(sample: RiskSample, grid: GridSpec) -> None:
 
 
 def validate_verification_sample(sample: VerificationSample, grid: GridSpec) -> None:
-    """Raise :class:`ContractError` if a :class:`VerificationSample` is malformed."""
+    """Raise :class:`ContractError` if a verification sample is malformed."""
+
     h, w, k = grid.height, grid.width, grid.history_steps
     _check_float_array(
         sample.bev_history, (k, grid.n_history_channels, h, w), "bev_history"

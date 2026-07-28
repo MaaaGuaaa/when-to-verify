@@ -20,13 +20,6 @@ test = [
 train = [
     "torch==2.0.1",
 ]
-verification = [
-    "torch>=2.0,<3",
-]
-visual-audit = [
-    "matplotlib==3.7.5",
-    "Pillow==12.3.0",
-]
 
 [tool.setuptools.packages.find]
 include = ["src*"]
@@ -36,7 +29,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.learning-when-to-verify.verified-environment]
-status = "sop01-07-verified-training-foundation-provisional"
+status = "sop01-08-long40-occupancy-active"
 python = "3.10.14"
 pip = "24.2"
 setuptools = "82.0.1"

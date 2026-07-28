@@ -19,7 +19,7 @@ from src.contracts import (
     POSE_TIME_LAYOUT_VERSION,
 )
 from src.geometry import CircleFootprint
-from src.generation.sop06_pipeline import (
+from src.generation.sop06_single import (
     Sop06SinglePublication,
     Sop06SinglePublicationContext,
     Sop06SingleRendererInput,

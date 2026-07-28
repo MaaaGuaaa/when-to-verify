@@ -51,7 +51,7 @@ from .sop05r_teb_templates import canonical_sop05r_teb_base_state_digest
 from .sop05r_teb_trajectory_store import (
     open_sop05r_teb_trajectory_selection,
 )
-from .sop06_pipeline import (
+from .sop06_single import (
     Sop06SinglePublication,
     Sop06SinglePublicationContext,
     Sop06SingleRendererInput,

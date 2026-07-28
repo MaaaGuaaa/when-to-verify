@@ -18,6 +18,46 @@ FORBIDDEN_PRODUCTION_PATTERNS = (
     re.compile(r"\(15,\s*3\)"),
 )
 
+RETIRED_PRODUCTION_PATHS = (
+    "configs/generator_seen_occluded_visual_audit.yaml",
+    "configs/generator_test.yaml",
+    "configs/generator_train.yaml",
+    "configs/paired_variants.yaml",
+    "configs/paired_variants_visual_audit.yaml",
+    "configs/seen_occluded_joint_visual_audit.yaml",
+    "scripts/02_build_snippet_library.py",
+    "scripts/03_finalize_sop03_artifact.py",
+    "scripts/04_build_trajectory_bank.py",
+    "scripts/04_generate_risk_dataset.py",
+    "scripts/04_publish_risk_evaluation_records.py",
+    "scripts/05_render_seen_occluded_visual_audit.py",
+    "scripts/05_render_sop05r_audit.py",
+    "src/datasets/snippet_library.py",
+    "src/datasets/sop03_publication.py",
+    "src/datasets/verification_sources.py",
+    "src/evaluation/seen_occluded_visual_audit.py",
+    "src/evaluation/seen_occluded_visuals.py",
+    "src/evaluation/sop05r_audit.py",
+    "src/evaluation/sop05r_visuals.py",
+    "src/generation/dynamic_object_transplant.py",
+    "src/generation/event_sampler.py",
+    "src/generation/paired_variants.py",
+    "src/generation/sop05_input_adapter.py",
+    "src/generation/sop05_output_loader.py",
+    "src/generation/sop05_run.py",
+    "src/generation/sop05r_event_sampler.py",
+    "src/generation/sop05r_output_loader.py",
+    "src/generation/sop05r_revealability.py",
+    "src/generation/sop05r_run.py",
+    "src/generation/sop05r_trajectory_store.py",
+    "src/generation/sop06_pipeline.py",
+)
+
+
+def test_retired_15_step_production_paths_are_absent() -> None:
+    remaining = [path for path in RETIRED_PRODUCTION_PATHS if (ROOT / path).exists()]
+    assert remaining == []
+
 
 def test_production_tree_has_no_retired_15_step_contract() -> None:
     matches: list[str] = []

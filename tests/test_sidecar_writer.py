@@ -364,6 +364,21 @@ def test_sidecar_loader_rejects_payload_and_summary_tampering(tmp_path: Path) ->
         )
 
 
+def test_sidecar_writer_reports_the_frozen_long40_endpoint_horizon(
+    tmp_path: Path,
+) -> None:
+    sidecar = _sidecar("sample-long40", offset=1)
+    invalid_times = sidecar.future_endpoint_times_s.copy()
+    invalid_times[-1] = np.float32(6.3)
+    invalid = replace(sidecar, future_endpoint_times_s=invalid_times)
+
+    with pytest.raises(ValueError, match=r"0\.2 \.\.\. 6\.4 s"):
+        _write_custom(
+            tmp_path / "invalid-long40",
+            sidecars=(invalid,),
+        )
+
+
 def test_sidecar_loader_rejects_symlink_root(tmp_path: Path) -> None:
     real_root = tmp_path / "real-sidecar-shard"
     linked_root = tmp_path / "linked-sidecar-shard"

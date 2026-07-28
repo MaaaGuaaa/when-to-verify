@@ -23,7 +23,7 @@ class ConfigError(ValueError):
     """Raised when a config file contains unknown keys or an invalid shape."""
 
 
-# Frozen default configuration (spec §29 plus SOP-00 frozen contracts).
+# Frozen default configuration for the active SOP-01 through SOP-06 surface.
 DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 42,
     "schema_version": SCHEMA_VERSION,

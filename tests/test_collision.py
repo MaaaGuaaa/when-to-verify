@@ -198,17 +198,17 @@ def test_segments_intersect_is_stable_at_large_and_small_finite_scales():
     )
 
 
-def test_fifteen_frame_trajectory_returns_float64_clearances_and_first_collision():
+def test_long40_trajectory_returns_float64_clearances_and_first_collision():
     footprint = CircleFootprint(0.30)
-    poses_a = np.zeros((15, 3), dtype=np.float64)
-    poses_b = np.zeros((15, 3), dtype=np.float64)
-    poses_b[:, 0] = 1.3 - 0.1 * np.arange(15)
+    poses_a = np.zeros((32, 3), dtype=np.float64)
+    poses_b = np.zeros((32, 3), dtype=np.float64)
+    poses_b[:, 0] = 1.3 - 0.1 * np.arange(32)
 
     clearances = trajectory_signed_clearances(footprint, poses_a, footprint, poses_b)
 
     expected = np.abs(poses_b[:, 0]) - 0.60
     np.testing.assert_allclose(clearances, expected, atol=1e-15)
-    assert clearances.shape == (15,)
+    assert clearances.shape == (32,)
     assert clearances.dtype == np.float64
     assert first_collision_index(clearances, atol=1e-14) == 7
     assert clearances[7] == pytest.approx(0.0, abs=1e-14)

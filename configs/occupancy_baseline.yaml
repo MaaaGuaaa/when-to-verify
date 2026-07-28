@@ -31,5 +31,5 @@ aggregation:
   occupancy_threshold: 0.5
 
 artifact:
-  checkpoint_layout_version: occupancy_baseline_checkpoint_v2
+  checkpoint_layout_version: occupancy_baseline_checkpoint_v3
   calibration_status: deferred_to_sop10_same_protocol

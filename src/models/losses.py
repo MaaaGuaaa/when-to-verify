@@ -103,13 +103,11 @@ def risk_loss(
         )
     else:
         occupancy_aux = pinball.new_zeros(())
-    total = (
-        pinball
-        + float(lambda_collision) * collision_bce
-        + float(lambda_occupancy_aux) * occupancy_aux
-    )
+    main_risk = pinball + float(lambda_collision) * collision_bce
+    total = main_risk + float(lambda_occupancy_aux) * occupancy_aux
     return {
         "total": total,
+        "main_risk": main_risk,
         "pinball": pinball,
         "collision_bce": collision_bce,
         "occupancy_aux": occupancy_aux,

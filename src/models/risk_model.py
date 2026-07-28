@@ -17,6 +17,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from src.contracts import (
+    LONG40_FUTURE_HORIZON_S,
     N_HISTORY_CHANNELS,
     N_STATE_CHANNELS,
     N_TRAJECTORY_CHANNELS,
@@ -40,6 +41,7 @@ from src.models.losses import risk_loss
 
 RISK_CHECKPOINT_LAYOUT_VERSION = "risk_model_checkpoint_v2"
 RISK_MODEL_VARIANTS: tuple[str, ...] = ("r0", "r1", "r2")
+R1_FUSION_MODE = "spatial_concat_before_pool"
 TRAJECTORY_SENSITIVITY_EPSILON = 1e-8
 R2_SCENE_INPUT_CHANNELS = 8 * N_HISTORY_CHANNELS + N_STATE_CHANNELS
 R2_STEM_CHANNELS = 32
@@ -461,9 +463,10 @@ class TrajectoryQueryTransformer(nn.Module):
 
         target_size = trajectory_features.shape[-2:]
         swept = _resize_grid(trajectory_channels[:, :1], target_size).clamp(0.0, 1.0)
-        arrival = _resize_grid(
+        arrival_seconds = _resize_grid(
             trajectory_channels[:, 1:2] * trajectory_channels[:, :1], target_size
         ) / swept.clamp_min(torch.finfo(trajectory_features.dtype).eps)
+        arrival = arrival_seconds / LONG40_FUTURE_HORIZON_S
         weights: list[torch.Tensor] = []
         for index in range(self.query_bins):
             lower = float(index) / self.query_bins
@@ -614,6 +617,7 @@ class RiskModel(nn.Module):
         r2_fusion_mode: str = "cross_attention",
         occupancy_aux_enabled: bool = False,
         occupancy_future_steps: int = R2_OCCUPANCY_AUX_CHANNELS,
+        r1_fusion_mode: str = R1_FUSION_MODE,
         # Read legacy pre-refactor R2 checkpoints without emitting this shape
         # back into new checkpoint configs.
         d_model: int | None = None,
@@ -629,6 +633,10 @@ class RiskModel(nn.Module):
             raise ValueError("occupancy_aux_enabled must be boolean")
         if variant != "r2" and occupancy_aux_enabled:
             raise ValueError("occupancy_aux_enabled is available only for r2")
+        if variant == "r1" and r1_fusion_mode != R1_FUSION_MODE:
+            raise ValueError(
+                f"r1_fusion_mode must equal {R1_FUSION_MODE!r}"
+            )
         if history_steps != 8:
             raise ValueError("SOP09 frozen history_steps must equal 8")
         self.variant = variant
@@ -685,6 +693,10 @@ class RiskModel(nn.Module):
             self.context_encoder = BEVEncoder(
                 N_STATE_CHANNELS + N_TRAJECTORY_CHANNELS, hidden_channels
             )
+            self.r1_fusion_mode = R1_FUSION_MODE
+            self.r1_spatial_fusion = BEVEncoder(
+                2 * hidden_channels, 2 * hidden_channels
+            )
             fused_features = 2 * hidden_channels + ROBOT_STATE_DIM
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fusion = nn.Sequential(
@@ -697,11 +709,14 @@ class RiskModel(nn.Module):
     def export_config(self) -> dict[str, object]:
         if self.variant == "r2":
             return self.r2_model.export_config()
-        return {
+        config: dict[str, object] = {
             "variant": self.variant,
             "hidden_channels": self.hidden_channels,
             "history_steps": self.history_steps,
         }
+        if self.variant == "r1":
+            config["r1_fusion_mode"] = self.r1_fusion_mode
+        return config
 
     def _validate_inputs(self, inputs: Mapping[str, torch.Tensor]) -> None:
         if not isinstance(inputs, Mapping):
@@ -758,10 +773,11 @@ class RiskModel(nn.Module):
                 encoded = self.history_encoder(history[:, step])
                 hidden = self.temporal_cell(encoded, hidden)
             assert hidden is not None
-            temporal_features = self.pool(hidden).flatten(1)
             context = self.context_encoder(torch.cat((state, trajectory), dim=1))
-            context_features = self.pool(context).flatten(1)
-            features = torch.cat((temporal_features, context_features), dim=1)
+            spatial_features = self.r1_spatial_fusion(
+                torch.cat((hidden, context), dim=1)
+            )
+            features = self.pool(spatial_features).flatten(1)
         else:
             scene_inputs = torch.cat(
                 (history.reshape(batch, steps * channels, height, width), state),
@@ -992,8 +1008,29 @@ def _validate_provenance(mode: str, provenance: Mapping[str, object]) -> None:
             raise RiskDataContractError(
                 "fixture_standin checkpoint must contain fewer than 1000 samples"
             )
-    if training_stage == "formal_50k" and data_scale != "formal_50k":
-        raise RiskDataContractError("formal_50k checkpoint provenance scale mismatch")
+    if training_stage == "formal_50k":
+        if data_scale not in {"fixture_standin", "formal_50k"}:
+            raise RiskDataContractError(
+                "formal_50k checkpoint provenance scale mismatch"
+            )
+        if provenance["consumed_sample_count"] != provenance[
+            "selected_sample_count"
+        ]:
+            raise RiskDataContractError(
+                "formal_50k checkpoint must consume all selected samples"
+            )
+        if data_scale == "formal_50k" and provenance[
+            "selected_sample_count"
+        ] != 50_000:
+            raise RiskDataContractError(
+                "formal_50k checkpoint provenance requires exactly 50000 samples"
+            )
+        if data_scale == "fixture_standin" and provenance[
+            "selected_sample_count"
+        ] == 50_000:
+            raise RiskDataContractError(
+                "formal checkpoint scale must match its exact 50000-sample identity"
+            )
     if provenance["global_cross_split_leakage"] not in {
         "NOT_PROVEN",
         "PROVEN",

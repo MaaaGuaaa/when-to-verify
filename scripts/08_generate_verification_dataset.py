@@ -11,9 +11,8 @@ import shutil
 import sys
 import tempfile
 import time
-from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 for _thread_env in (
     "OMP_NUM_THREADS",
@@ -29,15 +28,9 @@ if str(ROOT) not in sys.path:
 
 from src.contracts import SCHEMA_VERSION, build_grid_spec
 from src.datasets.verification_dataloader import write_verification_shard
-from src.datasets.verification_sources import (
-    load_joined_source_events,
-    load_verification_source_index,
-)
 from src.generation.verification_gt import load_verification_gt_config
 from src.generation.verification_pipeline import (
     VERIFICATION_PIPELINE_VERSION,
-    VerificationSourceIneligibleError,
-    build_real_verification_input,
     build_verification_toy_input,
     generate_verification_group,
 )
@@ -50,21 +43,13 @@ from src.utils.config import load_config
 
 
 GENERATION_VERSION = "verification_dataset_cli_v5"
-_REAL_REQUIRED_ARGS = (
-    "sop03_root",
-    "sop04_root",
-    "sop05_batch_handoff",
-    "sop07_collection_handoff",
-    "expected_sop05_batch_digest",
-    "expected_sop07_collection_digest",
-)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=("toy", "sop05-train", "sop05-heldout", "sop05-final"),
+        choices=("toy", "sop05-final"),
         required=True,
     )
     parser.add_argument("--split", choices=("train", "calibration", "val", "test"))
@@ -75,14 +60,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gt-config", type=Path, required=True)
     parser.add_argument("--max-replan-candidates", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checksum-workers", type=int, default=2)
-    parser.add_argument("--max-source-attempts", type=int, default=100)
-    parser.add_argument("--sop03-root", type=Path)
-    parser.add_argument("--sop04-root", type=Path)
-    parser.add_argument("--sop05-batch-handoff", type=Path)
-    parser.add_argument("--sop07-collection-handoff", type=Path)
-    parser.add_argument("--expected-sop05-batch-digest")
-    parser.add_argument("--expected-sop07-collection-digest")
     parser.add_argument(
         "--source-family",
         choices=("natural", "a_supplement"),
@@ -165,39 +142,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "sample_count must be in [10,100] and divisible by the six-action group size"
         )
-    if args.checksum_workers <= 0:
-        raise ValueError("checksum_workers must be positive")
-    required_groups = args.sample_count // 6
-    if (
-        args.max_source_attempts < required_groups
-        or args.max_source_attempts > 1000
-    ):
-        raise ValueError(
-            "max_source_attempts must cover every requested group and be at most 1000"
-        )
     if args.mode == "toy" and args.split is not None:
         raise ValueError("toy mode does not accept --split")
-    if args.mode == "sop05-train" and args.split not in (None, "train"):
-        raise ValueError("sop05-train requires --split train when split is explicit")
-    if args.mode == "sop05-heldout" and args.split not in {
-        "calibration",
-        "val",
-        "test",
-    }:
-        raise ValueError(
-            "sop05-heldout requires explicit --split calibration, val, or test"
-        )
-    if args.mode in {"sop05-train", "sop05-heldout"}:
-        missing = [name for name in _REAL_REQUIRED_ARGS if getattr(args, name) is None]
-        if missing:
-            raise ValueError(
-                f"required for {args.mode}: "
-                + ", ".join(name.replace("_", "-") for name in missing)
-            )
 
 
 def _resolved_split(args: argparse.Namespace) -> str:
-    if args.mode in {"toy", "sop05-train"}:
+    if args.mode == "toy":
         return "train"
     assert args.split in {"train", "calibration", "val", "test"}
     return str(args.split)
@@ -220,75 +170,6 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-class _SourceSelection:
-    __slots__ = (
-        "groups",
-        "accepted_event_ids",
-        "attempted_event_count",
-        "rejection_counts",
-        "rejected_event_ids",
-    )
-
-    def __init__(
-        self,
-        *,
-        groups: tuple[object, ...],
-        accepted_event_ids: tuple[str, ...],
-        attempted_event_count: int,
-        rejection_counts: dict[str, int],
-        rejected_event_ids: dict[str, tuple[str, ...]],
-    ) -> None:
-        self.groups = groups
-        self.accepted_event_ids = accepted_event_ids
-        self.attempted_event_count = attempted_event_count
-        self.rejection_counts = rejection_counts
-        self.rejected_event_ids = rejected_event_ids
-
-
-def _generate_exact_eligible_groups(
-    events: Sequence[object],
-    *,
-    required_group_count: int,
-    build_group: Callable[[object], object],
-    event_id: Callable[[object], str],
-) -> _SourceSelection:
-    if required_group_count <= 0:
-        raise ValueError("required_group_count must be positive")
-    groups: list[object] = []
-    accepted_ids: list[str] = []
-    rejection_counts: Counter[str] = Counter()
-    rejected_ids: defaultdict[str, list[str]] = defaultdict(list)
-    attempted = 0
-    for event in events:
-        identifier = event_id(event)
-        attempted += 1
-        try:
-            group = build_group(event)
-        except VerificationSourceIneligibleError as exc:
-            rejection_counts[exc.reason] += 1
-            rejected_ids[exc.reason].append(identifier)
-            continue
-        groups.append(group)
-        accepted_ids.append(identifier)
-        if len(groups) == required_group_count:
-            break
-    if len(groups) != required_group_count:
-        raise RuntimeError(
-            "candidate pool exhausted before enough eligible groups were generated: "
-            f"accepted={len(groups)}, required={required_group_count}, "
-            f"attempted={attempted}, rejections={dict(sorted(rejection_counts.items()))}"
-        )
-    return _SourceSelection(
-        groups=tuple(groups),
-        accepted_event_ids=tuple(accepted_ids),
-        attempted_event_count=attempted,
-        rejection_counts=dict(sorted(rejection_counts.items())),
-        rejected_event_ids={
-            key: tuple(value) for key, value in sorted(rejected_ids.items())
-        },
-    )
-
-
 def _implementation_digest(root: Path, config_paths: Sequence[Path]) -> str:
     relative_files = (
         Path("scripts/08_generate_verification_dataset.py"),
@@ -296,7 +177,6 @@ def _implementation_digest(root: Path, config_paths: Sequence[Path]) -> str:
         Path("src/generation/verification_gt.py"),
         Path("src/datasets/verification_dataset.py"),
         Path("src/datasets/verification_dataloader.py"),
-        Path("src/datasets/verification_sources.py"),
     )
     digest = hashlib.sha256()
     digest.update(b"verification-smoke-implementation-v4\0")
@@ -580,74 +460,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         grid = build_grid_spec(toy_config)
         scientific_status = "toy_smoke_only"
         source_summary = {"mode": "toy", "cross_split_status": "NOT_PROVEN"}
-    else:
-        index = load_verification_source_index(
-            args.sop05_batch_handoff,
-            args.sop07_collection_handoff,
-            expected_sop05_batch_digest=args.expected_sop05_batch_digest,
-            expected_sop07_collection_digest=args.expected_sop07_collection_digest,
-            expected_split=split,
-        )
-        grid = build_grid_spec(config)
-        bundle = load_joined_source_events(
-            index,
-            sop03_root=args.sop03_root,
-            sop04_root=args.sop04_root,
-            grid=grid,
-            event_count=args.max_source_attempts,
-            seed=args.seed,
-            checksum_workers=args.checksum_workers,
-        )
-
-        def build_real_group(event):
-            source = build_real_verification_input(
-                event,
-                base_config=config,
-                action_library=action_library,
-                sop05_batch_digest=index.sop05_batch_digest,
-                sop07_collection_digest=index.sop07_collection_digest,
-                scientific_status=index.scientific_status,
-                cross_split_status=index.global_cross_split_leakage,
-            )
-            return generate_verification_group(
-                source,
-                base_config=config,
-                action_library=action_library,
-                gt_config=gt_config,
-                max_replan_candidates=args.max_replan_candidates,
-            )
-
-        selection = _generate_exact_eligible_groups(
-            bundle.events,
-            required_group_count=group_count,
-            build_group=build_real_group,
-            event_id=lambda item: item.event.generated_event_id,
-        )
-        groups.extend(result.samples for result in selection.groups)
-        sampled_child_world_ids.extend(
-            result.sampled_child_world_id for result in selection.groups
-        )
-        scientific_status = index.scientific_status
-        source_summary = {
-            "mode": args.mode,
-            "split": split,
-            "sop05_batch_digest": index.sop05_batch_digest,
-            "sop07_collection_digest": index.sop07_collection_digest,
-            "cross_split_status": index.global_cross_split_leakage,
-            "loaded_sop05_publication_digests": list(
-                bundle.loaded_sop05_publication_digests
-            ),
-            "candidate_pool_count": len(bundle.events),
-            "attempted_event_count": selection.attempted_event_count,
-            "accepted_group_count": len(selection.groups),
-            "selected_event_ids": list(selection.accepted_event_ids),
-            "rejection_counts": selection.rejection_counts,
-            "rejected_event_ids": {
-                key: list(value)
-                for key, value in selection.rejected_event_ids.items()
-            },
-        }
-
     samples = tuple(sample for group in groups for sample in group)
     if len(samples) != args.sample_count:
         raise RuntimeError("generated sample count differs from the exact request")

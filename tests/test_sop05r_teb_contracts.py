@@ -20,9 +20,7 @@ from src.generation.sop05r_contracts import (
     SOP05R_TEB_SUMMARY_VERSION,
     SOP05R_TEB_TEMPLATE_VERSION,
     SOP05R_TEB_TRAJECTORY_COLLECTION_VERSION,
-    load_sop05r_config,
     load_sop05r_teb_config,
-    normalize_sop05r_config,
     normalize_sop05r_teb_config,
 )
 
@@ -466,7 +464,7 @@ def test_teb_config_rejects_invalid_dual_horizon_schedule() -> None:
         ("placement", "occluder_angular_margins_deg", [60.0, 30.0, 10.0]),
     ],
 )
-def test_teb_config_rejects_removed_pre_long40_keys(
+def test_teb_config_rejects_keys_outside_current_schema(
     section: str,
     obsolete_key: str,
     value: object,
@@ -478,17 +476,12 @@ def test_teb_config_rejects_removed_pre_long40_keys(
         normalize_sop05r_teb_config(raw)
 
 
-def test_v1_normalizer_rejects_v4_config_at_the_mode_boundary() -> None:
-    with pytest.raises(ValueError, match="long40 v4.*obstacle_first_teb mode"):
-        normalize_sop05r_config(_valid_config())
-
-
 def test_teb_config_is_immutable_and_production_configs_only_differ_by_selection() -> None:
     config = normalize_sop05r_teb_config(_valid_config())
     with pytest.raises(FrozenInstanceError):
         config.planner.band_node_count = 12  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
-        config.trajectory.future_steps = 15  # type: ignore[misc]
+        config.trajectory.future_steps = 32  # type: ignore[misc]
 
     train = load_sop05r_teb_config(
         Path("configs/generator_obstacle_first_teb_train.yaml")
@@ -503,38 +496,3 @@ def test_teb_config_is_immutable_and_production_configs_only_differ_by_selection
     train_payload = train.as_dict()
     train_payload["revealability"]["selection_filtering"] = False
     assert train_payload == test.as_dict()
-
-
-def test_v1_generator_config_uses_canonical_schema_four() -> None:
-    legacy = load_sop05r_config(Path("configs/generator_obstacle_first_train.yaml"))
-    assert legacy.schema_version == "4.0.0"
-
-
-def test_v4_normalizer_identifies_v1_config_boundary() -> None:
-    legacy = load_sop05r_config(
-        Path("configs/generator_obstacle_first_train.yaml")
-    )
-    with pytest.raises(ValueError, match="SOP05R v1.*obstacle_first mode"):
-        normalize_sop05r_teb_config(legacy.as_dict())
-
-
-def test_v4_normalizer_identifies_pre_long40_v2_without_misrouting() -> None:
-    pre_long40 = _valid_config()
-    pre_long40["schema_version"] = "3.0.0"
-    pre_long40["generator_algorithm_version"] = "obstacle_first_lightweight_teb_v2"
-    with pytest.raises(
-        ValueError,
-        match="pre-long40 v2.*not accepted by the long40 v4 normalizer",
-    ):
-        normalize_sop05r_teb_config(pre_long40)
-
-
-def test_v1_normalizer_identifies_pre_long40_v2_without_misrouting() -> None:
-    pre_long40 = _valid_config()
-    pre_long40["schema_version"] = "3.0.0"
-    pre_long40["generator_algorithm_version"] = "obstacle_first_lightweight_teb_v2"
-    with pytest.raises(
-        ValueError,
-        match="pre-long40 v2.*not accepted by the SOP05R v1 normalizer",
-    ):
-        normalize_sop05r_config(pre_long40)

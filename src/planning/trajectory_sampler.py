@@ -1,4 +1,4 @@
-"""Configuration-driven differential-drive primitive sampling."""
+"""Configuration-driven Long40 differential-drive primitive sampling."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .differential_drive import rollout_constant_control
+from .trajectory_contracts import CandidateRollout
 
 
 @dataclass(frozen=True)
@@ -16,17 +17,6 @@ class TrajectoryPrimitive:
     primitive_id: str
     v: float
     omega: float
-    is_stop: bool
-    is_reverse: bool
-
-
-@dataclass(frozen=True)
-class CandidateRollout:
-    """Rolled-out primitive before geometry query maps are attached."""
-
-    trajectory_id: str
-    poses: np.ndarray
-    controls: np.ndarray
     is_stop: bool
     is_reverse: bool
 

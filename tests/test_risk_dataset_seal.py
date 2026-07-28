@@ -36,7 +36,6 @@ from src.datasets.risk_dataset_seal import (
     validate_risk_dataset_manifest,
 )
 from src.datasets.shard_writer import load_risk_shard
-from src.datasets.sop03_publication import publish_checksum_envelope
 from src.utils.config import config_digest, load_config
 from tests.fixtures.formal_risk_publication import (
     FormalRiskPublication,
@@ -44,6 +43,7 @@ from tests.fixtures.formal_risk_publication import (
     create_formal_risk_publication,
     create_formal_risk_sidecar_publication,
     heldout_collection_semantic_digest,
+    publish_checksum_envelope,
     resign_dataset_seal,
     rewrite_collection_handoff,
     sha256_file,

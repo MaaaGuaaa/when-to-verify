@@ -26,7 +26,7 @@ from src.generation.counterfactual_verify import (
     CounterfactualObservationTrace,
 )
 from src.generation.observation_renderer import RenderedObservation
-from src.generation.sop06_pipeline import Sop06SinglePublication
+from src.generation.sop06_single import Sop06SinglePublication
 from src.planning.verification_actions import ActionTrace
 from src.utils.atomic_publish import atomic_rename_noreplace
 

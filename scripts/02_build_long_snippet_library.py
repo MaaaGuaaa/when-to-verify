@@ -16,7 +16,9 @@ from src.datasets.long_snippet_library import (  # noqa: E402
     load_long_snippet_artifact,
     write_long_snippet_artifacts,
 )
-from src.datasets.snippet_library import audit_snippet_source_overlap  # noqa: E402
+from src.datasets.motion_snippet_utils import (  # noqa: E402
+    audit_snippet_source_overlap,
+)
 from src.datasets.split_manager import SPLIT_NAMES  # noqa: E402
 from src.datasets.thor_adapter import (  # noqa: E402
     ThorDataError,

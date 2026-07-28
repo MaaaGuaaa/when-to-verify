@@ -123,7 +123,7 @@ def _toy_table(split: str, rows: list[dict]) -> dict:
 def _as_occupancy_table(table: dict) -> dict:
     result = copy.deepcopy(table)
     result["method_id"] = "occupancy_b3_hand_aggregation"
-    result["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v2"
+    result["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v3"
     result["checkpoint_digest"] = "e" * 64
     result["checkpoint_digest_kind"] = "occupancy_checkpoint_semantic_sha256"
     result["prediction_semantics"] = (
@@ -214,7 +214,7 @@ def test_prediction_table_accepts_finite_negative_signed_collision_clearance() -
 def test_prediction_table_accepts_v2_occupancy_baseline_checkpoint() -> None:
     table = _toy_table("calibration", [_row("c0", "calibration")])
     table["method_id"] = "occupancy_b3_hand_aggregation"
-    table["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v2"
+    table["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v3"
     table["checkpoint_digest"] = "e" * 64
     table["checkpoint_digest_kind"] = "occupancy_checkpoint_semantic_sha256"
     table["prediction_semantics"] = (
@@ -225,7 +225,7 @@ def test_prediction_table_accepts_v2_occupancy_baseline_checkpoint() -> None:
     validated = validate_prediction_table(table, expected_mode="toy")
 
     assert validated["checkpoint_layout_version"] == (
-        "occupancy_baseline_checkpoint_v2"
+        "occupancy_baseline_checkpoint_v3"
     )
 
 
@@ -288,13 +288,13 @@ def test_prediction_table_public_api_fails_closed_on_production() -> None:
             "risk_checkpoint_semantic_sha256",
         ),
         (
-            "occupancy_baseline_checkpoint_v2",
+            "occupancy_baseline_checkpoint_v3",
             "checkpoint_digest_kind",
             "model_state_semantic_sha256",
             "occupancy_checkpoint_semantic_sha256",
         ),
         (
-            "occupancy_baseline_checkpoint_v2",
+            "occupancy_baseline_checkpoint_v3",
             "prediction_semantics",
             "quantile",
             "scalar_baseline_score_repeated_for_common_calibration",
@@ -308,7 +308,7 @@ def test_prediction_table_requires_layout_specific_semantic_provenance(
     message: str,
 ) -> None:
     table = _toy_table("calibration", [_row("c0", "calibration")])
-    if layout == "occupancy_baseline_checkpoint_v2":
+    if layout == "occupancy_baseline_checkpoint_v3":
         table = _as_occupancy_table(table)
     if bad_value is None:
         table.pop(field)
@@ -760,7 +760,7 @@ def test_offline_eval_cli_applies_calibration_and_marks_toy_gate_unresolved(
 
     mismatched_artifact = copy.deepcopy(artifact)
     mismatched_artifact["checkpoint_layout_version"] = (
-        "occupancy_baseline_checkpoint_v2"
+        "occupancy_baseline_checkpoint_v3"
     )
     mismatched_artifact["checkpoint_digest_kind"] = (
         "occupancy_checkpoint_semantic_sha256"

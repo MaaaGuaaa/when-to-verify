@@ -34,7 +34,7 @@ from src.generation.sop06_history_release import (
     LoadedSop06HistoryRelease,
     load_sop06_history_release_checkpoint,
 )
-from src.generation.sop06_pipeline import build_sop06_single_risk_input
+from src.generation.sop06_single import build_sop06_single_risk_input
 from src.utils.atomic_publish import atomic_rename_noreplace
 from src.utils.config import config_digest, load_config
 

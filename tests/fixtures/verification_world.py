@@ -1,4 +1,4 @@
-"""Compatibility re-export of the production hand-checkable SOP11–14 toy."""
+"""Compatibility re-export of the production hand-checkable SOP11-14 toy."""
 
 from src.generation.verification_toy import (
     VerificationToyWorld,

@@ -4,7 +4,7 @@
 
 **Goal:** Publish a runnable and provenance-bound risk experiment matrix whose formal comparison contains R0, R1, R2, and B1-B4, with R2 defined as cross-attention trajectory risk plus occupancy auxiliary supervision.
 
-**Architecture:** Keep one shared production prediction protocol and one calibration/test cohort for all seven formal methods. R2 consumes only deployment-visible scene and trajectory inputs; its scene-only occupancy decoder is trained from label-only sidecars and is discarded by formal inference. R2-no-aux and R2-concat reuse the same trainer as controlled ablations but do not receive separate formal method IDs.
+**Architecture:** Keep one shared production prediction protocol and one calibration/test cohort for all seven formal methods. R1 fuses aligned temporal/context feature maps before global pooling. R2 consumes only deployment-visible scene and trajectory inputs; its scene-only occupancy decoder is trained from label-only sidecars and is discarded by formal inference. R2-no-aux is the controlled auxiliary-supervision ablation. R2-concat is exploratory only because it is not a capacity-matched attention ablation; neither receives a formal method ID.
 
 **Tech Stack:** Python 3.10, PyTorch, YAML/JSON experiment configs, pytest through Slurm.
 
@@ -15,13 +15,14 @@
 | Experiment | Model | Occupancy auxiliary | Formal method ID | Purpose |
 |---|---|---:|---|---|
 | R0 | concat CNN | no | `risk-r0` | minimal direct-risk baseline |
-| R1 | temporal trajectory-conditioned concat | no | `risk-r1` | temporal direct-risk baseline |
+| R1 | temporal/context spatial fusion, then pooling | no | `risk-r1` | temporal direct-risk baseline |
 | R2 | cross-attention trajectory queries | yes | `risk-r2` | main method |
 | R2-no-aux | same as R2 | no | none | auxiliary-task ablation |
-| R2-concat | concat fusion control | yes | none | attention-fusion ablation |
-| B1-B4 | occupancy baselines | n/a | `B1`-`B4` | occupancy-to-risk comparison |
+| R2-concat | unmatched concat fusion control | yes | none | exploratory; no attention-superiority claim |
+| B1-B4 | occupancy baselines; B3/B4 use history + scene state | n/a | `B1`-`B4` | occupancy-to-risk comparison |
 
 All formal methods use seeds `42`, `43`, and `44`, the same authenticated dataset family, the same calibration/test cohorts, and the same prediction protocol digest.
+R2 best-checkpoint selection uses only `pinball + lambda_collision * collision_bce`; occupancy auxiliary loss remains in the training objective and validation records but cannot select the checkpoint.
 
 ### Task 1: Make R2 a formal prediction method
 

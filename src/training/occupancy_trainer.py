@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from src.contracts import SCHEMA_VERSION
+from src.contracts import SCHEMA_VERSION, STATE_CHANNELS
 from src.datasets.risk_dataloader import (
     ProductionOccupancyBatch,
     ProductionRiskSubset,
@@ -49,15 +49,15 @@ from src.models.occupancy_baseline import (
 from src.utils.atomic_publish import atomic_rename_noreplace
 
 
-PRODUCTION_OCCUPANCY_TRAINING_LAYOUT_VERSION = "sop08_production_training_v1"
+PRODUCTION_OCCUPANCY_TRAINING_LAYOUT_VERSION = "sop08_production_training_v2"
 PRODUCTION_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = (
-    "sop08_production_occupancy_checkpoint_v1"
+    "sop08_production_occupancy_checkpoint_v2"
 )
 FORMAL_PRODUCTION_OCCUPANCY_TRAINING_LAYOUT_VERSION = (
-    "sop08_formal_occupancy_training_v1"
+    "sop08_formal_occupancy_training_v2"
 )
 FORMAL_PRODUCTION_OCCUPANCY_CHECKPOINT_LAYOUT_VERSION = (
-    "sop08_formal_occupancy_checkpoint_v1"
+    "sop08_formal_occupancy_checkpoint_v2"
 )
 _FORMAL_TRAIN_SAMPLE_COUNT = 50_000
 
@@ -776,6 +776,7 @@ def load_production_occupancy_checkpoint(
     model_spec = value["model_spec"]
     if not isinstance(model_spec, dict) or set(model_spec) != {
         "hidden_channels",
+        "state_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
         "future_steps",
@@ -783,6 +784,7 @@ def load_production_occupancy_checkpoint(
         raise ValueError("production occupancy checkpoint model_spec mismatch")
     for name in (
         "hidden_channels",
+        "state_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
         "future_steps",
@@ -797,6 +799,8 @@ def load_production_occupancy_checkpoint(
         )
     if model_spec["future_steps"] != FUTURE_STEPS:
         raise ValueError("production occupancy checkpoint future_steps mismatch")
+    if model_spec["state_channels"] != len(STATE_CHANNELS):
+        raise ValueError("production occupancy checkpoint state_channels mismatch")
     states: list[Mapping[str, torch.Tensor]] = []
     for key in ("b3_model_state_dict", "b4_aggregator_state_dict"):
         state_value = value[key]
@@ -814,6 +818,7 @@ def load_production_occupancy_checkpoint(
         raise ValueError("B4 aggregator state digest mismatch")
     try:
         model = ConvGRUOccupancyPredictor(
+            state_channels=model_spec["state_channels"],
             hidden_channels=model_spec["hidden_channels"],
             future_steps=model_spec["future_steps"],
             kernel_size=model_spec["convgru_kernel_size"],
@@ -1150,7 +1155,10 @@ def _evaluate_formal_b3_validation_loss(
             snapshot=snapshot,
         ):
             batch = _move_batch(raw_batch, device)
-            logits = model.predict_logits(batch.model_inputs["bev_history"])
+            logits = model.predict_logits(
+                batch.model_inputs["bev_history"],
+                batch.model_inputs["state_channels"],
+            )
             loss_sum, element_count = compute_weighted_binary_loss_sum(
                 logits,
                 batch.occupancy_targets["hidden_risk_occupancy"],
@@ -1222,7 +1230,10 @@ def _evaluate_formal_b4_validation_loss(
             snapshot=snapshot,
         ):
             batch = _move_batch(raw_batch, device)
-            occupancy = model(batch.model_inputs["bev_history"])
+            occupancy = model(
+                batch.model_inputs["bev_history"],
+                batch.model_inputs["state_channels"],
+            )
             probability = aggregator(
                 occupancy,
                 batch.query_inputs["robot_endpoint_footprints"],
@@ -1294,6 +1305,7 @@ def _build_formal_checkpoint(
         "provenance": dict(provenance),
         "model_spec": {
             "hidden_channels": config.hidden_channels,
+            "state_channels": len(STATE_CHANNELS),
             "convgru_kernel_size": config.convgru_kernel_size,
             "learned_aggregator_hidden_dim": config.learned_aggregator_hidden_dim,
             "future_steps": config.future_steps,
@@ -1358,6 +1370,7 @@ def load_formal_production_occupancy_checkpoint(
     model_spec = value["model_spec"]
     if not isinstance(model_spec, Mapping) or set(model_spec) != {
         "hidden_channels",
+        "state_channels",
         "convgru_kernel_size",
         "learned_aggregator_hidden_dim",
         "future_steps",
@@ -1365,6 +1378,8 @@ def load_formal_production_occupancy_checkpoint(
         raise ValueError("formal occupancy checkpoint model spec mismatch")
     if model_spec["future_steps"] != FUTURE_STEPS:
         raise ValueError("formal occupancy checkpoint future_steps mismatch")
+    if model_spec["state_channels"] != len(STATE_CHANNELS):
+        raise ValueError("formal occupancy checkpoint state_channels mismatch")
     states = (
         value["b3_model_state_dict"],
         value["b4_aggregator_state_dict"],
@@ -1393,6 +1408,7 @@ def load_formal_production_occupancy_checkpoint(
             raise ValueError(f"formal occupancy checkpoint {digest_key} mismatch")
     try:
         model = ConvGRUOccupancyPredictor(
+            state_channels=int(model_spec["state_channels"]),
             hidden_channels=int(model_spec["hidden_channels"]),
             future_steps=int(model_spec["future_steps"]),
             kernel_size=int(model_spec["convgru_kernel_size"]),
@@ -1593,7 +1609,10 @@ def _train_formal_occupancy_baselines(
         ):
             saw_batch = True
             batch = _move_batch(raw_batch, device)
-            logits = model.predict_logits(batch.model_inputs["bev_history"])
+            logits = model.predict_logits(
+                batch.model_inputs["bev_history"],
+                batch.model_inputs["state_channels"],
+            )
             loss_sum, count = compute_weighted_binary_loss_sum(
                 logits,
                 batch.occupancy_targets["hidden_risk_occupancy"],
@@ -1691,7 +1710,10 @@ def _train_formal_occupancy_baselines(
             saw_batch = True
             batch = _move_batch(raw_batch, device)
             with torch.no_grad():
-                occupancy = model(batch.model_inputs["bev_history"]).detach()
+                occupancy = model(
+                    batch.model_inputs["bev_history"],
+                    batch.model_inputs["state_channels"],
+                ).detach()
             probability = aggregator(
                 occupancy,
                 batch.query_inputs["robot_endpoint_footprints"],
@@ -2126,7 +2148,10 @@ def train_production_occupancy_baselines(
     )
     model.train()
     occupancy_optimizer.zero_grad(set_to_none=True)
-    occupancy_logits = model.predict_logits(batch.model_inputs["bev_history"])
+    occupancy_logits = model.predict_logits(
+        batch.model_inputs["bev_history"],
+        batch.model_inputs["state_channels"],
+    )
     occupancy_loss_sum, occupancy_count = compute_weighted_binary_loss_sum(
         occupancy_logits,
         batch.occupancy_targets["hidden_risk_occupancy"],
@@ -2144,7 +2169,10 @@ def train_production_occupancy_baselines(
         parameter.requires_grad_(False)
     model.eval()
     with torch.no_grad():
-        frozen_occupancy = model(batch.model_inputs["bev_history"]).detach()
+        frozen_occupancy = model(
+            batch.model_inputs["bev_history"],
+            batch.model_inputs["state_channels"],
+        ).detach()
     aggregator_optimizer = torch.optim.AdamW(
         aggregator.parameters(),
         lr=config.aggregator_learning_rate,
@@ -2218,6 +2246,7 @@ def train_production_occupancy_baselines(
         "provenance": provenance,
         "model_spec": {
             "hidden_channels": config.hidden_channels,
+            "state_channels": len(STATE_CHANNELS),
             "convgru_kernel_size": config.convgru_kernel_size,
             "learned_aggregator_hidden_dim": config.learned_aggregator_hidden_dim,
             "future_steps": config.future_steps,

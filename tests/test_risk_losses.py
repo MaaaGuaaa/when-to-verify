@@ -54,9 +54,9 @@ def test_risk_loss_composes_pinball_and_collision_bce():
     assert losses["pinball"].item() == pytest.approx(expected_pinball)
     assert losses["collision_bce"].item() == pytest.approx(math.log(2.0))
     assert losses["occupancy_aux"].item() == pytest.approx(0.0)
-    assert losses["total"].item() == pytest.approx(
-        expected_pinball + 2.0 * math.log(2.0)
-    )
+    expected_main_risk = expected_pinball + 2.0 * math.log(2.0)
+    assert losses["main_risk"].item() == pytest.approx(expected_main_risk)
+    assert losses["total"].item() == pytest.approx(expected_main_risk)
 
 
 def test_optional_occupancy_auxiliary_loss_requires_both_prediction_and_label():
@@ -75,6 +75,7 @@ def test_optional_occupancy_auxiliary_loss_requires_both_prediction_and_label():
         lambda_occupancy_aux=0.2,
     )
     assert with_aux["occupancy_aux"].item() == pytest.approx(math.log(2.0))
+    assert with_aux["total"].item() > with_aux["main_risk"].item()
 
 
 def test_occupancy_auxiliary_loss_uses_train_only_positive_weight():

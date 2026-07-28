@@ -1394,7 +1394,7 @@ z\rightarrow occupancy\ map\rightarrow risk
 至少实现一个：
 
 ```text
-历史 BEV → future occupancy probability
+历史 BEV + 当前部署可见 scene-state → future occupancy probability
 future occupancy + swept volume → 手写概率聚合 → trajectory risk
 ```
 
@@ -1463,13 +1463,17 @@ Value = BEV latent features
 不要直接把 predicted occupancy map 当唯一 Value。
 `risk-r2` 仅指 cross-attention 且启用 occupancy auxiliary 的主方法。
 concat fusion 与关闭 auxiliary 分别记为 R2-concat、R2-no-aux 消融，
-不得进入正式 method ID 集。
+不得进入正式 method ID 集。R2-concat 并非等容量 attention ablation，只能作
+探索性 control，不得用于声称 cross-attention 优于 concat。
 
 ### 15.3 Loss
 
 \[
 L_{risk}=L_{quantile}+\lambda_{coll}L_{BCE}+\lambda_{occ}L_{occ(aux)}
 \]
+
+训练使用完整目标；best checkpoint 只按
+`L_quantile + lambda_coll * L_BCE` 选择，auxiliary loss 仅记录。
 
 Pinball：
 
@@ -2019,7 +2023,7 @@ scenario bank: M=16
 
 ```text
 R0 / risk-r0  Concat CNN direct-risk baseline
-R1 / risk-r1  Temporal trajectory-conditioned concat baseline
+R1 / risk-r1  Temporal/context spatial fusion before pooling
 R2 / risk-r2  Cross-attention trajectory-query risk + occupancy auxiliary
 B1            Last observation hold + hand aggregation
 B2            Age-decay heuristic + hand aggregation
@@ -2028,7 +2032,7 @@ B4            Occupancy predictor + learned aggregation
 
 Ablations only (no formal method ID):
 R2-no-aux     R2 with occupancy auxiliary disabled
-R2-concat     R2 with concat fusion and occupancy auxiliary enabled
+R2-concat     Exploratory unmatched concat control; no attention-superiority claim
 ```
 
 ### 25.2 验证

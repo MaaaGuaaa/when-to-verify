@@ -57,7 +57,7 @@ from src.utils.atomic_publish import atomic_rename_noreplace
 
 
 PRODUCTION_RISK_TRAINING_LAYOUT_VERSION = "sop09_production_training_v1"
-PRODUCTION_RISK_TRAINING_STATE_LAYOUT_VERSION = "sop09_training_state_v2"
+PRODUCTION_RISK_TRAINING_STATE_LAYOUT_VERSION = "sop09_training_state_v3"
 _TRAINING_STAGES = frozenset(
     {"one_shard_smoke", "real_1k_overfit", "formal_50k"}
 )
@@ -114,6 +114,8 @@ _TRAINING_STATE_KEYS = frozenset(
         "loss_history",
         "optimizer_step_loss_history",
         "validation_loss_history",
+        "validation_total_loss_history",
+        "validation_occupancy_aux_loss_history",
         "epoch_running_loss_sum",
         "epoch_running_sample_count",
         "initial_train_loss",
@@ -265,6 +267,31 @@ class _AuxiliaryOccupancyStatistics:
     negative_count: int
     pos_weight: float
     future_steps: int
+
+
+@dataclass(frozen=True)
+class RiskLossEvaluation:
+    """Sample-weighted loss components plus the quantile crossing diagnostic."""
+
+    total: float
+    main_risk: float
+    occupancy_aux: float
+    crossing_rate: float
+
+
+def _is_better_validation_candidate(
+    candidate: RiskLossEvaluation,
+    best_main_risk_loss: float | None,
+) -> bool:
+    """Select checkpoints exclusively by the primary risk objective."""
+
+    if not isinstance(candidate, RiskLossEvaluation):
+        raise TypeError("candidate must be a RiskLossEvaluation")
+    if best_main_risk_loss is None:
+        return True
+    if not math.isfinite(float(best_main_risk_loss)):
+        raise RiskDataContractError("best main-risk validation loss must be finite")
+    return candidate.main_risk < float(best_main_risk_loss)
 
 
 @dataclass(frozen=True)
@@ -538,6 +565,12 @@ def _training_state_semantic_digest(payload: Mapping[str, object]) -> str:
             "optimizer_step_loss_history"
         ),
         "validation_loss_history": payload.get("validation_loss_history"),
+        "validation_total_loss_history": payload.get(
+            "validation_total_loss_history"
+        ),
+        "validation_occupancy_aux_loss_history": payload.get(
+            "validation_occupancy_aux_loss_history"
+        ),
         "epoch_running_loss_sum": payload.get("epoch_running_loss_sum"),
         "epoch_running_sample_count": payload.get("epoch_running_sample_count"),
         "initial_train_loss": payload.get("initial_train_loss"),
@@ -1021,9 +1054,11 @@ def _evaluate_loss(
     epoch: int,
     occupancy_sidecar_root: str | Path | None,
     occupancy_pos_weight: float,
-) -> tuple[float, float]:
+) -> RiskLossEvaluation:
     model.eval()
-    weighted_loss = 0.0
+    weighted_total_loss = 0.0
+    weighted_main_risk_loss = 0.0
+    weighted_occupancy_aux_loss = 0.0
     sample_count = 0
     crossings = 0
     quantile_comparisons = 0
@@ -1044,17 +1079,34 @@ def _evaluate_loss(
                 occupancy_pos_weight=occupancy_pos_weight,
             )
             batch_size = len(batch.sample_ids)
-            value = losses["total"]
-            if not torch.isfinite(value).item():
+            values = {
+                "total": losses["total"],
+                "main_risk": losses["main_risk"],
+                "occupancy_aux": losses["occupancy_aux"],
+            }
+            if not all(torch.isfinite(value).item() for value in values.values()):
                 raise RiskDataContractError("production evaluation loss contains NaN/Inf")
-            weighted_loss += float(value.detach().cpu().item()) * batch_size
+            weighted_total_loss += (
+                float(values["total"].detach().cpu().item()) * batch_size
+            )
+            weighted_main_risk_loss += (
+                float(values["main_risk"].detach().cpu().item()) * batch_size
+            )
+            weighted_occupancy_aux_loss += (
+                float(values["occupancy_aux"].detach().cpu().item()) * batch_size
+            )
             sample_count += batch_size
             comparison = output["quantiles"][:, 1:] < output["quantiles"][:, :-1]
             crossings += int(torch.count_nonzero(comparison).item())
             quantile_comparisons += comparison.numel()
     if sample_count != len(subset.sample_ids) or sample_count < 1:
         raise RiskDataContractError("production evaluation sample count mismatch")
-    return weighted_loss / sample_count, crossings / max(1, quantile_comparisons)
+    return RiskLossEvaluation(
+        total=weighted_total_loss / sample_count,
+        main_risk=weighted_main_risk_loss / sample_count,
+        occupancy_aux=weighted_occupancy_aux_loss / sample_count,
+        crossing_rate=crossings / max(1, quantile_comparisons),
+    )
 
 
 def _optimizer_to_device(
@@ -1080,6 +1132,8 @@ def _make_training_state(
     loss_history: list[float],
     optimizer_step_loss_history: list[float],
     validation_loss_history: list[float],
+    validation_total_loss_history: list[float],
+    validation_occupancy_aux_loss_history: list[float],
     epoch_running_loss_sum: float,
     epoch_running_sample_count: int,
     initial_train_loss: float,
@@ -1105,6 +1159,10 @@ def _make_training_state(
         "loss_history": list(loss_history),
         "optimizer_step_loss_history": list(optimizer_step_loss_history),
         "validation_loss_history": list(validation_loss_history),
+        "validation_total_loss_history": list(validation_total_loss_history),
+        "validation_occupancy_aux_loss_history": list(
+            validation_occupancy_aux_loss_history
+        ),
         "epoch_running_loss_sum": float(epoch_running_loss_sum),
         "epoch_running_sample_count": epoch_running_sample_count,
         "initial_train_loss": float(initial_train_loss),
@@ -1378,9 +1436,41 @@ def _validate_state_against_publication(
             f"{label} optimizer history length does not match optimizer_steps"
         )
     _finite_float_list(state.get("loss_history"), field="loss_history")
-    _finite_float_list(
+    validation_main = _finite_float_list(
         state.get("validation_loss_history"), field="validation_loss_history"
     )
+    validation_total = _finite_float_list(
+        state.get("validation_total_loss_history"),
+        field="validation_total_loss_history",
+    )
+    validation_aux = _finite_float_list(
+        state.get("validation_occupancy_aux_loss_history"),
+        field="validation_occupancy_aux_loss_history",
+    )
+    if not len(validation_main) == len(validation_total) == len(validation_aux):
+        raise RiskDataContractError(
+            f"{label} validation loss component histories must align"
+        )
+    best_loss = state.get("best_validation_loss")
+    best_step = state.get("best_validation_step")
+    best_state = state.get("best_model_state_dict")
+    if validation_main:
+        if (
+            type(best_loss) not in {int, float}
+            or not math.isfinite(float(best_loss))
+            or float(best_loss) != min(validation_main)
+            or type(best_step) is not int
+            or best_step < 1
+            or not isinstance(best_state, Mapping)
+            or not best_state
+        ):
+            raise RiskDataContractError(
+                f"{label} best checkpoint must bind minimum main-risk validation loss"
+            )
+    elif any(value is not None for value in (best_loss, best_step, best_state)):
+        raise RiskDataContractError(
+            f"{label} cannot contain a best checkpoint without validation"
+        )
     for field in ("epoch_running_loss_sum", "initial_train_loss"):
         value = state.get(field)
         if type(value) not in {int, float} or not math.isfinite(float(value)):
@@ -1635,6 +1725,24 @@ def _validate_published_resume_state(
     final_state = states.get("training_state.pt")
     if final_state is None or final_checkpoint_payload is None:
         raise RiskDataContractError("published final checkpoint/state is missing")
+    if (
+        metrics.get("validation_selection_metric") != "main_risk_loss"
+        or metrics.get("validation_loss_history")
+        != final_state.get("validation_loss_history")
+        or metrics.get("validation_main_risk_loss_history")
+        != final_state.get("validation_loss_history")
+        or metrics.get("validation_total_loss_history")
+        != final_state.get("validation_total_loss_history")
+        or metrics.get("validation_occupancy_aux_loss_history")
+        != final_state.get("validation_occupancy_aux_loss_history")
+        or metrics.get("best_validation_loss")
+        != final_state.get("best_validation_loss")
+        or metrics.get("best_validation_step")
+        != final_state.get("best_validation_step")
+    ):
+        raise RiskDataContractError(
+            "training metrics do not bind main-risk checkpoint selection"
+        )
     if manifest.get("optimizer_steps") != final_state.get("optimizer_steps"):
         raise RiskDataContractError("manifest/final-state optimizer step mismatch")
     checkpoint_state = final_checkpoint_payload["model_state_dict"]
@@ -1659,6 +1767,8 @@ def _validate_published_resume_state(
             "optimizer_step_loss_history",
             "loss_history",
             "validation_loss_history",
+            "validation_total_loss_history",
+            "validation_occupancy_aux_loss_history",
         ):
             _require_history_prefix(
                 interval_state,
@@ -1904,6 +2014,8 @@ def train_production_risk_model(
         loss_history: list[float] = []
         optimizer_step_loss_history: list[float] = []
         validation_loss_history: list[float] = []
+        validation_total_loss_history: list[float] = []
+        validation_occupancy_aux_loss_history: list[float] = []
         epoch_running_loss_sum = 0.0
         epoch_running_sample_count = 0
         initial_train_loss = float("nan")
@@ -1978,6 +2090,13 @@ def train_production_risk_model(
             validation_loss_history = [
                 float(value) for value in state["validation_loss_history"]
             ]
+            validation_total_loss_history = [
+                float(value) for value in state["validation_total_loss_history"]
+            ]
+            validation_occupancy_aux_loss_history = [
+                float(value)
+                for value in state["validation_occupancy_aux_loss_history"]
+            ]
             epoch_running_loss_sum = float(state["epoch_running_loss_sum"])
             epoch_running_sample_count = int(state["epoch_running_sample_count"])
             initial_train_loss = float(state["initial_train_loss"])
@@ -1995,7 +2114,7 @@ def train_production_risk_model(
             _restore_rng_state(state["rng_state"], device=device)
 
         elif config.stage != "one_shard_smoke":
-            initial_train_loss, _ = _evaluate_loss(
+            initial_evaluation = _evaluate_loss(
                 model,
                 dataset=train_dataset,
                 subset=train_subset,
@@ -2005,6 +2124,7 @@ def train_production_risk_model(
                 occupancy_sidecar_root=train_occupancy_sidecar_root,
                 occupancy_pos_weight=occupancy_pos_weight,
             )
+            initial_train_loss = initial_evaluation.total
             loss_history.append(initial_train_loss)
 
         validation_subset: ProductionRiskSubset | None = None
@@ -2106,7 +2226,7 @@ def train_production_risk_model(
                     epoch_running_loss_sum = 0.0
                     epoch_running_sample_count = 0
                     if validation_dataset is not None and validation_subset is not None:
-                        validation_loss, _ = _evaluate_loss(
+                        validation_evaluation = _evaluate_loss(
                             model,
                             dataset=validation_dataset,
                             subset=validation_subset,
@@ -2116,10 +2236,17 @@ def train_production_risk_model(
                             occupancy_sidecar_root=validation_occupancy_sidecar_root,
                             occupancy_pos_weight=occupancy_pos_weight,
                         )
+                        validation_loss = validation_evaluation.main_risk
                         validation_loss_history.append(validation_loss)
-                        if (
-                            best_validation_loss is None
-                            or validation_loss < best_validation_loss
+                        validation_total_loss_history.append(
+                            validation_evaluation.total
+                        )
+                        validation_occupancy_aux_loss_history.append(
+                            validation_evaluation.occupancy_aux
+                        )
+                        if _is_better_validation_candidate(
+                            validation_evaluation,
+                            best_validation_loss,
                         ):
                             best_validation_loss = validation_loss
                             best_validation_step = optimizer_steps
@@ -2141,6 +2268,10 @@ def train_production_risk_model(
                     loss_history=loss_history,
                     optimizer_step_loss_history=optimizer_step_loss_history,
                     validation_loss_history=validation_loss_history,
+                    validation_total_loss_history=validation_total_loss_history,
+                    validation_occupancy_aux_loss_history=(
+                        validation_occupancy_aux_loss_history
+                    ),
                     epoch_running_loss_sum=epoch_running_loss_sum,
                     epoch_running_sample_count=epoch_running_sample_count,
                     initial_train_loss=initial_train_loss,
@@ -2204,7 +2335,7 @@ def train_production_risk_model(
             final_train_loss = smoke_final_loss
             final_crossing_rate = 0.0
         else:
-            final_train_loss, final_crossing_rate = _evaluate_loss(
+            final_evaluation = _evaluate_loss(
                 model,
                 dataset=train_dataset,
                 subset=train_subset,
@@ -2214,6 +2345,8 @@ def train_production_risk_model(
                 occupancy_sidecar_root=train_occupancy_sidecar_root,
                 occupancy_pos_weight=occupancy_pos_weight,
             )
+            final_train_loss = final_evaluation.total
+            final_crossing_rate = final_evaluation.crossing_rate
         if not all(
             math.isfinite(value)
             for value in (
@@ -2222,6 +2355,8 @@ def train_production_risk_model(
                 *loss_history,
                 *optimizer_step_loss_history,
                 *validation_loss_history,
+                *validation_total_loss_history,
+                *validation_occupancy_aux_loss_history,
             )
         ):
             raise RiskDataContractError("production loss history contains NaN/Inf")
@@ -2239,6 +2374,10 @@ def train_production_risk_model(
             loss_history=loss_history,
             optimizer_step_loss_history=optimizer_step_loss_history,
             validation_loss_history=validation_loss_history,
+            validation_total_loss_history=validation_total_loss_history,
+            validation_occupancy_aux_loss_history=(
+                validation_occupancy_aux_loss_history
+            ),
             epoch_running_loss_sum=epoch_running_loss_sum,
             epoch_running_sample_count=epoch_running_sample_count,
             initial_train_loss=initial_train_loss,
@@ -2296,6 +2435,12 @@ def train_production_risk_model(
             "loss_history": loss_history,
             "optimizer_step_loss_history": optimizer_step_loss_history,
             "validation_loss_history": validation_loss_history,
+            "validation_selection_metric": "main_risk_loss",
+            "validation_main_risk_loss_history": validation_loss_history,
+            "validation_total_loss_history": validation_total_loss_history,
+            "validation_occupancy_aux_loss_history": (
+                validation_occupancy_aux_loss_history
+            ),
             "best_validation_loss": best_validation_loss,
             "best_validation_step": best_validation_step,
             "quantile_crossing_rate": final_crossing_rate,

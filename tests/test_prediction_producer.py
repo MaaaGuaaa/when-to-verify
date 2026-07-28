@@ -583,6 +583,7 @@ def test_occupancy_checkpoint_must_bind_family_train_and_validation_members(
         },
         "model_spec": {
             "hidden_channels": 2,
+            "state_channels": 9,
             "convgru_kernel_size": 3,
             "learned_aggregator_hidden_dim": 4,
             "future_steps": 32,
@@ -656,6 +657,7 @@ def test_occupancy_checkpoint_loader_uses_bound_long40_horizon(
         },
         "model_spec": {
             "hidden_channels": 2,
+            "state_channels": 9,
             "convgru_kernel_size": 3,
             "learned_aggregator_hidden_dim": 4,
             "future_steps": 32,

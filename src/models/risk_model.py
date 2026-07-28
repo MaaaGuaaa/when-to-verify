@@ -41,6 +41,7 @@ from src.models.losses import risk_loss
 
 RISK_CHECKPOINT_LAYOUT_VERSION = "risk_model_checkpoint_v2"
 RISK_MODEL_VARIANTS: tuple[str, ...] = ("r0", "r1", "r2")
+R1_FUSION_MODE = "spatial_concat_before_pool"
 TRAJECTORY_SENSITIVITY_EPSILON = 1e-8
 R2_SCENE_INPUT_CHANNELS = 8 * N_HISTORY_CHANNELS + N_STATE_CHANNELS
 R2_STEM_CHANNELS = 32
@@ -616,6 +617,7 @@ class RiskModel(nn.Module):
         r2_fusion_mode: str = "cross_attention",
         occupancy_aux_enabled: bool = False,
         occupancy_future_steps: int = R2_OCCUPANCY_AUX_CHANNELS,
+        r1_fusion_mode: str = R1_FUSION_MODE,
         # Read legacy pre-refactor R2 checkpoints without emitting this shape
         # back into new checkpoint configs.
         d_model: int | None = None,
@@ -631,6 +633,10 @@ class RiskModel(nn.Module):
             raise ValueError("occupancy_aux_enabled must be boolean")
         if variant != "r2" and occupancy_aux_enabled:
             raise ValueError("occupancy_aux_enabled is available only for r2")
+        if variant == "r1" and r1_fusion_mode != R1_FUSION_MODE:
+            raise ValueError(
+                f"r1_fusion_mode must equal {R1_FUSION_MODE!r}"
+            )
         if history_steps != 8:
             raise ValueError("SOP09 frozen history_steps must equal 8")
         self.variant = variant
@@ -687,6 +693,10 @@ class RiskModel(nn.Module):
             self.context_encoder = BEVEncoder(
                 N_STATE_CHANNELS + N_TRAJECTORY_CHANNELS, hidden_channels
             )
+            self.r1_fusion_mode = R1_FUSION_MODE
+            self.r1_spatial_fusion = BEVEncoder(
+                2 * hidden_channels, 2 * hidden_channels
+            )
             fused_features = 2 * hidden_channels + ROBOT_STATE_DIM
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fusion = nn.Sequential(
@@ -699,11 +709,14 @@ class RiskModel(nn.Module):
     def export_config(self) -> dict[str, object]:
         if self.variant == "r2":
             return self.r2_model.export_config()
-        return {
+        config: dict[str, object] = {
             "variant": self.variant,
             "hidden_channels": self.hidden_channels,
             "history_steps": self.history_steps,
         }
+        if self.variant == "r1":
+            config["r1_fusion_mode"] = self.r1_fusion_mode
+        return config
 
     def _validate_inputs(self, inputs: Mapping[str, torch.Tensor]) -> None:
         if not isinstance(inputs, Mapping):
@@ -760,10 +773,11 @@ class RiskModel(nn.Module):
                 encoded = self.history_encoder(history[:, step])
                 hidden = self.temporal_cell(encoded, hidden)
             assert hidden is not None
-            temporal_features = self.pool(hidden).flatten(1)
             context = self.context_encoder(torch.cat((state, trajectory), dim=1))
-            context_features = self.pool(context).flatten(1)
-            features = torch.cat((temporal_features, context_features), dim=1)
+            spatial_features = self.r1_spatial_fusion(
+                torch.cat((hidden, context), dim=1)
+            )
+            features = self.pool(spatial_features).flatten(1)
         else:
             scene_inputs = torch.cat(
                 (history.reshape(batch, steps * channels, height, width), state),

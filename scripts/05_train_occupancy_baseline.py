@@ -493,8 +493,9 @@ def _baseline_scores_for_dataset(
     )(state)
     with torch.no_grad():
         history_tensor = torch.from_numpy(history)
+        state_tensor = torch.from_numpy(state)
         footprint_tensor = torch.from_numpy(footprints)
-        b3_tensor = model(history_tensor)
+        b3_tensor = model(history_tensor, state_tensor)
         b4_score = learned_aggregator(b3_tensor, footprint_tensor)
     b3_occupancy = b3_tensor.cpu().numpy().astype(np.float32, copy=False)
     b1_scores = hand_trajectory_risk_scores(
@@ -647,6 +648,7 @@ def _publish_toy_artifact(
     footprints_np = np.asarray(label_sidecars["robot_future_footprints"], dtype=np.float32)
     collision_np = np.asarray(labels["collision_label"], dtype=np.float32)
     history = torch.from_numpy(history_np)
+    state = torch.from_numpy(state_np)
     target = torch.from_numpy(target_np)
     footprints = torch.from_numpy(footprints_np)
     collision = torch.from_numpy(collision_np)
@@ -664,12 +666,13 @@ def _publish_toy_artifact(
     occupancy_training = fit_toy_occupancy_model(
         model,
         history,
+        state,
         target,
         steps=int(config["training"]["occupancy_steps"]),
         learning_rate=float(config["training"]["occupancy_learning_rate"]),
     )
     with torch.no_grad():
-        learned_occupancy_torch = model(history)
+        learned_occupancy_torch = model(history, state)
     aggregator_training = fit_toy_learned_aggregator(
         aggregator,
         learned_occupancy_torch.detach(),

@@ -111,10 +111,11 @@ Both return finite float32 probabilities clipped to `[0, 1]`.
 
 ### Learned occupancy
 
-A small ConvGRU consumes the eight two-channel history frames. It rolls forward
-15 steps and returns logits/probabilities `[B,T,H,W]`. A separate learned risk
-head implements B4 and consumes only predicted occupancy plus query geometry;
-it never consumes occupancy labels.
+A small ConvGRU consumes the eight two-channel history frames plus the frozen
+deployment-visible scene-state channels, fuses their spatial feature maps, then
+rolls forward 15 steps and returns logits/probabilities `[B,T,H,W]`. A separate
+learned risk head implements B4 and consumes only predicted occupancy plus query
+geometry; it never consumes occupancy labels.
 
 ### Aggregation
 
@@ -162,8 +163,8 @@ a clear contract error until the v2 dataset manifest exists.
   the nine state and four trajectory channels, applies a small CNN and global
   pooling, then concatenates the two-element robot state before the MLP.
 - R1 encodes each history frame with a shared spatial encoder and a ConvGRU,
-  then fuses the temporal representation with current state, trajectory maps,
-  and robot state.
+  fuses its spatial hidden map with encoded current state and trajectory maps
+  before global pooling, then adds robot state for the output heads.
 
 Both return `quantiles [B,4]`, `collision_logits [B]`, and `p_collision [B]`.
 Quantiles are non-crossing by construction without forcing Q95 to one:

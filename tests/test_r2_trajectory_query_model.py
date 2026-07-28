@@ -167,6 +167,35 @@ def test_r2_backward_has_finite_trajectory_gradients_and_is_trajectory_sensitive
     assert float(delta) > 1e-8
 
 
+def test_r1_fuses_aligned_spatial_features_before_global_pooling():
+    model = RiskModel(variant="r1", hidden_channels=4).eval()
+    inputs = _inputs(batch_size=2, height=16, width=12)
+    observed: dict[str, tuple[int, ...]] = {}
+
+    def capture_spatial_fusion(_module, arguments):
+        observed["spatial_fusion_input"] = tuple(arguments[0].shape)
+
+    def capture_pool(_module, arguments):
+        observed["pool_input"] = tuple(arguments[0].shape)
+
+    fusion_handle = model.r1_spatial_fusion.register_forward_pre_hook(
+        capture_spatial_fusion
+    )
+    pool_handle = model.pool.register_forward_pre_hook(capture_pool)
+    try:
+        output = model(inputs)
+    finally:
+        fusion_handle.remove()
+        pool_handle.remove()
+
+    assert observed == {
+        "spatial_fusion_input": (2, 8, 16, 12),
+        "pool_input": (2, 8, 16, 12),
+    }
+    assert model.export_config()["r1_fusion_mode"] == "spatial_concat_before_pool"
+    assert output["quantiles"].shape == (2, 4)
+
+
 def test_r2_query_bins_cover_the_full_long40_horizon():
     model = RiskModel(
         variant="r2",
@@ -273,11 +302,14 @@ def test_r0_r1_legacy_configs_and_checkpoints_remain_round_trippable(
     tmp_path, variant
 ):
     model = RiskModel(variant=variant, hidden_channels=4).eval()
-    assert model.export_config() == {
+    expected_config = {
         "variant": variant,
         "hidden_channels": 4,
         "history_steps": 8,
     }
+    if variant == "r1":
+        expected_config["r1_fusion_mode"] = "spatial_concat_before_pool"
+    assert model.export_config() == expected_config
     path = tmp_path / f"{variant}.pt"
     provenance = _toy_provenance(variant)
     save_risk_checkpoint(path, model=model, mode="toy", provenance=provenance)
@@ -453,6 +485,13 @@ def test_r2_configs_and_cli_variant_are_accepted_by_the_training_entry():
     assert r1_config["variant"] == "r1"
     assert concat_config["r2_fusion_mode"] == "concat"
     assert concat_config["occupancy_aux_enabled"] is True
+    occupancy_config = yaml.safe_load(
+        (ROOT / "configs" / "occupancy_baseline_production.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert occupancy_config["hidden_channels"] >= 8
+    assert occupancy_config["learned_aggregator_hidden_dim"] >= 32
     matrix = yaml.safe_load(
         (ROOT / "configs" / "risk_experiment_matrix.yaml").read_text(
             encoding="utf-8"
@@ -500,6 +539,13 @@ def test_r2_configs_and_cli_variant_are_accepted_by_the_training_entry():
         assert loaded["occupancy_aux_enabled"] is auxiliary
         if fusion is not None:
             assert loaded["r2_fusion_mode"] == fusion
+    concat_experiment = next(
+        item for item in matrix["risk_experiments"] if item["name"] == "R2-concat"
+    )
+    assert concat_experiment["role"] == "exploratory_unmatched_fusion_control"
+    assert concat_experiment["claim_policy"] == (
+        "must_not_support_cross_attention_superiority_claims"
+    )
     assert matrix["occupancy_experiments"] == [
         {
             "name": "B1",
@@ -515,13 +561,13 @@ def test_r2_configs_and_cli_variant_are_accepted_by_the_training_entry():
         },
         {
             "name": "B3",
-            "role": "convgru_occupancy_hand_aggregation",
+            "role": "convgru_history_scene_state_occupancy_hand_aggregation",
             "config": "configs/occupancy_baseline_production.yaml",
             "formal_method_id": "B3",
         },
         {
             "name": "B4",
-            "role": "convgru_occupancy_learned_aggregation",
+            "role": "convgru_history_scene_state_occupancy_learned_aggregation",
             "config": "configs/occupancy_baseline_production.yaml",
             "formal_method_id": "B4",
         },

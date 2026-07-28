@@ -177,12 +177,13 @@ class ConvGRUCell(nn.Module):
 
 
 class ConvGRUOccupancyPredictor(nn.Module):
-    """Encode eight observed BEV frames and autoregress future occupancy logits."""
+    """Encode history plus current scene state and autoregress occupancy logits."""
 
     def __init__(
         self,
         *,
         history_channels: int = len(HISTORY_CHANNELS),
+        state_channels: int = len(STATE_CHANNELS),
         hidden_channels: int = 8,
         future_steps: int = FUTURE_STEPS,
         kernel_size: int = 3,
@@ -192,10 +193,41 @@ class ConvGRUOccupancyPredictor(nn.Module):
             raise ValueError(
                 f"history_channels must match frozen contract ({len(HISTORY_CHANNELS)})"
             )
+        if state_channels != len(STATE_CHANNELS):
+            raise ValueError(
+                f"state_channels must match frozen contract ({len(STATE_CHANNELS)})"
+            )
         self.history_channels = history_channels
+        self.state_channels = state_channels
         self.hidden_channels = _positive_integer("hidden_channels", hidden_channels)
         self.future_steps = _positive_integer("future_steps", future_steps)
         self.encoder_cell = ConvGRUCell(history_channels, hidden_channels, kernel_size)
+        padding = kernel_size // 2
+        self.state_encoder = nn.Sequential(
+            nn.Conv2d(
+                state_channels,
+                hidden_channels,
+                kernel_size,
+                padding=padding,
+            ),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size,
+                padding=padding,
+            ),
+            nn.Tanh(),
+        )
+        self.history_state_fusion = nn.Sequential(
+            nn.Conv2d(
+                2 * hidden_channels,
+                hidden_channels,
+                kernel_size,
+                padding=padding,
+            ),
+            nn.Tanh(),
+        )
         self.decoder_cell = ConvGRUCell(1, hidden_channels, kernel_size)
         self.output_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
         self.dynamic_channel_index = HISTORY_CHANNELS.index("past_dynamic_occupancy")
@@ -221,12 +253,43 @@ class ConvGRUOccupancyPredictor(nn.Module):
         if bool(((bev_history < 0.0) | (bev_history > 1.0)).any()):
             raise ValueError("bev_history probability channels must be in [0,1]")
 
-    def predict_logits(self, bev_history: torch.Tensor) -> torch.Tensor:
+    def _validate_state(
+        self,
+        state_channels: torch.Tensor,
+        *,
+        bev_history: torch.Tensor,
+    ) -> None:
+        if not torch.is_tensor(state_channels):
+            raise TypeError("state_channels must be a torch tensor")
+        if state_channels.ndim != 4:
+            raise ValueError("state_channels must have rank 4 [B,C,H,W]")
+        if int(state_channels.shape[1]) != self.state_channels:
+            raise ValueError(
+                f"state_channels channels must be {self.state_channels}, "
+                f"got {int(state_channels.shape[1])}"
+            )
+        if state_channels.dtype != torch.float32:
+            raise ValueError("state_channels must be float32")
+        if not bool(torch.isfinite(state_channels).all()):
+            raise ValueError("state_channels must be finite")
+        if state_channels.shape[0] != bev_history.shape[0] or (
+            state_channels.shape[-2:] != bev_history.shape[-2:]
+        ):
+            raise ValueError("state_channels must align with bev_history batch and grid")
+
+    def predict_logits(
+        self,
+        bev_history: torch.Tensor,
+        state_channels: torch.Tensor,
+    ) -> torch.Tensor:
         self._validate_history(bev_history)
+        self._validate_state(state_channels, bev_history=bev_history)
         batch_size, _, _, height, width = bev_history.shape
         hidden = bev_history.new_zeros(batch_size, self.hidden_channels, height, width)
         for step in range(int(bev_history.shape[1])):
             hidden = self.encoder_cell(bev_history[:, step], hidden)
+        scene_state = self.state_encoder(state_channels)
+        hidden = self.history_state_fusion(torch.cat((hidden, scene_state), dim=1))
 
         previous = bev_history[:, -1, self.dynamic_channel_index : self.dynamic_channel_index + 1]
         logits: list[torch.Tensor] = []
@@ -237,8 +300,12 @@ class ConvGRUOccupancyPredictor(nn.Module):
             previous = torch.sigmoid(current_logits)
         return torch.stack(logits, dim=1)
 
-    def forward(self, bev_history: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.predict_logits(bev_history))
+    def forward(
+        self,
+        bev_history: torch.Tensor,
+        state_channels: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.sigmoid(self.predict_logits(bev_history, state_channels))
 
 
 class LearnedOccupancyRiskAggregator(nn.Module):

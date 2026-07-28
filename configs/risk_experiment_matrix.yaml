@@ -39,7 +39,8 @@ risk_experiments:
     config: configs/risk_model_r2_no_aux_production.yaml
     formal_method_id: null
   - name: R2-concat
-    role: fusion_ablation
+    role: exploratory_unmatched_fusion_control
+    claim_policy: must_not_support_cross_attention_superiority_claims
     config: configs/risk_model_r2_concat_control_production.yaml
     formal_method_id: null
 occupancy_experiments:
@@ -52,10 +53,10 @@ occupancy_experiments:
     config: configs/occupancy_baseline_production.yaml
     formal_method_id: B2
   - name: B3
-    role: convgru_occupancy_hand_aggregation
+    role: convgru_history_scene_state_occupancy_hand_aggregation
     config: configs/occupancy_baseline_production.yaml
     formal_method_id: B3
   - name: B4
-    role: convgru_occupancy_learned_aggregation
+    role: convgru_history_scene_state_occupancy_learned_aggregation
     config: configs/occupancy_baseline_production.yaml
     formal_method_id: B4

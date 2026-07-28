@@ -306,6 +306,7 @@ def _load_selected_occupancy_models(
     if future_steps != FUTURE_STEPS or config.get("future_steps") != future_steps:
         raise PredictionProducerError("occupancy checkpoint future_steps mismatch")
     model = ConvGRUOccupancyPredictor(
+        state_channels=int(model_spec["state_channels"]),
         hidden_channels=int(model_spec["hidden_channels"]),
         future_steps=int(future_steps),
         kernel_size=int(model_spec["convgru_kernel_size"]),

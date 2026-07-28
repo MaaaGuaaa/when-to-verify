@@ -284,6 +284,31 @@ def _config(
     )
 
 
+def test_best_checkpoint_selection_ignores_auxiliary_validation_loss() -> None:
+    best_main_risk = 0.30
+    lower_total_but_worse_risk = trainer_module.RiskLossEvaluation(
+        total=0.20,
+        main_risk=0.40,
+        occupancy_aux=0.01,
+        crossing_rate=0.0,
+    )
+    higher_total_but_better_risk = trainer_module.RiskLossEvaluation(
+        total=1.20,
+        main_risk=0.25,
+        occupancy_aux=4.75,
+        crossing_rate=0.0,
+    )
+
+    assert not trainer_module._is_better_validation_candidate(
+        lower_total_but_worse_risk,
+        best_main_risk,
+    )
+    assert trainer_module._is_better_validation_candidate(
+        higher_total_but_better_risk,
+        best_main_risk,
+    )
+
+
 def _production_provenance(dataset: LoadedRiskDataset) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,

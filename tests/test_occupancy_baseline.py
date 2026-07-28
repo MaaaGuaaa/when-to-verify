@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.contracts import HISTORY_CHANNELS
+from src.contracts import HISTORY_CHANNELS, STATE_CHANNELS
 from src.models.occupancy_baseline import (
     ConvGRUOccupancyPredictor,
     LearnedOccupancyRiskAggregator,
@@ -28,14 +28,25 @@ def _history(batch_size: int = 3, grid_size: int = 8) -> torch.Tensor:
     return history
 
 
+def _state(batch_size: int = 3, grid_size: int = 8) -> torch.Tensor:
+    return torch.zeros(
+        batch_size,
+        len(STATE_CHANNELS),
+        grid_size,
+        grid_size,
+        dtype=torch.float32,
+    )
+
+
 def test_convgru_predictor_has_frozen_future_contract_and_is_deterministic() -> None:
     torch.manual_seed(11)
     model = ConvGRUOccupancyPredictor(hidden_channels=4)
     history = _history()
+    state = _state()
 
-    probability = model(history)
-    repeated = model(history)
-    logits = model.predict_logits(history)
+    probability = model(history, state)
+    repeated = model(history, state)
+    logits = model.predict_logits(history, state)
 
     assert model.future_steps == 32
     assert probability.shape == (3, 32, 8, 8)
@@ -46,12 +57,29 @@ def test_convgru_predictor_has_frozen_future_contract_and_is_deterministic() -> 
     torch.testing.assert_close(probability, torch.sigmoid(logits))
 
 
+def test_convgru_predictor_is_conditioned_on_frozen_scene_state() -> None:
+    torch.manual_seed(19)
+    model = ConvGRUOccupancyPredictor(hidden_channels=4).eval()
+    history = _history(batch_size=1)
+    reference_state = _state(batch_size=1)
+    changed_state = reference_state.clone()
+    changed_state[:, STATE_CHANNELS.index("last_seen_occupancy"), 3, 4] = 1.0
+
+    with torch.no_grad():
+        reference = model(history, reference_state)
+        changed = model(history, changed_state)
+
+    assert model.state_channels == len(STATE_CHANNELS)
+    assert model.state_encoder[0].in_channels == len(STATE_CHANNELS)
+    assert not torch.equal(reference, changed)
+
+
 def test_convgru_rejects_wrong_history_channel_contract() -> None:
     model = ConvGRUOccupancyPredictor(hidden_channels=4)
     wrong = torch.zeros(1, 8, 1, 8, 8, dtype=torch.float32)
 
     with pytest.raises(ValueError, match="history channels"):
-        model(wrong)
+        model(wrong, _state(batch_size=1))
 
 
 @pytest.mark.parametrize("history_steps", [7, 9])
@@ -67,7 +95,7 @@ def test_convgru_requires_exactly_eight_history_frames(history_steps: int) -> No
     )
 
     with pytest.raises(ValueError, match="exactly 8 history frames"):
-        model(wrong)
+        model(wrong, _state(batch_size=1))
 
 
 def test_learned_aggregator_only_consumes_prediction_and_query_geometry() -> None:

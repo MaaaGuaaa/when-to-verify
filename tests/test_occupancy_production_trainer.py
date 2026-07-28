@@ -540,7 +540,7 @@ def _resign_publication(root: Path, manifest: dict[str, object]) -> str:
         checksums_bytes=checksums_bytes,
     )
     marker = {
-        "training_layout_version": "sop08_production_training_v1",
+        "training_layout_version": "sop08_production_training_v2",
         "semantic_digest_sha256": manifest["semantic_digest_sha256"],
         "publication_instance_digest_sha256": instance,
         "training_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
@@ -694,7 +694,7 @@ def test_resigned_manifest_ghost_key_is_rejected_even_with_new_instance_digest(
         checksums_bytes=checksums_payload,
     )
     marker = {
-        "training_layout_version": "sop08_production_training_v1",
+        "training_layout_version": "sop08_production_training_v2",
         "semantic_digest_sha256": manifest["semantic_digest_sha256"],
         "publication_instance_digest_sha256": new_instance,
         "training_manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),

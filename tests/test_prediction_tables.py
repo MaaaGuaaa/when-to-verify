@@ -361,7 +361,7 @@ def test_shared_table_validation_rejects_nonformal_b3_artifact(
         )
         for method, artifact in _artifacts().items()
     }
-    tables["B3"]["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v2"
+    tables["B3"]["checkpoint_layout_version"] = "occupancy_baseline_checkpoint_v3"
     tables["B3"]["checkpoint_digest_kind"] = (
         "occupancy_checkpoint_semantic_sha256"
     )

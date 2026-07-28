@@ -74,6 +74,7 @@ N_TRAJECTORY_CHANNELS = len(TRAJECTORY_CHANNELS)  # 4
 # Fixed vector dimensions (frozen; changing them is a schema change).
 ROBOT_STATE_DIM = 2  # (v, omega)
 ACTION_VECTOR_DIM = 3  # (duration_s, delta_forward_m, delta_yaw_rad)
+QUANTILE_LEVELS: tuple[float, ...] = (0.5, 0.8, 0.9, 0.95)
 DYNAMIC_OBJECT_TYPES: tuple[str, ...] = (
     "human",
     "carried_object",

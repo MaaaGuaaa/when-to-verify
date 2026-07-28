@@ -13,14 +13,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from src.contracts import LONG40_FUTURE_STEPS, LONG40_SAMPLE_DT_S
 
-
-def future_endpoint_times(
-    *,
-    future_steps: int = LONG40_FUTURE_STEPS,
-    dt_s: float = LONG40_SAMPLE_DT_S,
-) -> np.ndarray:
+def future_endpoint_times(*, future_steps: int = 32, dt_s: float = 0.2) -> np.ndarray:
     """Return float32 endpoint times ``dt_s .. future_steps * dt_s``."""
     if isinstance(future_steps, bool) or not isinstance(future_steps, int) or future_steps < 1:
         raise ValueError("future_steps must be a positive integer")

@@ -1,0 +1,16 @@
+mode: toy
+seed: 42
+grid_size: 16
+train_count: 128
+validation_count: 28
+calibration_count: 28
+test_count: 28
+variants:
+  - r0
+  - r1
+hidden_channels: 8
+optimization_steps: 40
+learning_rate: 0.02
+lambda_collision: 1.0
+lambda_occupancy_aux: 0.0
+optimizer: AdamW

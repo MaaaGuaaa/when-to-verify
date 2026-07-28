@@ -119,6 +119,9 @@ def test_grid_spec_and_time_layout_are_current_long40_contract() -> None:
         "history_steps",
         "future_steps",
         "resolution_m",
+        "n_history_channels",
+        "n_state_channels",
+        "n_trajectory_channels",
     )
     assert (grid.height, grid.width) == (160, 160)
     assert grid.history_steps == 8
@@ -135,12 +138,13 @@ def test_current_long40_document_freezes_the_same_layout() -> None:
     assert "sample_count                      = 40" in contents
 
 
-def test_current_dataclass_surface_excludes_retired_training_samples() -> None:
+def test_current_dataclass_surface_includes_active_risk_sample() -> None:
     assert set(contracts._CLASS_REGISTRY) == {
         "BaseState",
         "OracleContext",
         "OracleWorld",
         "LocalTrajectory",
+        "RiskSample",
     }
     assert tuple(field.name for field in fields(BaseState)) == (
         "state_id",

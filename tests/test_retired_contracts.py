@@ -1,4 +1,4 @@
-"""Repository guards for retired short-horizon and post-SOP08 contracts."""
+"""Repository guards for contracts that remain retired after SOP08."""
 
 from __future__ import annotations
 
@@ -9,22 +9,12 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 
 RETIRED_PATHS = (
-    "src/calibration/grouped_calibration.py",
-    "src/evaluation/prediction_tables.py",
-    "src/evaluation/risk_metrics.py",
     "src/evaluation/verification_baselines.py",
     "src/evaluation/verification_metrics.py",
-    "src/models/bev_encoder.py",
-    "src/models/losses.py",
-    "src/models/risk_model.py",
     "src/models/verification_model.py",
     "src/models/verification_training.py",
-    "src/training/risk_ddp_trainer.py",
-    "src/training/risk_trainer.py",
-    "docs/superpowers/plans/2026-07-25-sop05r-lightweight-teb",
     "src/datasets/snippet_library.py",
     "src/datasets/risk_dataset.py",
-    "src/datasets/risk_evaluation_store.py",
     "src/datasets/sop03_publication.py",
     "src/datasets/verification_collection.py",
     "src/datasets/verification_dataloader.py",
@@ -43,17 +33,12 @@ RETIRED_PATHS = (
     "src/generation/sop05r_trajectory_store.py",
     "src/generation/sop06_pipeline.py",
     "scripts/04_generate_risk_dataset.py",
-    "scripts/06_train_risk_model.py",
-    "scripts/07_calibrate_risk.py",
     "scripts/08_generate_verification_dataset.py",
-    "scripts/09_predict_risk.py",
     "scripts/09_train_verification_model.py",
-    "scripts/10_eval_offline.py",
     "scripts/10_evaluate_verification_model.py",
 )
 
 RETIRED_CONTRACT_SYMBOLS = (
-    "QUANTILE_LEVELS",
     "VerificationSample",
     "validate_verification_sample",
 )

@@ -23,8 +23,6 @@ from src.contracts import (
     FORBIDDEN_INPUT_TOKENS,
     HISTORY_CHANNELS,
     INPUT_CHANNELS,
-    LONG40_FUTURE_STEPS,
-    LONG40_SAMPLE_DT_S,
     SCHEMA_VERSION,
     STATE_CHANNELS,
     TRAJECTORY_CHANNELS,
@@ -102,8 +100,7 @@ _SUBSET_DIGEST_DOMAIN = "risk-production-subset-v1"
 _SHARD_ORDER_DOMAIN = "risk-production-shard-order-v1"
 _ROW_ORDER_DOMAIN = "risk-production-row-order-v1"
 _PRODUCTION_TARGET_CHANNELS = (*TARGET_KEYS, "first_collision_time")
-_PRODUCTION_FUTURE_STEPS = LONG40_FUTURE_STEPS
-_PRODUCTION_FUTURE_DT_S = LONG40_SAMPLE_DT_S
+_PRODUCTION_FUTURE_STEPS = 32
 _FROZEN_LINEAR_PRIMITIVES = (-0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8)
 _FROZEN_ANGULAR_PRIMITIVES = (-0.8, -0.4, 0.0, 0.4, 0.8)
 
@@ -121,6 +118,7 @@ class RiskBatch:
     sample_ids: tuple[str, ...]
     split: str
     provenance: dict[str, object]
+    occupancy_targets: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -189,7 +187,7 @@ class ProductionOccupancyBatch:
             )
         expected_endpoints = torch.arange(
             1, future_steps + 1, dtype=torch.float32, device=endpoints.device
-        ) * _PRODUCTION_FUTURE_DT_S
+        ) * 0.2
         if not torch.equal(endpoints, expected_endpoints):
             raise RiskDataContractError(
                 "endpoint_times_s must equal exact 0.2-second endpoints"
@@ -712,14 +710,9 @@ def production_endpoint_times_from_query_geometry(
         raise RiskDataContractError("occupancy query future_steps must equal 32")
     dt_value = query_geometry.get("future_dt_s")
     if type(dt_value) not in {int, float} or not math.isclose(
-        float(dt_value),
-        _PRODUCTION_FUTURE_DT_S,
-        rel_tol=0.0,
-        abs_tol=1e-12,
+        float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
     ):
-        raise RiskDataContractError(
-            f"occupancy query future_dt_s must equal {_PRODUCTION_FUTURE_DT_S}"
-        )
+        raise RiskDataContractError("occupancy query future_dt_s must equal 0.2")
     endpoint_times = (
         np.arange(1, future_steps + 1, dtype=np.float32)
         * np.float32(dt_value)
@@ -791,14 +784,9 @@ def reconstruct_production_robot_endpoint_footprints(
         )
     dt_value = query_geometry.get("future_dt_s")
     if type(dt_value) not in {int, float} or not math.isclose(
-        float(dt_value),
-        _PRODUCTION_FUTURE_DT_S,
-        rel_tol=0.0,
-        abs_tol=1e-12,
+        float(dt_value), 0.2, rel_tol=0.0, abs_tol=1e-12
     ):
-        raise RiskDataContractError(
-            f"occupancy query future_dt_s must equal {_PRODUCTION_FUTURE_DT_S}"
-        )
+        raise RiskDataContractError("occupancy query future_dt_s must equal 0.2")
     provenance = sample.metadata.get("provenance") if isinstance(
         sample.metadata, Mapping
     ) else None
@@ -854,7 +842,7 @@ def reconstruct_production_robot_endpoint_footprints(
         grid.width,
         grid.resolution_m,
         future_steps,
-        _PRODUCTION_FUTURE_DT_S,
+        0.2,
         length,
         width,
         inflation,
@@ -864,10 +852,7 @@ def reconstruct_production_robot_endpoint_footprints(
         _ROBOT_ENDPOINT_MASK_CACHE.move_to_end(cache_key)
         return np.array(cached, dtype=np.float32, order="C", copy=True)
     poses, _ = rollout_constant_control(
-        v=v,
-        omega=omega,
-        dt_s=_PRODUCTION_FUTURE_DT_S,
-        steps=future_steps,
+        v=v, omega=omega, dt_s=0.2, steps=future_steps
     )
     footprint = inflate_footprint(RectangleFootprint(length, width), inflation)
     masks = np.ascontiguousarray(

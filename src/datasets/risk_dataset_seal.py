@@ -65,6 +65,18 @@ _HELDOUT_GENERATION_REPORT_ROLE = "sop07_heldout_batch_generation_report"
 _HELDOUT_COLLECTION_SEMANTIC_DOMAIN = (
     b"sop07-heldout-collection-semantic-v1\0"
 )
+SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION = (
+    "sop07_single_risk_collection_complete_handoff_v1"
+)
+SOP07_SINGLE_RISK_COLLECTION_HANDOFF_ROLE = (
+    "sop07_single_risk_collection_complete_handoff"
+)
+SOP07_SINGLE_RISK_COLLECTION_PRODUCER_VERSION = (
+    "sop07_single_risk_collection_adapter_v1"
+)
+_SOP07_SINGLE_RISK_COLLECTION_SEMANTIC_DOMAIN = (
+    b"sop07-single-risk-collection-semantic-v1\0"
+)
 _HELDOUT_SPLITS = frozenset({"calibration", "val", "test"})
 _COLLECTION_HANDOFF_NAME = "collection_complete_handoff.json"
 _DATASET_MANIFEST_NAME = "dataset_manifest.json"
@@ -962,14 +974,26 @@ def _load_authenticated_handoff(
     except UnicodeError as exc:
         raise RiskDataContractError("SOP07 collection handoff must be UTF-8") from exc
     handoff = _strict_json_loads(text, label="SOP07 collection handoff")
-    if expected_split == "train":
+    if expected_split not in {"train", *_HELDOUT_SPLITS}:
+        raise RiskDataContractError(
+            "unsupported SOP07 collection split/handoff dialect"
+        )
+    handoff_version = handoff.get("handoff_version")
+    if handoff_version == SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION:
+        expected_version = SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION
+        expected_role = SOP07_SINGLE_RISK_COLLECTION_HANDOFF_ROLE
+        is_heldout = False
+        is_single_release = True
+    elif expected_split == "train":
         expected_version = _COLLECTION_HANDOFF_VERSION
         expected_role = "sop07_train_collection_complete_handoff"
         is_heldout = False
+        is_single_release = False
     elif expected_split in _HELDOUT_SPLITS:
         expected_version = _HELDOUT_COLLECTION_HANDOFF_VERSION
         expected_role = _HELDOUT_COLLECTION_HANDOFF_ROLE
         is_heldout = True
+        is_single_release = False
     else:
         raise RiskDataContractError(
             "unsupported SOP07 collection split/handoff dialect"
@@ -998,7 +1022,40 @@ def _load_authenticated_handoff(
         field="collection_semantic_digest_sha256",
     )
     _require_commit(handoff.get("code_commit"), field="SOP07 code_commit")
-    if is_heldout:
+    if is_single_release:
+        if handoff.get("producer_version") != (
+            SOP07_SINGLE_RISK_COLLECTION_PRODUCER_VERSION
+        ):
+            raise RiskDataContractError("single-release collection producer mismatch")
+        _require_blake2b128(
+            handoff.get("target_type_policy_digest"),
+            field="single-release target_type_policy_digest",
+        )
+        source_release = handoff.get("source_release")
+        if not isinstance(source_release, Mapping) or set(source_release) != {
+            "version",
+            "request_identity",
+            "manifest_digest",
+            "sample_count",
+            "shard_count",
+        }:
+            raise RiskDataContractError("single-release source identity is invalid")
+        if source_release.get("version") != "sop07_single_risk_release_v1":
+            raise RiskDataContractError("single-release source version mismatch")
+        _require_sha256(
+            source_release.get("request_identity"),
+            field="single-release request identity",
+        )
+        _require_sha256(
+            source_release.get("manifest_digest"),
+            field="single-release manifest digest",
+        )
+        if (
+            source_release.get("sample_count") != handoff["sample_count"]
+            or source_release.get("shard_count") != handoff["shard_count"]
+        ):
+            raise RiskDataContractError("single-release source counts mismatch")
+    elif is_heldout:
         producer_version = _load_authenticated_heldout_generation_report(
             collection_root,
             handoff=handoff,
@@ -1549,12 +1606,54 @@ def _formally_validate_sidecar_collection(
     )
 
 
+def _single_release_collection_semantic_digest(
+    handoff: Mapping[str, object],
+    *,
+    descriptors: Sequence[RiskShardDescriptor],
+    expected_split: str,
+    sample_count: int,
+) -> str:
+    """Recompute one single-release adapter collection identity."""
+
+    source_release = handoff.get("source_release")
+    if not isinstance(source_release, Mapping):
+        raise RiskDataContractError("single-release source identity is missing")
+    target_digest = _require_blake2b128(
+        handoff.get("target_type_policy_digest"),
+        field="single-release target_type_policy_digest",
+    )
+    scope = {
+        "handoff_version": SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "layout_version": RISK_SHARD_LAYOUT_VERSION,
+        "split": expected_split,
+        "sample_count": sample_count,
+        "shard_count": len(descriptors),
+        "source_release": dict(source_release),
+        "target_type_policy_digest": target_digest,
+        "shards": [asdict(descriptor) for descriptor in descriptors],
+    }
+    return _framed_domain_digest(
+        _SOP07_SINGLE_RISK_COLLECTION_SEMANTIC_DOMAIN,
+        scope,
+        label="single-release collection semantic scope",
+    )
+
+
 def _target_policy_from_loaded_shard(
     loaded: LoadedRiskShard,
     *,
     shard_index: int,
+    fallback_digest: str | None = None,
 ) -> set[str]:
     values: set[str] = set()
+    fallback = (
+        _require_blake2b128(
+            fallback_digest, field="fallback target_type_policy_digest"
+        )
+        if fallback_digest is not None
+        else None
+    )
     for row_index, row in enumerate(loaded.manifest):
         metadata = row.get("metadata")
         provenance = metadata.get("provenance") if isinstance(metadata, Mapping) else None
@@ -1562,12 +1661,15 @@ def _target_policy_from_loaded_shard(
             raise RiskDataContractError(
                 f"shard {shard_index} row {row_index} provenance is missing"
             )
-        values.add(
-            _require_blake2b128(
-                provenance.get("target_type_policy_digest"),
-                field="target_type_policy_digest",
+        value = provenance.get("target_type_policy_digest")
+        if value is None and fallback is not None:
+            values.add(fallback)
+        else:
+            values.add(
+                _require_blake2b128(
+                    value, field="target_type_policy_digest"
+                )
             )
-        )
     return values
 
 
@@ -1641,6 +1743,18 @@ def _formally_validate_collection(
     descriptors: list[RiskShardDescriptor] = []
     target_policy_values: set[str] = set()
     sample_ids: set[str] = set()
+    is_single_release = (
+        handoff.get("handoff_version")
+        == SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION
+    )
+    fallback_target_policy = (
+        _require_blake2b128(
+            handoff.get("target_type_policy_digest"),
+            field="single-release target_type_policy_digest",
+        )
+        if is_single_release
+        else None
+    )
     for position, (shard_root, handoff_value) in enumerate(
         zip(shard_roots, handoff_values)
     ):
@@ -1691,7 +1805,11 @@ def _formally_validate_collection(
                     f"shard file checksum mismatch for {descriptor.relative_root}: {field}"
                 )
         target_policy_values.update(
-            _target_policy_from_loaded_shard(loaded, shard_index=position)
+            _target_policy_from_loaded_shard(
+                loaded,
+                shard_index=position,
+                fallback_digest=fallback_target_policy,
+            )
         )
         for sample in loaded.samples:
             if sample.sample_id in sample_ids:
@@ -1734,7 +1852,18 @@ def _formally_validate_collection(
         handoff.get("collection_semantic_digest_sha256"),
         field="collection_semantic_digest_sha256",
     )
-    if expected_split in _HELDOUT_SPLITS:
+    if is_single_release:
+        recomputed_collection_digest = (
+            _single_release_collection_semantic_digest(
+                handoff,
+                descriptors=descriptors,
+                expected_split=expected_split,
+                sample_count=len(sample_ids),
+            )
+        )
+        if recomputed_collection_digest != declared_collection_digest:
+            raise RiskDataContractError("collection semantic digest mismatch")
+    elif expected_split in _HELDOUT_SPLITS:
         recomputed_collection_digest = _heldout_collection_semantic_digest(
             handoff,
             descriptors=descriptors,
@@ -2077,7 +2206,10 @@ def _load_risk_dataset_seal_with_authenticated_rows(
         raise RiskDataContractError("dataset manifest schema_version mismatch")
     if manifest.get("split") != split:
         raise RiskDataContractError("dataset manifest split mismatch")
-    if split == "train":
+    manifest_handoff_version = manifest.get("collection_handoff_version")
+    if manifest_handoff_version == SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION:
+        expected_handoff_version = SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION
+    elif split == "train":
         expected_handoff_version = _COLLECTION_HANDOFF_VERSION
     elif split in _HELDOUT_SPLITS:
         expected_handoff_version = _HELDOUT_COLLECTION_HANDOFF_VERSION
@@ -2085,7 +2217,7 @@ def _load_risk_dataset_seal_with_authenticated_rows(
         raise RiskDataContractError(
             "unsupported SOP07 collection split/handoff dialect"
         )
-    if manifest.get("collection_handoff_version") != expected_handoff_version:
+    if manifest_handoff_version != expected_handoff_version:
         raise RiskDataContractError("dataset collection handoff version mismatch")
     g1_digest = _require_blake2b128(
         manifest.get("g1_split_manifest_digest"), field="g1_split_manifest_digest"
@@ -3228,6 +3360,9 @@ __all__ = [
     "RISK_DATASET_FAMILY_LAYOUT_VERSION",
     "RISK_DATASET_LAYOUT_VERSION",
     "RISK_SIDECAR_COLLECTION_LAYOUT_VERSION",
+    "SOP07_SINGLE_RISK_COLLECTION_HANDOFF_ROLE",
+    "SOP07_SINGLE_RISK_COLLECTION_HANDOFF_VERSION",
+    "SOP07_SINGLE_RISK_COLLECTION_PRODUCER_VERSION",
     "LoadedRiskDataset",
     "LoadedRiskDatasetFamily",
     "LoadedRiskSidecarCollection",
